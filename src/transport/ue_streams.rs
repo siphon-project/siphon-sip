@@ -21,6 +21,7 @@
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -31,7 +32,7 @@ use super::crlf_keepalive::CrlfPongTracker;
 use super::disconnect;
 use super::pool::ConnectionPool;
 use super::send_queue::SendQueue;
-use super::stream::{serve_sip_stream, StreamContext};
+use super::stream::{serve_registered_sip_stream, StreamContext};
 use super::ue_sockets::ReconcileOutcome;
 use super::{
     configure_tcp_socket, next_connection_id, ConnectionId, InboundMessage, StreamConnections,
@@ -77,6 +78,10 @@ pub(crate) struct UeListeners {
     inbound_tx: flume::Sender<InboundMessage>,
     acl: Arc<TransportAcl>,
     tos: Option<u32>,
+    /// Holds each accepted connection's task before it serves, for a test to
+    /// close the listener inside that window.
+    #[cfg(test)]
+    hold_before_serve: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 /// One listener: its accept task, and the connections it accepted.
@@ -84,10 +89,17 @@ struct UeListener {
     address: SocketAddr,
     accept_task: tokio::task::AbortHandle,
     accepted: Arc<DashMap<ConnectionId, SocketAddr>>,
+    /// Set once the listener is closing, so an accept that lands while it is
+    /// closes the connection itself (see [`accept_loop`]).
+    closed: Arc<AtomicBool>,
 }
 
 impl Drop for UeListener {
     fn drop(&mut self) {
+        // Flag first, then close what is entered: an accept either is entered
+        // before the flag, and is found here, or reads the flag after entering
+        // itself and closes on its own. Both sides are SeqCst.
+        self.closed.store(true, Ordering::SeqCst);
         self.accept_task.abort();
         close_accepted_on(&self.accepted, |listener| listener == self.address);
     }
@@ -139,6 +151,8 @@ impl UeListeners {
             inbound_tx,
             acl,
             tos,
+            #[cfg(test)]
+            hold_before_serve: std::sync::Mutex::new(None),
         }
     }
 
@@ -207,9 +221,11 @@ impl UeListeners {
             ));
         }
         let listener = bind_freebind_listener(addr, self.tos)?;
+        let closed = Arc::new(AtomicBool::new(false));
         let accept_task = tokio::spawn(accept_loop(AcceptLoop {
             listener,
             address: addr,
+            closed: Arc::clone(&closed),
             accepted: Arc::clone(&self.accepted),
             inbound_tx: self.inbound_tx.clone(),
             connection_map: Arc::clone(&self.context.connection_map),
@@ -217,6 +233,12 @@ impl UeListeners {
             crlf_pong_tracker: self.context.crlf_pong_tracker.clone(),
             acl: Arc::clone(&self.acl),
             tos: self.tos,
+            #[cfg(test)]
+            hold_before_serve: self
+                .hold_before_serve
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
         }))
         .abort_handle();
         self.listeners.insert(
@@ -225,6 +247,7 @@ impl UeListeners {
                 address: addr,
                 accept_task,
                 accepted: Arc::clone(&self.accepted),
+                closed,
             },
         );
         debug!(%addr, "opened a per-UE TCP listener");
@@ -268,6 +291,16 @@ impl UeListeners {
     pub(crate) fn pool(&self) -> &Arc<ConnectionPool> {
         &self.context.pool
     }
+
+    /// Hold the task of every connection a listener opened from now on
+    /// accepts until `hold` has a permit, before it serves.
+    #[cfg(test)]
+    pub(crate) fn hold_before_serve(&self, hold: Arc<tokio::sync::Semaphore>) {
+        *self
+            .hold_before_serve
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hold);
+    }
 }
 
 /// A TCP listener on `addr` with `IP_FREEBIND`, so it binds before the address
@@ -301,6 +334,7 @@ fn bind_freebind_listener(
 struct AcceptLoop {
     listener: tokio::net::TcpListener,
     address: SocketAddr,
+    closed: Arc<AtomicBool>,
     accepted: Arc<DashMap<ConnectionId, SocketAddr>>,
     inbound_tx: flume::Sender<InboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
@@ -308,11 +342,19 @@ struct AcceptLoop {
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
     acl: Arc<TransportAcl>,
     tos: Option<u32>,
+    #[cfg(test)]
+    hold_before_serve: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// Accept connections until aborted, serving each as a `listen.tcp`
-/// connection is served. A connection is entered in `accepted` before its task
-/// starts, with no await in between, so dropping the listener finds it.
+/// connection is served.
+///
+/// A connection is closable from the instant it is accepted: its closer is
+/// registered and it is entered in `accepted` here, before its task is
+/// spawned, so a listener dropped at any point after finds and closes it, and
+/// the close is kept until the task serves the connection. Registering inside
+/// the task instead lost a close sent before the task first ran, and the
+/// connection then lived until the peer closed it.
 async fn accept_loop(context: AcceptLoop) {
     loop {
         let (socket, remote_addr) = match context.listener.accept().await {
@@ -336,26 +378,41 @@ async fn accept_loop(context: AcceptLoop) {
         };
         configure_tcp_socket(&socket, context.tos);
         let connection_id = next_connection_id();
+        let closer =
+            disconnect::ConnectionCloser::register(connection_id, remote_addr, Transport::Tcp);
         context.accepted.insert(connection_id, context.address);
         let guard = AcceptedGuard {
             accepted: Arc::clone(&context.accepted),
             connection_id,
         };
+        // The listener began closing before this connection was entered, so it
+        // may not have seen it: drop it here (the socket, the guard and the
+        // closer go with this iteration).
+        if context.closed.load(Ordering::SeqCst) {
+            debug!(peer = %remote_addr, "per-UE TCP connection accepted as its listener closed");
+            return;
+        }
         let local_addr = socket.local_addr().unwrap_or(context.address);
         let inbound_tx = context.inbound_tx.clone();
         let connection_map = Arc::clone(&context.connection_map);
         let stream_connections = context.stream_connections.clone();
         let crlf_pong_tracker = context.crlf_pong_tracker.clone();
+        #[cfg(test)]
+        let hold_before_serve = context.hold_before_serve.clone();
         debug!(local = %local_addr, peer = %remote_addr, ?connection_id, "per-UE TCP accepted");
         tokio::spawn(async move {
             let _guard = guard;
+            #[cfg(test)]
+            if let Some(hold) = hold_before_serve {
+                let _ = hold.acquire().await;
+            }
             // Served without the first-line sniff of a configured listener:
             // registered for closing from its first instant, and the framer
             // drops anything that is not SIP.
             permit.handshake_done();
             let _permit = permit;
             let (reader, writer) = socket.into_split();
-            serve_sip_stream(
+            serve_registered_sip_stream(
                 reader,
                 writer,
                 StreamContext {
@@ -365,6 +422,7 @@ async fn accept_loop(context: AcceptLoop) {
                     local_addr,
                     remote_addr,
                 },
+                closer,
                 bytes::BytesMut::new(),
                 inbound_tx,
                 connection_map,

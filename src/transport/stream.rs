@@ -505,8 +505,48 @@ fn spawn_outbound_distributor_with(
 /// tests and callers that serve a stream nobody routes back over.
 pub(crate) async fn serve_sip_stream<R, W>(
     reader: R,
+    writer: W,
+    context: StreamContext,
+    seed: BytesMut,
+    inbound_tx: flume::Sender<InboundMessage>,
+    connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
+    stream_connections: Option<StreamConnections>,
+    crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
+    close_tx: Option<flume::Sender<u64>>,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let closer = crate::transport::disconnect::ConnectionCloser::register(
+        context.connection_id,
+        context.remote_addr,
+        context.transport,
+    );
+    serve_registered_sip_stream(
+        reader,
+        writer,
+        context,
+        closer,
+        seed,
+        inbound_tx,
+        connection_map,
+        stream_connections,
+        crlf_pong_tracker,
+        close_tx,
+    )
+    .await;
+}
+
+/// [`serve_sip_stream`] for a connection whose closer the caller registered
+/// already: one that has to be closable from the instant it is accepted, before
+/// its task first runs (a per-UE listener torn down right after an accept, see
+/// [`super::ue_streams`]). A close signalled through `closer` before this runs
+/// is kept and ends the connection as soon as it is served.
+pub(crate) async fn serve_registered_sip_stream<R, W>(
+    reader: R,
     mut writer: W,
     context: StreamContext,
+    closer: crate::transport::disconnect::ConnectionCloser,
     seed: BytesMut,
     inbound_tx: flume::Sender<InboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
@@ -540,11 +580,6 @@ pub(crate) async fn serve_sip_stream<R, W>(
     // accept-path check and the registration would miss the connection entirely
     // — and it is the connection a banned source keeps that the ban has to end
     // (see [`crate::transport::disconnect`]).
-    let closer = crate::transport::disconnect::ConnectionCloser::register(
-        connection_id,
-        remote_addr,
-        transport,
-    );
     if crate::security::is_source_banned(remote_addr.ip()) {
         debug!("{transport} dropping {remote_addr}: source banned before it was served");
         return;

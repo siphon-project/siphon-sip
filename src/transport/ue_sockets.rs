@@ -138,6 +138,14 @@ impl UeSockets {
     }
 
     /// The pool the TCP half hands its sources to, once attached.
+    /// See [`UeListeners::hold_before_serve`].
+    #[cfg(test)]
+    pub(crate) fn hold_tcp_serving(&self, hold: Arc<tokio::sync::Semaphore>) {
+        if let Some(tcp) = self.tcp.get() {
+            tcp.hold_before_serve(hold);
+        }
+    }
+
     pub fn tcp_pool(&self) -> Option<&Arc<super::pool::ConnectionPool>> {
         self.tcp.get().map(UeListeners::pool)
     }
