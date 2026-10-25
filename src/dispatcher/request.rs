@@ -115,7 +115,7 @@ pub(super) fn invite_action_target_gone(
 /// lost-request case is the whole reason this path matters. Falls back to a
 /// direct send when no transaction was created (a topmost Via carrying no
 /// branch).
-fn answer_locally(
+pub(super) fn answer_locally(
     response: SipMessage,
     server_key: Option<&TransactionKey>,
     inbound: &InboundMessage,
@@ -158,12 +158,96 @@ fn answer_locally(
     }
 }
 
+/// Create the server transaction for a new request and schedule its initial
+/// timers.
+///
+/// `None` when another worker created the same transaction between the
+/// retransmission check and this create (a retransmission arrived while the
+/// original was still being processed, on another worker): that copy is
+/// already being handled, and handling this one too would fork the call a
+/// second time downstream on a fresh branch. `Some(None)` when no transaction
+/// could be created (a topmost Via with no branch): the request is still
+/// handled, statelessly.
+pub(super) fn open_server_transaction(
+    inbound: &InboundMessage,
+    message: &SipMessage,
+    method: &str,
+    state: &DispatcherState,
+) -> Option<Option<TransactionKey>> {
+    let txn_transport = crate::transaction::state::Transport::from(inbound.transport);
+    match state
+        .transaction_manager
+        .new_server_transaction(message, txn_transport)
+    {
+        Ok(outcome) if !outcome.is_new => {
+            debug!(
+                method = %method,
+                key = %outcome.key,
+                "request raced an in-flight copy of itself — absorbed"
+            );
+            None
+        }
+        Ok(crate::transaction::ServerTransactionOutcome { key, actions, .. }) => {
+            // Schedule any initial server-side timers
+            for action in &actions {
+                if let Action::StartTimer(name, duration) = action {
+                    let timer_id = format!("{}:{:?}", key, name);
+                    state.timer_wheel.insert(
+                        timer_id,
+                        Box::new(TimerEntry {
+                            key: key.clone(),
+                            name: *name,
+                            fires_at: std::time::Instant::now() + *duration,
+                            // Server transaction timers send responses upstream (to UAC)
+                            destination: Some(inbound.remote_addr),
+                            transport: Some(inbound.transport),
+                            connection_id: Some(inbound.connection_id),
+                            // Retransmit cached responses on the same SA's
+                            // local endpoint (TS 33.203 §7.4).
+                            source_local_addr: Some(inbound.local_addr),
+                        }),
+                    );
+                }
+            }
+            Some(Some(key))
+        }
+        Err(error) => {
+            // The request is still processed, statelessly — but with no
+            // transaction there is no retransmission absorption, so every
+            // retransmission runs the script again. Overwhelmingly this is a
+            // topmost Via with no `branch` (mandatory since RFC 3261 §8.1.1.7;
+            // siphon has no RFC 2543 legacy matching — see
+            // `transaction::key`), which is worth counting rather than
+            // learning about later from a duplicate-call report.
+            if let Some(metrics) = crate::metrics::try_metrics() {
+                metrics.requests_without_branch_total.inc();
+            }
+            debug!(method = %method, "failed to create server transaction: {error}");
+            Some(None)
+        }
+    }
+}
+
 /// Handle an inbound SIP request — run through Python handlers.
-#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. handle_request: security, method intercepts, script dispatch, action arms
+#[cfg(test)]
 pub(super) fn handle_request(
     inbound: InboundMessage,
     message: SipMessage,
     method: String,
+    state: &Arc<DispatcherState>,
+) {
+    handle_request_after_queue(inbound, message, method, std::time::Duration::ZERO, state);
+}
+
+/// [`handle_request`] for a request that waited `queue_wait` in the script
+/// executor's queue: an initial request that waited past the budget is
+/// answered 503 here and never reaches the script ([`super::stale_shed`]).
+#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. handle_request: security, method intercepts, script dispatch, action arms
+pub(super) fn handle_request_after_queue(
+    inbound: InboundMessage,
+    message: SipMessage,
+    method: String,
+    queue_wait: std::time::Duration,
     state: &Arc<DispatcherState>,
 ) {
     // --- Request security filter (scanner_block + rate_limit) ---
@@ -333,6 +417,21 @@ pub(super) fn handle_request(
         Err(error) => {
             debug!(method = %method, "failed to check server retransmit: {error}");
         }
+    }
+
+    // Age-based load shedding. An initial request that queued past the budget
+    // is answered 503 + Retry-After through a server transaction and never
+    // reaches the script: the answer it would get is about to be too late for
+    // the client's Timer F/B. Placed after the retransmission check, so a
+    // resend of a request already shed is answered from that transaction's
+    // cached 503, and ahead of every B2BUA intercept, so a new B2BUA INVITE is
+    // shed the same way. One comparison on the hot path; the classification
+    // only runs once the budget is exceeded.
+    if queue_wait > state.stale_request_budget
+        && super::stale_shed::sheds_when_stale(&method, &message)
+    {
+        super::stale_shed::shed_stale_request(&inbound, &message, &method, queue_wait, state);
+        return;
     }
 
     // A request on a dialog `proxy.release` ended is answered 481
@@ -607,63 +706,8 @@ pub(super) fn handle_request(
     // --- Create server transaction ---
     // The server transaction handles retransmission absorption and timer management.
     // ACK is excluded (handled by existing IST), as are requests going to B2BUA.
-    let txn_transport = crate::transaction::state::Transport::from(inbound.transport);
-    let server_key = match state
-        .transaction_manager
-        .new_server_transaction(&message, txn_transport)
-    {
-        Ok(outcome) if !outcome.is_new => {
-            // Another worker created this transaction between our
-            // `handle_server_retransmit` check above and the create — i.e. a
-            // retransmission arrived while the original was still being
-            // processed, and both landed on different workers. It is already
-            // being handled; running the script for this copy too would fork
-            // the call a second time downstream on a fresh branch.
-            debug!(
-                method = %method,
-                key = %outcome.key,
-                "request raced an in-flight copy of itself — absorbed"
-            );
-            return;
-        }
-        Ok(crate::transaction::ServerTransactionOutcome { key, actions, .. }) => {
-            // Schedule any initial server-side timers
-            for action in &actions {
-                if let Action::StartTimer(name, duration) = action {
-                    let timer_id = format!("{}:{:?}", key, name);
-                    state.timer_wheel.insert(
-                        timer_id,
-                        Box::new(TimerEntry {
-                            key: key.clone(),
-                            name: *name,
-                            fires_at: std::time::Instant::now() + *duration,
-                            // Server transaction timers send responses upstream (to UAC)
-                            destination: Some(inbound.remote_addr),
-                            transport: Some(inbound.transport),
-                            connection_id: Some(inbound.connection_id),
-                            // Retransmit cached responses on the same SA's
-                            // local endpoint (TS 33.203 §7.4).
-                            source_local_addr: Some(inbound.local_addr),
-                        }),
-                    );
-                }
-            }
-            Some(key)
-        }
-        Err(error) => {
-            // The request is still processed, statelessly — but with no
-            // transaction there is no retransmission absorption, so every
-            // retransmission runs the script again. Overwhelmingly this is a
-            // topmost Via with no `branch` (mandatory since RFC 3261 §8.1.1.7;
-            // siphon has no RFC 2543 legacy matching — see
-            // `transaction::key`), which is worth counting rather than
-            // learning about later from a duplicate-call report.
-            if let Some(metrics) = crate::metrics::try_metrics() {
-                metrics.requests_without_branch_total.inc();
-            }
-            debug!(method = %method, "failed to create server transaction: {error}");
-            None
-        }
+    let Some(server_key) = open_server_transaction(&inbound, &message, &method, state) else {
+        return;
     };
 
     // --- Max-Forwards enforcement (RFC 3261 §16.3) ---

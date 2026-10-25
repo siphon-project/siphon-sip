@@ -162,6 +162,11 @@ pub struct DispatcherState {
     /// INVITEs admission refused, remembered so a retransmission is answered
     /// again rather than counted again. The periodic sweep prunes it.
     pub refused_invites: Arc<crate::admission::refused::RefusedInvites>,
+    /// How long an initial request may wait in the script executor's queue
+    /// before it is answered 503 instead of reaching the script. Always
+    /// [`super::stale_shed::STALE_REQUEST_BUDGET`] in production; a field so a
+    /// test can shed without queueing for seconds.
+    pub stale_request_budget: std::time::Duration,
     /// The gateway groups, for the inbound limit of the group an INVITE's
     /// source belongs to (`gateway.groups[].inbound_limit`). `None` when no
     /// `gateway:` block is configured.

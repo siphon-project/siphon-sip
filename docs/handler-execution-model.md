@@ -39,7 +39,9 @@ blocking handlers need; never-reaping keeps the no-leak property.
 
 The queue feeding the pool is **bounded** (`script.executor_queue_capacity`,
 default 1024): once the pool is at its thread cap *and* the queue is full, new
-jobs are shed.
+jobs are shed. An initial request that waited in the queue past 8 s is
+answered 503 without reaching the script (see
+[Backpressure & liveness guarantees](#backpressure--liveness-guarantees)).
 
 ## Which handlers run, and which decision survives
 
@@ -331,6 +333,40 @@ handler degrades gracefully instead of taking the node down silently:
 1. **Bounded queue + load-shed.** When the pool is at its cap and the queue is
    full, new jobs are dropped (the SIP client retransmits) rather than growing
    memory without bound. Counted by `siphon_pyexec_jobs_shed_total`.
+
+   **Age-based shed.** A queue that is not full can still be too slow: when a
+   worker picks up an inbound request that waited in the queue longer than
+   **8 s**, siphon answers it `503 Service Unavailable` with a `Retry-After`
+   and **the script never sees it**. 8 s is 16·T1, a quarter of the client's
+   Timer F / Timer B (64·T1 = 32 s): a request that waited longer has too little
+   of its client's transaction left for the script, the next hop and the answer
+   back, so running it is work spent on an answer that arrives after the
+   client gave up and retried into the same queue. The budget is fixed, not
+   configurable, because the clock it races is the client's.
+
+   - Only **dialog-initiating and out-of-dialog requests** are shed: requests
+     with no To tag, i.e. initial and refresh REGISTER, an initial INVITE or
+     SUBSCRIBE, OPTIONS, MESSAGE, PUBLISH. These are new work, and refusing
+     them is what drains the queue.
+   - **In-dialog requests always run**, however long they queued: anything
+     with a To tag, and a BYE whatever it carries. They are the cheap work that
+     releases dialogs, media and charging; a shed BYE would leave its dialog
+     dangling.
+   - **ACK is never answered** and **CANCEL is never shed** (the framework
+     answers CANCEL itself, before the script).
+   - **Responses, timer expiries and handler continuations are never
+     age-shed.** Dropping one would strand a transaction a client is owed an
+     answer on; they complete work instead of starting it.
+   - The 503 goes through a server transaction like any locally answered
+     request: a retransmission is answered from the cached 503 without queueing
+     again, the ACK to a shed INVITE is absorbed, and on a P-CSCF the 503
+     leaves over the UE's security association.
+   - `Retry-After` is the queue wait in seconds (capped at 32) plus a spread of
+     up to half that, derived from the Call-ID, so the clients shed together do
+     not come back together.
+   - Counted by `siphon_pyexec_stale_requests_shed_total{method}`, apart from
+     queue-full drops, and logged at WARN at most every 10 s with the queue
+     wait and the budget.
 2. **Liveness watchdog / fail-fast.** A dedicated thread (immune to any lock a
    wedged handler holds) aborts the process when there is **work pending (a
    handler in-flight *or* jobs queued) yet zero completions** for
@@ -413,6 +449,7 @@ siphon keeps every such wait detached:
 | `siphon_pyexec_queue_depth` | handler jobs waiting in the queue |
 | `siphon_pyexec_jobs_completed_total` | completed handler jobs |
 | `siphon_pyexec_jobs_shed_total` | jobs dropped because the queue was full |
+| `siphon_pyexec_stale_requests_shed_total{method}` | initial requests answered 503 without the script because they queued past the 8 s budget |
 | `siphon_async_coroutines_pending` | `async def` handler coroutines on a driver, not yet settled |
 | `siphon_interpreter_attach_wait_ms` | how long the liveness probe's last attach to the interpreter waited |
 | `siphon_blocking_waits_in_flight` | threads parked right now in a blocking wait through siphon's released helpers; stuck high means a slow backend or a hang |

@@ -7,7 +7,20 @@
 use super::*;
 
 /// Handle a single inbound SIP message (request or response).
+#[cfg(test)]
 pub(super) fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
+    handle_inbound_after_queue(inbound, std::time::Duration::ZERO, state);
+}
+
+/// [`handle_inbound`] for a message that waited `queue_wait` in the script
+/// executor's queue before this ran. Only an initial request reads it
+/// ([`super::stale_shed`]); every other message is handled as if it had not
+/// waited.
+pub(super) fn handle_inbound_after_queue(
+    inbound: InboundMessage,
+    queue_wait: std::time::Duration,
+    state: &Arc<DispatcherState>,
+) {
     // Defensive drop of payloads that cannot be a SIP message at all — stray
     // CRLF (RFC 3261 §7.5), a vendor's all-NUL UDP NAT keepalive, or a datagram
     // too short to hold a start line.  Stream transports (TCP/TLS/WSS/pool)
@@ -196,7 +209,7 @@ pub(super) fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherStat
                 metrics.record_request(&request_line.method, crate::metrics::Direction::In);
             }
             let method = request_line.method.as_str().to_string();
-            handle_request(inbound, message, method, state);
+            handle_request_after_queue(inbound, message, method, queue_wait, state);
         }
         StartLine::Response(status_line) => {
             if let Some(metrics) = recorded_metrics {

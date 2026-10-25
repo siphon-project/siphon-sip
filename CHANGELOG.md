@@ -17,6 +17,23 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **Age-based load shedding of initial requests.** An inbound request that
+  waited in the script executor's queue longer than 8 s (16·T1, a quarter of
+  the client's Timer F / Timer B) is answered `503 Service Unavailable` with a
+  `Retry-After` and never reaches the script. Under a re-REGISTER storm the
+  executor used to spend its capacity on requests whose answers left after the
+  client had timed out, and the 408s it then saw sent every client straight
+  back into the queue. Only requests with no To tag are shed (initial and
+  refresh REGISTER, initial INVITE and SUBSCRIBE, OPTIONS, MESSAGE, PUBLISH);
+  in-dialog requests, BYE above all, still run however long they queued, ACK is
+  never answered and CANCEL is never shed, and responses and timer expiries are
+  never age-shed. The 503 goes through a server transaction, so a
+  retransmission gets the cached 503 and on a P-CSCF it leaves over the UE's
+  security association. `Retry-After` is the queue wait (capped at 32 s) plus
+  a per-Call-ID spread of up to half that. Counted by
+  `siphon_pyexec_stale_requests_shed_total{method}`, separately from
+  queue-full drops, and logged at WARN at most every 10 s.
+
 - **Blocking-wait metrics.** `siphon_blocking_waits_in_flight` is how many
   threads are parked right now in a blocking wait through
   `blocking_released`, `block_on_released` or `detach_block_on`, and
