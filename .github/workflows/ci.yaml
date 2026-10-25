@@ -53,11 +53,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@v3.2.0
-        with:
-          python-version: "3.14-dev"
-
       - name: Install SCTP system dependency
         if: ${{ matrix.sctp }}
         run: sudo apt-get update && sudo apt-get install -y libsctp-dev
@@ -66,8 +61,20 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The tests run on the free-threaded CPython the packages ship
+      # (scripts/bundle-python.sh, pinned by version and SHA-256), not on a
+      # nightly or a GIL build: the stop-the-world tests only mean something
+      # on the interpreter siphon runs on. After the cache restore, so a cached
+      # target/ cannot overlay it.
+      - name: Stage the bundled free-threaded CPython
+        run: |
+          scripts/bundle-python.sh target/python-bundle
+          echo "PYO3_PYTHON=$GITHUB_WORKSPACE/target/python-bundle/bin/python3.14t" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=$(scripts/bundle-python.sh --print-rustflags target/python-bundle)" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/target/python-bundle/lib" >> "$GITHUB_ENV"
+
       - name: Run tests
-        run: PYO3_PYTHON=python3.14 cargo test ${{ matrix.flags }}
+        run: cargo test ${{ matrix.flags }}
 
       # Runs alone because it measures a process-global counter: glibc in-use
       # bytes. Inside the parallel binary the other tests allocate on the same
@@ -78,7 +85,7 @@ jobs:
       # `siphon_memory_*`.
       - name: Python thread-state leak guard (needs the process to itself)
         run: |
-          PYO3_PYTHON=python3.14 cargo test --lib ${{ matrix.flags }} -- --ignored --exact \
+          cargo test --lib ${{ matrix.flags }} -- --ignored --exact \
             server::tests::reaped_thread_releases_its_python_thread_state \
             --test-threads=1 --nocapture
 
@@ -86,7 +93,7 @@ jobs:
       # needs the process to itself.
       - name: Awaitables complete on pinned threads (needs the process to itself)
         run: |
-          PYO3_PYTHON=python3.14 cargo test --lib ${{ matrix.flags }} -- --ignored --exact \
+          cargo test --lib ${{ matrix.flags }} -- --ignored --exact \
             server::tests::awaitables_complete_on_pinned_threads \
             --test-threads=1 --nocapture
 

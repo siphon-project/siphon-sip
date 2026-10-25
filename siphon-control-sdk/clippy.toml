@@ -1,0 +1,7 @@
+# The control SDK is its own workspace, so it gets its own clippy settings
+# instead of inheriting the siphon crate's from the repo root. The thresholds
+# match the root's. The root's `disallowed-methods` list is left out on purpose:
+# it guards siphon's interpreter attach rules and names siphon-internal helpers,
+# and the SDK neither embeds the interpreter that way nor can call them.
+too-many-arguments-threshold = 12
+too-many-lines-threshold = 300
