@@ -288,3 +288,37 @@ async fn repeated_ue_cycles_return_every_store_to_baseline() {
     assert!(wait_until(|| fixture.connection_map.is_empty()).await);
     assert!(!fixture.pool.binds_source(SocketAddr::new(ue_ip, 1)));
 }
+
+/// A listener closed after it accepted a connection but before that
+/// connection's task served it still closes it, with no later reconcile to
+/// sweep it up. The P-CSCF keeps its side open, so nothing else would end it.
+///
+/// Before: the close went through the connection-closer registry, which the
+/// task joined only once it started serving; a close sent earlier was lost,
+/// and the connection lived until the peer closed it (the leak gate below
+/// failed on loaded runners with "listeners/accepted (0, 1)").
+#[tokio::test]
+async fn a_connection_accepted_just_before_its_listener_closes_is_closed() {
+    let fixture = fixture();
+    let hold = Arc::new(tokio::sync::Semaphore::new(0));
+    fixture.sockets.hold_tcp_serving(Arc::clone(&hold));
+    let ue_server = SocketAddr::from(([127, 0, 0, 4], free_port()));
+    fixture.sockets.reconcile_tcp(&listening(&[ue_server]));
+    let (mut pcscf, _) = pcscf_connects(ue_server).await;
+    assert!(
+        wait_until(|| fixture.sockets.tcp_len() == (1, 1)).await,
+        "accepted"
+    );
+
+    // Closed while the connection's task has not served it yet.
+    fixture.sockets.reconcile_tcp(&UeTcpPlan::default());
+    hold.add_permits(1);
+
+    let mut buffer = [0u8; 16];
+    let read = tokio::time::timeout(Duration::from_secs(3), pcscf.read(&mut buffer)).await;
+    assert!(
+        matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+        "the connection must end without the peer closing it: {read:?}"
+    );
+    assert!(wait_until(|| fixture.sockets.tcp_len() == (0, 0)).await);
+}
