@@ -276,9 +276,13 @@ pub struct SiphonMetrics {
     // --- Registrar ---
     pub registrations_active: IntGauge,
     pub registrar_refusals_total: IntCounterVec,
-    /// Commands queued for the registrar's L2 write-through backend.
+    /// Registrar keys whose latest write-through has not reached the backend.
     pub registrar_backend_queue_depth: IntGauge,
-    /// Write-through commands discarded without reaching the backend.
+    /// Age of the longest-waiting write-through, 0 when nothing is pending.
+    pub registrar_backend_oldest_pending_seconds: IntGauge,
+    /// Write-throughs replaced by a newer write to the same key.
+    pub registrar_backend_coalesced_total: IntCounter,
+    /// Write-throughs discarded without reaching the backend.
     pub registrar_backend_dropped_total: IntCounterVec,
     /// Time `count_aors` spent queued behind the writes ahead of it.
     pub registrar_count_aors_queue_wait_seconds: Histogram,
@@ -786,17 +790,27 @@ impl SiphonMetrics {
             Opts::new("siphon_registrar_refusals_total", "REGISTER refusals"),
             &["reason"],
         )?;
+        // Pending writes are coalesced per key, so this is bounded by the AoRs
+        // written since the last drain, not by the write rate.
         let registrar_backend_queue_depth = IntGauge::new(
             "siphon_registrar_backend_queue_depth",
-            "Write-through commands queued for the registrar's persistence backend",
+            "Registrar keys whose latest write-through is not yet applied to the backend",
         )?;
-        // A non-zero rate means L1 and L2 have diverged: the binding is live in
-        // memory and absent from the backend, so a restart loses it. Alert on
-        // any of it rather than on a threshold.
+        let registrar_backend_oldest_pending_seconds = IntGauge::new(
+            "siphon_registrar_backend_oldest_pending_seconds",
+            "Seconds the oldest pending registrar write-through has waited (0 when caught up)",
+        )?;
+        let registrar_backend_coalesced_total = IntCounter::new(
+            "siphon_registrar_backend_coalesced_total",
+            "Registrar write-throughs superseded by a newer write to the same key",
+        )?;
+        // A non-zero rate means L1 and L2 have diverged. Writes that outrun the
+        // backend are held and retried, so this counts only a writer task that
+        // is gone (`closed`) or an unencodable write. Alert on any of it.
         let registrar_backend_dropped_total = IntCounterVec::new(
             Opts::new(
                 "siphon_registrar_backend_dropped_total",
-                "Registrar write-through commands discarded before reaching the backend",
+                "Registrar write-throughs discarded before reaching the backend",
             ),
             &["command", "reason"],
         )?;
@@ -1287,6 +1301,8 @@ impl SiphonMetrics {
         registry.register(Box::new(registrations_active.clone()))?;
         registry.register(Box::new(registrar_refusals_total.clone()))?;
         registry.register(Box::new(registrar_backend_queue_depth.clone()))?;
+        registry.register(Box::new(registrar_backend_oldest_pending_seconds.clone()))?;
+        registry.register(Box::new(registrar_backend_coalesced_total.clone()))?;
         registry.register(Box::new(registrar_backend_dropped_total.clone()))?;
         registry.register(Box::new(registrar_count_aors_queue_wait_seconds.clone()))?;
         registry.register(Box::new(registrar_count_aors_duration_seconds.clone()))?;
@@ -1379,6 +1395,8 @@ impl SiphonMetrics {
             registrations_active,
             registrar_refusals_total,
             registrar_backend_queue_depth,
+            registrar_backend_oldest_pending_seconds,
+            registrar_backend_coalesced_total,
             registrar_backend_dropped_total,
             registrar_count_aors_queue_wait_seconds,
             registrar_count_aors_duration_seconds,
