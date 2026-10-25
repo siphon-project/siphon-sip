@@ -334,7 +334,8 @@ handler degrades gracefully instead of taking the node down silently:
    - a thread that attaches to the interpreter and detaches every second, which
      cannot complete while a garbage collection's stop-the-world never ends;
    - the timer sweep, which drives every SIP transaction timer, stamping each
-     turn.
+     turn of its Rust part (which never waits for the executor, so a deep
+     executor queue is overload, not a wedge).
 
    Any of them owed for `script.process_stall_abort_secs` (default 30 s; `0`
    disables it, independently of `handler_stall_abort_secs`) writes one line
@@ -361,10 +362,18 @@ siphon keeps every such wait detached:
 - Every blocking wait in the dispatcher and the transport goes through a helper
   that releases the interpreter when the thread holds it, and a source scan in
   the test suite fails any that does not.
-- The timer sweep runs each turn on the executor, and each expiry that reaches
-  a script (`@proxy.on_failure` on Timer B/F, `@b2bua.on_failure` on a ring
-  timeout, and more) as an executor job of its own, so no script handler runs
-  on a tokio worker and one slow handler holds up only its own transaction.
+- The timer sweep runs the transaction timer wheel (retransmissions, Timer
+  B/F/H) on its own tokio task, where nothing attaches, and posts each expiry
+  that reaches a script (`@proxy.on_failure` on Timer B/F, `@b2bua.on_failure`
+  on a ring timeout, and more) to the executor as a job of its own, never
+  awaited. No script handler runs on a tokio worker, one slow handler holds up
+  only its own transaction, and a backlog of handlers never stops
+  retransmissions or timeouts elsewhere. A branch failure that reaches no
+  script is answered on the sweep's task, off the executor; the B2BUA checks
+  that can reach a script run as one executor job at a time.
+- `siphon_pyexec_queue_wait_ms` reads how long the job a worker last took had
+  waited in the queue: under a backlog, the age of the oldest job. Past 5 s it
+  is logged as overload.
 - The request's action runs on a copy of the request, not under its lock, so a
   script task still holding the request never waits for that lock attached.
 - The proxy session's relay callbacks are shared, so the response path copies

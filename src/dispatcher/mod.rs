@@ -266,6 +266,8 @@ mod originate_tests;
 #[cfg(test)]
 mod originated_cancel_awaits_provisional_tests;
 #[cfg(test)]
+mod own_process_test;
+#[cfg(test)]
 mod prack_offer_answer_tests;
 #[cfg(test)]
 mod provisional_presentation_tests;
@@ -369,6 +371,8 @@ mod subscribe_notify_before_2xx_tests;
 mod subscribe_reply_order_tests;
 #[cfg(test)]
 mod subscribe_test_harness;
+#[cfg(test)]
+mod sweep_backlog_tests;
 #[cfg(test)]
 mod sweep_executor_tests;
 #[cfg(test)]

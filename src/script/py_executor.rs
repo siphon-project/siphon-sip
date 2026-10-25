@@ -530,6 +530,7 @@ impl PyExecutor {
     /// growth is handled off-thread by the grower, so `submit` is just a
     /// non-blocking enqueue.
     fn submit(&self, job: Job) -> SubmitResult {
+        let job = stamped(job);
         match self.sender.lock() {
             Ok(guard) => match guard.as_ref() {
                 Some(sender) => match sender.try_send(job) {
@@ -717,6 +718,7 @@ fn run_watchdog(
     let mut stalled_for = Duration::ZERO;
     let mut last_completed = metrics.completed.load(Ordering::Relaxed);
     let mut last_published = last_completed;
+    let mut overload_warned = None;
 
     loop {
         pace();
@@ -731,6 +733,7 @@ fn run_watchdog(
         let completed = metrics.completed.load(Ordering::Relaxed);
 
         // Publish snapshots off the hot path.
+        publish_queue_wait(queue_depth, &mut overload_warned);
         if let Some(registry) = crate::metrics::try_metrics() {
             registry.pyexec_inflight.set(inflight as i64);
             registry.pyexec_pool_size.set(total as i64);
@@ -921,7 +924,72 @@ where
     let job: Job = Box::new(move || {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     });
-    sender.send_async(job).await.is_ok()
+    sender.send_async(stamped(job)).await.is_ok()
+}
+
+/// How long the job a worker last picked up had waited in the queue, in
+/// milliseconds. The queue is FIFO, so under a backlog this is the age of the
+/// oldest job, the figure that says how far behind the executor runs.
+static LAST_QUEUE_WAIT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// `job`, recording on pickup how long it waited in the queue.
+fn stamped(job: Job) -> Job {
+    let enqueued = std::time::Instant::now();
+    Box::new(move || {
+        let waited = u64::try_from(enqueued.elapsed().as_millis()).unwrap_or(u64::MAX);
+        LAST_QUEUE_WAIT_MS.store(waited, Ordering::Relaxed);
+        job();
+    })
+}
+
+/// Jobs waiting in the installed pool's queue (0 with no pool).
+pub fn queue_depth() -> usize {
+    PyExecutor::global()
+        .and_then(|pool| {
+            pool.sender
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(flume::Sender::len))
+        })
+        .unwrap_or(0)
+}
+
+/// Publish how far behind the executor runs, and say so when it is far behind.
+///
+/// Overload is not a wedge: the watchdogs leave a busy pool alone, so this is
+/// what tells an operator that handlers (an `@proxy.on_failure` storm behind a
+/// dead next hop, say) are queuing faster than the workers drain them.
+fn publish_queue_wait(queue_depth: usize, last_warned: &mut Option<std::time::Instant>) {
+    static GAUGE: OnceLock<Option<prometheus::IntGauge>> = OnceLock::new();
+    let waited_ms = if queue_depth == 0 {
+        0
+    } else {
+        LAST_QUEUE_WAIT_MS.load(Ordering::Relaxed)
+    };
+    let gauge = GAUGE.get_or_init(|| {
+        let registry = crate::metrics::try_metrics()?;
+        let gauge = prometheus::IntGauge::new(
+            "siphon_pyexec_queue_wait_ms",
+            "How long the job a Python executor worker last picked up had waited in the queue (ms); 0 with the queue empty",
+        )
+        .ok()?;
+        registry.registry.register(Box::new(gauge.clone())).ok()?;
+        Some(gauge)
+    });
+    if let Some(gauge) = gauge {
+        gauge.set(i64::try_from(waited_ms).unwrap_or(i64::MAX));
+    }
+    const FAR_BEHIND_MS: u64 = 5_000;
+    const WARN_EVERY: Duration = Duration::from_secs(30);
+    if waited_ms >= FAR_BEHIND_MS && last_warned.is_none_or(|at| at.elapsed() >= WARN_EVERY) {
+        *last_warned = Some(std::time::Instant::now());
+        warn!(
+            queue_depth,
+            waited_ms,
+            "Python executor overloaded: jobs wait {waited_ms} ms in the queue before a worker \
+             takes them (handlers queue faster than the pool drains them)"
+        );
+    }
 }
 
 /// [`spawn_queued`], awaiting `f`'s result — for work that continues a job the

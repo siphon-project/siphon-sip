@@ -109,7 +109,7 @@ pub(crate) struct Loops {
 }
 
 impl Loops {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             slots: [const { OnceLock::new() }; LOOP_SLOTS],
         }
@@ -132,13 +132,55 @@ impl Loops {
         stamp
     }
 
-    fn stalled(&self, stall: Duration) -> Option<&'static str> {
-        self.slots
-            .iter()
-            .filter_map(OnceLock::get)
-            .find(|stamp| stamp.idle_for() >= stall)
-            .map(|stamp| stamp.name)
+    /// Watch an existing stamp too, for a test whose watchdog judges a loop
+    /// the process registered.
+    #[cfg(test)]
+    pub(crate) fn watch(&self, stamp: &Arc<LoopStamp>) {
+        for slot in &self.slots {
+            if slot.set(Arc::clone(stamp)).is_ok() {
+                return;
+            }
+        }
     }
+
+    /// One watchdog sample: the first loop whose stamp has not moved for
+    /// `stall_samples` consecutive samples, if any.
+    ///
+    /// Counted in the watchdog's own samples, never as wall-clock time since
+    /// the last stamp. A suspension of the whole process (a cgroup freeze, a
+    /// paused VM, SIGSTOP) stops the watchdog along with the loops, and on
+    /// resume the clock shows a gap no loop could have closed; judging that gap
+    /// aborted healthy processes within a second of every resume. Counting
+    /// samples, the suspension is at most one sample without progress.
+    fn stalled(&self, progress: &mut LoopProgress, stall_samples: u32) -> Option<&'static str> {
+        let mut stalled = None;
+        for (index, stamp) in self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.get().map(|stamp| (index, stamp)))
+        {
+            let last = stamp.last_ms.load(Ordering::Acquire);
+            let seen = &mut progress.seen[index];
+            match seen {
+                Some((previous, unchanged)) if *previous == last => *unchanged += 1,
+                _ => *seen = Some((last, 0)),
+            }
+            if let Some((_, unchanged)) = seen {
+                if *unchanged >= stall_samples && stalled.is_none() {
+                    stalled = Some(stamp.name);
+                }
+            }
+        }
+        stalled
+    }
+}
+
+/// Per loop slot: the stamp the watchdog last saw, and for how many samples
+/// since it has not moved.
+#[derive(Default)]
+struct LoopProgress {
+    seen: [Option<(u64, u32)>; LOOP_SLOTS],
 }
 
 /// The process's critical loops, watched by [`start`].
@@ -166,7 +208,9 @@ impl LoopStamp {
         self.last_ms.store(now_ms(), Ordering::Release);
     }
 
-    fn idle_for(&self) -> Duration {
+    /// How long since the last turn.
+    #[cfg(test)]
+    pub(crate) fn idle_for(&self) -> Duration {
         Duration::from_millis(now_ms().saturating_sub(self.last_ms.load(Ordering::Acquire)))
     }
 }
@@ -264,15 +308,25 @@ pub(crate) fn run_liveness_watchdog(
     let mut tokio_owed = Owed::default();
     let mut interpreter_owed = Owed::default();
     let mut workers = Workers::default();
-    let loop_stall = sample * stall_samples;
+    let mut loop_progress = LoopProgress::default();
     loop {
         if !tokio_beat.outstanding() {
             tokio_beat.begin();
             runtime.spawn(beat_through_the_drivers(Arc::clone(&tokio_beat)));
         }
+        let paced = Instant::now();
         pace();
         if shutdown.load(Ordering::Relaxed) {
             return;
+        }
+        // A sample that came far later than its period means this thread was
+        // not running: the whole process was suspended, or starved of CPU.
+        // Nothing could progress meanwhile, so judge from here afresh.
+        if paced.elapsed() > sample * 3 {
+            tokio_owed = Owed::default();
+            interpreter_owed = Owed::default();
+            workers = Workers::default();
+            loop_progress = LoopProgress::default();
         }
         let tokio_samples = tokio_owed.sample(&tokio_beat);
         let interpreter_samples = interpreter_owed.sample(&interpreter);
@@ -287,13 +341,16 @@ pub(crate) fn run_liveness_watchdog(
         } else if interpreter_samples >= stall_samples {
             Some(Stalled::Interpreter)
         } else {
-            loops.stalled(loop_stall).map(Stalled::Loop)
+            loops
+                .stalled(&mut loop_progress, stall_samples)
+                .map(Stalled::Loop)
         };
         if let Some(which) = stalled {
             on_stall(which);
             tokio_owed = Owed::default();
             interpreter_owed = Owed::default();
             workers = Workers::default();
+            loop_progress = LoopProgress::default();
         }
     }
 }
@@ -601,5 +658,70 @@ mod tests {
         let interpreter = Arc::new(Beat::default());
         let fired = first_stall_with(runtime.handle().clone(), interpreter, &loops, 5, 40);
         assert_eq!(fired, Some(Stalled::Loop("test-loop-that-stops")));
+    }
+
+    /// A suspension of the whole process (a cgroup freeze, a paused VM, a
+    /// SIGSTOP) stops the watchdog together with the loops it watches. On
+    /// resume the loops turn again; the time they could not turn is not a
+    /// stall, and the watchdog must not abort for it.
+    #[test]
+    fn a_suspension_of_the_whole_process_is_not_a_stall() {
+        let runtime = runtime(2);
+        let loops = Loops::new();
+        let stamp = loops.register("test-loop-suspended");
+        stamp.tick();
+        // The loop turns every 10 ms, except while "suspended".
+        let suspended = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let turner = {
+            let stamp = Arc::clone(&stamp);
+            let suspended = Arc::clone(&suspended);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if !suspended.load(Ordering::Relaxed) {
+                        stamp.tick();
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+        let fired = Arc::new(Mutex::new(None));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut taken = 0;
+        let record = Arc::clone(&fired);
+        let shut = Arc::clone(&shutdown);
+        let freeze = Arc::clone(&suspended);
+        run_liveness_watchdog(
+            runtime.handle().clone(),
+            Arc::new(Beat::default()),
+            &loops,
+            5,
+            SAMPLE,
+            Arc::clone(&shutdown),
+            move |which| {
+                let mut slot = record.lock().unwrap();
+                slot.get_or_insert(which);
+            },
+            move || {
+                taken += 1;
+                if taken == 10 {
+                    // The whole process stops for 1 s, many stall windows
+                    // (5 samples of 20 ms); the watchdog's own sleep with it.
+                    freeze.store(true, Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_secs(1));
+                    freeze.store(false, Ordering::Relaxed);
+                } else {
+                    std::thread::sleep(SAMPLE);
+                }
+                if taken >= 40 {
+                    shut.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        stop.store(true, Ordering::Relaxed);
+        let _ = turner.join();
+        let result = *fired.lock().unwrap();
+        assert_eq!(result, None, "the suspension was judged a stall");
     }
 }
