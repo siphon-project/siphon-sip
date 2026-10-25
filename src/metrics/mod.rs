@@ -11,6 +11,7 @@ pub mod event_lag;
 pub mod glibc;
 pub mod ipsec;
 pub mod log_writer;
+pub mod pool_connect;
 mod python_stats;
 pub mod rate_limit;
 pub mod send_queue;

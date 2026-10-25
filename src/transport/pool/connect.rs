@@ -1,9 +1,8 @@
 //! Opening a pooled TCP connection without sending on it.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
-use super::{evict_if_current, ConnectionPool, PoolKey};
+use super::{evict_if_current, Coalesced, ConnectionPool, PoolKey};
 use crate::transport::{ConnectionId, Transport};
 
 impl ConnectionPool {
@@ -35,24 +34,15 @@ impl ConnectionPool {
             }
             evict_if_current(&self.connections, &key, connection_id);
         }
-        let connect_lock = self
-            .connect_locks
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let result = {
-            let _establish_guard = connect_lock.lock().await;
-            match self.pooled(&key) {
-                Some((connection_id, sender)) if !sender.is_closed() => Ok(connection_id),
-                _ => {
-                    self.establish_tcp_connection(key.clone(), source, destination, None)
-                        .await
-                }
-            }
-        };
-        self.connect_locks
-            .remove_if(&key, |_, lock| Arc::strong_count(lock) <= 2);
-        result
+        match self
+            .establish_coalesced(&key, || {
+                self.establish_tcp_connection(key.clone(), source, destination, None)
+            })
+            .await
+        {
+            Coalesced::Reuse((connection_id, _)) => Ok(connection_id),
+            Coalesced::Established(result) => result,
+        }
     }
 }
 
@@ -61,6 +51,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use dashmap::DashMap;
+    use std::sync::Arc;
 
     fn pool() -> ConnectionPool {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();

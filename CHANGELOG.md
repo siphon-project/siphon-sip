@@ -265,6 +265,23 @@ entry, but a working config keeps working.
   (`unencodable`). `/admin/metrics.json` carries the two new values next to
   the old ones. `count_aors` now applies the pending writes before it counts,
   so the answer includes them.
+- **A TCP or TLS peer that stops accepting costs one connect timeout, not one
+  per queued message.** Sends with no live connection queue per destination
+  and ran in order, each paying its own 5 s connect timeout against a peer
+  that never answered the SYN, so a full queue of 64 took about 320 s to fail
+  and everything new behind it was shed. After a peer restarted while
+  overloaded, its REGISTER responses stopped for most of a minute and the
+  peer timed the transactions out. Now a failed or timed-out connect puts the
+  destination in a backoff window (1 s, doubling per consecutive failure, at
+  most 4 s, reset by a success): inside it every send to that destination,
+  queued or new, request or response, fails at once with no connect, counted
+  in `siphon_pool_connect_suppressed_total` and logged once a second with the
+  count (`siphon_pool_connect_failures_total` counts the connects that
+  failed). The first send after the window connects again, while the others
+  keep failing fast, so a recovered peer is found within the window. TLS
+  connects to one destination now coalesce onto one connection the way TCP
+  ones did. A response still reconnects to the port in its Via over the same
+  transport (RFC 3261 §18.2.2).
 
 - **Memory no longer scales with how many blocking waits are parked at once.**
   Every thread of tokio's blocking pool was pinned to the interpreter when it

@@ -607,6 +607,17 @@ impl SendOutcome {
     }
 }
 
+/// Log a request the pool could not send. One whose destination is backing
+/// off after a failed connect was already counted and logged by the pool, once
+/// per window, so it stays out of the error log here.
+fn log_pool_send_failure(destination: SocketAddr, what: &str, error: &std::io::Error) {
+    if crate::transport::pool::is_destination_down(error) {
+        debug!(destination = %destination, "{what}: {error}");
+    } else {
+        error!(destination = %destination, "{what}: {error}");
+    }
+}
+
 pub(super) fn send_to_target(
     data: Bytes,
     target: &RelayTarget,
@@ -679,10 +690,7 @@ pub(super) fn send_to_target(
                     // sends (ACK, BYE) on that branch will miss the
                     // connection_map lookup and be dropped — which is the
                     // correct outcome when we never reached the upstream.
-                    error!(
-                        destination = %destination,
-                        "TCP pool send failed: {error}"
-                    );
+                    log_pool_send_failure(destination, "TCP pool send failed", &error);
                     SendOutcome::failed()
                 }
             }
@@ -715,7 +723,11 @@ pub(super) fn send_to_target(
                         SendOutcome::sent(connection_id)
                     }
                     Err(error) => {
-                        error!(destination = %destination, "source-bound TLS pool send failed: {error}");
+                        log_pool_send_failure(
+                            destination,
+                            "source-bound TLS pool send failed",
+                            &error,
+                        );
                         SendOutcome::failed()
                     }
                 };
@@ -783,7 +795,7 @@ pub(super) fn send_to_target(
                     Err(error) => {
                         // Same rationale as the TCP arm above — never echo to
                         // the inbound connection on outbound failure.
-                        error!(destination = %destination, "TLS pool send failed: {error}");
+                        log_pool_send_failure(destination, "TLS pool send failed", &error);
                         SendOutcome::failed()
                     }
                 }
