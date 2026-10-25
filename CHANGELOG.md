@@ -13,7 +13,7 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
-## [1.15.4] — 2026-10-24
+## [1.15.4] — 2026-10-25
 
 ### Added
 
