@@ -3176,7 +3176,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-sip"
-version = "1.15.3"
+version = "1.15.4"
 dependencies = [
  "aes",
  "arc-swap",
