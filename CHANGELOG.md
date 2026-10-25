@@ -221,6 +221,23 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **P-CSCF: a re-REGISTER wave no longer floods the thread pool.** Every
+  XFRM netlink operation ran as its own `spawn_blocking` task on a new
+  socket with no receive timeout, and allocating a pair for a 401 is up to
+  sixteen of them, so thousands of UEs re-authenticating at once (after an
+  outage) ran tokio's blocking pool to its 512-thread cap and stalled
+  everything else queued on it. Kernel operations now go through two
+  dedicated threads (`xfrm-netlink-0/1`), each keeping one netlink socket,
+  fed by a bounded queue that callers await without blocking a tokio
+  worker. Acks are matched on their sequence number, so a late one is
+  dropped instead of answering the next operation; a kernel that does not
+  answer within 2 s fails the operation with an error; a queue still full
+  after 5 s fails it unsent. The eight deletes that clear leftovers before
+  an install go to the kernel as one datagram, which handles and acks each
+  on its own as before. The `ip` backend runs at most four `ip` commands
+  at once. Measured with 2000 pairs installed at once against a fake
+  kernel with a 2 ms round trip: 6 -> 519 threads before, 6 -> 9 after.
+
 - **Memory no longer scales with how many blocking waits are parked at once.**
   Every thread of tokio's blocking pool was pinned to the interpreter when it
   started, and awaitable script APIs finished on that pool, so each of the up

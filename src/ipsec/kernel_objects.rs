@@ -26,7 +26,10 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::retire::{pair_spis, Pending, RetireCondition, SA_RETIRE_GRACE};
-use super::{IpsecError, IpsecManager, PolicyDir, SaProtocol, SaRole, SecurityAssociationPair};
+use super::{
+    netlink, IpsecError, IpsecManager, PolicyDir, SaProtocol, SaRole, SecurityAssociationPair,
+    XfrmBackend,
+};
 
 /// One of the eight kernel objects of a pair, with what it takes to install it
 /// again. Compared by [`KernelObject::same_kernel_key`], the key the kernel
@@ -100,6 +103,31 @@ impl KernelObject {
             }
             _ => false,
         }
+    }
+}
+
+/// The netlink message deleting `object`, keyed as the kernel keys it.
+fn delete_message(object: &KernelObject) -> Vec<u8> {
+    match *object {
+        KernelObject::State {
+            destination, spi, ..
+        } => netlink::del_sa_message(&destination, spi),
+        KernelObject::Policy {
+            source,
+            source_port,
+            destination,
+            destination_port,
+            direction,
+            protocol,
+            ..
+        } => netlink::del_policy_message(
+            &source,
+            source_port,
+            &destination,
+            destination_port,
+            direction.into(),
+            protocol.as_u8(),
+        ),
     }
 }
 
@@ -260,10 +288,44 @@ impl IpsecManager {
         sa: &SecurityAssociationPair,
         kept: &[KernelObject],
     ) {
-        for object in kernel_objects(sa) {
-            if !kept.contains(&object) {
-                self.delete_kernel_object(&object).await;
+        let doomed: Vec<KernelObject> = kernel_objects(sa)
+            .into_iter()
+            .filter(|object| !kept.contains(object))
+            .collect();
+        self.delete_kernel_objects(&doomed).await;
+    }
+
+    /// Delete `objects`, best-effort, each on its own as
+    /// [`delete_kernel_object`](Self::delete_kernel_object) does. On netlink
+    /// they go as one datagram of one message each: the kernel handles and
+    /// acks every message of it in order, one failing (`ENOENT`) never
+    /// skipping the next, so the kernel ends where the deletes one by one
+    /// left it, for one round trip instead of eight.
+    pub(super) async fn delete_kernel_objects(&self, objects: &[KernelObject]) {
+        #[cfg(test)]
+        let one_by_one = self.kernel_mock.is_some() || self.backend == XfrmBackend::IpCommand;
+        #[cfg(not(test))]
+        let one_by_one = self.backend == XfrmBackend::IpCommand;
+        if one_by_one {
+            for object in objects {
+                self.delete_kernel_object(object).await;
             }
+            return;
+        }
+        let messages = objects.iter().map(delete_message).collect();
+        // ENOENT is an object already gone, the usual case; anything else is
+        // logged and the rest still deleted, as one by one.
+        match self.xfrm().acknowledge(messages).await {
+            Ok(results) => {
+                for (object, result) in objects.iter().zip(results) {
+                    if let Err(error) = result {
+                        if !error.to_string().contains("No such file or directory") {
+                            debug!(?object, %error, "IPsec: kernel object delete failed");
+                        }
+                    }
+                }
+            }
+            Err(error) => warn!(%error, "IPsec: kernel object deletes not sent"),
         }
     }
 

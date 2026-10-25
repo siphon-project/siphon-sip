@@ -48,6 +48,8 @@ mod spi_reuse_tests;
 /// Sends to a UE held while a pending pair of its is taken into use.
 pub(crate) mod switch;
 pub use spi::{MAX_SPI_RANGE_COUNT, MIN_SPI};
+#[cfg(all(test, target_os = "linux"))]
+mod xfrm_flood_tests;
 
 pub mod ue;
 
@@ -747,6 +749,11 @@ impl std::error::Error for IpsecError {}
 // IPsec Manager
 // ---------------------------------------------------------------------------
 
+/// `ip` children the `ip` backend runs at once.
+const IP_COMMANDS_AT_ONCE: usize = 4;
+/// How long an `ip` command waits for one of them before it fails.
+const IP_COMMAND_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// XFRM backend — either direct netlink (fast, requires CAP_NET_ADMIN
 /// on the netlink socket) or `/sbin/ip xfrm` shell-out (slower but
 /// works in any environment where ``ip`` itself works).
@@ -790,6 +797,9 @@ pub struct IpsecManager {
     /// `CAP_NET_ADMIN`.  Always `None` in production builds.
     #[cfg(test)]
     kernel_mock: Option<std::sync::Mutex<KernelMock>>,
+    /// Test-only netlink pool on a fake socket, in place of the kernel's.
+    #[cfg(test)]
+    xfrm_workers: Option<Arc<netlink::XfrmWorkers>>,
 }
 
 impl Default for IpsecManager {
@@ -831,7 +841,20 @@ impl IpsecManager {
             backend,
             #[cfg(test)]
             kernel_mock: None,
+            #[cfg(test)]
+            xfrm_workers: None,
         }
+    }
+
+    /// The netlink worker pool this manager's kernel operations go through:
+    /// the process's fixed pool (see [`netlink::XfrmWorkers`]).
+    #[cfg(target_os = "linux")]
+    fn xfrm(&self) -> &netlink::XfrmWorkers {
+        #[cfg(test)]
+        if let Some(workers) = self.xfrm_workers.as_deref() {
+            return workers;
+        }
+        netlink::XfrmWorkers::kernel()
     }
 
     /// Currently-active backend.
@@ -1125,7 +1148,7 @@ impl IpsecManager {
     pub async fn dump_sa_use_times(&self) -> std::collections::HashMap<u32, u64> {
         #[cfg(target_os = "linux")]
         {
-            match netlink::dump_sa_use_times().await {
+            match self.xfrm().dump_sa_use_times().await {
                 Ok(map) => map,
                 Err(error) => {
                     tracing::warn!(
@@ -1402,7 +1425,7 @@ impl IpsecManager {
                 } else {
                     decode_hex(encryption_key)?
                 };
-                netlink::add_sa(
+                let message = netlink::add_sa_message(
                     source,
                     source_port,
                     destination,
@@ -1414,8 +1437,8 @@ impl IpsecManager {
                     &auth_key_bytes,
                     protocol.as_u8(),
                     hard_lifetime_secs,
-                )
-                .await
+                );
+                self.xfrm().acknowledge_one(message).await
             }
             #[cfg(not(target_os = "linux"))]
             XfrmBackend::Netlink => Err(IpsecError::Command(
@@ -1474,7 +1497,7 @@ impl IpsecManager {
                 } else {
                     decode_hex(encryption_key)?
                 };
-                netlink::update_sa(
+                let message = netlink::update_sa_message(
                     source,
                     source_port,
                     destination,
@@ -1486,8 +1509,8 @@ impl IpsecManager {
                     &auth_key_bytes,
                     protocol.as_u8(),
                     hard_lifetime_secs,
-                )
-                .await
+                );
+                self.xfrm().acknowledge_one(message).await
             }
             #[cfg(not(target_os = "linux"))]
             XfrmBackend::Netlink => Err(IpsecError::Command(
@@ -1526,7 +1549,9 @@ impl IpsecManager {
             #[cfg(target_os = "linux")]
             XfrmBackend::Netlink => {
                 let _ = source;
-                netlink::del_sa(destination, spi).await
+                self.xfrm()
+                    .acknowledge_one(netlink::del_sa_message(destination, spi))
+                    .await
             }
             #[cfg(not(target_os = "linux"))]
             XfrmBackend::Netlink => Err(IpsecError::Command(
@@ -1568,22 +1593,18 @@ impl IpsecManager {
         match self.backend {
             #[cfg(target_os = "linux")]
             XfrmBackend::Netlink => {
-                let netlink_dir = match direction {
-                    PolicyDir::In => netlink::PolicyDirection::In,
-                    PolicyDir::Out => netlink::PolicyDirection::Out,
-                };
-                netlink::add_policy(
+                let message = netlink::add_policy_message(
                     source,
                     source_port,
                     destination,
                     destination_port,
-                    netlink_dir,
+                    direction.into(),
                     spi,
                     protocol.as_u8(),
                     hard_lifetime_secs,
                     replace,
-                )
-                .await
+                );
+                self.xfrm().acknowledge_one(message).await
             }
             #[cfg(not(target_os = "linux"))]
             XfrmBackend::Netlink => Err(IpsecError::Command(
@@ -1628,19 +1649,15 @@ impl IpsecManager {
         match self.backend {
             #[cfg(target_os = "linux")]
             XfrmBackend::Netlink => {
-                let netlink_dir = match direction {
-                    PolicyDir::In => netlink::PolicyDirection::In,
-                    PolicyDir::Out => netlink::PolicyDirection::Out,
-                };
-                netlink::del_policy(
+                let message = netlink::del_policy_message(
                     source,
                     source_port,
                     destination,
                     destination_port,
-                    netlink_dir,
+                    direction.into(),
                     protocol.as_u8(),
-                )
-                .await
+                );
+                self.xfrm().acknowledge_one(message).await
             }
             #[cfg(not(target_os = "linux"))]
             XfrmBackend::Netlink => Err(IpsecError::Command(
@@ -1885,6 +1902,23 @@ impl IpsecManager {
     }
 
     async fn run_ip_command(args: &[&str]) -> Result<(), IpsecError> {
+        // At most IP_COMMANDS_AT_ONCE `ip` children at a time, process-wide:
+        // a REGISTER wave would otherwise fork one per kernel operation of
+        // every UE at once (the netlink backend's fixed pool, for `ip`).
+        static IP_COMMANDS: tokio::sync::Semaphore =
+            tokio::sync::Semaphore::const_new(IP_COMMANDS_AT_ONCE);
+        let _permit = match tokio::time::timeout(IP_COMMAND_WAIT, IP_COMMANDS.acquire()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_closed)) => {
+                return Err(IpsecError::Command("ip: command limit closed".to_string()))
+            }
+            Err(_elapsed) => {
+                tracing::warn!(cmd = %args.join(" "), "IPsec: too many ip commands waiting; not run");
+                return Err(IpsecError::Command(format!(
+                    "ip: {IP_COMMANDS_AT_ONCE} commands already running for {IP_COMMAND_WAIT:?}, not run"
+                )));
+            }
+        };
         debug!(cmd = %args.join(" "), "IPsec: running ip command");
         let output = tokio::process::Command::new("ip")
             .args(args)
@@ -1977,6 +2011,19 @@ impl IpsecManager {
         let mut manager =
             Self::with_partition(XfrmBackend::IpCommand, spi_range_start, spi_range_count);
         manager.kernel_mock = Some(std::sync::Mutex::new(KernelMock::default()));
+        manager
+    }
+
+    /// A netlink-backend manager whose kernel operations go through
+    /// `workers` (a pool on a fake socket) instead of the kernel's.
+    pub(crate) fn with_xfrm_workers(
+        workers: Arc<netlink::XfrmWorkers>,
+        spi_range_start: u32,
+        spi_range_count: u32,
+    ) -> Self {
+        let mut manager =
+            Self::with_partition(XfrmBackend::Netlink, spi_range_start, spi_range_count);
+        manager.xfrm_workers = Some(workers);
         manager
     }
 
