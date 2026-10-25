@@ -8,6 +8,9 @@ use super::*;
 /// The over-MTU UDP-to-TCP decision toward a UE with a security association.
 mod over_mtu;
 pub(super) use over_mtu::over_mtu_upgrade;
+/// Next hops whose TCP path just failed, not probed again for a while.
+mod probe_cache;
+pub(super) use probe_cache::probe_cache;
 
 /// Resolve a SIP URI string to a socket address using DNS (RFC 3263).
 ///
@@ -485,7 +488,23 @@ pub(super) fn mtu_tcp_upgrade(
     if outbound_transport != Transport::Udp || !over_mtu(serialized_len, mtu) {
         return None;
     }
-    match resolve_tcp_path(target_uri_string, destination, resolver) {
+    // One probe per next hop at a time, and none for a window after one
+    // failed: a peer that stopped accepting would otherwise cost every
+    // over-MTU request its own blocking connect timeout (see `probe_cache`).
+    let probe = match probe_cache().claim(destination, std::time::Instant::now()) {
+        Ok(probe) => probe,
+        Err(skip) => {
+            debug!(
+                serialized_len, mtu, %destination, ?skip,
+                "transport: forced UDP over-MTU send (TCP path not probed: it failed recently, \
+                 or is being probed)"
+            );
+            return None;
+        }
+    };
+    let path = resolve_tcp_path(target_uri_string, destination, resolver);
+    probe.finish(path.is_some(), std::time::Instant::now());
+    match path {
         Some(tcp_addr) => {
             debug!(
                 serialized_len, mtu, %destination,
@@ -496,7 +515,9 @@ pub(super) fn mtu_tcp_upgrade(
         None => {
             warn!(
                 serialized_len, mtu, %destination,
-                "transport: forced UDP over-MTU send (no reachable TCP path)"
+                skip_secs = probe_cache::UNREACHABLE_WINDOW.as_secs(),
+                "transport: forced UDP over-MTU send (no reachable TCP path); this next hop is \
+                 not probed again for skip_secs seconds"
             );
             None
         }

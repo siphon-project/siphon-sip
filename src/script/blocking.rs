@@ -155,8 +155,15 @@ pub fn blocking_released<T>(work: impl FnOnce() -> T) -> T {
 /// Run `work` released from the interpreter if this thread is attached to it,
 /// as it is; for a wait that already happens off tokio's workers.
 pub fn released<T>(work: impl FnOnce() -> T) -> T {
-    // SAFETY: `PyGILState_Check` only reads this thread's own thread state and
-    // is defined before the interpreter is initialised (it then reports 0).
+    // Before the interpreter is initialised `PyGILState_Check` reports 1 (its
+    // check is not enabled yet), and releasing a thread state that does not
+    // exist crashes in `PyEval_SaveThread`. No thread can be attached then.
+    // SAFETY: `Py_IsInitialized` reads a runtime flag and may be called at
+    // any time.
+    if unsafe { pyo3::ffi::Py_IsInitialized() } == 0 {
+        return work();
+    }
+    // SAFETY: `PyGILState_Check` only reads this thread's own thread state.
     let attached = unsafe { pyo3::ffi::PyGILState_Check() } == 1;
     if !attached {
         return work();
@@ -198,6 +205,45 @@ unsafe impl<T> Send for AssertUngil<T> {}
 
 #[cfg(test)]
 mod tests {
+    /// `released` on a process whose interpreter was never initialised runs
+    /// the work and returns: there is no thread state to release. It used to
+    /// take `PyGILState_Check`'s 1 (reported before initialisation) as
+    /// "attached" and crash in `PyEval_SaveThread`. Checked in a child process,
+    /// because this test binary's interpreter is up by the time it runs.
+    #[test]
+    fn released_before_the_interpreter_is_up_runs_the_work() {
+        let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "script::blocking::tests::released_child_without_an_interpreter",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("SIPHON_RELEASED_CHILD", "1")
+            .output()
+            .expect("the child runs");
+        assert!(
+            output.status.success(),
+            "the child crashed or failed: {:?}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    /// The child half of the test above; does nothing unless run as it.
+    #[test]
+    #[ignore = "run by released_before_the_interpreter_is_up_runs_the_work"]
+    fn released_child_without_an_interpreter() {
+        if std::env::var_os("SIPHON_RELEASED_CHILD").is_none() {
+            return;
+        }
+        // SAFETY: reads a runtime flag.
+        assert_eq!(unsafe { pyo3::ffi::Py_IsInitialized() }, 0);
+        assert_eq!(super::released(|| 7), 7);
+        assert_eq!(super::blocking_released(|| 8), 8);
+    }
+
     /// Every blocking Rust-API call reachable from a script handler must go
     /// through [`detach_block_on`], never a bare `block_in_place` +
     /// `block_on`. The two compile identically and behave identically on an

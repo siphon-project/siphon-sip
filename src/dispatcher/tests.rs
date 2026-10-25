@@ -5859,7 +5859,9 @@ async fn mtu_tcp_upgrade_switches_when_tcp_reachable() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let dest = listener.local_addr().unwrap();
     let uri = dest.to_string(); // numeric "127.0.0.1:PORT" next hop
-                                // Over threshold + reachable TCP → switch to TCP at the same address.
+                                // The port may have been refused to another test within the window.
+    probe_cache().forget(dest);
+    // Over threshold + reachable TCP → switch to TCP at the same address.
     assert_eq!(
         mtu_tcp_upgrade(Some(1280), Transport::Udp, 1300, &uri, dest, &resolver),
         Some((Transport::Tcp, dest)),
@@ -6118,6 +6120,8 @@ async fn mtu_tcp_upgrade_probes_the_uri_it_is_given_not_the_udp_destination() {
     let edge_addr = edge_v4.local_addr().unwrap();
     let contact_addr = contact_v4.local_addr().unwrap();
     assert_eq!(edge_v6.local_addr().unwrap().port(), edge_addr.port());
+    // The port may have been refused to another test within the window.
+    probe_cache().forget(edge_addr);
 
     let probe = |uri: String| {
         mtu_tcp_upgrade(Some(1280), Transport::Udp, 1300, &uri, edge_addr, &resolver)
