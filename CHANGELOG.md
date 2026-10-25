@@ -282,6 +282,24 @@ entry, but a working config keeps working.
   (`unencodable`). `/admin/metrics.json` carries the two new values next to
   the old ones. `count_aors` now applies the pending writes before it counts,
   so the answer includes them.
+- **The registrar and iFC backends reconnect after Redis or PostgreSQL comes
+  back.** A Redis connection and a PostgreSQL client never recover once their
+  link drops: after a server restart or a network blip every command on them
+  failed for the life of the process, so the writes now held and retried
+  instead of dropped were never written, and `count_aors` kept failing. Each
+  shard now opens a new connection on the next operation after the old one
+  failed (Redis: a dropped, I/O or unrecoverable error; PostgreSQL: the client
+  closed), at the pace of the writer's backoff and at most once per 100 ms,
+  with the same 500 ms Redis response timeout and a 2 s connect timeout.
+  Measured against a killed and restarted server: the held writes drained
+  within one backoff step of it answering, and
+  `siphon_registrar_backend_oldest_pending_seconds` went back to 0.
+  New `siphon::ifc::spawn_ifc_backend_writer_with_client` and
+  `spawn_ifc_backend_writer_with_client_and_ttl` take the `redis::Client`
+  beside the connection so the iFC writer can reconnect. The connection-only
+  `spawn_ifc_backend_writer` and `spawn_ifc_backend_writer_with_ttl` keep
+  their signatures and still never drop a write, but cannot reconnect; they
+  are deprecated in favour of the `_with_client` pair.
 - **iFC profile writes to Redis are never dropped either.** The S-CSCF's iFC
   write-through was a FIFO of 4096 commands that dropped the next one when
   full, so a registration burst or a Redis outage lost profile stores (the

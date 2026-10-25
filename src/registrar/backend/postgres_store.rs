@@ -3,7 +3,8 @@
 //! Split out of `backend.rs` beside the Redis backend, for the same reason.
 
 use super::*;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
+use std::time::Instant;
 
 /// PostgreSQL registrar backend.
 ///
@@ -17,8 +18,9 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct PostgresBackend {
     config: PostgresBackendConfig,
-    /// Clients — single element when not sharding, multiple when sharding.
-    clients: Vec<Arc<tokio_postgres::Client>>,
+    /// One per shard (a single one when not sharding), each reconnecting
+    /// after its connection closes.
+    shards: Vec<PostgresShard>,
     /// The longest binding the registrar grants. An auxiliary-state row with
     /// no live binding is purged once it has gone unwritten this long plus
     /// `expired_row_grace_secs`.
@@ -27,6 +29,27 @@ pub struct PostgresBackend {
     /// the margin `ttl_slack_secs` gives a Redis key.
     expired_row_grace_secs: u64,
 }
+
+/// One shard's server and its current client.
+///
+/// A `tokio_postgres::Client` never recovers once its connection closes (a
+/// server restart, a network blip): every query on it fails for the life of
+/// the process. The shard opens a new one on the next use instead, so the
+/// writer's held writes reach the server once it answers again. Nothing
+/// retries by itself: the next operation reconnects, at the pace of the
+/// writer's backoff, and at most once per [`RECONNECT_INTERVAL`].
+#[derive(Debug)]
+struct PostgresShard {
+    url: String,
+    /// Held for a clone or a swap only, never across an await.
+    client: RwLock<Arc<tokio_postgres::Client>>,
+    /// When the last reconnect attempt failed; held across the attempt, so
+    /// a batch's operations share one.
+    reconnect: tokio::sync::Mutex<Option<Instant>>,
+}
+
+/// The least time between two reconnect attempts of one shard.
+const RECONNECT_INTERVAL: Duration = Duration::from_millis(100);
 
 /// One shard's share of a batch: each write's position in the batch, and the
 /// write.
@@ -39,7 +62,7 @@ const EXPIRED_ROW_GRACE_SECS: u64 = 30;
 impl PostgresBackend {
     /// Connect to PostgreSQL and create the registrations table if needed.
     pub async fn connect(config: PostgresBackendConfig) -> Result<Self, BackendError> {
-        let clients = if config.shard_count > 0 {
+        let urls = if config.shard_count > 0 {
             if config.urls.len() != config.shard_count {
                 return Err(BackendError::Connection(format!(
                     "shard_count is {} but {} URLs provided",
@@ -47,26 +70,32 @@ impl PostgresBackend {
                     config.urls.len()
                 )));
             }
-            let mut clients = Vec::with_capacity(config.shard_count);
-            for url in &config.urls {
-                let client = Self::connect_one(url, &config.table).await?;
-                clients.push(client);
-            }
+            config.urls.clone()
+        } else {
+            vec![config.url.clone()]
+        };
+        let mut shards = Vec::with_capacity(urls.len());
+        for url in urls {
+            let client = Self::connect_one(&url, &config.table).await?;
+            shards.push(PostgresShard {
+                url,
+                client: RwLock::new(client),
+                reconnect: tokio::sync::Mutex::new(None),
+            });
+        }
+        if config.shard_count > 0 {
             tracing::info!(
                 shard_count = config.shard_count,
                 table = %config.table,
                 "postgres registrar backend connected (sharded)"
             );
-            clients
         } else {
-            let client = Self::connect_one(&config.url, &config.table).await?;
             tracing::info!(table = %config.table, "postgres registrar backend connected");
-            vec![client]
-        };
+        }
 
         Ok(Self {
             config,
-            clients,
+            shards,
             max_binding_lifetime_secs: DEFAULT_MAX_BINDING_LIFETIME_SECS,
             expired_row_grace_secs: EXPIRED_ROW_GRACE_SECS,
         })
@@ -149,16 +178,59 @@ impl PostgresBackend {
         format!("{}_aor_state", self.config.table)
     }
 
-    /// Get the client for the given AoR (shard-aware).
-    fn client_for(&self, aor: &str) -> &tokio_postgres::Client {
-        &self.clients[self.shard_of(aor)]
+    /// The client of the shard holding `aor`, reconnected first if its
+    /// connection closed.
+    async fn client_for(&self, aor: &str) -> Result<Arc<tokio_postgres::Client>, BackendError> {
+        self.client_at(self.shard_of(aor)).await
+    }
+
+    /// The client of `shard`, reconnected first if its connection closed.
+    /// Fails without a new attempt when one failed moments ago.
+    async fn client_at(&self, shard: usize) -> Result<Arc<tokio_postgres::Client>, BackendError> {
+        let shard = &self.shards[shard];
+        let current = || Arc::clone(&shard.client.read().unwrap_or_else(PoisonError::into_inner));
+        let client = current();
+        if !client.is_closed() {
+            return Ok(client);
+        }
+        let mut last_failure = shard.reconnect.lock().await;
+        // Another operation may have reconnected while this one waited.
+        let client = current();
+        if !client.is_closed() {
+            return Ok(client);
+        }
+        if let Some(failed_at) = *last_failure {
+            if failed_at.elapsed() < RECONNECT_INTERVAL {
+                return Err(BackendError::Connection(
+                    "PostgreSQL is unreachable (reconnect failed moments ago)".to_string(),
+                ));
+            }
+        }
+        match Self::connect_one(&shard.url, &self.config.table).await {
+            Ok(client) => {
+                *shard.client.write().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&client);
+                *last_failure = None;
+                tracing::info!("reconnected to PostgreSQL");
+                Ok(client)
+            }
+            Err(error) => {
+                *last_failure = Some(Instant::now());
+                Err(error)
+            }
+        }
+    }
+
+    /// The client of the first shard, for tests that inspect the tables.
+    #[cfg(test)]
+    async fn first_client(&self) -> Arc<tokio_postgres::Client> {
+        self.client_at(0).await.expect("the test Postgres")
     }
 
     fn shard_of(&self, aor: &str) -> usize {
-        if self.clients.len() == 1 {
+        if self.shards.len() == 1 {
             0
         } else {
-            shard_index(aor, self.clients.len())
+            shard_index(aor, self.shards.len())
         }
     }
 
@@ -175,7 +247,10 @@ impl PostgresBackend {
         shard: usize,
         writes: &[(&str, &BackendWrite)],
     ) -> Vec<Result<(), BackendError>> {
-        let client = &self.clients[shard];
+        let client = match self.client_at(shard).await {
+            Ok(client) => client,
+            Err(error) => return writes.iter().map(|_| Err(error.clone())).collect(),
+        };
         let committed: Result<(), BackendError> = async {
             client
                 .batch_execute("BEGIN")
@@ -210,7 +285,7 @@ impl PostgresBackend {
 
 impl RegistrarBackend for PostgresBackend {
     async fn save(&self, aor: &str, contacts: &[StoredContact]) -> Result<(), BackendError> {
-        let client = self.client_for(aor);
+        let client = self.client_for(aor).await?;
         let table = &self.config.table;
 
         if contacts.is_empty() {
@@ -262,7 +337,7 @@ impl RegistrarBackend for PostgresBackend {
     }
 
     async fn load(&self, aor: &str) -> Result<Vec<StoredContact>, BackendError> {
-        let client = self.client_for(aor);
+        let client = self.client_for(aor).await?;
         let table = &self.config.table;
 
         // Select remaining seconds so we can set accurate TTL on the
@@ -298,7 +373,7 @@ impl RegistrarBackend for PostgresBackend {
     }
 
     async fn remove(&self, aor: &str) -> Result<(), BackendError> {
-        let client = self.client_for(aor);
+        let client = self.client_for(aor).await?;
         let table = &self.config.table;
 
         let query = format!("DELETE FROM {} WHERE aor = $1", table);
@@ -310,7 +385,7 @@ impl RegistrarBackend for PostgresBackend {
     }
 
     async fn exists(&self, aor: &str) -> Result<bool, BackendError> {
-        let client = self.client_for(aor);
+        let client = self.client_for(aor).await?;
         let table = &self.config.table;
 
         let query = format!(
@@ -328,7 +403,8 @@ impl RegistrarBackend for PostgresBackend {
     async fn all_aors(&self) -> Result<Vec<String>, BackendError> {
         let mut all_aors = Vec::new();
 
-        for client in &self.clients {
+        for shard in 0..self.shards.len() {
+            let client = self.client_at(shard).await?;
             let query = format!(
                 "SELECT DISTINCT aor FROM {} WHERE expires_at > NOW()",
                 self.config.table
@@ -348,7 +424,7 @@ impl RegistrarBackend for PostgresBackend {
     }
 
     async fn save_aor_state(&self, aor: &str, state: &StoredAorState) -> Result<(), BackendError> {
-        let client = self.client_for(aor);
+        let client = self.client_for(aor).await?;
         let table = self.state_table();
 
         if state.is_empty() {
@@ -374,7 +450,7 @@ impl RegistrarBackend for PostgresBackend {
     }
 
     async fn load_aor_state(&self, aor: &str) -> Result<Option<StoredAorState>, BackendError> {
-        let client = self.client_for(aor);
+        let client = self.client_for(aor).await?;
         let table = self.state_table();
         let query = format!("SELECT state FROM {table} WHERE aor = $1");
         let rows = client
@@ -394,7 +470,7 @@ impl RegistrarBackend for PostgresBackend {
     }
 
     async fn remove_aor_state(&self, aor: &str) -> Result<(), BackendError> {
-        let client = self.client_for(aor);
+        let client = self.client_for(aor).await?;
         let table = self.state_table();
         let query = format!("DELETE FROM {table} WHERE aor = $1");
         client
@@ -406,7 +482,8 @@ impl RegistrarBackend for PostgresBackend {
 
     async fn count_aors(&self) -> Result<usize, BackendError> {
         let mut total = 0usize;
-        for client in &self.clients {
+        for shard in 0..self.shards.len() {
+            let client = self.client_at(shard).await?;
             let query = format!(
                 "SELECT COUNT(DISTINCT aor) FROM {} WHERE expires_at > NOW()",
                 self.config.table
@@ -439,7 +516,8 @@ impl RegistrarBackend for PostgresBackend {
                )"
         );
         let mut purged = 0u64;
-        for client in &self.clients {
+        for shard in 0..self.shards.len() {
+            let client = self.client_at(shard).await?;
             purged += client
                 .execute(&contacts, &[&slack])
                 .await
@@ -457,9 +535,8 @@ impl RegistrarBackend for PostgresBackend {
     /// single connection to a few hundred writes a second however well they
     /// were pipelined.
     async fn apply_batch(&self, writes: &[(&str, &BackendWrite)]) -> Vec<Result<(), BackendError>> {
-        let mut by_shard: Vec<ShardWrites<'_>> = (0..self.clients.len())
-            .map(|_| Default::default())
-            .collect();
+        let mut by_shard: Vec<ShardWrites<'_>> =
+            (0..self.shards.len()).map(|_| Default::default()).collect();
         for (position, write) in writes.iter().enumerate() {
             let (positions, shard_writes) = &mut by_shard[self.shard_of(write.0)];
             positions.push(position);
@@ -491,7 +568,8 @@ impl RegistrarBackend for PostgresBackend {
         let table = self.state_table();
         let mut aors = Vec::new();
 
-        for client in &self.clients {
+        for shard in 0..self.shards.len() {
+            let client = self.client_at(shard).await?;
             let query = format!("SELECT aor FROM {table}");
             let rows = client
                 .query(&query, &[])

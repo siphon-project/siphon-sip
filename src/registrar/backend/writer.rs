@@ -206,6 +206,12 @@ impl BackendWriter {
         self.queue.pending_writes()
     }
 
+    /// How long the oldest pending write has waited, as the gauge reports it.
+    #[cfg(test)]
+    pub(crate) fn oldest_pending(&self) -> Duration {
+        self.queue.oldest_pending()
+    }
+
     /// Replace the AoR's backend binding set with `contacts`, ordered as of
     /// now. A caller racing other writers to the AoR uses [`save_at`].
     ///

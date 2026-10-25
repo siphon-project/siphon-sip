@@ -22,6 +22,7 @@
 //! An AoR can never be named `index` here: a SIP or tel URI always carries a
 //! scheme and its colon.
 
+use super::redis_link::RedisLink;
 use super::*;
 use redis::AsyncCommands;
 
@@ -32,23 +33,15 @@ use redis::AsyncCommands;
 #[derive(Debug)]
 pub struct RedisBackend {
     config: RedisBackendConfig,
-    /// Connections — single element when not sharding, multiple when sharding.
-    connections: Vec<redis::aio::MultiplexedConnection>,
+    /// One link per shard (a single one when not sharding), each reopening
+    /// its connection after the link drops.
+    links: Vec<RedisLink>,
     /// The longest binding the registrar grants. Bounds a state key written
     /// while its AoR has no binding hash (a script may set Service-Route
     /// ahead of the save): it lives this long plus `ttl_slack_secs`, and
     /// takes the binding's TTL at the next save.
     max_binding_lifetime_secs: u64,
 }
-
-/// How long a single Redis command may take before it fails.
-///
-/// The same 500ms the `redis` crate happens to default to, pinned here so
-/// it is siphon's choice rather than a dependency's. It is the only reason
-/// an individual operation is bounded at all, and a bump that changed or
-/// dropped that default would otherwise remove the bound silently, leaving
-/// the write-through queue to back up behind commands that never return.
-const REDIS_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
 
 impl RedisBackend {
     /// Connect to Redis (single instance or sharded).
@@ -58,7 +51,7 @@ impl RedisBackend {
     /// binding hashes before this returns, so the boot-time restore and the
     /// first count see every AoR. That one walk is a cursor `SCAN`.
     pub async fn connect(config: RedisBackendConfig) -> Result<Self, BackendError> {
-        let connections = if config.shard_count > 0 {
+        let urls = if config.shard_count > 0 {
             if config.urls.len() != config.shard_count {
                 return Err(BackendError::Connection(format!(
                     "shard_count is {} but {} URLs provided",
@@ -66,41 +59,32 @@ impl RedisBackend {
                     config.urls.len()
                 )));
             }
-            let mut connections = Vec::with_capacity(config.shard_count);
-            for url in &config.urls {
-                let client = redis::Client::open(url.as_str())
-                    .map_err(|error| BackendError::Connection(error.to_string()))?;
-                let mut connection = client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(|error| BackendError::Connection(error.to_string()))?;
-                connection.set_response_timeout(REDIS_RESPONSE_TIMEOUT);
-                connections.push(connection);
-            }
+            config.urls.clone()
+        } else {
+            vec![config.url.clone()]
+        };
+        let mut links = Vec::with_capacity(urls.len());
+        for url in &urls {
+            let client = redis::Client::open(url.as_str())
+                .map_err(|error| BackendError::Connection(error.to_string()))?;
+            links.push(RedisLink::connect(client).await?);
+        }
+        if config.shard_count > 0 {
             tracing::info!(
                 shard_count = config.shard_count,
                 "redis registrar backend connected (sharded)"
             );
-            connections
         } else {
-            let client = redis::Client::open(config.url.as_str())
-                .map_err(|error| BackendError::Connection(error.to_string()))?;
-            let mut connection = client
-                .get_multiplexed_async_connection()
-                .await
-                .map_err(|error| BackendError::Connection(error.to_string()))?;
-            connection.set_response_timeout(REDIS_RESPONSE_TIMEOUT);
             tracing::info!("redis registrar backend connected");
-            vec![connection]
-        };
+        }
 
         let backend = Self {
             config,
-            connections,
+            links,
             max_binding_lifetime_secs: DEFAULT_MAX_BINDING_LIFETIME_SECS,
         };
-        for connection in backend.all_connections() {
-            backend.build_index_if_absent(connection).await?;
+        for link in &backend.links {
+            backend.build_index_if_absent(link).await?;
         }
         Ok(backend)
     }
@@ -127,19 +111,13 @@ impl RedisBackend {
         format!("{}index", self.config.key_prefix)
     }
 
-    /// Get a cloned connection for the given AoR (shard-aware).
-    fn connection_for(&self, aor: &str) -> redis::aio::MultiplexedConnection {
-        if self.connections.len() == 1 {
-            self.connections[0].clone()
+    /// The link of the shard holding `aor`.
+    fn link_for(&self, aor: &str) -> &RedisLink {
+        if self.links.len() == 1 {
+            &self.links[0]
         } else {
-            let index = shard_index(aor, self.connections.len());
-            self.connections[index].clone()
+            &self.links[shard_index(aor, self.links.len())]
         }
-    }
-
-    /// Get all connections (for operations that span all shards).
-    fn all_connections(&self) -> Vec<redis::aio::MultiplexedConnection> {
-        self.connections.to_vec()
     }
 
     /// Build a shard's AoR index from its binding hashes when it has none.
@@ -147,15 +125,14 @@ impl RedisBackend {
     /// Runs once per shard at connect. Concurrent replicas booting together
     /// both build it, harmlessly: `ZADD` of the same member and score is
     /// idempotent, and each one's later saves keep it current.
-    async fn build_index_if_absent(
-        &self,
-        mut connection: redis::aio::MultiplexedConnection,
-    ) -> Result<(), BackendError> {
+    async fn build_index_if_absent(&self, link: &RedisLink) -> Result<(), BackendError> {
+        let mut lease = link.lease().await?;
         let index_key = self.index_key();
-        let present: bool = connection
+        let present: bool = lease
+            .connection
             .exists(&index_key)
             .await
-            .map_err(|error| BackendError::Query(error.to_string()))?;
+            .map_err(|error| link.fail(&lease, error))?;
         if present {
             return Ok(());
         }
@@ -172,9 +149,9 @@ impl RedisBackend {
                 .arg(&pattern)
                 .arg("COUNT")
                 .arg(SCAN_COUNT)
-                .query_async(&mut connection)
+                .query_async(&mut lease.connection)
                 .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
+                .map_err(|error| link.fail(&lease, error))?;
             for key in keys {
                 if key.starts_with(&state_prefix) || key == index_key || key.len() <= prefix_len {
                     continue;
@@ -183,7 +160,7 @@ impl RedisBackend {
                 // A key under the prefix that is not a binding hash (a
                 // deployment sharing the prefix with something else) is not
                 // an AoR; skip it rather than fail the boot.
-                let entries: Vec<(String, String)> = match connection.hgetall(&key).await {
+                let entries: Vec<(String, String)> = match lease.connection.hgetall(&key).await {
                     Ok(entries) => entries,
                     Err(_) => continue,
                 };
@@ -194,10 +171,11 @@ impl RedisBackend {
                     .max()
                     .unwrap_or(0);
                 if expiry > now {
-                    let _: () = connection
+                    let _: () = lease
+                        .connection
                         .zadd(&index_key, aor, expiry)
                         .await
-                        .map_err(|error| BackendError::Query(error.to_string()))?;
+                        .map_err(|error| link.fail(&lease, error))?;
                     indexed += 1;
                 }
             }
@@ -220,9 +198,10 @@ impl RedisBackend {
     /// includes an AoR that expired before it was taken.
     async fn read_index<T: redis::FromRedisValue>(
         &self,
-        connection: &mut redis::aio::MultiplexedConnection,
+        link: &RedisLink,
         read: redis::Cmd,
     ) -> Result<(usize, T), BackendError> {
+        let mut lease = link.lease().await?;
         let mut pipe = redis::pipe();
         pipe.atomic()
             .cmd("ZREMRANGEBYSCORE")
@@ -230,9 +209,9 @@ impl RedisBackend {
             .arg("-inf")
             .arg(epoch_now())
             .add_command(read);
-        pipe.query_async(connection)
+        pipe.query_async(&mut lease.connection)
             .await
-            .map_err(|error| BackendError::Query(error.to_string()))
+            .map_err(|error| link.fail(&lease, error))
     }
 }
 
@@ -283,7 +262,6 @@ impl RegistrarBackend for RedisBackend {
 
         let key = self.key(aor);
         let ttl_with_slack = (expiry - now).saturating_add(self.config.ttl_slack_secs);
-        let mut connection = self.connection_for(aor);
 
         // Replace the hash, give it and the AoR's state key the binding's
         // TTL, and move the AoR in the index, as one transaction: a reader
@@ -305,19 +283,23 @@ impl RegistrarBackend for RedisBackend {
             .ignore()
             .zadd(self.index_key(), aor, expiry)
             .ignore();
-        pipe.query_async::<()>(&mut connection)
+        let link = self.link_for(aor);
+        let mut lease = link.lease().await?;
+        pipe.query_async::<()>(&mut lease.connection)
             .await
-            .map_err(|error| BackendError::Query(error.to_string()))
+            .map_err(|error| link.fail(&lease, error))
     }
 
     async fn load(&self, aor: &str) -> Result<Vec<StoredContact>, BackendError> {
         let key = self.key(aor);
-        let mut connection = self.connection_for(aor);
+        let link = self.link_for(aor);
+        let mut lease = link.lease().await?;
 
-        let entries: Vec<(String, String)> = connection
+        let entries: Vec<(String, String)> = lease
+            .connection
             .hgetall(&key)
             .await
-            .map_err(|error| BackendError::Query(error.to_string()))?;
+            .map_err(|error| link.fail(&lease, error))?;
 
         let mut contacts = Vec::with_capacity(entries.len());
         let mut expired_fields: Vec<String> = Vec::new();
@@ -338,44 +320,48 @@ impl RegistrarBackend for RedisBackend {
         // while any field is, and is dropped by score once none is.
         if !expired_fields.is_empty() {
             let fields: Vec<&str> = expired_fields.iter().map(|s| s.as_str()).collect();
-            let _: () = connection
+            let _: () = lease
+                .connection
                 .hdel(&key, &fields[..])
                 .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
+                .map_err(|error| link.fail(&lease, error))?;
         }
 
         Ok(contacts)
     }
 
     async fn remove(&self, aor: &str) -> Result<(), BackendError> {
-        let mut connection = self.connection_for(aor);
+        let link = self.link_for(aor);
+        let mut lease = link.lease().await?;
         let mut pipe = redis::pipe();
         pipe.atomic()
             .del(self.key(aor))
             .ignore()
             .zrem(self.index_key(), aor)
             .ignore();
-        pipe.query_async::<()>(&mut connection)
+        pipe.query_async::<()>(&mut lease.connection)
             .await
-            .map_err(|error| BackendError::Query(error.to_string()))
+            .map_err(|error| link.fail(&lease, error))
     }
 
     async fn exists(&self, aor: &str) -> Result<bool, BackendError> {
         let key = self.key(aor);
-        let mut connection = self.connection_for(aor);
-        let result: bool = connection
+        let link = self.link_for(aor);
+        let mut lease = link.lease().await?;
+        let result: bool = lease
+            .connection
             .exists(&key)
             .await
-            .map_err(|error| BackendError::Query(error.to_string()))?;
+            .map_err(|error| link.fail(&lease, error))?;
         Ok(result)
     }
 
     async fn all_aors(&self) -> Result<Vec<String>, BackendError> {
         let mut all_aors = Vec::new();
-        for mut connection in self.all_connections() {
+        for link in &self.links {
             let mut range = redis::cmd("ZRANGE");
             range.arg(self.index_key()).arg(0).arg(-1);
-            let (_, aors): (usize, Vec<String>) = self.read_index(&mut connection, range).await?;
+            let (_, aors): (usize, Vec<String>) = self.read_index(link, range).await?;
             all_aors.extend(aors);
         }
         Ok(all_aors)
@@ -383,10 +369,10 @@ impl RegistrarBackend for RedisBackend {
 
     async fn count_aors(&self) -> Result<usize, BackendError> {
         let mut total = 0usize;
-        for mut connection in self.all_connections() {
+        for link in &self.links {
             let mut card = redis::cmd("ZCARD");
             card.arg(self.index_key());
-            let (_, count): (usize, usize) = self.read_index(&mut connection, card).await?;
+            let (_, count): (usize, usize) = self.read_index(link, card).await?;
             total += count;
         }
         Ok(total)
@@ -394,14 +380,15 @@ impl RegistrarBackend for RedisBackend {
 
     async fn purge_expired(&self) -> Result<usize, BackendError> {
         let mut purged = 0usize;
-        for mut connection in self.all_connections() {
+        for link in &self.links {
+            let mut lease = link.lease().await?;
             let removed: usize = redis::cmd("ZREMRANGEBYSCORE")
                 .arg(self.index_key())
                 .arg("-inf")
                 .arg(epoch_now())
-                .query_async(&mut connection)
+                .query_async(&mut lease.connection)
                 .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
+                .map_err(|error| link.fail(&lease, error))?;
             purged += removed;
         }
         Ok(purged)
@@ -409,13 +396,15 @@ impl RegistrarBackend for RedisBackend {
 
     async fn save_aor_state(&self, aor: &str, state: &StoredAorState) -> Result<(), BackendError> {
         let key = self.state_key(aor);
-        let mut connection = self.connection_for(aor);
+        let link = self.link_for(aor);
+        let mut lease = link.lease().await?;
 
         if state.is_empty() {
-            let _: () = connection
+            let _: () = lease
+                .connection
                 .del(&key)
                 .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
+                .map_err(|error| link.fail(&lease, error))?;
             return Ok(());
         }
 
@@ -430,19 +419,21 @@ impl RegistrarBackend for RedisBackend {
             .key(&key)
             .arg(json)
             .arg(without_binding)
-            .invoke_async(&mut connection)
+            .invoke_async(&mut lease.connection)
             .await
-            .map_err(|error| BackendError::Query(error.to_string()))?;
+            .map_err(|error| link.fail(&lease, error))?;
         Ok(())
     }
 
     async fn load_aor_state(&self, aor: &str) -> Result<Option<StoredAorState>, BackendError> {
         let key = self.state_key(aor);
-        let mut connection = self.connection_for(aor);
-        let value: Option<String> = connection
+        let link = self.link_for(aor);
+        let mut lease = link.lease().await?;
+        let value: Option<String> = lease
+            .connection
             .get(&key)
             .await
-            .map_err(|error| BackendError::Query(error.to_string()))?;
+            .map_err(|error| link.fail(&lease, error))?;
         match value {
             Some(json) => {
                 let state: StoredAorState = serde_json::from_str(&json)
@@ -455,11 +446,13 @@ impl RegistrarBackend for RedisBackend {
 
     async fn remove_aor_state(&self, aor: &str) -> Result<(), BackendError> {
         let key = self.state_key(aor);
-        let mut connection = self.connection_for(aor);
-        let _: () = connection
+        let link = self.link_for(aor);
+        let mut lease = link.lease().await?;
+        let _: () = lease
+            .connection
             .del(&key)
             .await
-            .map_err(|error| BackendError::Query(error.to_string()))?;
+            .map_err(|error| link.fail(&lease, error))?;
         Ok(())
     }
 
@@ -470,7 +463,8 @@ impl RegistrarBackend for RedisBackend {
         let pattern = format!("{state_prefix}*");
         let mut aors = Vec::new();
 
-        for mut connection in self.all_connections() {
+        for link in &self.links {
+            let mut lease = link.lease().await?;
             let mut cursor: u64 = 0;
             loop {
                 let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
@@ -479,9 +473,9 @@ impl RegistrarBackend for RedisBackend {
                     .arg(&pattern)
                     .arg("COUNT")
                     .arg(SCAN_COUNT)
-                    .query_async(&mut connection)
+                    .query_async(&mut lease.connection)
                     .await
-                    .map_err(|error| BackendError::Query(error.to_string()))?;
+                    .map_err(|error| link.fail(&lease, error))?;
 
                 for key in keys {
                     if key.len() > prefix_len {

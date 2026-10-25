@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::*;
+use crate::registrar::backend::coalesce::WriteSink;
 use crate::registrar::backend::BackendError;
 
 const PROFILE: &str = concat!(

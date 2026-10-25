@@ -30,6 +30,11 @@ async fn connection() -> Option<redis::aio::MultiplexedConnection> {
     )
 }
 
+/// A client on the test Redis; call only after [`connection`] found one.
+fn client() -> redis::Client {
+    redis::Client::open(std::env::var("SIPHON_TEST_REDIS_URL").expect("url")).expect("redis url")
+}
+
 fn unique_prefix(test: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -55,7 +60,8 @@ async fn a_stored_profile_carries_its_ttl_and_each_store_renews_it() {
     };
     let prefix = unique_prefix("ttl");
     let store = IfcStore::new(Vec::new());
-    store.set_backend_writer(spawn_ifc_backend_writer_with_ttl(
+    store.set_backend_writer(spawn_ifc_backend_writer_with_client_and_ttl(
+        client(),
         connection.clone(),
         prefix.clone(),
         7230,
@@ -148,7 +154,8 @@ async fn a_burst_of_profile_writes_reaches_redis_in_full() {
     const USERS: usize = 6_000;
     let prefix = unique_prefix("burst");
     let store = IfcStore::new(Vec::new());
-    store.set_backend_writer(spawn_ifc_backend_writer_with_ttl(
+    store.set_backend_writer(spawn_ifc_backend_writer_with_client_and_ttl(
+        client(),
         connection.clone(),
         prefix.clone(),
         600,
@@ -214,4 +221,105 @@ async fn keys_under(
             return keys;
         }
     }
+}
+
+/// Profile writes held while the link to Redis is down reach it through a new
+/// connection once it answers again: a connection never recovers by itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_writes_drain_through_a_new_connection_after_the_link_drops() {
+    let Some(mut connection) = connection().await else {
+        return;
+    };
+    let url = std::env::var("SIPHON_TEST_REDIS_URL").expect("url");
+    let (scheme, rest) = url.split_once("://").expect("scheme");
+    let (authority, path) = match rest.find('/') {
+        Some(slash) => (&rest[..slash], &rest[slash..]),
+        None => (rest, ""),
+    };
+    let (userinfo, upstream) = match authority.rsplit_once('@') {
+        Some((userinfo, host_port)) => (format!("{userinfo}@"), host_port),
+        None => (String::new(), authority),
+    };
+    let cutter =
+        crate::registrar::backend::link_cutter::LinkCutter::start(upstream.to_string()).await;
+    let relayed = redis::Client::open(format!("{scheme}://{userinfo}{}{path}", cutter.address()))
+        .expect("relay url");
+    let relayed_connection = relayed
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect through the relay");
+    let prefix = unique_prefix("reconnect");
+    let store = IfcStore::new(Vec::new());
+    let writer = spawn_ifc_backend_writer_with_client_and_ttl(
+        relayed,
+        relayed_connection,
+        prefix.clone(),
+        600,
+    );
+    store.set_backend_writer(writer.clone());
+
+    store
+        .store_profile_xml("sip:before@example.com", PROFILE)
+        .expect("store");
+    cutter.cut();
+    store
+        .store_profile_xml("sip:during@example.com", PROFILE)
+        .expect("store");
+    store.remove_profile("sip:before@example.com");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(writer.pending_writes() > 0, "nothing passes a cut link");
+
+    cutter.restore();
+    for _ in 0..300 {
+        if writer.pending_writes() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(writer.pending_writes(), 0, "the held writes never drained");
+    let stored = keys_under(&mut connection, &prefix).await;
+    let _: () = redis::cmd("DEL")
+        .arg(stored.iter().collect::<Vec<_>>())
+        .query_async(&mut connection)
+        .await
+        .expect("clean up");
+    assert_eq!(
+        stored.into_iter().collect::<Vec<_>>(),
+        vec![format!("{prefix}sip:during@example.com")]
+    );
+}
+
+/// The deprecated connection-only constructor still writes through the
+/// coalescing queue (it only cannot reconnect).
+#[tokio::test]
+#[allow(deprecated)]
+async fn the_connection_only_constructor_still_persists() {
+    let Some(mut connection) = connection().await else {
+        return;
+    };
+    let prefix = unique_prefix("deprecated");
+    let store = IfcStore::new(Vec::new());
+    store.set_backend_writer(spawn_ifc_backend_writer_with_ttl(
+        connection.clone(),
+        prefix.clone(),
+        600,
+    ));
+    store
+        .store_profile_xml("sip:alice@example.com", PROFILE)
+        .expect("store");
+    let key = format!("{prefix}sip:alice@example.com");
+    let mut seen = -2;
+    for _ in 0..100 {
+        seen = ttl(&mut connection, &key).await;
+        if seen > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let _: () = redis::cmd("DEL")
+        .arg(&key)
+        .query_async(&mut connection)
+        .await
+        .expect("clean up");
+    assert!((500..=600).contains(&seen), "profile ttl {seen}");
 }

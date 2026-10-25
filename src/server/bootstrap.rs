@@ -397,8 +397,12 @@ pub(super) async fn init_ifc_redis_backend(redis_url: &str, ttl_slack_secs: u64,
     // TTL slack, and every store of the profile (each SAR) renews it, so a
     // profile outlives its registration by at most that and no longer.
     let ttl_secs = u64::from(config.registrar.max_expires).saturating_add(ttl_slack_secs);
-    let writer =
-        crate::ifc::spawn_ifc_backend_writer_with_ttl(connection, ifc_key_prefix, ttl_secs);
+    let writer = crate::ifc::spawn_ifc_backend_writer_with_client_and_ttl(
+        client,
+        connection,
+        ifc_key_prefix,
+        ttl_secs,
+    );
     ifc_store.set_backend_writer(writer);
     info!("iFC Redis backend writer initialized");
 }
