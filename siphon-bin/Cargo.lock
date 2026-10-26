@@ -126,9 +126,9 @@ dependencies = [
 
 [[package]]
 name = "async-sctp"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dea7feb5d8961d6fcdf580e578b48809f359b92746ef574528a14d902a0a3f40"
+checksum = "5e2ebbfc77fa1d31f7800f672f34f3f8ac58039decf20eb6c9bf6cee7fe4212c"
 dependencies = [
  "libc",
  "thiserror 2.0.21",
@@ -316,16 +316,6 @@ dependencies = [
  "radium",
  "tap",
  "wyz",
-]
-
-[[package]]
-name = "bitvec-nom2"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d988fcc40055ceaa85edc55875a08f8abd29018582647fd82ad6128dba14a5f0"
-dependencies = [
- "bitvec",
- "nom 7.1.3",
 ]
 
 [[package]]
@@ -1112,23 +1102,23 @@ dependencies = [
 
 [[package]]
 name = "gsm_cap"
-version = "3.0.0"
+version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c6cc4e0d6df2c2a825f65c5a8c31759203f309fa2a823c13c4b81828663e7f3"
+checksum = "d3a8d85a582b3b8e788dd4c36a44974b40143bc45a87e7298a6eb3b96cff1a72"
 dependencies = [
  "inap",
- "rasn 0.28.13",
+ "rasn",
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "gsm_map"
-version = "3.0.0"
+version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5f4a773ade83f2cf0dde54e5c6b7faf3b2a70edb451dbd891f79d60656c87f5"
+checksum = "b756ee6565fd9c7823c15123b61b81fbadca469f64de4243a8d16f5620ba2995"
 dependencies = [
  "hex",
- "rasn 0.28.13",
+ "rasn",
  "sccp",
  "tcap",
  "thiserror 2.0.21",
@@ -1508,11 +1498,11 @@ dependencies = [
 
 [[package]]
 name = "inap"
-version = "2.0.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad9e33756e8b519cb21a2900ea28fff7745edada59b2c64cdc1b6d7ffd47f58d"
+checksum = "494431b43612e8109b96b938835a096383aed170fec271cc1a63e690d25321ec"
 dependencies = [
- "rasn 0.28.13",
+ "rasn",
  "thiserror 2.0.21",
 ]
 
@@ -1762,9 +1752,9 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "m2pa"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52ee94d9aff2f4388222d266cf4d38abfa5c5d38d2531b032b2fe399e3ffe7df"
+checksum = "04096ef975904051fc5a88a062c61df0ef150a26fbc3858b08d78a67db7de3f4"
 dependencies = [
  "modular-bitfield-msb",
  "thiserror 2.0.21",
@@ -1772,9 +1762,9 @@ dependencies = [
 
 [[package]]
 name = "m3ua"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "034364374aa58b7153aceab0969c55725a4b2d51a7d3eeb525b0a5ad9e3f3d08"
+checksum = "33841bc19d1edf8fb7698abf2da7e9a386b6cb83ecb86d8d92527fbac04c1327"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -1890,9 +1880,9 @@ dependencies = [
 
 [[package]]
 name = "mtp3"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aaa5e221ff33f662a04e099c665b413b2063d994a46e0b9ded9f24ab4ac3ae57"
+checksum = "a262ba3eb02826fe7b7cd2476f67fdb879c8eddd5e79b1649686832297863020"
 dependencies = [
  "async-trait",
  "serde",
@@ -2612,29 +2602,6 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rasn"
-version = "0.28.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88235e585f2f3fc26ad809c79a84dd77e6a7203eb7d12e5bcaab89fc036d3d90"
-dependencies = [
- "bitvec",
- "bitvec-nom2",
- "bytes",
- "cfg-if",
- "chrono",
- "either",
- "nom 7.1.3",
- "num-bigint",
- "num-integer",
- "num-traits",
- "once_cell",
- "rasn-derive 0.28.13",
- "serde_json",
- "snafu",
- "xml-no-std",
-]
-
-[[package]]
-name = "rasn"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c442ad572d02886fe3a24f770763cb39afb9b3dfe16e05fcdf133b3895e4a24"
@@ -2649,21 +2616,10 @@ dependencies = [
  "num-integer",
  "num-traits",
  "once_cell",
- "rasn-derive 0.29.0",
+ "rasn-derive",
  "serde_json",
  "snafu",
  "xml-no-std",
-]
-
-[[package]]
-name = "rasn-derive"
-version = "0.28.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11dcd4dab09ceadedb3e2bedf340deb583f0e25bba9ad966b5655c2fb62b1392"
-dependencies = [
- "proc-macro2",
- "rasn-derive-impl 0.28.13",
- "syn 2.0.118",
 ]
 
 [[package]]
@@ -2673,22 +2629,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "261556388c573dde262717e06ad2c9a9ed78405418f16f2789a0dd8004793fba"
 dependencies = [
  "proc-macro2",
- "rasn-derive-impl 0.29.0",
+ "rasn-derive-impl",
  "syn 2.0.118",
-]
-
-[[package]]
-name = "rasn-derive-impl"
-version = "0.28.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f121c276d3f2fba8caabc870288de3f81abdb0bb94d5510651e58e1e00a7b9e7"
-dependencies = [
- "either",
- "itertools",
- "proc-macro2",
- "quote",
- "syn 2.0.118",
- "uuid",
 ]
 
 [[package]]
@@ -3274,8 +3216,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sigtran"
-version = "4.1.0"
-source = "git+https://github.com/siphon-project/siphon-sigtran?tag=v4.1.0#68fe5c6d3b1518593d8ceb0033c0406bac9f247e"
+version = "5.1.0"
+source = "git+https://github.com/siphon-project/siphon-sigtran?tag=v5.1.0#328169f970458ba07c468d151b281df4f2ea45c7"
 dependencies = [
  "async-sctp",
  "gsm_cap",
@@ -3286,8 +3228,7 @@ dependencies = [
  "m3ua",
  "mtp3",
  "pyo3",
- "pyo3-async-runtimes",
- "rasn 0.28.13",
+ "rasn",
  "sccp",
  "serde",
  "serde-saphyr",
@@ -3302,7 +3243,7 @@ dependencies = [
 [[package]]
 name = "siphon-sip"
 version = "1.15.4"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#64e35eb045d9dffca1c6fa5096c15a3e44be9c59"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#14f800de698170e3fee0763d939330eea803bc1e"
 dependencies = [
  "aes",
  "arc-swap",
@@ -3334,8 +3275,8 @@ dependencies = [
  "pyo3",
  "pyo3-async-runtimes",
  "quick-xml",
- "rasn 0.29.0",
- "rasn-derive 0.29.0",
+ "rasn",
+ "rasn-derive",
  "redis",
  "regex",
  "reqwest",
@@ -3623,12 +3564,12 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tcap"
-version = "2.0.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2487e2dd5c81e55c4fb7f4d4ce8b8a4024c20e8e4069e9fa99c48e5634952cdc"
+checksum = "c96f554e05c74b472c963b9a0e090682d1b70d6a4a39425291e0b5795cbb6819"
 dependencies = [
  "hex",
- "rasn 0.28.13",
+ "rasn",
  "thiserror 2.0.21",
 ]
 
@@ -3639,7 +3580,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
