@@ -341,7 +341,7 @@ All four, plus the reliable-provisional scenario that had been driven only by
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| SUBSCRIBE/NOTIFY (RFC 6665) | **Production** | Python `presence` API | reg-event package; `presence.terminate()` + auto-GC on terminated NOTIFY drops dialog state per RFC 6665 §4.4.1 |
+| SUBSCRIBE/NOTIFY (RFC 6665) | **Production** | Python `presence` API | reg-event package; `presence.terminate()` + auto-GC on terminated NOTIFY drops dialog state per RFC 6665 §4.4.1; a NOTIFY answered 481 (or another §4.2.2 failure), a 408 or no answer before Timer F removes the subscription, counted in `siphon_presence_subscriptions_removed_total{reason}` |
 | PIDF (RFC 3863) | Implemented | | |
 | Resource List Server (RFC 4662) | Implemented | | |
 | Watcher Info (RFC 3857/3858) | Implemented | | |

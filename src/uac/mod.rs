@@ -127,6 +127,9 @@ struct PendingRequest {
     /// the transaction timeout (RFC 3261 Timer F) so a probe whose response
     /// never arrives does not strand its `oneshot::Sender` forever.
     inserted_at: Instant,
+    /// Deliver the final response only: a provisional one is absorbed and
+    /// the entry kept for the response that ends the transaction.
+    final_only: bool,
 }
 
 /// UAC sender — generates and sends outbound SIP requests.
@@ -621,6 +624,7 @@ impl UacSender {
             PendingRequest {
                 sender,
                 inserted_at: Instant::now(),
+                final_only: false,
             },
         );
 
@@ -662,6 +666,19 @@ impl UacSender {
             Some(b) if b.starts_with("z9hG4bK-uac-") => b,
             _ => return false,
         };
+
+        // A provisional response to a request that waits for its final one
+        // is ours, but it does not end the transaction (RFC 3261 §17.1.2.2).
+        let provisional = message.status_code().is_some_and(|status| status < 200);
+        if provisional
+            && self
+                .pending
+                .get(&branch)
+                .is_some_and(|pending| pending.final_only)
+        {
+            debug!(branch = %branch, "UAC absorbed a provisional response");
+            return true;
+        }
 
         if let Some((_, pending)) = self.pending.remove(&branch) {
             debug!(branch = %branch, "UAC matched response");
@@ -755,6 +772,7 @@ impl UacSender {
             PendingRequest {
                 sender,
                 inserted_at: Instant::now(),
+                final_only: false,
             },
         );
 
@@ -926,6 +944,24 @@ impl UacSender {
             PendingRequest {
                 sender,
                 inserted_at: Instant::now(),
+                final_only: false,
+            },
+        );
+        receiver
+    }
+
+    /// [`expect_response`](Self::expect_response) for the *final* response:
+    /// a provisional one is absorbed and the entry kept, so the receiver
+    /// resolves with the response that ends the transaction, or with
+    /// [`UacResult::Timeout`] once the sweep expires it at Timer F.
+    pub fn expect_final_response(&self, branch: &str) -> oneshot::Receiver<UacResult> {
+        let (sender, receiver) = oneshot::channel();
+        self.pending.insert(
+            branch.to_string(),
+            PendingRequest {
+                sender,
+                inserted_at: Instant::now(),
+                final_only: true,
             },
         );
         receiver
@@ -1048,6 +1084,50 @@ mod tests {
 
         assert!(sender.match_response(&response));
         assert_eq!(sender.pending_count(), 0);
+    }
+
+    fn response_on(branch: &str, status: u16) -> SipMessage {
+        SipMessageBuilder::new()
+            .response(status, "Reason".to_string())
+            .via(format!("SIP/2.0/UDP 127.0.0.1:5060;branch={branch}"))
+            .to("<sip:watcher@192.0.2.7>;tag=watcher".to_string())
+            .from("<sip:notifier@192.0.2.1>;tag=notifier".to_string())
+            .call_id("final-only".to_string())
+            .cseq("2 NOTIFY".to_string())
+            .content_length(0)
+            .build()
+            .unwrap()
+    }
+
+    /// A request waiting for its final response absorbs a provisional one
+    /// and stays pending; the final one resolves it.
+    #[test]
+    fn expect_final_response_absorbs_provisionals() {
+        let (sender, _rxs) = make_uac_sender();
+        let branch = "z9hG4bK-uac-notify-final";
+        let mut receiver = sender.expect_final_response(branch);
+
+        assert!(sender.match_response(&response_on(branch, 100)));
+        assert_eq!(sender.pending_count(), 1, "still waiting for the final");
+        assert!(receiver.try_recv().is_err());
+
+        assert!(sender.match_response(&response_on(branch, 481)));
+        assert_eq!(sender.pending_count(), 0);
+        match receiver.try_recv() {
+            Ok(UacResult::Response(response)) => assert_eq!(response.status_code(), Some(481)),
+            other => panic!("expected the 481, got {other:?}"),
+        }
+    }
+
+    /// Any other pending request still ends on the first response, as before.
+    #[test]
+    fn expect_response_still_ends_on_a_provisional() {
+        let (sender, _rxs) = make_uac_sender();
+        let branch = "z9hG4bK-uac-any-response";
+        let mut receiver = sender.expect_response(branch);
+        assert!(sender.match_response(&response_on(branch, 180)));
+        assert_eq!(sender.pending_count(), 0);
+        assert!(matches!(receiver.try_recv(), Ok(UacResult::Response(_))));
     }
 
     #[test]

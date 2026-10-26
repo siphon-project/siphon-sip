@@ -27,12 +27,14 @@ use std::time::Duration;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::presence::{NotifyDialogState, PresenceStore, Subscription};
+use crate::dns::SipResolver;
+use crate::presence::{notify_failure, NotifyDialogState, PresenceStore, Subscription};
 use crate::script::api::subscribe_state::strip_nameaddr;
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::message::Method;
 use crate::sip::parser::parse_uri_standalone;
-use crate::transport::Transport;
+use crate::transport::{ConnectionId, Transport};
+use crate::uac::{UacResult, UacSender};
 
 /// Returns true if the given Subscription-State header value indicates a
 /// terminated subscription per RFC 6665 §4.1.3.  Matches both the bare
@@ -337,12 +339,29 @@ impl PyPresence {
     /// from the SUBSCRIBE to construct a proper in-dialog NOTIFY.  The message
     /// is routed through the dialog's Route set (typically via the P-CSCF).
     ///
+    /// The NOTIFY's final response is always observed, whether or not the
+    /// script waits for it: a 404, 405, 410, 416, 480-485, 489, 501 or 604, a
+    /// 408, or no final response before Timer F removes the subscription (RFC
+    /// 6665 §4.2.2), counted in ``siphon_presence_subscriptions_removed_total``.
+    ///
     /// Args:
     ///     subscription_id: The subscription ID returned by ``subscribe()``.
     ///     body: Optional body string (reginfo XML, PIDF XML, etc.).
     ///     content_type: Content-Type of the body (e.g. ``"application/reginfo+xml"``).
     ///     subscription_state: Subscription-State header value (default ``"active"``).
-    #[pyo3(signature = (subscription_id, body=None, content_type=None, subscription_state="active"))]
+    ///     wait_for_response: ``False`` (the default) resolves once the NOTIFY
+    ///         is handed to the transport; ``True`` resolves to the final
+    ///         status code instead.  The initial NOTIFY sent from the
+    ///         SUBSCRIBE handler is held until the handler's 200 OK is out, so
+    ///         waiting on it there only ends at ``timeout_ms``.
+    ///     timeout_ms: How long ``wait_for_response=True`` waits before
+    ///         resolving to ``None``.
+    ///
+    /// Returns:
+    ///     ``None``, or with ``wait_for_response=True`` the final status
+    ///     (``int``), or ``None`` when no final response arrived in time.
+    #[pyo3(signature = (subscription_id, body=None, content_type=None, subscription_state="active", wait_for_response=false, timeout_ms=2000))]
+    #[allow(clippy::too_many_arguments)]
     fn notify<'py>(
         &self,
         python: Python<'py>,
@@ -350,22 +369,31 @@ impl PyPresence {
         body: Option<&str>,
         content_type: Option<&str>,
         subscription_state: &str,
+        wait_for_response: bool,
+        timeout_ms: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let store = Arc::clone(&self.store);
         let subscription_id = subscription_id.to_string();
         let body = body.map(str::to_string);
         let content_type = content_type.map(str::to_string);
         let subscription_state = subscription_state.to_string();
+        let (uac_sender, resolver) = notify_senders()?;
 
         crate::script::awaitable(python, async move {
-            Self::notify_inner(
+            let outcome = Self::notify_inner(
                 store,
+                uac_sender,
+                resolver,
                 &subscription_id,
                 body.as_deref(),
                 content_type.as_deref(),
                 &subscription_state,
             )
-            .await
+            .await?;
+            if !wait_for_response {
+                return Ok(None);
+            }
+            Ok(await_notify_status(outcome, Duration::from_millis(timeout_ms)).await)
         })
     }
 
@@ -411,6 +439,7 @@ impl PyPresence {
         let body = body.map(str::to_string);
         let content_type = content_type.map(str::to_string);
         let subscription_state = format!("terminated;reason={}", reason.unwrap_or("noresource"));
+        let (uac_sender, resolver) = notify_senders()?;
 
         crate::script::awaitable(python, async move {
             // notify() auto-removes the subscription when the state is
@@ -418,6 +447,8 @@ impl PyPresence {
             // notify(state="terminated;…") are observably equivalent.
             Self::notify_inner(
                 store,
+                uac_sender,
+                resolver,
                 &subscription_id,
                 body.as_deref(),
                 content_type.as_deref(),
@@ -478,24 +509,20 @@ impl PyPresence {
     /// driver every coroutine on that loop shares. The deferral below still
     /// works: the script awaits this before its handler returns, so the send is
     /// registered in time for the dispatcher to order it after the 200 OK.
+    ///
+    /// Resolves once the NOTIFY is handed on, to the receiver of its outcome:
+    /// the final status, or `None` when there was none before Timer F.  The
+    /// outcome is acted on in the background whether or not anyone reads it
+    /// ([`watch_notify_outcome`]).
     async fn notify_inner(
         store: Arc<PresenceStore>,
+        uac_sender: Arc<UacSender>,
+        resolver: Arc<SipResolver>,
         subscription_id: &str,
         body: Option<&str>,
         content_type: Option<&str>,
         subscription_state: &str,
-    ) -> PyResult<()> {
-        let uac_sender = super::proxy_utils::uac_sender().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "presence.notify() unavailable: UAC sender not initialized",
-            )
-        })?;
-        let resolver = super::proxy_utils::send_resolver().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "presence.notify() unavailable: DNS resolver not initialized",
-            )
-        })?;
-
+    ) -> PyResult<tokio::sync::oneshot::Receiver<Option<u16>>> {
         // Look up subscription and extract + increment CSeq atomically
         let dialog = store.prepare_notify(subscription_id).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
@@ -513,6 +540,7 @@ impl PyPresence {
             to_tag,
             route_set,
             cseq,
+            generation,
         } = dialog;
         let call_id_for_gate = call_id.clone();
 
@@ -545,7 +573,7 @@ impl PyPresence {
         let transport_hint = resolve_uri
             .get_param("transport")
             .map(|s: &str| s.to_string());
-        let resolver_clone = Arc::clone(resolver);
+        let resolver_clone = Arc::clone(&resolver);
         let host = resolve_uri.host.clone();
         let port = resolve_uri.port;
         let scheme = resolve_uri.scheme.clone();
@@ -578,9 +606,17 @@ impl PyPresence {
             }
         };
 
-        // Build in-dialog NOTIFY: same Call-ID, swapped From/To tags, Route set
-        let branch = format!("z9hG4bK-py-{}", uuid::Uuid::new_v4());
-        let via = format!("SIP/2.0/{} {};branch={}", transport, target.address, branch);
+        // Build in-dialog NOTIFY: same Call-ID, swapped From/To tags, Route set.
+        // The branch is a UAC one, so the dispatcher hands its responses to
+        // the UAC sender (`UacSender::match_response`), and the Via names our
+        // own sent-by, where the response is sent back (RFC 3261 §18.2.2).
+        let branch = format!("z9hG4bK-uac-notify-{}", uuid::Uuid::new_v4());
+        let (sent_by_host, sent_by_port) =
+            uac_sender.sent_by_for(transport, Some(target.address), ConnectionId::default());
+        let via = format!(
+            "SIP/2.0/{} {}:{};branch={}",
+            transport, sent_by_host, sent_by_port, branch
+        );
         let cseq_str = format!("{} NOTIFY", cseq);
         // RFC 3261 §12.2.1.1 — a request sent within a dialog carries the
         // dialog's *URIs*, not its remote target:
@@ -634,6 +670,18 @@ impl PyPresence {
             ))
         })?;
 
+        // Registered before the NOTIFY can leave, so an answer that overtakes
+        // the rest of this function still finds its transaction.
+        let answered = uac_sender.expect_final_response(&branch);
+        let (outcome_sender, outcome) = tokio::sync::oneshot::channel();
+        tokio::spawn(watch_notify_outcome(
+            Arc::clone(&store),
+            subscription_id.to_string(),
+            generation,
+            answered,
+            outcome_sender,
+        ));
+
         // Called while the SUBSCRIBE that created the dialog is still being
         // handled: hold it until that 200 OK is out (RFC 6665 §4.1.2.3, the
         // initial NOTIFY follows the 2xx). This future runs on a tokio worker,
@@ -656,9 +704,76 @@ impl PyPresence {
         if is_terminated_subscription_state(subscription_state) {
             store.remove_subscription(subscription_id);
         }
-        Ok(())
+        Ok(outcome)
     }
 }
+
+/// The UAC sender and resolver a NOTIFY is sent with.
+fn notify_senders() -> PyResult<(Arc<UacSender>, Arc<SipResolver>)> {
+    let uac_sender = super::proxy_utils::uac_sender().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "presence.notify() unavailable: UAC sender not initialized",
+        )
+    })?;
+    let resolver = super::proxy_utils::send_resolver().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "presence.notify() unavailable: DNS resolver not initialized",
+        )
+    })?;
+    Ok((Arc::clone(uac_sender), Arc::clone(resolver)))
+}
+
+/// Wait for the final response to the NOTIFY sent under `generation`, end
+/// the subscription when RFC 6665 §4.2.2 says it ends, and pass the outcome
+/// on to whoever still listens.
+///
+/// Pure Rust on a tokio worker: nothing here attaches to Python.  It ends
+/// when the transaction does, on its final response or when the UAC sweep
+/// expires it at Timer F, so it holds nothing past the transaction.
+async fn watch_notify_outcome(
+    store: Arc<PresenceStore>,
+    subscription_id: String,
+    generation: u64,
+    answered: tokio::sync::oneshot::Receiver<UacResult>,
+    outcome_sender: tokio::sync::oneshot::Sender<Option<u16>>,
+) {
+    let outcome = match answered.await {
+        Ok(UacResult::Response(response)) => response.status_code(),
+        // Timer F, or the transaction was dropped without an answer.
+        Ok(UacResult::Timeout) | Err(_) => None,
+    };
+    if let Some(failure) = notify_failure(outcome) {
+        // A late failure must not end an incarnation the NOTIFY was not sent
+        // under: a refresh meanwhile moved the subscription on, and an id
+        // already removed (terminate(), an un-SUBSCRIBE) stays a no-op.
+        if store.remove_subscription_if_current(&subscription_id, generation) {
+            tracing::debug!(
+                subscription_id = %subscription_id,
+                status = ?outcome,
+                reason = failure.label(),
+                "presence: NOTIFY failed, subscription removed (RFC 6665 §4.2.2)"
+            );
+            crate::presence::metrics::record_removed(failure);
+        }
+    }
+    let _ = outcome_sender.send(outcome);
+}
+
+/// What `notify(wait_for_response=True)` resolves to: the final status, or
+/// `None` without one inside `timeout`.
+async fn await_notify_status(
+    outcome: tokio::sync::oneshot::Receiver<Option<u16>>,
+    timeout: Duration,
+) -> Option<u16> {
+    match tokio::time::timeout(timeout, outcome).await {
+        Ok(Ok(status)) => status,
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[path = "presence_notify_tests.rs"]
+mod notify_tests;
 
 #[cfg(test)]
 mod tests {

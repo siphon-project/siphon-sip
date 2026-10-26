@@ -1532,7 +1532,7 @@
       "notify": {
         "doc": "Send an in-dialog NOTIFY for a subscription (RFC 3265 \u00a73.2.2).",
         "kind": "method_descriptor",
-        "sig": "($self, subscription_id, body=None, content_type=None, subscription_state=\"active\")"
+        "sig": "($self, subscription_id, body=None, content_type=None, subscription_state=\"active\", wait_for_response=False, timeout_ms=2000)"
       },
       "parse_reginfo": {
         "doc": "Parse an RFC 3680 ``application/reginfo+xml`` body.",
