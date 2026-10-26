@@ -3,9 +3,11 @@
 //! Split out of `server/mod.rs`, which is one long `run_async`. This is the part
 //! that runs once the node has stopped being useful, and the only part with a
 //! contract an operator has to configure around: the container runtime's stop
-//! timeout must exceed `drain_secs + teardown_secs` (plus up to 9 seconds when
-//! the registrant holds IMS UE security associations to delete), or its
-//! `SIGKILL` lands first and none of it happens.
+//! timeout must exceed `drain_secs + teardown_secs`, and 25 seconds when the
+//! registrant has bindings to clear (its de-REGISTERs get up to 20 seconds to
+//! be answered, counted from the signal and overlapping the drain, and the IMS
+//! UE security associations left up to 5 more to be deleted), or its `SIGKILL`
+//! lands first and none of it happens.
 
 use super::*;
 
@@ -21,7 +23,25 @@ pub(super) async fn run_shutdown_sequence(
 ) -> ! {
     // Wait for shutdown signal (SIGINT or SIGTERM)
     shutdown::wait_for_signal().await;
+    shut_down(config, drain, shutdown_registrant, shutdown_outbound).await;
 
+    dispatcher_handle.abort();
+    let _ = dispatcher_handle.await;
+
+    std::process::exit(0);
+}
+
+/// Everything shutdown does between the signal and the exit: clear the
+/// outbound bindings, drain, end the calls the deadline is still holding, wait
+/// (bounded) for the de-registrations to end, and delete the IMS UE security
+/// associations left. The dispatcher runs on throughout, so the answers to the
+/// de-REGISTERs (a challenge among them) are handled.
+pub(crate) async fn shut_down(
+    config: &Config,
+    drain: &Arc<crate::dispatcher::DrainState>,
+    shutdown_registrant: Option<&Arc<crate::registrant::RegistrantManager>>,
+    shutdown_outbound: &Arc<crate::transport::OutboundRouter>,
+) {
     // Clear this node's outbound bindings before draining, so an upstream
     // registrar stops offering calls to a node that is going away rather
     // than waiting out the granted Expires (RFC 3261 §10.2.2). Done here
@@ -79,6 +99,11 @@ pub(super) async fn run_shutdown_sequence(
     // Before the dispatcher goes: it delivers the de-REGISTER answers that
     // release the IMS UE SA sets. Bounded, so it never holds the exit.
     if let Some(manager) = shutdown_registrant {
+        // The de-REGISTERs ran on through the drain; what is left gets until
+        // the answer bound.
+        if !crate::registrant::await_deregistrations(manager, sa_answers_by).await {
+            warn!("outbound de-registrations still unanswered at the shutdown bound");
+        }
         let deleted =
             crate::registrant::retire_ue_security_associations(manager, sa_answers_by).await;
         if deleted > 0 {
@@ -88,11 +113,6 @@ pub(super) async fn run_shutdown_sequence(
             );
         }
     }
-
-    dispatcher_handle.abort();
-    let _ = dispatcher_handle.await;
-
-    std::process::exit(0);
 }
 
 /// End the B2BUA calls the drain deadline is still holding, and wait for the

@@ -843,6 +843,12 @@ pub async fn run(
 
     install_charging_hooks(&state);
 
+    // Every REGISTER the registrant sends goes under a client transaction of
+    // this layer, so it is retransmitted and timed out like any other request.
+    if let Some(registrant) = state.registrant_manager.as_ref() {
+        registrant.attach_transactions(Arc::new(RegisterTransactionLayer::of(&state)));
+    }
+
     // Published now as well as on the sweep, so the limit gauges are right
     // from the first scrape rather than thirty seconds in.
     crate::metrics::admission::publish_limits(state.admission.limits());

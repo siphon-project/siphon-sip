@@ -130,6 +130,9 @@ impl RegistrantManager {
         defaults: EgressDefaults<'_>,
         expires: u32,
     ) -> Option<BuiltRegister> {
+        if self.refuses_registration(aor, expires) {
+            return None;
+        }
         let mut entry = self.entries.get_mut(aor)?;
         // A registered IMS UE re-registers and de-registers over the SA set it
         // holds (TS 24.229 5.1.1.4.1, 5.1.1.6.1).
@@ -235,7 +238,7 @@ impl RegistrantManager {
 
         if expires > 0 {
             entry.state = RegistrantState::Registering;
-            entry.last_sent_at = Some(Instant::now());
+            entry.in_flight_branch = Some(branch.clone());
         }
 
         match message {
@@ -266,6 +269,9 @@ impl RegistrantManager {
         is_proxy_auth: bool,
         expires: u32,
     ) -> Option<BuiltRegister> {
+        if self.refuses_registration(aor, expires) {
+            return None;
+        }
         let mut entry = self.entries.get_mut(aor)?;
         let egress = EntryEgress::of(&entry, defaults);
         let effective_addr = egress.sent_by;
@@ -325,7 +331,7 @@ impl RegistrantManager {
         };
 
         entry.state = RegistrantState::Challenging;
-        entry.last_sent_at = Some(Instant::now());
+        entry.in_flight_branch = Some(branch.clone());
 
         let mut builder = SipMessageBuilder::new()
             .request(Method::Register, request_uri)
@@ -392,6 +398,9 @@ impl RegistrantManager {
         expires: u32,
         security_verify: Option<&str>,
     ) -> Option<BuiltRegister> {
+        if self.refuses_registration(aor, expires) {
+            return None;
+        }
         let mut entry = self.entries.get_mut(aor)?;
 
         let credentials = entry.aka.clone()?;
@@ -502,7 +511,7 @@ impl RegistrantManager {
         }
 
         entry.state = RegistrantState::Challenging;
-        entry.last_sent_at = Some(Instant::now());
+        entry.in_flight_branch = Some(branch.clone());
 
         let mut builder = SipMessageBuilder::new()
             .request(Method::Register, request_uri)

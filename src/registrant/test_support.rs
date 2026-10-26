@@ -134,11 +134,23 @@ pub(crate) fn take_deregistrations(manager: &RegistrantManager) -> Vec<super::Bu
     manager.take_pending_deregistrations()
 }
 
-/// Pretend the last REGISTER of `aor` left `age` ago.
-pub(crate) fn backdate_last_sent(manager: &RegistrantManager, aor: &str, age: Duration) {
-    if let Some(mut entry) = manager.entries.get_mut(aor) {
-        entry.last_sent_at = Some(std::time::Instant::now() - age);
+/// A transaction layer that opens nothing, for a test of the registrant alone
+/// (the dispatcher's own is tested with the dispatcher).
+struct Untracked;
+
+impl super::RegisterTransactions for Untracked {
+    fn open(
+        &self,
+        _request: &crate::sip::message::SipMessage,
+        _message: &crate::transport::OutboundMessage,
+    ) -> Result<(), String> {
+        Ok(())
     }
+}
+
+/// Attach [`Untracked`], so [`super::registration_loop`] starts.
+pub(crate) fn attach_untracked_transactions(manager: &RegistrantManager) {
+    manager.attach_transactions(std::sync::Arc::new(Untracked));
 }
 
 /// Make `aor` due now.

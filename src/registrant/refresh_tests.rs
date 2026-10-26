@@ -167,6 +167,37 @@ async fn a_tick_opens_each_ues_sockets_and_registers_it_from_them() {
     assert!(sockets.is_empty());
 }
 
+/// Shutdown keeps every per-UE socket open: the de-REGISTERs leave from them,
+/// are retransmitted from them and are answered (a challenge among them) on
+/// them. The tick after the de-REGISTERs used to close them all, as the
+/// entries were removed, so the answers went nowhere and a retransmission left
+/// from the process's address instead.
+#[tokio::test]
+async fn shutdown_keeps_the_ues_sockets_for_the_de_registers() {
+    let manager = test_support::manager();
+    let sockets = ue_sockets();
+    let (outbound, _default) = router_with(Some(Arc::clone(&sockets)));
+    let port = free_port();
+    let context = context(Arc::clone(&outbound), Some(Arc::clone(&sockets)), port);
+    install(&manager, &context);
+    for index in 2..4u32 {
+        manager
+            .try_add(ue(index, Some(ip(&format!("127.0.0.{index}")))))
+            .expect("added");
+    }
+    tick(&manager, &context);
+    for index in 2..4u32 {
+        manager.handle_success(&impu(index), 600);
+    }
+    let open = sockets.len();
+    assert!(open >= 2, "the UEs' sockets are open");
+
+    deregister_all(&manager, &outbound);
+    tick(&manager, &context);
+
+    assert_eq!(sockets.len(), open, "a socket closed during shutdown");
+}
+
 /// The REGISTER of an entry with its own address is handed to the transport
 /// pinned to that address; a process-address entry keeps the first listener.
 #[tokio::test]
@@ -364,6 +395,8 @@ async fn the_loop_ramps_at_the_capped_rate_oldest_first() {
         manager.add(entry);
     }
     let (outbound, sent) = router();
+    // The loop waits for a transaction layer, as the dispatcher attaches one.
+    test_support::attach_untracked_transactions(&manager);
     let started = tokio::time::Instant::now();
     let task = tokio::spawn(registration_loop(
         Arc::clone(&manager),
@@ -643,4 +676,127 @@ async fn tcp_ues_register_from_their_own_address_and_take_the_pcscf_connection()
         harness.sockets.tcp_len()
     );
     assert!(eventually(|| harness.connection_map.is_empty()).await);
+}
+
+/// The `Expires` of every REGISTER on the wire, by To AoR.
+fn expires_by_aor(sent: &flume::Receiver<OutboundMessage>) -> Vec<(String, u32)> {
+    sent.try_iter()
+        .map(|message| {
+            let parsed = crate::sip::parser::parse_sip_message_bytes(&message.data)
+                .expect("a REGISTER that parses");
+            let to = parsed.headers.get("To").cloned().expect("a To");
+            let expires = parsed
+                .headers
+                .get("Expires")
+                .and_then(|value| value.trim().parse().ok())
+                .expect("an Expires");
+            (
+                to.trim_matches(|c| c == '<' || c == '>').to_string(),
+                expires,
+            )
+        })
+        .collect()
+}
+
+/// Shutdown clears every binding once and starts nothing afterwards: not the
+/// refresh tick, not a failure retry, not the trunks a source reconcile or a
+/// script adds back, not a forced refresh. A process that registers again on
+/// its way out leaves the registrar holding a binding (and an IMS UE's P-CSCF a
+/// security association) that its successor then registers over afresh.
+#[tokio::test]
+async fn shutdown_de_registers_each_entry_once_and_never_registers_again() {
+    const ENTRIES: u32 = 8;
+    const FAILED: &str = "sip:failed@carrier.example";
+    let manager = test_support::manager();
+    let (outbound, sent) = router();
+    let context = context(Arc::clone(&outbound), None, 5070);
+    install(&manager, &context);
+    let aors: Vec<String> = (0..ENTRIES)
+        .map(|index| format!("sip:trunk{index}@carrier.example"))
+        .collect();
+    for aor in &aors {
+        manager.add(trunk(aor));
+        manager.handle_success(aor, 3600);
+        // Its refresh is due on the next tick.
+        test_support::make_due(&manager, aor);
+    }
+    // And one whose last attempt failed, its retry due now.
+    manager.add(trunk(FAILED));
+    manager.handle_failure(FAILED, 503, Some(Duration::ZERO));
+
+    assert_eq!(deregister_all(&manager, &outbound), ENTRIES as usize);
+
+    // What the process does while it drains: the source reconcile and a script
+    // put the trunks back, a refresh is forced, and the tick fires.
+    for aor in aors.iter().map(String::as_str).chain([FAILED]) {
+        manager.add(trunk(aor));
+        manager.refresh(aor);
+    }
+    for _ in 0..3 {
+        tick(&manager, &context);
+    }
+
+    let wire = expires_by_aor(&sent);
+    for aor in &aors {
+        let de_registers = wire
+            .iter()
+            .filter(|(to, expires)| to == aor && *expires == 0)
+            .count();
+        assert_eq!(de_registers, 1, "{aor}: {wire:?}");
+    }
+    let registers: Vec<&(String, u32)> = wire.iter().filter(|(_, expires)| *expires > 0).collect();
+    assert!(
+        registers.is_empty(),
+        "registered after shutdown: {registers:?}"
+    );
+}
+
+/// A removed entry de-registers once and is never registered again: not by
+/// the tick, not by a forced refresh.
+#[tokio::test]
+async fn a_removed_entry_de_registers_once_and_never_re_registers() {
+    const AOR: &str = "sip:removed@carrier.example";
+    let manager = test_support::manager();
+    let (outbound, sent) = router();
+    let context = context(outbound, None, 5070);
+    install(&manager, &context);
+    manager.add(trunk(AOR));
+    manager.handle_success(AOR, 3600);
+    test_support::make_due(&manager, AOR);
+
+    manager.remove(AOR);
+    assert!(!manager.refresh(AOR));
+    for _ in 0..3 {
+        tick(&manager, &context);
+    }
+
+    assert_eq!(expires_by_aor(&sent), vec![(AOR.to_string(), 0)]);
+}
+
+/// Shutdown stops the source reconcile before it reads the source: a pass
+/// already scheduled when the shutdown began would otherwise add every trunk
+/// back.
+#[tokio::test]
+async fn a_reconcile_after_shutdown_reads_nothing_and_adds_nothing() {
+    use crate::registrant::source::{
+        reconcile_once, HttpSource, ReconcileReport, RegistrantSource,
+    };
+    let manager = Arc::new(test_support::manager());
+    let (outbound, _sent) = router();
+    // An address nothing listens on (RFC 5737): a read would fail.
+    let source = RegistrantSource::Http(
+        HttpSource::new(crate::config::RegistrantHttpConfig {
+            url: "http://192.0.2.1:1/registrants".to_string(),
+            refresh_secs: 30,
+            timeout_ms: 50,
+            auth_header: None,
+        })
+        .expect("the HTTP client builds"),
+    );
+
+    deregister_all(&manager, &outbound);
+    let report = reconcile_once(&manager, &source).await;
+
+    assert_eq!(report, Ok(ReconcileReport::default()));
+    assert!(manager.is_empty());
 }
