@@ -58,7 +58,8 @@ nodes and **(b)** whether it survives a process restart.
 | **`subscribe_state` dialogs** | local map + optional cache | **Yes — live**, read-through | Yes, with Redis |
 | **Transactions** (RFC 3261 §17) | local in-memory | No | No |
 | **Dialogs / proxy sessions / B2BUA calls** | local in-memory / actors | No | No |
-| **Presence** (PIDF, subscriptions) | local in-memory | No | No |
+| **Presence subscriptions** (`presence.subscribe_dialog`) | in-memory + Redis when the registrar is on Redis | Snapshot at boot | Yes, with the Redis registrar backend |
+| **Presence documents** (PIDF) | local in-memory | No | No |
 | **Gateway health** | local atomics, per-node probing | No (each node probes independently) | No (resets to healthy) |
 | **Outbound registrations** (`registrant`) | local in-memory | No | No |
 
@@ -125,6 +126,7 @@ every one it has ever seen. In Redis, under `registrar.redis.key_prefix`:
 | `{prefix}state:{aor}` | Service-Route, P-Asserted-Identity, P-Associated-URI | the binding hash's, refreshed on every save; written before the AoR has a binding, `max_expires` + `ttl_slack_secs` |
 | `{prefix}index` | sorted set of AoRs, scored by the epoch second the last contact expires | none; members whose score has passed are dropped on every read and once a minute |
 | `{isc.ifc_key_prefix}{aor}` | the iFC profile XML | `max_expires` + `ttl_slack_secs`, renewed by every `isc.store_profile()` |
+| `{registrar.redis.presence_key_prefix}{id}` | one presence subscription: its dialog (Call-ID, tags, route set, remote target, local and remote URI), the CSeq of its last NOTIFY, its next reginfo version, event, resource and expiry | the subscription's remaining lifetime + `ttl_slack_secs`, renewed by every change |
 
 `registrar.aor_count()` reads the index (one `ZREMRANGEBYSCORE` + `ZCARD` per
 shard), so polling it costs the same at a million AoRs as at ten, and nothing
@@ -132,8 +134,28 @@ walks the keyspace at runtime. The index is updated in the same transaction as
 the binding hash on every save and removal, so it holds across nodes and
 restarts and does not depend on keyspace expiry events. Boot is the one place
 siphon walks keys, by cursor `SCAN` (never `KEYS`): the iFC and auxiliary-state
-restore, and building the index when a node finds none (a keyspace written by a
-version without it).
+restore, the presence subscription restore, and building the index when a node
+finds none (a keyspace written by a version without it).
+
+### Presence subscriptions across a restart
+
+A notifier that restarts (an S-CSCF serving the reg event package) used to come
+back with no subscriptions, so every change and every terminating NOTIFY reached
+no watcher until each one re-SUBSCRIBEd, up to a whole refresh interval later.
+With `registrar.backend: redis`, every change to a subscription is written
+through to the same Redis, under `registrar.redis.presence_key_prefix` (default
+`siphon:presence:`), through the same coalescing writer as the registrar's: the
+latest state per subscription, never dropped under a burst, retried while Redis
+is away. At boot the subscriptions are read back before any listener is up, one
+that expired while the node was down is dropped (and its key deleted), and the
+rest continue their dialogs: the next NOTIFY carries one CSeq more than the last
+one written (RFC 3261 §12.2.1.1) and the next reginfo document the next version
+(RFC 3680 §5.2). A terminate, an un-SUBSCRIBE, a failed NOTIFY's removal or the
+expiry sweep deletes the key. Like the registrar's writes these are write-behind:
+a crash, unlike a stop, can lose the last few milliseconds of them, so a NOTIFY
+sent just before one may be followed after the restart by one with the same CSeq,
+which the subscriber answers with an error that ends that transaction only.
+With `postgres` the subscriptions stay in memory, as before.
 
 Store the iFC profile from the SAR of every REGISTER, re-registrations
 included, as the example S-CSCF script does: a profile stored only at initial

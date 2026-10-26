@@ -400,6 +400,11 @@ registrar:
   #   url: "redis://127.0.0.1:6379"
   #   key_prefix: "siphon:reg:"   # namespace prefix (default: "siphon:reg:")
   #   ttl_slack_secs: 30          # extra seconds beyond expires for race safety
+  #   presence_key_prefix: "siphon:presence:"
+  #   # presence subscriptions (presence.subscribe_dialog) are written through
+  #   # to this Redis under their own prefix and restored at boot, so a
+  #   # restarted reg event notifier keeps NOTIFYing its watchers in their
+  #   # dialogs (CSeq and reginfo version continue). Default "siphon:presence:".
   #   # Every key siphon writes here expires with its registration (state keys
   #   # and iFC profiles too); registrar.aor_count() reads a maintained AoR
   #   # index ({key_prefix}index), not the keyspace. See

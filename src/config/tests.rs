@@ -6373,3 +6373,26 @@ fn aka_credential_sqn_that_is_not_48_bit_hex_is_refused_at_load() {
         );
     }
 }
+
+/// Presence subscriptions ride the registrar's Redis under a prefix of their
+/// own, defaulted apart from the registrar's keyspace and settable.
+#[test]
+fn registrar_redis_presence_key_prefix_defaults_and_overrides() {
+    let config = Config::from_str(&backend_yaml(
+        "registrar:\n  backend: redis\n  redis:\n    url: \"redis://127.0.0.1:6379\"\n",
+    ))
+    .expect("config");
+    let redis = config.registrar.redis.expect("redis");
+    assert_eq!(redis.presence_key_prefix, "siphon:presence:");
+    assert!(!redis.presence_key_prefix.starts_with(&redis.key_prefix));
+
+    let config = Config::from_str(&backend_yaml(
+        "registrar:\n  backend: redis\n  redis:\n    url: \"redis://127.0.0.1:6379\"\n    \
+         presence_key_prefix: \"scscf-a:presence:\"\n",
+    ))
+    .expect("config");
+    assert_eq!(
+        config.registrar.redis.expect("redis").presence_key_prefix,
+        "scscf-a:presence:"
+    );
+}

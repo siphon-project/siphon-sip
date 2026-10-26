@@ -154,10 +154,19 @@ pub struct RedisBackendConfig {
     /// Extra seconds beyond `expires` to retain keys, to avoid race conditions.
     #[serde(default = "default_ttl_slack")]
     pub ttl_slack_secs: u32,
+    /// Key prefix of the presence store's subscriptions, written through to
+    /// this same Redis and restored at boot (default: "siphon:presence:").
+    /// Kept apart from `key_prefix`, so neither restore walks the other's keys.
+    #[serde(default = "default_presence_key_prefix")]
+    pub presence_key_prefix: String,
 }
 
 fn default_redis_key_prefix() -> String {
     "siphon:reg:".to_owned()
+}
+
+fn default_presence_key_prefix() -> String {
+    crate::presence::persist::DEFAULT_PRESENCE_KEY_PREFIX.to_owned()
 }
 
 fn default_ttl_slack() -> u32 {
