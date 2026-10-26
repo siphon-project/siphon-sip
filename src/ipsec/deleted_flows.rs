@@ -90,8 +90,14 @@ impl IpsecManager {
             ue_port_c: sa.ue_port_c,
             ue_port_s: sa.ue_port_s,
         };
+        // A port another pair of the UE still covers is that pair's: the
+        // protected server port an old and a new set share (TS 33.203 clause
+        // 7.4.0) stays protected when a challenge that failed beside the set
+        // in use goes.
         for port in [sa.ue_port_c, sa.ue_port_s] {
-            ports.insert(SocketAddr::new(sa.ue_addr, port), flow.clone());
+            if self.find_sa_by_ue(&sa.ue_addr, port).is_none() {
+                ports.insert(SocketAddr::new(sa.ue_addr, port), flow.clone());
+            }
         }
     }
 

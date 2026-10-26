@@ -19,6 +19,10 @@ mod network_dereg;
 pub use egress::{pcscf_tcp_request_egress, pcscf_udp_egress};
 #[cfg(test)]
 mod egress_tests;
+/// A pair named by its installation (its SPIs), for the callers holding one.
+mod installation;
+#[cfg(test)]
+mod installation_tests;
 /// `ip xfrm policy` command lines of the `ip` backend.
 mod ip_policy;
 #[cfg(target_os = "linux")]
@@ -983,44 +987,59 @@ impl IpsecManager {
         self.create_sa_pair(sa).await
     }
 
-    /// Delete IPsec SAs and SPs for a UE.
+    /// Delete whichever pair is held at `(ue_addr, ue_port_c)`: the UE's
+    /// current pair on that client port, for a caller that means the port (a
+    /// registration's flow going, the script's `ipsec.delete`). A caller that
+    /// holds a particular installation (a `PendingSA`, a scheduled
+    /// retirement, the expiry sweep) deletes it with
+    /// [`delete_installation`](Self::delete_installation) instead, so a newer
+    /// pair on the same port is never taken in its place.
     pub async fn delete_sa_pair(&self, ue_addr: &IpAddr, ue_port_c: u16) -> Result<(), IpsecError> {
         let key = Self::contact_key(ue_addr, ue_port_c);
-        if let Some((_, sa)) = self.associations.remove(&key) {
-            let in_use = self.is_in_use(&sa);
-            self.forget_lifecycle(&key);
-            if in_use {
-                self.set_in_use_went(&sa);
-            }
-            // The connection the P-CSCF opened to the UE's protected server
-            // port for its own requests (TS 24.229 clause 5.2.2.2 1A b) is
-            // carried by this pair, and a connection from a pinned port is
-            // never closed for idleness, so it goes with the pair, before
-            // the kernel objects do. A retirement has closed it already; the
-            // liveness reaper and the expiry sweep delete directly.
-            if sa.role == SaRole::PCscf {
-                self.close_unshared_connections(
-                    &sa,
-                    &[sa.ue_port_s],
-                    "security association deleted",
-                )
-                .await;
-            }
-            // Best-effort teardown — every delete is independent, so a single
-            // missing key (e.g. an SA already reaped on hard-lifetime) can't
-            // skip the rest. (The old code `?`-chained the four del_sa, so the
-            // first ENOENT aborted before the policies, leaking them.) The
-            // in-memory entry is already removed above, so the manager's view
-            // stays authoritative regardless of kernel-side failures. A kernel
-            // object another pair of the UE holds is left to it.
-            self.teardown_unshared(&sa, in_use).await;
-            // Only once the kernel states are gone may the SPIs be reused.
-            self.release_pair_spis(&sa);
-            // A request still on its way to the UE must not leave in clear.
-            self.bar_deleted_pair(&sa);
-            info!(ue = %ue_addr, ue_port_c, "IPsec: SA pair deleted");
+        if let Some((key, sa)) = self.associations.remove(&key) {
+            self.tear_down_removed(&key, sa).await;
         }
         Ok(())
+    }
+
+    /// Tear down `sa`, just removed from `associations` at `key`: its
+    /// lifecycle, its connections, the kernel objects no other pair of the UE
+    /// holds, its SPIs, and the egress bar on its UE ports.
+    async fn tear_down_removed(&self, key: &str, sa: SecurityAssociationPair) {
+        let in_use = self.is_in_use(&sa);
+        self.forget_lifecycle(key);
+        if in_use {
+            self.set_in_use_went(&sa);
+        }
+        // The connection the P-CSCF opened to the UE's protected server
+        // port for its own requests (TS 24.229 clause 5.2.2.2 1A b) is
+        // carried by this pair, and a connection from a pinned port is
+        // never closed for idleness, so it goes with the pair, before
+        // the kernel objects do. A retirement has closed it already; the
+        // liveness reaper and the expiry sweep delete directly.
+        if sa.role == SaRole::PCscf {
+            self.close_unshared_connections(&sa, &[sa.ue_port_s], "security association deleted")
+                .await;
+        }
+        // Best-effort teardown — every delete is independent, so a single
+        // missing key (e.g. an SA already reaped on hard-lifetime) can't
+        // skip the rest. (The old code `?`-chained the four del_sa, so the
+        // first ENOENT aborted before the policies, leaking them.) The
+        // in-memory entry is already removed above, so the manager's view
+        // stays authoritative regardless of kernel-side failures. A kernel
+        // object another pair of the UE holds is left to it.
+        self.teardown_unshared(&sa, in_use).await;
+        // Only once the kernel states are gone may the SPIs be reused.
+        self.release_pair_spis(&sa);
+        // A request still on its way to the UE must not leave in clear.
+        self.bar_deleted_pair(&sa);
+        info!(
+            ue = %sa.ue_addr,
+            ue_port_c = sa.ue_port_c,
+            spi_pc = sa.spi_pc,
+            spi_ps = sa.spi_ps,
+            "IPsec: SA pair deleted"
+        );
     }
 
     /// Re-pin the kernel hard-lifetime on all four SAs of an existing
@@ -1204,7 +1223,7 @@ impl IpsecManager {
     /// Collect-then-delete: snapshots the expired keys first (`expired_keys`)
     /// then deletes each, so we never `remove` while holding a DashMap
     /// iterator guard.  Per-victim kernel-delete failures are logged but
-    /// never propagated — `delete_sa_pair` removes the in-memory entry
+    /// never propagated — `delete_installation` removes the in-memory entry
     /// before any kernel call, so the manager's view stays authoritative
     /// even when the kernel objects were already reaped on hard-lifetime
     /// (the common case, since the kernel deadline precedes the grace).
@@ -1230,25 +1249,20 @@ impl IpsecManager {
 
         let mut reaped: Vec<(IpAddr, u16)> = Vec::new();
         for key in victims {
-            // Re-read the entry to recover the UE address/port for
-            // delete_sa_pair; if it vanished between snapshot and now
-            // (concurrent re-REGISTER teardown), skip it.
-            let (ue_addr, ue_port_c) = match self.associations.get(&key) {
-                Some(entry) => {
-                    let sa = entry.value();
-                    (sa.ue_addr, sa.ue_port_c)
-                }
-                None => continue,
+            // Re-read the entry; if it vanished between snapshot and now
+            // (concurrent re-REGISTER teardown), skip it. Deleted as this
+            // installation, so a pair re-created on the port meanwhile
+            // (a new registration, not expired) is never taken.
+            let Some(sa) = self
+                .associations
+                .get(&key)
+                .map(|entry| entry.value().clone())
+            else {
+                continue;
             };
-            if let Err(error) = self.delete_sa_pair(&ue_addr, ue_port_c).await {
-                tracing::warn!(
-                    ue = %ue_addr,
-                    ue_port_c,
-                    %error,
-                    "IPsec: abandoned SA sweep — kernel delete failed (in-memory entry already removed)"
-                );
+            if sa.expires_at <= Instant::now() && self.delete_installation(&sa).await {
+                reaped.push((sa.ue_addr, sa.ue_port_c));
             }
-            reaped.push((ue_addr, ue_port_c));
         }
 
         if !reaped.is_empty() {
@@ -2025,6 +2039,12 @@ impl IpsecManager {
             Self::with_partition(XfrmBackend::Netlink, spi_range_start, spi_range_count);
         manager.xfrm_workers = Some(workers);
         manager
+    }
+
+    /// How many pairs wait to be taken into use, for tests outside this
+    /// module.
+    pub(crate) fn test_pending_count(&self) -> usize {
+        self.lifecycle.pending_len()
     }
 
     /// The mock kernel's op log, for tests outside this module.

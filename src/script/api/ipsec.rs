@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use pyo3::prelude::*;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::config::IpsecConfig;
 use crate::ipsec::{
@@ -584,7 +584,7 @@ impl PyPendingSA {
     /// expiry window relative to the spec.
     #[pyo3(signature = (*, hard_lifetime_secs=None))]
     fn activate(&self, hard_lifetime_secs: Option<u64>) -> PyResult<()> {
-        let (manager, ue_addr, ue_port_c) = {
+        let (manager, sa) = {
             let mut guard = self.inner.lock().map_err(|error| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "PendingSA lock poisoned: {error}"
@@ -608,49 +608,13 @@ impl PyPendingSA {
                 hard_lifetime_secs = ?hard_lifetime_secs,
                 "ipsec.PendingSA: activated"
             );
-            (
-                Arc::clone(&guard.manager),
-                guard.sa.ue_addr,
-                guard.sa.ue_port_c,
-            )
+            (Arc::clone(&guard.manager), guard.sa.clone())
         };
-
-        if let Some(secs) = hard_lifetime_secs {
-            // Fire-and-forget the four UPDSA messages.  See doc-comment
-            // for why this is sound — a missed repin can only widen the
-            // expiry window, never tighten it past the registrar's grant.
-            let manager_for_repin = Arc::clone(&manager);
-            tokio::spawn(async move {
-                if let Err(error) = manager_for_repin
-                    .update_sa_pair_lifetime(&ue_addr, ue_port_c, Some(secs))
-                    .await
-                {
-                    warn!(
-                        %error,
-                        ue = %ue_addr,
-                        ue_port_c,
-                        hard_lifetime_secs = secs,
-                        "ipsec.PendingSA.activate: kernel hard-lifetime repin failed"
-                    );
-                }
-            });
-        }
-
-        // The UE's other pairs go now that this one is in use (3GPP TS 33.203
-        // clause 7.4.2a). The UE picks a fresh port_uc on every REGISTER, so a
-        // re-REGISTER installs under a new contact key and the previous pair's
-        // policies would otherwise stay in the kernel until a later port_uc
-        // collides with one (EEXIST). The pair the REGISTER arrived over is
-        // kept until the transactions pending on it can be done; any other is
-        // deleted at once. Fired here, post-200-OK, because that is where the
-        // registrar of record has granted the new binding. Fire-and-forget
-        // like the repin: the transition has committed.
-        tokio::spawn(async move {
-            manager
-                .supersede_pairs_for_ue(&ue_addr, ue_port_c, crate::ipsec::retire::SA_RETIRE_GRACE)
-                .await;
-        });
-
+        // Fire-and-forget: the repin (a missed one only widens the expiry
+        // window) and superseding the UE's other pairs (TS 33.203 clause
+        // 7.4.2a), on this installation only: nothing when a newer challenge
+        // replaced it on its client port.
+        manager.activate_installation(&sa, hard_lifetime_secs);
         Ok(())
     }
 
@@ -672,36 +636,17 @@ impl PyPendingSA {
         Ok(guard.state == PendingState::Cleaned)
     }
 
-    /// Tear down all four XFRM states + policies for this pair.
+    /// Tear down all four XFRM states + policies for this pair, named by its
+    /// own SPIs: a newer challenge that replaced it on the UE's protected
+    /// client port (a retransmitted REGISTER) is left alone.
     /// Idempotent — calling on an already-cleaned PendingSA is a no-op.
     fn cleanup<'py>(&self, python: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         crate::script::awaitable(python, async move {
-            let (manager, ue_addr, ue_port_c, already_cleaned) = {
-                let mut guard = inner.lock().map_err(|error| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "PendingSA lock poisoned: {error}"
-                    ))
-                })?;
-                let already = guard.state == PendingState::Cleaned;
-                let manager = Arc::clone(&guard.manager);
-                let ue_addr = guard.sa.ue_addr;
-                let ue_port_c = guard.sa.ue_port_c;
-                if !already {
-                    guard.state = PendingState::Cleaned;
-                }
-                (manager, ue_addr, ue_port_c, already)
-            };
-            if already_cleaned {
-                return Ok(());
+            if let Some((manager, sa)) = take_for_cleanup(&inner) {
+                manager.delete_installation(&sa).await;
+                debug!(ue = %sa.ue_addr, ue_port_c = sa.ue_port_c, "ipsec.PendingSA: cleaned up");
             }
-            if let Err(error) = manager.delete_sa_pair(&ue_addr, ue_port_c).await {
-                warn!(%error, ue = %ue_addr, "ipsec.PendingSA.cleanup: delete failed");
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "delete_sa_pair failed: {error}"
-                )));
-            }
-            debug!(ue = %ue_addr, ue_port_c, "ipsec.PendingSA: cleaned up");
             Ok(())
         })
     }
@@ -736,6 +681,11 @@ impl PyPendingSA {
                 }
                 manager = Arc::clone(&guard.manager);
                 sa_new = guard.sa.clone();
+            }
+            if manager.is_replaced(&sa_new) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "PendingSA replaced by a newer challenge on its client port",
+                ));
             }
             // The Security-Server recorded on the stored pair when its 401 was
             // relayed is not on this copy; keep it across the delete below. The
@@ -1219,27 +1169,26 @@ fn spawn_pending_cleanup(pending: Py<PyPendingSA>) {
         Arc::clone(&cell.inner)
     });
     tokio::spawn(async move {
-        let (manager, ue_addr, ue_port_c, already_cleaned) = {
-            let mut guard = match inner.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            let already = guard.state == PendingState::Cleaned;
-            let manager = Arc::clone(&guard.manager);
-            let ue_addr = guard.sa.ue_addr;
-            let ue_port_c = guard.sa.ue_port_c;
-            if !already {
-                guard.state = PendingState::Cleaned;
-            }
-            (manager, ue_addr, ue_port_c, already)
-        };
-        if already_cleaned {
-            return;
-        }
-        if let Err(error) = manager.delete_sa_pair(&ue_addr, ue_port_c).await {
-            warn!(%error, ue = %ue_addr, "ipsec auto-cleanup: delete_sa_pair failed");
+        if let Some((manager, sa)) = take_for_cleanup(&inner) {
+            manager.delete_installation(&sa).await;
         }
     });
+}
+
+/// Mark the PendingSA cleaned and hand back what deletes its pair, or `None`
+/// when it was already cleaned. The pair goes by its own SPIs
+/// ([`IpsecManager::delete_installation`]): a retransmitted REGISTER's second
+/// challenge replaces it on the same UE client port, and that pair, likely in
+/// use by the time this one is abandoned, must stay (TS 33.203 clause 7.4).
+fn take_for_cleanup(
+    inner: &Mutex<PendingSAInner>,
+) -> Option<(Arc<IpsecManager>, SecurityAssociationPair)> {
+    let mut guard = inner.lock().ok()?;
+    if guard.state == PendingState::Cleaned {
+        return None;
+    }
+    guard.state = PendingState::Cleaned;
+    Some((Arc::clone(&guard.manager), guard.sa.clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1568,6 +1517,10 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "ipsec_pending_tests.rs"]
+mod pending_tests;
 
 #[cfg(test)]
 mod tests {
