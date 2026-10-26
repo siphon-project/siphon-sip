@@ -11575,7 +11575,8 @@ class MockPresence:
                          to_tag: str = "", route_set: Optional[list] = None,
                          local_uri: Optional[str] = None,
                          remote_uri: Optional[str] = None,
-                         local_cseq: int = 0) -> str:
+                         local_cseq: int = 0,
+                         version: int = 0) -> str:
         """Create a subscription with dialog state for in-dialog NOTIFY.
 
         Args:
@@ -11602,6 +11603,12 @@ class MockPresence:
                 carries one more. ``0`` for a new dialog; a dialog rebuilt
                 from stored state (IMS restoration) starts high enough for the
                 subscriber to accept it. Kept as ``local_cseq`` in the record.
+            version: The version the next event-state document carries
+                (RFC 3680 §5.2), handed out by :meth:`next_version`. ``0`` for
+                a new subscription. IMS restoration stores no version, so a
+                rebuilt dialog passes one above any it could have sent, as for
+                ``local_cseq``: a subscriber that sees a version more than one
+                higher takes it and SHOULD refresh for full state.
 
         Both URI arguments default to ``resource``, which is correct for any
         package where the subscriber watches an AoR directly (the reg event
@@ -11625,6 +11632,7 @@ class MockPresence:
             "local_uri": _strip_nameaddr(local_uri) if local_uri else resource,
             "remote_uri": _strip_nameaddr(remote_uri) if remote_uri else resource,
             "local_cseq": local_cseq,
+            "next_version": version,
         }
         return sub_id
 
@@ -11681,6 +11689,36 @@ class MockPresence:
             if value.get("call_id") == call_id and value.get("from_tag") == from_tag:
                 return sub_id
         return None
+
+    def next_version(self, subscription_id: str) -> Optional[int]:
+        """The version for the next event-state document on a subscription.
+
+        RFC 3680 §5.2: "Versions start at 0, and increment by one for each new
+        document sent to a subscriber.  Versions are scoped within a
+        subscription."  The store owns one count per subscription; each call
+        returns it and advances it, so take a version only for a document
+        that is sent.
+
+        Args:
+            subscription_id: The subscription ID.
+
+        Returns:
+            The version (0 for the first document), or ``None`` for an unknown
+            subscription. A removed subscription's count goes with it.
+
+        Example::
+
+            body = registrar.reginfo_xml(aor, state="partial",
+                                         version=presence.next_version(sub_id))
+            await presence.notify(sub_id, body=body,
+                                  content_type="application/reginfo+xml")
+        """
+        subscription = self._subscriptions.get(subscription_id)
+        if subscription is None:
+            return None
+        version = subscription.get("next_version", 0)
+        subscription["next_version"] = min(version + 1, 0xFFFFFFFF)
+        return version
 
     def subscribers(self, resource: str) -> list[dict]:
         """List subscribers (watchers) for a resource.

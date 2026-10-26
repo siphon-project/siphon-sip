@@ -185,3 +185,29 @@ def test_notify_without_waiting_resolves_to_none():
     presence = _fresh_presence()
     sub_id = _reg_subscription(presence)
     assert run(presence.notify(sub_id)) is None
+
+
+def test_next_version_counts_per_subscription():
+    presence = _fresh_presence()
+    first = _reg_subscription(presence)
+    second = presence.subscribe_dialog(
+        subscriber="sip:other@192.0.2.8:5060",
+        resource="sip:001010000000001@ims.example.com",
+        event="reg", expires=600, call_id="other", from_tag="f2", to_tag="t2",
+    )
+    assert [presence.next_version(first) for _ in range(3)] == [0, 1, 2]
+    assert presence.next_version(second) == 0
+    assert presence.unsubscribe(first)
+    assert presence.next_version(first) is None
+
+
+def test_next_version_continues_from_a_rebuilt_dialog():
+    presence = _fresh_presence()
+    restored = presence.subscribe_dialog(
+        subscriber="sip:watcher@192.0.2.7:5060",
+        resource="sip:001010000000001@ims.example.com",
+        event="reg", expires=600, call_id="restored", from_tag="f", to_tag="t",
+        local_cseq=1792310400, version=1792310400,
+    )
+    assert presence.next_version(restored) == 1792310400
+    assert presence.next_version(restored) == 1792310401

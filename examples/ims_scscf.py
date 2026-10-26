@@ -196,7 +196,7 @@ async def handle_subscribe(request):
         # in-dialog NOTIFY; `subscriber` is the remote target and belongs in the
         # Request-URI only. Pass a Contact as `subscriber` when the NOTIFY must
         # reach the UE directly rather than being re-resolved through the I-CSCF.
-        presence.subscribe_dialog(
+        sub_id = presence.subscribe_dialog(
             str(request.from_uri), aor, "reg", expires,
             request.call_id, request.from_tag, SCSCF_NOTIFIER_TAG,
             local_uri=str(request.to_uri), remote_uri=str(request.from_uri),
@@ -206,8 +206,10 @@ async def handle_subscribe(request):
         request.reply(200, "OK")
 
         # Initial NOTIFY with full reginfo (RFC 3680 §3.2), in-dialog: From-tag
-        # is the To-tag we just assigned.
-        body = registrar.reginfo_xml(aor, state="full", version=0)
+        # is the To-tag we just assigned. The store counts each subscription's
+        # reginfo versions (RFC 3680 §5.2): 0 here, one more per NOTIFY after.
+        body = registrar.reginfo_xml(aor, state="full",
+                                     version=presence.next_version(sub_id))
         await proxy.send_request("NOTIFY", str(request.from_uri), headers={
             "Event": "reg",
             "Subscription-State": f"active;expires={expires}",
@@ -237,7 +239,8 @@ async def on_registration_change(aor, event_type, contacts):
     for watcher in presence.subscribers(aor):
         if watcher.get("event") != "reg":
             continue
-        body = registrar.reginfo_xml(aor, state="partial")
+        body = registrar.reginfo_xml(aor, state="partial",
+                                     version=presence.next_version(watcher["id"]))
         await proxy.send_request("NOTIFY", watcher["subscriber"], headers={
             "Event": "reg",
             "Subscription-State": "active",

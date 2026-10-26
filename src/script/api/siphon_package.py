@@ -1438,6 +1438,9 @@ class _PresenceNamespace:
     def subscribers(self, resource):
         raise NotImplementedError("presence.subscribers() not available — presence store not initialized")
 
+    def next_version(self, subscription_id):
+        raise NotImplementedError("presence.next_version() not available — presence store not initialized")
+
     def notify(self, subscription_id, body=None, content_type=None, subscription_state="active",
                wait_for_response=False, timeout_ms=2000):
         raise NotImplementedError("presence.notify() not available — presence store not initialized")

@@ -118,6 +118,11 @@ pub struct Subscription {
     /// only while that generation is still current (see
     /// [`PresenceStore::remove_subscription_if_current`]).
     pub generation: u64,
+    /// The version the next event-state document sent on this subscription
+    /// carries (RFC 3680 §5.2, the reginfo `version`): 0 for a new
+    /// subscription, one more for every document handed out since.  Lives
+    /// with the subscription, so it goes when the subscription does.
+    pub next_version: u32,
 }
 
 /// Source of [`Subscription::generation`] values.
@@ -156,6 +161,7 @@ impl Subscription {
             local_uri: None,
             remote_uri: None,
             generation: 0,
+            next_version: 0,
         }
     }
 
@@ -200,6 +206,7 @@ impl Subscription {
             local_uri,
             remote_uri,
             generation: 0,
+            next_version: 0,
         }
     }
 
@@ -259,6 +266,20 @@ impl Subscription {
     pub fn next_cseq(&mut self) -> u32 {
         self.local_cseq += 1;
         self.local_cseq
+    }
+
+    /// The version for the next document sent on this subscription, and
+    /// advance the count past it.
+    ///
+    /// RFC 3680 §5.2: "Versions start at 0, and increment by one for each new
+    /// document sent to a subscriber.  Versions are scoped within a
+    /// subscription.  Versions MUST be representable using a 32 bit
+    /// integer."  Saturates at `u32::MAX` rather than wrapping to 0, which
+    /// the subscriber would discard as older.
+    pub fn take_version(&mut self) -> u32 {
+        let version = self.next_version;
+        self.next_version = version.saturating_add(1);
+        version
     }
 
     /// Refresh the subscription with a new expiry duration, resetting the timer.
@@ -437,6 +458,14 @@ impl PresenceStore {
     /// Look up a subscription by ID, returning a clone.
     pub fn get_subscription(&self, id: &str) -> Option<Subscription> {
         self.subscriptions.get(id).map(|entry| entry.clone())
+    }
+
+    /// The version the next document on subscription `id` carries, advancing
+    /// its count ([`Subscription::take_version`]).  `None` for an unknown id.
+    pub fn next_version(&self, id: &str) -> Option<u32> {
+        self.subscriptions
+            .get_mut(id)
+            .map(|mut entry| entry.take_version())
     }
 
     /// Prepare dialog state for an in-dialog NOTIFY, incrementing CSeq atomically.
@@ -1362,5 +1391,82 @@ mod tests {
         store.add_subscription(dialog_sub("sub-x", "callX", "ftagX"));
         assert!(store.refresh_subscription("sub-x", Duration::from_secs(7200)));
         assert!(!store.refresh_subscription("sub-missing", Duration::from_secs(7200)));
+    }
+
+    // ── PresenceStore: event-state versions (RFC 3680 §5.2) ─────────────
+
+    /// Two documents on one subscription carry v and v+1, starting at 0.
+    #[test]
+    fn next_version_starts_at_zero_and_counts_up() {
+        let store = PresenceStore::new();
+        store.add_subscription(dialog_sub("sub-v", "callV", "ftagV"));
+        assert_eq!(store.next_version("sub-v"), Some(0));
+        assert_eq!(store.next_version("sub-v"), Some(1));
+        assert_eq!(store.next_version("sub-v"), Some(2));
+    }
+
+    /// Versions are scoped within a subscription: two count independently.
+    #[test]
+    fn next_version_is_per_subscription() {
+        let store = PresenceStore::new();
+        store.add_subscription(dialog_sub("sub-a", "callA", "ftagA"));
+        store.add_subscription(dialog_sub("sub-b", "callB", "ftagB"));
+        assert_eq!(store.next_version("sub-a"), Some(0));
+        assert_eq!(store.next_version("sub-a"), Some(1));
+        assert_eq!(store.next_version("sub-b"), Some(0));
+        assert_eq!(store.next_version("sub-a"), Some(2));
+        assert_eq!(store.next_version("sub-b"), Some(1));
+    }
+
+    /// A removed subscription's count goes with it; a refresh keeps it.
+    #[test]
+    fn next_version_goes_with_the_subscription() {
+        let store = PresenceStore::new();
+        store.add_subscription(dialog_sub("sub-r", "callR", "ftagR"));
+        assert_eq!(store.next_version("sub-r"), Some(0));
+        assert!(store.refresh_subscription("sub-r", Duration::from_secs(600)));
+        assert_eq!(
+            store.next_version("sub-r"),
+            Some(1),
+            "a refresh keeps the count"
+        );
+        store.remove_subscription("sub-r");
+        assert_eq!(store.next_version("sub-r"), None);
+        assert_eq!(store.next_version("never-added"), None);
+    }
+
+    /// The count saturates rather than wrapping to 0, which a subscriber would
+    /// discard as older than what it holds.
+    #[test]
+    fn next_version_saturates() {
+        let store = PresenceStore::new();
+        let mut subscription = dialog_sub("sub-max", "callM", "ftagM");
+        subscription.next_version = u32::MAX;
+        store.add_subscription(subscription);
+        assert_eq!(store.next_version("sub-max"), Some(u32::MAX));
+        assert_eq!(store.next_version("sub-max"), Some(u32::MAX));
+    }
+
+    /// Concurrent takers never share a version.
+    #[test]
+    fn next_version_is_unique_under_concurrency() {
+        let store = Arc::new(PresenceStore::new());
+        store.add_subscription(dialog_sub("sub-c", "callC", "ftagC"));
+        let takers: Vec<_> = (0..8)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    (0..250)
+                        .map(|_| store.next_version("sub-c").unwrap())
+                        .collect::<Vec<u32>>()
+                })
+            })
+            .collect();
+        let mut versions: Vec<u32> = takers
+            .into_iter()
+            .flat_map(|taker| taker.join().unwrap())
+            .collect();
+        versions.sort_unstable();
+        assert_eq!(versions, (0..2000).collect::<Vec<u32>>());
     }
 }
