@@ -7,6 +7,7 @@
 //! Uses `DashMap` for lock-free concurrent access from multiple Tokio tasks.
 
 pub mod metrics;
+pub mod persist;
 pub mod pidf;
 pub mod rls;
 pub mod winfo;
@@ -19,6 +20,9 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tracing::{debug, warn};
+
+use crate::registrar::backend::WriteSequence;
+use persist::{PresenceBackendWriter, StoredSubscription};
 
 /// Process-wide presence store, installed at startup so background tasks
 /// (the dispatcher cleanup tick) can reach it to expire stale documents and
@@ -420,7 +424,13 @@ pub struct PresenceStore {
     documents: DashMap<String, Vec<PresenceDocument>>,
     /// Resource URI → list of subscription IDs watching that resource.
     watchers: DashMap<String, Vec<String>>,
+    /// The write-through to the registrar's Redis, when it has one
+    /// ([`persist`]).  Every change to a subscription is written through.
+    backend: OnceLock<PresenceBackendWriter>,
 }
+
+/// A subscription's write-through, snapshotted under its entry.
+type Snapshot = Option<(WriteSequence, StoredSubscription)>;
 
 impl PresenceStore {
     /// Create an empty presence store.
@@ -429,6 +439,39 @@ impl PresenceStore {
             subscriptions: DashMap::new(),
             documents: DashMap::new(),
             watchers: DashMap::new(),
+            backend: OnceLock::new(),
+        }
+    }
+
+    /// Write every later change to a subscription through `writer`.  Set once,
+    /// at boot, after the restore.
+    pub fn set_backend_writer(&self, writer: PresenceBackendWriter) {
+        let _ = self.backend.set(writer);
+    }
+
+    /// The write-through of `subscription` as it stands: call it while holding
+    /// the entry, so the sequence orders the snapshot.
+    fn snapshot(&self, subscription: &Subscription) -> Snapshot {
+        let writer = self.backend.get()?;
+        Some((writer.sequence(), StoredSubscription::of(subscription)))
+    }
+
+    /// Hand a snapshot taken under the entry to the writer.
+    fn write_through(&self, snapshot: Snapshot) {
+        if let (Some(writer), Some((sequence, stored))) = (self.backend.get(), snapshot) {
+            writer.save_at(&stored, sequence);
+        }
+    }
+
+    /// The sequence of a removal: call it while holding the entry.
+    fn removal_sequence(&self) -> Option<WriteSequence> {
+        self.backend.get().map(PresenceBackendWriter::sequence)
+    }
+
+    /// Hand the removal of `id` decided at `sequence` to the writer.
+    fn write_removal(&self, id: &str, sequence: Option<WriteSequence>) {
+        if let (Some(writer), Some(sequence)) = (self.backend.get(), sequence) {
+            writer.remove_at(id, sequence);
         }
     }
 
@@ -446,13 +489,37 @@ impl PresenceStore {
             "adding subscription"
         );
 
-        self.subscriptions
-            .insert(subscription_id.clone(), subscription);
+        let snapshot = {
+            let entry = self
+                .subscriptions
+                .entry(subscription_id.clone())
+                .insert(subscription);
+            self.snapshot(&entry)
+        };
+        self.write_through(snapshot);
 
         self.watchers
             .entry(resource)
             .or_default()
             .push(subscription_id);
+    }
+
+    /// Put back a subscription read from the backend at boot: into the store
+    /// and its resource's watchers, without writing it through again.
+    pub fn restore_subscription(&self, mut subscription: Subscription) {
+        subscription.generation = next_generation();
+        let resource = subscription.resource.clone();
+        let subscription_id = subscription.id.clone();
+        if self
+            .subscriptions
+            .insert(subscription_id.clone(), subscription)
+            .is_none()
+        {
+            self.watchers
+                .entry(resource)
+                .or_default()
+                .push(subscription_id);
+        }
     }
 
     /// Look up a subscription by ID, returning a clone.
@@ -463,39 +530,55 @@ impl PresenceStore {
     /// The version the next document on subscription `id` carries, advancing
     /// its count ([`Subscription::take_version`]).  `None` for an unknown id.
     pub fn next_version(&self, id: &str) -> Option<u32> {
-        self.subscriptions
-            .get_mut(id)
-            .map(|mut entry| entry.take_version())
+        let (version, snapshot) = {
+            let mut entry = self.subscriptions.get_mut(id)?;
+            let version = entry.take_version();
+            (version, self.snapshot(&entry))
+        };
+        self.write_through(snapshot);
+        Some(version)
     }
 
     /// Prepare dialog state for an in-dialog NOTIFY, incrementing CSeq atomically.
     ///
     /// Returns `None` if the subscription doesn't exist or has no dialog state.
     pub fn prepare_notify(&self, id: &str) -> Option<NotifyDialogState> {
-        let mut entry = self.subscriptions.get_mut(id)?;
-        let subscription = entry.value_mut();
-        let call_id = subscription.call_id.clone()?;
-        let local_uri = subscription.notify_from_uri().to_string();
-        let remote_uri = subscription.notify_to_uri().to_string();
-        let cseq = subscription.next_cseq();
-        Some(NotifyDialogState {
-            subscriber: subscription.subscriber.clone(),
-            local_uri,
-            remote_uri,
-            event: subscription.event.clone(),
-            call_id,
-            from_tag: subscription.from_tag.clone().unwrap_or_default(),
-            to_tag: subscription.to_tag.clone().unwrap_or_default(),
-            route_set: subscription.route_set.clone(),
-            cseq,
-            generation: subscription.generation,
-        })
+        let (dialog, snapshot) = {
+            let mut entry = self.subscriptions.get_mut(id)?;
+            let subscription = entry.value_mut();
+            let call_id = subscription.call_id.clone()?;
+            let local_uri = subscription.notify_from_uri().to_string();
+            let remote_uri = subscription.notify_to_uri().to_string();
+            let cseq = subscription.next_cseq();
+            let dialog = NotifyDialogState {
+                subscriber: subscription.subscriber.clone(),
+                local_uri,
+                remote_uri,
+                event: subscription.event.clone(),
+                call_id,
+                from_tag: subscription.from_tag.clone().unwrap_or_default(),
+                to_tag: subscription.to_tag.clone().unwrap_or_default(),
+                route_set: subscription.route_set.clone(),
+                cseq,
+                generation: subscription.generation,
+            };
+            // The CSeq just taken is written through, so a restarted notifier
+            // continues above it (RFC 3261 §12.2.1.1).
+            (dialog, self.snapshot(subscription))
+        };
+        self.write_through(snapshot);
+        Some(dialog)
     }
 
     /// Remove a subscription entirely (from both subscriptions and watchers maps).
     pub fn remove_subscription(&self, id: &str) {
-        if let Some((_, subscription)) = self.subscriptions.remove(id) {
+        let mut sequence = None;
+        if let Some((_, subscription)) = self.subscriptions.remove_if(id, |_, _| {
+            sequence = self.removal_sequence();
+            true
+        }) {
             debug!(subscription_id = %id, "removing subscription");
+            self.write_removal(id, sequence);
             self.forget_watcher(id, &subscription.resource);
         }
     }
@@ -510,13 +593,18 @@ impl PresenceStore {
     /// so the late failure leaves it alone.  An id that is already gone is a
     /// no-op returning `false`.
     pub fn remove_subscription_if_current(&self, id: &str, generation: u64) -> bool {
-        let Some((_, subscription)) = self
-            .subscriptions
-            .remove_if(id, |_, subscription| subscription.generation == generation)
-        else {
+        let mut sequence = None;
+        let Some((_, subscription)) = self.subscriptions.remove_if(id, |_, subscription| {
+            let current = subscription.generation == generation;
+            if current {
+                sequence = self.removal_sequence();
+            }
+            current
+        }) else {
             return false;
         };
         debug!(subscription_id = %id, "removing subscription after a failed NOTIFY");
+        self.write_removal(id, sequence);
         self.forget_watcher(id, &subscription.resource);
         true
     }
@@ -532,12 +620,15 @@ impl PresenceStore {
 
     /// Refresh a subscription's expiry. Returns `true` if the subscription was found.
     pub fn refresh_subscription(&self, id: &str, expires: Duration) -> bool {
-        if let Some(mut entry) = self.subscriptions.get_mut(id) {
-            entry.refresh(expires);
-            true
-        } else {
-            false
-        }
+        let snapshot = match self.subscriptions.get_mut(id) {
+            Some(mut entry) => {
+                entry.refresh(expires);
+                self.snapshot(&entry)
+            }
+            None => return false,
+        };
+        self.write_through(snapshot);
+        true
     }
 
     /// Find a subscription by its dialog identifiers `(Call-ID, From-tag)`.
@@ -568,10 +659,18 @@ impl PresenceStore {
     }
 
     /// Terminate a subscription (sets state to `Terminated` but does not remove it).
+    ///
+    /// A terminated subscription is never restored, so its stored copy goes
+    /// now rather than with the removal.
     pub fn terminate_subscription(&self, id: &str) {
-        if let Some(mut entry) = self.subscriptions.get_mut(id) {
-            entry.terminate();
-        }
+        let sequence = match self.subscriptions.get_mut(id) {
+            Some(mut entry) => {
+                entry.terminate();
+                self.removal_sequence()
+            }
+            None => return,
+        };
+        self.write_removal(id, sequence);
     }
 
     /// Get all active (non-terminated, non-expired) subscriptions for a resource URI.
@@ -755,6 +854,14 @@ impl Default for PresenceStore {
         Self::new()
     }
 }
+
+#[cfg(test)]
+#[path = "persist_tests.rs"]
+mod persist_tests;
+
+#[cfg(all(test, feature = "redis-backend"))]
+#[path = "persist_redis_tests.rs"]
+mod persist_redis_tests;
 
 #[cfg(test)]
 mod tests {

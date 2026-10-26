@@ -281,6 +281,9 @@ pub(super) async fn init_registrar_backend(config: &Config) {
                         config,
                     )
                     .await;
+
+                    // --- presence subscriptions (the same Redis, its own prefix) ---
+                    init_presence_redis_backend(redis_cfg).await;
                 }
                 Err(err) => {
                     error!(%err, "failed to connect to Redis registrar backend");
@@ -324,6 +327,85 @@ pub(super) async fn init_registrar_backend(config: &Config) {
         }
         RegistrarBackendType::Memory | RegistrarBackendType::Python => {}
     }
+    if matches!(config.registrar.backend, RegistrarBackendType::Postgres) {
+        info!(
+            "presence subscriptions are written through with the redis registrar backend \
+             only; with postgres they stay in memory and a restart drops them"
+        );
+    }
+}
+
+/// Stand-in when the `redis-backend` feature is off: subscriptions stay in
+/// memory, said once at boot.
+#[cfg(not(feature = "redis-backend"))]
+pub(super) async fn init_presence_redis_backend(_redis: &crate::config::RedisBackendConfig) {
+    warn!(
+        "presence subscription persistence needs the redis-backend cargo feature, which this \
+         binary was built without — subscriptions stay in memory and are lost on restart"
+    );
+}
+
+/// Restore the presence store's subscriptions from the registrar's Redis and
+/// write every later change through to it.
+///
+/// Runs from `init_registrar_backend`, before any listener is up, so a
+/// restored subscription is in the store before the first request that could
+/// change its resource's state arrives.
+#[cfg(feature = "redis-backend")]
+pub(super) async fn init_presence_redis_backend(redis: &crate::config::RedisBackendConfig) {
+    let Some(store) = crate::presence::global_store() else {
+        return;
+    };
+    let client = match redis::Client::open(redis.url.as_str()) {
+        Ok(client) => client,
+        Err(error) => {
+            error!(%error, "failed to open Redis client for presence subscriptions");
+            return;
+        }
+    };
+    let mut connection = match client.get_multiplexed_async_connection().await {
+        Ok(connection) => connection,
+        Err(error) => {
+            error!(%error, "failed to connect to Redis for presence subscriptions");
+            return;
+        }
+    };
+
+    let started = std::time::Instant::now();
+    let dropped = match crate::presence::persist::restore_presence_subscriptions(
+        &mut connection,
+        &redis.presence_key_prefix,
+        &store,
+    )
+    .await
+    {
+        Ok((counts, dropped)) => {
+            info!(
+                restored = counts.restored,
+                dropped = counts.dropped,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "restored presence subscriptions from Redis"
+            );
+            dropped
+        }
+        Err(error) => {
+            error!(error, "failed to restore presence subscriptions from Redis");
+            Vec::new()
+        }
+    };
+
+    let writer = crate::presence::persist::spawn_presence_redis_writer(
+        client,
+        connection,
+        redis.presence_key_prefix.clone(),
+        u64::from(redis.ttl_slack_secs),
+    );
+    // An expired entry is dropped, never resurrected: its key goes too rather
+    // than wait out its TTL slack.
+    for id in dropped {
+        writer.remove_at(&id, writer.sequence());
+    }
+    store.set_backend_writer(writer);
 }
 
 /// Stand-in when the `redis-backend` feature is off.

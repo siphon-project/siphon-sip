@@ -97,6 +97,9 @@ pub(crate) enum QueueKind {
     /// Only the Redis iFC writer drains one.
     #[cfg_attr(not(feature = "redis-backend"), allow(dead_code))]
     Ifc,
+    /// The presence store's subscriptions; only the Redis writer drains one.
+    #[cfg_attr(not(feature = "redis-backend"), allow(dead_code))]
+    Presence,
 }
 
 /// The metrics a queue reports to; only the registrar's has any.
@@ -112,6 +115,7 @@ impl QueueKind {
         match self {
             Self::Registrar => "registrar",
             Self::Ifc => "ifc",
+            Self::Presence => "presence",
         }
     }
 
@@ -123,7 +127,7 @@ impl QueueKind {
                 coalesced: &metrics.registrar_backend_coalesced_total,
                 dropped: &metrics.registrar_backend_dropped_total,
             }),
-            Self::Ifc => None,
+            Self::Ifc | Self::Presence => None,
         }
     }
 }
