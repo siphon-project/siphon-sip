@@ -554,7 +554,7 @@ class _B2buaNamespace:
 
     @staticmethod
     def on_invite(fn=None, *, request_uri=None):
-        """Register handler for new INVITE (new call).
+        r"""Register handler for new INVITE (new call).
 
         Usage:
             @b2bua.on_invite                          # every new INVITE
