@@ -81,7 +81,8 @@ pub(super) fn run_proxy_failure_handlers(
         source_addr.port(),
         Arc::clone(&state.local_domains),
     )
-    .with_self_identity(Arc::clone(&state.self_identity));
+    .with_self_identity(Arc::clone(&state.self_identity))
+    .with_client_timeouts(state.transaction_manager.timers());
     // Replay the inbound flow capture so the failure handler can do Path-token
     // MT routing (`registrar.lookup_by_token` + `request.relay(flow=…)`) on the
     // retry — the same context the on_request handler saw.
@@ -296,6 +297,7 @@ pub(super) fn execute_failure_retarget(
             ref flow,
             ref send_socket,
             ref strip,
+            no_response,
         } => {
             let send_socket = state.resolve_send_socket(send_socket.as_deref());
             relay_request(
@@ -312,6 +314,7 @@ pub(super) fn execute_failure_retarget(
                 flow.as_ref(),
                 send_socket.as_ref(),
                 strip,
+                no_response,
             );
         }
         RequestAction::Fork {
@@ -321,6 +324,7 @@ pub(super) fn execute_failure_retarget(
             ref strategy,
             ref send_socket,
             ref strip,
+            no_response,
         } => {
             if targets.is_empty() {
                 warn!(server_key = %server_key, "on_failure: fork with no targets — forwarding the failure");
@@ -345,6 +349,7 @@ pub(super) fn execute_failure_retarget(
                 retarget.on_reply_callback,
                 retarget.on_failure_callback,
                 strip,
+                no_response,
             );
         }
         _ => return false,
@@ -503,7 +508,17 @@ pub(super) fn fail_branch_locally(
     // straight to Terminated. Dropping it here also stops the synthetic
     // response below from being fed back into it — which for an INVITE would
     // otherwise emit an ACK to a peer that never sent anything.
-    state.transaction_manager.remove(client_key);
+    //
+    // An INVITE the no-response timer gave up on is only set aside, and put
+    // back once its branch has been answered: it still owes a CANCEL to a
+    // provisional that may come late (§9.1), and the ACK of the failure that
+    // follows it (§17.1.1.3).
+    let set_aside = state
+        .transaction_manager
+        .remove(client_key)
+        .filter(|transaction| {
+            matches!(transaction, crate::transaction::Transaction::Ict(ict) if ict.gave_up())
+        });
 
     let mut response = build_response(
         &original_request,
@@ -548,4 +563,9 @@ pub(super) fn fail_branch_locally(
         data: Bytes::new(),
     };
     handle_response(inbound, response, status_code, state);
+    if let Some(transaction) = set_aside {
+        state
+            .transaction_manager
+            .restore_given_up(client_key, transaction);
+    }
 }

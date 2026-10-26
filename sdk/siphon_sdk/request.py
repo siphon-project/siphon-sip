@@ -47,6 +47,38 @@ def _validate_strip(strip: Optional[list[str]]) -> list[str]:
     return names
 
 
+# Timer B / Timer F with T1 = 500 ms (RFC 3261 §17.1.1.2, §17.1.2.2).  The real
+# engine checks a non-INVITE against Timer F as ``transaction.timeout_secs``
+# configures it; the mock has no configuration and uses the default.
+_TRANSACTION_TIMEOUT_MS = 32_000
+
+
+def _validate_no_response(no_response_ms: Optional[int], method: str) -> Optional[int]:
+    """Validate a ``no_response_ms=`` bound, mirroring the Rust engine: a
+    positive number of milliseconds, below Timer B (INVITE) or Timer F
+    (anything else), and never on an ACK.  Refused with ``ValueError``,
+    never clamped."""
+    if no_response_ms is None:
+        return None
+    if isinstance(no_response_ms, bool) or not isinstance(no_response_ms, int):
+        raise TypeError("no_response_ms takes a whole number of milliseconds")
+    if no_response_ms <= 0:
+        raise ValueError(
+            f"no_response_ms={no_response_ms}: must be a positive number of milliseconds"
+        )
+    if method.upper() == "ACK":
+        raise ValueError(
+            "no_response_ms: an ACK draws no response, so there is nothing to time"
+        )
+    timer = "Timer B" if method.upper() == "INVITE" else "Timer F"
+    if no_response_ms >= _TRANSACTION_TIMEOUT_MS:
+        raise ValueError(
+            f"no_response_ms={no_response_ms}: must be below {timer} "
+            f"({_TRANSACTION_TIMEOUT_MS} ms), which ends the transaction first"
+        )
+    return no_response_ms
+
+
 def _validate_send_socket(spec: Optional[str]) -> None:
     """Format-validate a ``send_socket=`` spec, mirroring the Rust engine.
 
@@ -487,6 +519,7 @@ class Request:
         flow: Optional[Flow] = None,
         send_socket: Optional[str] = None,
         strip: Optional[list[str]] = None,
+        no_response_ms: Optional[int] = None,
     ) -> None:
         """Forward the request to its destination.
 
@@ -522,6 +555,22 @@ class Request:
                   Ro and CDRs read, still carries them.  Case-insensitive.
                   Via, Route, Record-Route, Call-ID, CSeq, From, To,
                   Max-Forwards and Content-Length raise ``ValueError``.
+            no_response_ms: Optional bound, in milliseconds, on the next hop
+                  sending *any* response (a ``100 Trying`` counts).  Silent
+                  past it, the branch ends as a locally generated
+                  ``408 Request Timeout`` that reaches ``on_failure`` and
+                  ``@proxy.on_failure`` exactly as a Timer B / Timer F expiry
+                  does, so the script can fail over early (3GPP TS 24.229
+                  §5.4.3.3).  The request stops being retransmitted.  An INVITE
+                  is not CANCELled then (RFC 3261 §9.1 forbids a CANCEL before
+                  a provisional), but a provisional that arrives later is sent
+                  the CANCEL and not forwarded.  Once any response has arrived
+                  the bound no longer applies: an INVITE that rang and went
+                  quiet is Timer C's.  Must be below Timer B (INVITE) or Timer
+                  F (anything else, ``transaction.timeout_secs``), 32 s by
+                  default; a value at or over it, zero, a negative value, or
+                  any value on an ACK raises ``ValueError`` (refused, not
+                  clamped).
 
         Example::
 
@@ -534,11 +583,14 @@ class Request:
             request.relay(flow=binding.flow)
             # towards a UE: no charging headers on the wire, kept for Rf
             request.relay(flow=binding.flow, strip=["P-Charging-Vector"])
+            # fail over from a next hop that sends nothing within 4 s
+            request.relay(next_hop, no_response_ms=4000)
         """
         _validate_send_socket(send_socket)
         stripped = _validate_strip(strip)
+        bound = _validate_no_response(no_response_ms, self.method)
         extras: Optional[dict] = None
-        if flow is not None or send_socket is not None or stripped:
+        if flow is not None or send_socket is not None or stripped or bound is not None:
             extras = {}
             if flow is not None:
                 extras["flow"] = flow
@@ -546,6 +598,8 @@ class Request:
                 extras["send_socket"] = send_socket
             if stripped:
                 extras["strip"] = stripped
+            if bound is not None:
+                extras["no_response_ms"] = bound
         self._actions.append(Action(
             kind="relay",
             next_hop=next_hop,
@@ -562,6 +616,9 @@ class Request:
         strategy: str = "parallel",
         send_socket: Optional[str] = None,
         strip: Optional[list[str]] = None,
+        no_response_ms: Optional[int] = None,
+        on_reply: Optional[Callable] = None,
+        on_failure: Optional[Callable] = None,
     ) -> None:
         """Fork the request to multiple targets.
 
@@ -580,6 +637,17 @@ class Request:
                       precedence over it for that branch.
             strip: Optional header field names left off every branch, as
                       for :meth:`relay`.
+            no_response_ms: Optional bound on each branch drawing any
+                      response, as for :meth:`relay`.  A branch silent past it
+                      ends as a local ``408`` that the fork aggregates like any
+                      other branch failure (RFC 3261 §16.7): a parallel fork
+                      keeps waiting on the branches that answer, a sequential
+                      fork moves on to its next target at once.
+            on_reply: Optional callback ``(request, reply)``, as for
+                      :meth:`relay`, for whichever branch responds.
+            on_failure: Optional callback ``(request, code, reason)``, as for
+                      :meth:`relay`.  Runs once, with the best failure, when
+                      every branch has failed.
 
         Example::
 
@@ -588,17 +656,21 @@ class Request:
             request.fork(contacts)
             request.fork(["sip:a@host", "sip:b@host"], strategy="sequential")
             request.fork(contacts, send_socket="udp:10.0.0.1:5060")
+            request.fork(contacts, no_response_ms=4000, on_failure=failed)
         """
         _validate_send_socket(send_socket)
         stripped = _validate_strip(strip)
+        bound = _validate_no_response(no_response_ms, self.method)
         uris = [t.uri if isinstance(t, Contact) else str(t) for t in targets]
         extras: Optional[dict] = None
-        if send_socket is not None or stripped:
+        if send_socket is not None or stripped or bound is not None:
             extras = {}
             if send_socket is not None:
                 extras["send_socket"] = send_socket
             if stripped:
                 extras["strip"] = stripped
+            if bound is not None:
+                extras["no_response_ms"] = bound
         self._actions.append(Action(
             kind="fork",
             targets=uris,
@@ -607,6 +679,8 @@ class Request:
             headers_removed=list(self._pending_removed()),
             extras=extras,
         ))
+        self._on_reply_callback = on_reply
+        self._on_failure_callback = on_failure
 
     def record_route(self) -> None:
         """Insert a Record-Route header so that subsequent in-dialog requests

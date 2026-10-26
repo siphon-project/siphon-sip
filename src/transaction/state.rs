@@ -14,6 +14,9 @@ use crate::sip::message::{Method, SipMessage, StartLine};
 use crate::sip::parser::parse_sip_message_bytes;
 use crate::transaction::timer::TimerConfig;
 
+mod no_response;
+use no_response::NoResponseProgress;
+
 /// Generate a random URL-safe To-tag for UAS-built responses
 /// (RFC 3261 §19.3 — token chars; §8.2.6.2 — UAS-stamped on all responses
 /// except 100 Trying).
@@ -147,6 +150,13 @@ pub enum TimerName {
     /// Not in RFC 3261, but mirrors §17.2.1's 200 ms IST timer to suppress
     /// UAC retransmits on slow non-INVITE relays (§17.1.2).
     Trying100,
+    /// A proxied branch's bound on drawing its first response at all
+    /// (`relay(no_response_ms=…)` / `fork(no_response_ms=…)`). Set below
+    /// Timer B / Timer F, so a next hop that never answers is given up on
+    /// before the transaction itself would time out (TS 24.229 §5.4.3.3
+    /// HSS based P-CSCF restoration, NOTE 24: "The configurable time needs to
+    /// be less than timer B and timer F"). Only armed when the script asks.
+    NoResponse,
 }
 
 // ===========================================================================
@@ -538,6 +548,8 @@ pub enum NictEvent {
     Provisional(SipMessage),
     /// A final (2xx-6xx) response received from the network.
     FinalResponse(SipMessage),
+    /// The no-response timer fired ([`TimerName::NoResponse`]).
+    NoResponse,
 }
 
 /// Non-INVITE Client Transaction state machine.
@@ -552,6 +564,9 @@ pub struct Nict {
     pub request_bytes: Bytes,
     /// Current Timer E interval.
     pub timer_e_interval: Duration,
+    /// Whether the proxy bounded this request's wait for a first response:
+    /// see [`Self::arm_no_response`].
+    no_response: NoResponseProgress,
     /// Keeps the connection the request left on from being closed for
     /// idleness while this transaction lives: see [`Ict::hold_connection`].
     connection_hold: Option<crate::transport::hold::ConnectionHold>,
@@ -576,6 +591,7 @@ impl Nict {
             timers,
             request_bytes,
             timer_e_interval,
+            no_response: NoResponseProgress::Off,
             connection_hold: None,
         };
         // Start Timer F (overall timeout)
@@ -593,7 +609,35 @@ impl Nict {
         self.connection_hold = Some(hold);
     }
 
+    /// Feed an event. A request whose no-response timer runs is watched
+    /// for leaving `Trying` (see [`Self::arm_no_response`]).
     pub fn process(&mut self, event: NictEvent) -> Vec<Action> {
+        if self.no_response != NoResponseProgress::Armed {
+            return self.advance(event);
+        }
+        if matches!(event, NictEvent::NoResponse) {
+            self.no_response = NoResponseProgress::Off;
+            if self.state != NictState::Trying {
+                return vec![];
+            }
+            self.state = NictState::Terminated;
+            return vec![
+                Action::CancelTimer(TimerName::E),
+                Action::CancelTimer(TimerName::F),
+                Action::Timeout,
+                Action::Terminated,
+            ];
+        }
+        let mut actions = self.advance(event);
+        if self.state != NictState::Trying {
+            // A response, or Timer F: the bound has nothing left to bound.
+            self.no_response = NoResponseProgress::Off;
+            actions.push(Action::CancelTimer(TimerName::NoResponse));
+        }
+        actions
+    }
+
+    fn advance(&mut self, event: NictEvent) -> Vec<Action> {
         match (&self.state, event) {
             // -- Trying --
             (NictState::Trying, NictEvent::TimerE) => {
@@ -727,6 +771,8 @@ pub enum IctEvent {
     Response2xx(SipMessage),
     /// A non-2xx final (3xx-6xx) response received.
     ResponseNon2xx(SipMessage),
+    /// The no-response timer fired ([`TimerName::NoResponse`]).
+    NoResponse,
 }
 
 /// Where a client transaction's request went: what RFC 3261 §9.1 and
@@ -839,6 +885,9 @@ pub struct Ict {
     last_progress: Option<std::time::Instant>,
     /// Where Timer C stands.
     timer_c: TimerCProgress,
+    /// Whether the proxy bounded this INVITE's wait for a first response, and
+    /// whether it gave up on it: see [`Self::arm_no_response`].
+    no_response: NoResponseProgress,
     /// Keeps the connection the INVITE left on from being closed for idleness
     /// while this transaction lives: see [`Self::hold_connection`].
     connection_hold: Option<crate::transport::hold::ConnectionHold>,
@@ -867,6 +916,7 @@ impl Ict {
             hop: None,
             last_progress: None,
             timer_c: TimerCProgress::Idle,
+            no_response: NoResponseProgress::Off,
             connection_hold: None,
         };
         // Start Timer B (overall timeout)
@@ -1158,7 +1208,28 @@ impl Ict {
         }
     }
 
+    /// Feed an event. An INVITE whose no-response timer runs is watched for
+    /// leaving `Calling`, and one it gave up on is handled apart (see
+    /// [`Self::arm_no_response`]).
     pub fn process(&mut self, event: IctEvent) -> Vec<Action> {
+        match self.no_response {
+            NoResponseProgress::Off => self.advance(event),
+            NoResponseProgress::GaveUp => self.process_given_up(event),
+            NoResponseProgress::Armed => {
+                let mut actions = self.advance(event);
+                if self.no_response == NoResponseProgress::Armed && self.state != IctState::Calling
+                {
+                    // A response, or Timer B: the bound has nothing left to
+                    // bound.
+                    self.no_response = NoResponseProgress::Off;
+                    actions.push(Action::CancelTimer(TimerName::NoResponse));
+                }
+                actions
+            }
+        }
+    }
+
+    fn advance(&mut self, event: IctEvent) -> Vec<Action> {
         match (&self.state, event) {
             // -- Calling --
             (IctState::Calling, IctEvent::TimerA) => {
@@ -1178,6 +1249,7 @@ impl Ict {
                     Action::Terminated,
                 ]
             }
+            (IctState::Calling, IctEvent::NoResponse) => self.give_up_unanswered(),
             (IctState::Calling, IctEvent::Provisional(response)) => {
                 // RFC 3261 §17.1.1.2: provisional response stops retransmissions
                 self.state = IctState::Proceeding;

@@ -19,6 +19,8 @@ mod cancel_tests;
 #[cfg(test)]
 mod connection_hold_tests;
 #[cfg(test)]
+mod no_response_tests;
+#[cfg(test)]
 mod timer_c_tests;
 
 use bytes::Bytes;
@@ -425,6 +427,54 @@ impl TransactionManager {
         match &mut **entry {
             Transaction::Ict(ict) => ict.request_cancel(reasons),
             _ => CancelOutcome::NothingToSend,
+        }
+    }
+
+    /// Bound how long client transaction `key` waits for its first response
+    /// of any kind (`relay(no_response_ms=…)`): see [`Ict::arm_no_response`]
+    /// and [`Nict::arm_no_response`]. Returns the timer to start, or nothing
+    /// when there is no such transaction or it has drawn a response already.
+    pub fn arm_no_response(
+        &self,
+        key: &TransactionKey,
+        after: std::time::Duration,
+    ) -> Option<Action> {
+        let mut entry = self.transactions.get_mut(key)?;
+        match &mut **entry {
+            Transaction::Ict(ict) => ict.arm_no_response(after),
+            Transaction::Nict(nict) => nict.arm_no_response(after),
+            Transaction::Ist(_) | Transaction::Nist(_) => None,
+        }
+    }
+
+    /// Stop the no-response timer of INVITE client transaction `key`, which
+    /// the TU is about to cancel. Whether it was running.
+    pub fn disarm_no_response(&self, key: &TransactionKey) -> bool {
+        let Some(mut entry) = self.transactions.get_mut(key) else {
+            return false;
+        };
+        match &mut **entry {
+            Transaction::Ict(ict) => ict.disarm_no_response(),
+            _ => false,
+        }
+    }
+
+    /// Whether `key` is an INVITE client transaction its no-response timer gave
+    /// up on ([`Ict::gave_up`]).
+    pub fn invite_client_gave_up(&self, key: &TransactionKey) -> bool {
+        self.transactions
+            .get(key)
+            .is_some_and(|entry| matches!(&**entry.value(), Transaction::Ict(ict) if ict.gave_up()))
+    }
+
+    /// Put back an INVITE client transaction its no-response timer gave up on,
+    /// taken out with [`Self::remove`] while its branch was answered locally.
+    /// It stays to CANCEL a provisional that may still come (RFC 3261 §9.1)
+    /// and to ACK the failure that follows, until Timer B. A key that has been
+    /// taken again meanwhile keeps what it has.
+    pub fn restore_given_up(&self, key: &TransactionKey, transaction: Transaction) {
+        if let Entry::Vacant(slot) = self.transactions.entry(key.clone()) {
+            slot.insert(Box::new(transaction));
         }
     }
 

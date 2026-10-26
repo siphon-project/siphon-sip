@@ -235,6 +235,7 @@ async fn a_request_relayed_over_a_captured_flow_is_captured() {
         Some(&flow),
         None,
         &[],
+        None,
     );
 
     let frames = captured.wire();

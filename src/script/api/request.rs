@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use ipnet::IpNet;
 use pyo3::prelude::*;
 
+pub(crate) use super::request_bound::{validate_no_response, ClientTimeouts};
 use super::sip_uri::{self, PySipUri};
 use crate::sip::headers::cseq::CSeq;
 use crate::sip::headers::nameaddr::NameAddr;
@@ -72,6 +73,10 @@ pub enum RequestAction {
         /// still see what the script left on it. Validated by
         /// [`validate_strip`].
         strip: Vec<String>,
+        /// `no_response_ms=`: how long the branch may go without any response
+        /// before it is given up on as a local `408`. Validated by
+        /// [`validate_no_response`].
+        no_response: Option<std::time::Duration>,
     },
     /// Fork to multiple targets.
     ///
@@ -100,6 +105,9 @@ pub enum RequestAction {
         /// Header fields removed from every branch as it is sent (see
         /// [`RequestAction::Relay::strip`]).
         strip: Vec<String>,
+        /// The no-response bound of every branch (see
+        /// [`RequestAction::Relay::no_response`]).
+        no_response: Option<std::time::Duration>,
     },
 }
 
@@ -219,6 +227,10 @@ pub struct PyRequest {
     /// and `matched_sa` to detect protected traffic.  `None` for
     /// constructors that don't supply it (defaults to non-protected).
     local_port: Option<u16>,
+    /// Timer B and Timer F of the transaction layer, which `no_response_ms=`
+    /// is checked against. The RFC defaults unless the dispatcher hands over
+    /// its own ([`Self::with_client_timeouts`]).
+    client_timeouts: ClientTimeouts,
     /// Full local SocketAddr the request arrived on.  Captured for
     /// flow-aware MT routing (`registrar.save(flow_token=...)`) so the
     /// outbound relay can egress from the same listener — load-bearing
@@ -270,6 +282,7 @@ impl PyRequest {
             reply_headers: vec![],
             reply_body: None,
             local_port: None,
+            client_timeouts: ClientTimeouts::default(),
             local_addr: None,
             inbound_connection_id: None,
             consumed_routes: vec![],
@@ -288,6 +301,13 @@ impl PyRequest {
         self_identity: Arc<crate::proxy::core::SelfIdentity>,
     ) -> Self {
         self.self_identity = Some(self_identity);
+        self
+    }
+
+    /// Check `no_response_ms=` against the transaction timers the request will
+    /// actually be relayed under.
+    pub fn with_client_timeouts(mut self, timers: &crate::transaction::timer::TimerConfig) -> Self {
+        self.client_timeouts = ClientTimeouts::of(timers);
         self
     }
 
@@ -328,6 +348,7 @@ impl PyRequest {
             reply_headers: vec![],
             reply_body: None,
             local_port: None,
+            client_timeouts: ClientTimeouts::default(),
             local_addr: None,
             inbound_connection_id: None,
             consumed_routes: vec![],
@@ -1144,13 +1165,26 @@ impl PyRequest {
     /// - `on_reply`: called with `(request, reply)` when a response arrives
     /// - `on_failure`: called with `(request, code, reason)` on error response
     ///
+    /// `no_response_ms` gives the next hop that long to send *any* response
+    /// (a `100 Trying` counts). Silent past it, the branch ends as a locally
+    /// generated `408 Request Timeout` that reaches `on_failure` /
+    /// `@proxy.on_failure` exactly as a Timer B / Timer F expiry does, so the
+    /// script can fail over early (TS 24.229 §5.4.3.3, a next hop that does
+    /// not answer within a configurable time). The request stops being
+    /// retransmitted; an INVITE is not CANCELled then (RFC 3261 §9.1 forbids a
+    /// CANCEL before a provisional), but a provisional that arrives later
+    /// draws its CANCEL. Once any response has arrived the bound is gone: an
+    /// INVITE that rang and went quiet is Timer C's. It must be below Timer B
+    /// (INVITE) or Timer F (anything else), or `ValueError` is raised.
+    ///
     /// `strip` names header fields to leave off the forwarded request while
     /// the request siphon keeps for the session (the one Rf, Ro and CDRs read)
     /// still carries them. A P-CSCF removes P-Charging-Vector towards the UE
     /// (TS 24.229 §5.2.1) and still reports the leg with its ICID this way.
     /// Names are case-insensitive; Via, Route, Record-Route, Call-ID, CSeq,
     /// From, To, Max-Forwards and Content-Length are refused (`ValueError`).
-    #[pyo3(signature = (next_hop=None, on_reply=None, on_failure=None, flow=None, send_socket=None, strip=None))]
+    #[pyo3(signature = (next_hop=None, on_reply=None, on_failure=None, flow=None, send_socket=None, strip=None, no_response_ms=None))]
+    #[allow(clippy::too_many_arguments)]
     fn relay(
         &mut self,
         next_hop: Option<String>,
@@ -1159,9 +1193,11 @@ impl PyRequest {
         flow: Option<super::registrar::PyFlow>,
         send_socket: Option<String>,
         strip: Option<Vec<String>>,
+        no_response_ms: Option<i64>,
     ) -> PyResult<()> {
         validate_send_socket(send_socket.as_deref())?;
         let strip = validate_strip(strip)?;
+        let no_response = self.validated_no_response(no_response_ms)?;
         self.on_reply_callback = on_reply;
         self.on_failure_callback = on_failure;
         self.action = RequestAction::Relay {
@@ -1169,6 +1205,7 @@ impl PyRequest {
             flow,
             send_socket,
             strip,
+            no_response,
         };
         Ok(())
     }
@@ -1197,16 +1234,31 @@ impl PyRequest {
     ///
     /// `strip` leaves the named header fields off every branch, as for
     /// [`relay`](Self::relay).
-    #[pyo3(signature = (targets, strategy="parallel", send_socket=None, strip=None))]
+    ///
+    /// `no_response_ms` bounds each branch on its own, as for
+    /// [`relay`](Self::relay): a branch silent past it ends as a local `408`,
+    /// which the fork aggregates like any other branch failure (RFC 3261
+    /// §16.7), so a parallel fork keeps waiting on the branches that answer
+    /// and a sequential fork moves on to its next target at once.
+    ///
+    /// `on_reply` / `on_failure` are the per-request callbacks of
+    /// [`relay`](Self::relay), for the fork as a whole: `on_failure` runs once,
+    /// with the best failure, when every branch has failed.
+    #[pyo3(signature = (targets, strategy="parallel", send_socket=None, strip=None, no_response_ms=None, on_reply=None, on_failure=None))]
+    #[allow(clippy::too_many_arguments)]
     fn fork(
         &mut self,
         targets: Vec<Bound<'_, PyAny>>,
         strategy: &str,
         send_socket: Option<String>,
         strip: Option<Vec<String>>,
+        no_response_ms: Option<i64>,
+        on_reply: Option<Py<PyAny>>,
+        on_failure: Option<Py<PyAny>>,
     ) -> PyResult<()> {
         validate_send_socket(send_socket.as_deref())?;
         let strip = validate_strip(strip)?;
+        let no_response = self.validated_no_response(no_response_ms)?;
         let mut target_uris: Vec<String> = Vec::with_capacity(targets.len());
         let mut flows: Vec<Option<super::registrar::PyFlow>> = Vec::with_capacity(targets.len());
         let mut routes: Vec<Vec<String>> = Vec::with_capacity(targets.len());
@@ -1230,7 +1282,10 @@ impl PyRequest {
             strategy: strategy.to_string(),
             send_socket,
             strip,
+            no_response,
         };
+        self.on_reply_callback = on_reply;
+        self.on_failure_callback = on_failure;
         Ok(())
     }
 
@@ -2014,6 +2069,18 @@ impl PyRequest {
         }
     }
 
+    /// [`validate_no_response`] for this request's method and timers.
+    fn validated_no_response(
+        &self,
+        no_response_ms: Option<i64>,
+    ) -> PyResult<Option<std::time::Duration>> {
+        if no_response_ms.is_none() {
+            return Ok(None);
+        }
+        let method = self.lock()?.method().cloned();
+        validate_no_response(no_response_ms, method.as_ref(), self.client_timeouts)
+    }
+
     fn lock(&self) -> PyResult<std::sync::MutexGuard<'_, SipMessage>> {
         self.message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
@@ -2487,7 +2554,9 @@ mod tests {
         ));
 
         // Handler 2, which never knew handler 1 ran.
-        request.relay(None, None, None, None, None, None).unwrap();
+        request
+            .relay(None, None, None, None, None, None, None)
+            .unwrap();
         assert_eq!(
             *request.action(),
             RequestAction::Relay {
@@ -2495,6 +2564,7 @@ mod tests {
                 flow: None,
                 send_socket: None,
                 strip: Vec::new(),
+                no_response: None,
             },
             "the reply is gone, not merged — only the last assignment executes"
         );
@@ -2533,7 +2603,9 @@ mod tests {
     #[test]
     fn relay_sets_action() {
         let mut request = make_request();
-        request.relay(None, None, None, None, None, None).unwrap();
+        request
+            .relay(None, None, None, None, None, None, None)
+            .unwrap();
         assert_eq!(
             *request.action(),
             RequestAction::Relay {
@@ -2541,6 +2613,7 @@ mod tests {
                 flow: None,
                 send_socket: None,
                 strip: Vec::new(),
+                no_response: None,
             }
         );
     }
@@ -2556,6 +2629,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -2565,6 +2639,7 @@ mod tests {
                 flow: None,
                 send_socket: None,
                 strip: Vec::new(),
+                no_response: None,
             }
         );
     }
@@ -2584,7 +2659,7 @@ mod tests {
             kind: crate::script::api::registrar::FlowKind::Inbound,
         };
         request
-            .relay(None, None, None, Some(flow.clone()), None, None)
+            .relay(None, None, None, Some(flow.clone()), None, None, None)
             .unwrap();
         assert_eq!(
             *request.action(),
@@ -2593,6 +2668,7 @@ mod tests {
                 flow: Some(flow),
                 send_socket: None,
                 strip: Vec::new(),
+                no_response: None,
             }
         );
     }
@@ -2618,6 +2694,7 @@ mod tests {
                 None,
                 None,
                 Some(flow.clone()),
+                None,
                 None,
                 None,
             )
@@ -2683,6 +2760,7 @@ mod tests {
                 None,
                 Some("udp:10.0.0.1:5060".to_string()),
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -2692,6 +2770,7 @@ mod tests {
                 flow: None,
                 send_socket: Some("udp:10.0.0.1:5060".to_string()),
                 strip: Vec::new(),
+                no_response: None,
             }
         );
     }
@@ -2708,6 +2787,7 @@ mod tests {
                 None,
                 None,
                 Some("10.0.0.1:5060".to_string()),
+                None,
                 None
             )
             .is_err());
@@ -2718,6 +2798,7 @@ mod tests {
                 None,
                 None,
                 Some("udp:nonsense".to_string()),
+                None,
                 None
             )
             .is_err());
@@ -2728,6 +2809,7 @@ mod tests {
                 None,
                 None,
                 Some("pigeon:10.0.0.1:5060".to_string()),
+                None,
                 None,
             )
             .is_err());
@@ -2740,6 +2822,7 @@ mod tests {
                 None,
                 None,
                 Some("tls:[2001:db8::1]:5061".to_string()),
+                None,
                 None,
             )
             .is_ok());
@@ -2756,6 +2839,7 @@ mod tests {
                 None,
                 None,
                 Some(vec![" P-Charging-Vector ".to_string()]),
+                None,
             )
             .expect("a header field name is accepted");
         match request.action() {
@@ -2783,7 +2867,8 @@ mod tests {
                         None,
                         None,
                         None,
-                        Some(vec![refused.to_string()])
+                        Some(vec![refused.to_string()]),
+                        None
                     )
                     .is_err(),
                 "{refused:?} is refused"
@@ -2804,6 +2889,9 @@ mod tests {
                     "parallel",
                     Some("tcp:10.0.0.1:5060".to_string()),
                     None,
+                    None,
+                    None,
+                    None,
                 )
                 .unwrap();
             match request.action() {
@@ -2816,7 +2904,146 @@ mod tests {
             let targets: Vec<Bound<'_, PyAny>> =
                 vec![pyo3::types::PyString::new(py, "sip:a@host").into_any()];
             assert!(request
-                .fork(targets, "parallel", Some("bad-spec".to_string()), None)
+                .fork(
+                    targets,
+                    "parallel",
+                    Some("bad-spec".to_string()),
+                    None,
+                    None,
+                    None,
+                    None
+                )
+                .is_err());
+        });
+    }
+
+    fn bye_with_no_response_bound() -> PyRequest {
+        let message = SipMessageBuilder::new()
+            .request(Method::Bye, SipUri::new("atlanta.com".to_string()))
+            .via("SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-bye".to_string())
+            .to("<sip:alice@atlanta.com>;tag=a".to_string())
+            .from("<sip:bob@biloxi.com>;tag=b".to_string())
+            .call_id("no-response-bye@example.com".to_string())
+            .cseq("2 BYE".to_string())
+            .content_length(0)
+            .build()
+            .expect("the BYE builds");
+        PyRequest::new(
+            Arc::new(Mutex::new(message)),
+            "udp".to_string(),
+            "192.0.2.10".to_string(),
+            5060,
+        )
+    }
+
+    fn relay_bounded(request: &mut PyRequest, no_response_ms: i64) -> PyResult<()> {
+        request.relay(None, None, None, None, None, None, Some(no_response_ms))
+    }
+
+    fn refusal(result: PyResult<()>) -> String {
+        pyo3::Python::attach(|py| {
+            let error = result.expect_err("refused");
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            error.to_string()
+        })
+    }
+
+    /// TS 24.229 §5.4.3.3 NOTE 24: below Timer B for an INVITE. At or past it
+    /// is refused, not clamped, and the action already chosen is left alone.
+    #[test]
+    fn no_response_ms_on_an_invite_must_be_below_timer_b() {
+        pyo3::Python::initialize();
+        let mut request = make_request();
+        relay_bounded(&mut request, 31_999).expect("just below Timer B");
+        assert!(matches!(
+            request.action(),
+            RequestAction::Relay { no_response: Some(bound), .. }
+                if *bound == std::time::Duration::from_millis(31_999)
+        ));
+        for refused in [32_000, 60_000] {
+            let mut request = make_request();
+            let message = refusal(relay_bounded(&mut request, refused));
+            assert!(message.contains("Timer B (32000 ms)"), "{message}");
+            assert_eq!(*request.action(), RequestAction::None, "nothing relayed");
+        }
+    }
+
+    /// Below Timer F for anything else, as the transaction layer is
+    /// configured (`transaction.timeout_secs`).
+    #[test]
+    fn no_response_ms_on_a_non_invite_must_be_below_the_configured_timer_f() {
+        pyo3::Python::initialize();
+        let timers = crate::transaction::timer::TimerConfig {
+            timer_f_secs: std::num::NonZeroU16::new(5),
+            ..Default::default()
+        };
+        let mut request = bye_with_no_response_bound().with_client_timeouts(&timers);
+        relay_bounded(&mut request, 4_999).expect("just below Timer F");
+        let mut request = bye_with_no_response_bound().with_client_timeouts(&timers);
+        let message = refusal(relay_bounded(&mut request, 5_000));
+        assert!(message.contains("Timer F (5000 ms)"), "{message}");
+
+        // Unconfigured, Timer F is 64*T1.
+        let mut request = bye_with_no_response_bound();
+        relay_bounded(&mut request, 31_999).expect("below 64*T1");
+        let message = refusal(relay_bounded(&mut bye_with_no_response_bound(), 32_000));
+        assert!(message.contains("Timer F (32000 ms)"), "{message}");
+    }
+
+    #[test]
+    fn no_response_ms_must_be_positive() {
+        pyo3::Python::initialize();
+        for refused in [0, -1] {
+            let message = refusal(relay_bounded(&mut make_request(), refused));
+            assert!(message.contains("positive"), "{message}");
+        }
+    }
+
+    #[test]
+    fn no_response_ms_is_refused_on_an_ack() {
+        assert!(
+            validate_no_response(Some(1000), Some(&Method::Ack), ClientTimeouts::default())
+                .is_err()
+        );
+        assert_eq!(
+            validate_no_response(None, Some(&Method::Ack), ClientTimeouts::default())
+                .expect("no bound asked for"),
+            None
+        );
+    }
+
+    /// `fork()` takes the bound and the per-request callbacks a relay takes.
+    #[test]
+    fn fork_takes_no_response_ms_and_the_relay_callbacks() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let mut request = make_request();
+            let targets: Vec<Bound<'_, PyAny>> =
+                vec![pyo3::types::PyString::new(py, "sip:a@host").into_any()];
+            let callback = py.None();
+            request
+                .fork(
+                    targets,
+                    "parallel",
+                    None,
+                    None,
+                    Some(1500),
+                    Some(callback.clone_ref(py)),
+                    Some(callback),
+                )
+                .expect("a valid fork");
+            assert!(matches!(
+                request.action(),
+                RequestAction::Fork { no_response: Some(bound), .. }
+                    if *bound == std::time::Duration::from_millis(1500)
+            ));
+            assert!(request.take_on_reply_callback().is_some());
+            assert!(request.take_on_failure_callback().is_some());
+
+            let targets: Vec<Bound<'_, PyAny>> =
+                vec![pyo3::types::PyString::new(py, "sip:a@host").into_any()];
+            assert!(request
+                .fork(targets, "parallel", None, None, Some(32_000), None, None)
                 .is_err());
         });
     }
@@ -2830,7 +3057,9 @@ mod tests {
                 pyo3::types::PyString::new(py, "sip:a@host").into_any(),
                 pyo3::types::PyString::new(py, "sip:b@host").into_any(),
             ];
-            request.fork(targets, "sequential", None, None).unwrap();
+            request
+                .fork(targets, "sequential", None, None, None, None, None)
+                .unwrap();
             assert_eq!(
                 *request.action(),
                 RequestAction::Fork {
@@ -2840,6 +3069,7 @@ mod tests {
                     strategy: "sequential".to_string(),
                     send_socket: None,
                     strip: Vec::new(),
+                    no_response: None,
                 }
             );
         });
@@ -2868,7 +3098,9 @@ mod tests {
                 // A bare string opts out of Path routing entirely.
                 pyo3::types::PyString::new(py, "sip:carol@10.0.0.3").into_any(),
             ];
-            request.fork(targets, "sequential", None, None).unwrap();
+            request
+                .fork(targets, "sequential", None, None, None, None, None)
+                .unwrap();
             match request.action() {
                 RequestAction::Fork {
                     targets, routes, ..

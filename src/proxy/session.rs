@@ -108,6 +108,9 @@ pub struct ProxySession {
     /// Script `strip=` header fields for the whole fork, stored so a branch
     /// started after the first leaves them off as well.
     pub fork_strip: Vec<String>,
+    /// Script `no_response_ms=` bound for the whole fork, stored so a branch
+    /// started after the first is given up on as quickly when it never answers.
+    pub fork_no_response: Option<std::time::Duration>,
     /// Maps client transaction key → branch index in the ForkAggregator.
     pub branch_index_map: HashMap<TransactionKey, usize>,
     /// Whether `record_route()` was called by the script.
@@ -179,6 +182,7 @@ impl ProxySession {
             fork_routes: Vec::new(),
             fork_send_socket: None,
             fork_strip: Vec::new(),
+            fork_no_response: None,
             branch_index_map: HashMap::new(),
             source_addr,
             inbound_local_addr,

@@ -126,6 +126,7 @@ pub(super) fn relay_request(
     flow: Option<&crate::script::api::registrar::PyFlow>,
     send_socket: Option<&crate::transport::SendSocket>,
     strip: &[String],
+    no_response: Option<std::time::Duration>,
 ) {
     // Two ways to know where this request is going:
     //   a) flow=Some — use the captured inbound flow directly,
@@ -586,7 +587,7 @@ pub(super) fn relay_request(
         txn_transport,
     ) {
         Ok((client_key, actions)) => {
-            for action in &actions {
+            for action in &with_no_response_timer(actions, &client_key, no_response, state) {
                 if let Action::StartTimer(name, duration) = action {
                     let timer_id = format!("{}:{:?}", client_key, name);
                     state.timer_wheel.insert(
@@ -789,6 +790,7 @@ pub(super) fn relay_fork_request(
     on_reply_callback: Option<Py<PyAny>>,
     on_failure_callback: Option<Py<PyAny>>,
     strip: &[String],
+    no_response: Option<std::time::Duration>,
 ) {
     use crate::proxy::fork::ForkAggregator;
 
@@ -881,6 +883,7 @@ pub(super) fn relay_fork_request(
                     .filter(|_| !has_route_set),
                 send_socket,
                 strip,
+                no_response,
             );
             return;
         }
@@ -900,6 +903,11 @@ pub(super) fn relay_fork_request(
     session.fork_routes = routes.to_vec();
     session.fork_send_socket = send_socket.cloned();
     session.fork_strip = strip.to_vec();
+    session.fork_no_response = no_response;
+    // `fork(on_reply=…, on_failure=…)`: the same per-request callbacks a relay
+    // takes, read by the response path for whichever branch answers.
+    session.on_reply_callback = on_reply_callback.map(Arc::new);
+    session.on_failure_callback = on_failure_callback.map(Arc::new);
 
     // Determine which branches to start now
     let branches_to_start: Vec<usize> = match strategy {
@@ -935,6 +943,7 @@ pub(super) fn relay_fork_request(
             send_socket,
             state,
             strip,
+            no_response,
         );
     }
 }
@@ -964,6 +973,7 @@ pub(super) fn relay_fork_branch(
     send_socket: Option<&crate::transport::SendSocket>,
     state: &DispatcherState,
     strip: &[String],
+    no_response: Option<std::time::Duration>,
 ) {
     // This branch's own route set, from the Path stored with its registration
     // binding.  Two bindings of one AoR usually traverse different proxy chains
@@ -1207,7 +1217,7 @@ pub(super) fn relay_fork_branch(
         txn_transport,
     ) {
         Ok((client_key, actions)) => {
-            for action in &actions {
+            for action in &with_no_response_timer(actions, &client_key, no_response, state) {
                 if let Action::StartTimer(name, duration) = action {
                     let timer_id = format!("{}:{:?}", client_key, name);
                     state.timer_wheel.insert(
@@ -1386,6 +1396,23 @@ pub(super) fn relay_fork_branch(
 /// Remove the `strip=` header fields from a request about to be forwarded.
 /// Names are matched case-insensitively (RFC 3261 §7.3.1); the script API has
 /// already refused the ones siphon routes on.
+/// The timers a new client transaction starts with, plus its no-response
+/// timer when the script bounded the branch (`no_response_ms=`).
+///
+/// Armed here, before the request is sent, like every other timer of the
+/// transaction: a fast next hop's first response has to find it to stop it.
+fn with_no_response_timer(
+    mut actions: Vec<Action>,
+    client_key: &TransactionKey,
+    no_response: Option<std::time::Duration>,
+    state: &DispatcherState,
+) -> Vec<Action> {
+    actions.extend(
+        no_response.and_then(|after| state.transaction_manager.arm_no_response(client_key, after)),
+    );
+    actions
+}
+
 fn strip_headers(relayed: &mut SipMessage, strip: &[String]) {
     for name in strip {
         relayed.headers.remove(name);

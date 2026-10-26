@@ -770,6 +770,7 @@ pub(super) fn handle_request_after_queue(
             None,
             None,
             &[],
+            None,
         );
         return;
     }
@@ -916,7 +917,8 @@ pub(super) fn handle_request_after_queue(
         inbound.remote_addr.port(),
         Arc::clone(&state.local_domains),
     )
-    .with_self_identity(Arc::clone(&state.self_identity));
+    .with_self_identity(Arc::clone(&state.self_identity))
+    .with_client_timeouts(state.transaction_manager.timers());
     // Tag the request with its arrival local port so `is_ipsec_protected`
     // / `matched_sa` can resolve when running as P-CSCF (3GPP TS 33.203).
     request.set_local_port(inbound.local_addr.port());
