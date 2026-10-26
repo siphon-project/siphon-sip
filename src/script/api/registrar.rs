@@ -11,7 +11,7 @@ use pyo3::prelude::*;
 use super::reply::PyReply;
 use super::request::PyRequest;
 use crate::registrar::update::ContactUpdate;
-use crate::registrar::{normalize_aor, reginfo, Contact, Registrar, RegistrarError};
+use crate::registrar::{normalize_aor, proxy_grant, reginfo, Contact, Registrar, RegistrarError};
 use crate::sip::headers::nameaddr::{contact_wildcard, ContactWildcard, NameAddr};
 use crate::sip::message::SipMessage;
 
@@ -838,11 +838,16 @@ impl PyRegistrar {
     ///
     /// Differs from [`save`](Self::save) in three ways:
     ///
-    /// 1. The contact lifetime is read from the **reply's** `Expires` header
-    ///    (the registrar's grant per RFC 3261 §10.3 step 8), not the
-    ///    request's (the UE's ask). UEs commonly ask for 600000 s and the
-    ///    registrar caps to a sensible value; mirroring the cap locally is
-    ///    incorrect — the proxy must trust the upstream's decision.
+    /// 1. Each contact's lifetime is the **reply's** grant (RFC 3261 §10.3
+    ///    step 8), not the request's (the UE's ask): the `expires` parameter
+    ///    on the reply's Contact for that binding (matched by URI), else the
+    ///    reply's `Expires` header. A Contact the reply gives `expires=0`,
+    ///    or one the REGISTER zeroed that the reply no longer lists, is
+    ///    removed. With neither an `expires` parameter nor an `Expires`
+    ///    header for a contact, `ValueError` is raised and nothing is
+    ///    cached. UEs commonly ask for 600000 s and the registrar caps to a
+    ///    sensible value; mirroring the cap locally is incorrect — the
+    ///    proxy must trust the upstream's decision.
     /// 2. The local `max_expires` cap is **not** applied. The registrar of
     ///    record has already capped, and a tighter local cap would expire
     ///    the proxy cache before the upstream binding, opening a window
@@ -871,35 +876,37 @@ impl PyRegistrar {
         aliases: Vec<String>,
         flow_token: Option<String>,
     ) -> PyResult<bool> {
-        let granted_expires = {
+        // Copied out, so the two messages are never locked together.
+        let reply_headers = {
             let reply_msg = reply.message();
             let reply_msg = reply_msg.lock().map_err(|error| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
             })?;
-            reply_msg
-                .headers
-                .get("Expires")
-                .and_then(|value| value.trim().parse::<u32>().ok())
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyValueError::new_err(
-                        "save_proxy: reply has no parseable Expires header — \
-                         the registrar of record must include the granted \
-                         Expires per RFC 3261 §10.3 step 8",
-                    )
-                })?
+            reply_msg.headers.clone()
         };
-
-        // Wildcard de-REGISTER (`Contact: *` with `Expires: 0`) handled by
-        // the upstream — clear our cache and we're done. No need to walk
-        // contacts.
         let request_msg = request.message();
         let request_msg = request_msg.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
         let aor = normalize_aor(&extract_aor(&request_msg)?);
 
-        if granted_expires == 0 {
-            self.inner.remove_all(&aor);
+        // Each Contact's grant: its `expires` in the 2xx, else the 2xx's
+        // `Expires` (RFC 3261 §10.3 step 8). Every grant is read before
+        // anything is cached, so a refusal caches nothing.
+        let grants = match proxy_grant::proxy_grants(&request_msg.headers, &reply_headers)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?
+        {
+            proxy_grant::ProxyGrant::ClearAll => {
+                self.inner.remove_all(&aor);
+                return Ok(true);
+            }
+            proxy_grant::ProxyGrant::PerContact(grants) => grants,
+        };
+        if !grants.is_empty() && grants.iter().all(|(_, granted)| *granted == 0) {
+            // Every Contact named was de-registered.
+            for (contact, _) in &grants {
+                self.inner.remove_contact(&aor, &contact.uri.to_string());
+            }
             return Ok(true);
         }
 
@@ -910,9 +917,12 @@ impl PyRegistrar {
         // only path that moves the SA forward — without it an actively-
         // refreshing UE's SA ages out of the kernel under it and gets reaped +
         // network-de-REGISTERed.  Match the per-contact binding grace applied
-        // below (granted + PROXY_BINDING_GRACE_SECS).  No-op when the request
-        // didn't arrive protected / no SA matches.
-        repin_protected_sa(request, granted_expires);
+        // below (granted + PROXY_BINDING_GRACE_SECS), for the longest-lived
+        // binding over it.  No-op when the request didn't arrive protected /
+        // no SA matches.
+        if let Some(longest) = grants.iter().map(|(_, granted)| *granted).max() {
+            repin_protected_sa(request, longest);
+        }
 
         let source_addr = request.source_socket_addr();
         let source_transport = crate::transport::Transport::from_scheme(request.transport_name());
@@ -948,82 +958,65 @@ impl PyRegistrar {
             .cloned()
             .unwrap_or_default();
 
-        let contact_values = request_msg
-            .headers
-            .get_all("Contact")
-            .cloned()
-            .unwrap_or_default();
+        for (nameaddr, granted_expires) in grants {
+            if granted_expires == 0 {
+                self.inner.remove_contact(&aor, &nameaddr.uri.to_string());
+                continue;
+            }
+            let contact_expires = granted_expires.saturating_add(PROXY_BINDING_GRACE_SECS);
+            let q = nameaddr.q.unwrap_or(1.0);
 
-        for raw in &contact_values {
-            let nameaddrs = match NameAddr::parse_multi(raw) {
-                Ok(addrs) => addrs,
-                Err(_) => continue,
-            };
+            let sip_instance = nameaddr
+                .other_params
+                .iter()
+                .find(|(name, _)| name == "+sip.instance")
+                .and_then(|(_, value)| value.clone());
+            let reg_id = nameaddr
+                .other_params
+                .iter()
+                .find(|(name, _)| name == "reg-id")
+                .and_then(|(_, value)| value.as_ref()?.parse::<u32>().ok());
 
-            for nameaddr in nameaddrs {
-                // Per-contact `expires=` param overrides only when *shorter*
-                // than the registrar's grant. UEs sometimes carry a longer
-                // value here than they put in the top-level Expires header;
-                // the registrar's grant is the ceiling.
-                let contact_expires = nameaddr
-                    .expires
-                    .map(|e| std::cmp::min(e, granted_expires))
-                    .unwrap_or(granted_expires)
-                    .saturating_add(PROXY_BINDING_GRACE_SECS);
-                let q = nameaddr.q.unwrap_or(1.0);
+            let extra_params: Vec<(String, Option<String>)> = nameaddr
+                .other_params
+                .iter()
+                .filter(|(name, _)| name != "+sip.instance" && name != "reg-id")
+                .cloned()
+                .collect();
 
-                let sip_instance = nameaddr
-                    .other_params
-                    .iter()
-                    .find(|(name, _)| name == "+sip.instance")
-                    .and_then(|(_, value)| value.clone());
-                let reg_id = nameaddr
-                    .other_params
-                    .iter()
-                    .find(|(name, _)| name == "reg-id")
-                    .and_then(|(_, value)| value.as_ref()?.parse::<u32>().ok());
-
-                let extra_params: Vec<(String, Option<String>)> = nameaddr
-                    .other_params
-                    .iter()
-                    .filter(|(name, _)| name != "+sip.instance" && name != "reg-id")
-                    .cloned()
-                    .collect();
-
-                self.inner
-                    .save_full_uncapped(
-                        &aor,
-                        nameaddr.uri,
-                        contact_expires,
-                        q,
-                        call_id.clone(),
-                        cseq_seq,
-                        source_addr,
-                        source_transport,
-                        sip_instance,
-                        reg_id,
-                        path.clone(),
-                        flow_capture.clone(),
-                        extra_params,
-                    )
-                    .map_err(|error| match error {
-                        RegistrarError::IntervalTooBrief { min_expires } => {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "registrar grant ({granted_expires}s) below local \
+            self.inner
+                .save_full_uncapped(
+                    &aor,
+                    nameaddr.uri,
+                    contact_expires,
+                    q,
+                    call_id.clone(),
+                    cseq_seq,
+                    source_addr,
+                    source_transport,
+                    sip_instance,
+                    reg_id,
+                    path.clone(),
+                    flow_capture.clone(),
+                    extra_params,
+                )
+                .map_err(|error| match error {
+                    RegistrarError::IntervalTooBrief { min_expires } => {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "registrar grant ({granted_expires}s) below local \
                                  min_expires ({min_expires}s) — registrar of record \
                                  misconfigured?"
-                            ))
-                        }
-                        RegistrarError::TooManyContacts { max } => {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "too many contacts (max: {max})"
-                            ))
-                        }
-                        RegistrarError::InvalidAor => pyo3::exceptions::PyValueError::new_err(
-                            "invalid AoR (unsafe storage key)".to_string(),
-                        ),
-                    })?;
-            }
+                        ))
+                    }
+                    RegistrarError::TooManyContacts { max } => {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "too many contacts (max: {max})"
+                        ))
+                    }
+                    RegistrarError::InvalidAor => pyo3::exceptions::PyValueError::new_err(
+                        "invalid AoR (unsafe storage key)".to_string(),
+                    ),
+                })?;
         }
 
         if !aliases.is_empty() {
@@ -2975,6 +2968,166 @@ mod tests {
             "expires {exp} should be ~3632, local max_expires cap of 600 \
              must not apply on save_proxy"
         );
+    }
+
+    /// A REGISTER for `sip:carol@ims.example.com` with `contacts` and an
+    /// optional `Expires`, as a P-CSCF relays it.
+    fn proxied_register(contacts: &[&str], expires: Option<&str>) -> PyRequest {
+        // A refusal is a `PyErr`, which needs the interpreter to be shown.
+        Python::initialize();
+        let mut builder = SipMessageBuilder::new()
+            .request(Method::Register, SipUri::new("ims.example.com".to_string()))
+            .via("SIP/2.0/UDP 10.0.0.3:5060;branch=z9hG4bK-carol".to_string())
+            .to("<sip:carol@ims.example.com>".to_string())
+            .from("<sip:carol@ims.example.com>;tag=carol".to_string())
+            .call_id("carol@host".to_string())
+            .cseq("1 REGISTER".to_string());
+        for contact in contacts {
+            builder = builder.header("Contact", (*contact).to_string());
+        }
+        if let Some(expires) = expires {
+            builder = builder.header("Expires", expires.to_string());
+        }
+        let message = builder.content_length(0).build().unwrap();
+        PyRequest::new(
+            Arc::new(Mutex::new(message)),
+            "udp".to_string(),
+            "10.0.0.3".to_string(),
+            5060,
+        )
+    }
+
+    /// The registrar of record's 2xx with `contacts` and an optional
+    /// `Expires`.
+    fn registrar_reply(contacts: &[&str], expires: Option<&str>) -> PyReply {
+        let mut builder = SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .via("SIP/2.0/UDP 10.0.0.3:5060;branch=z9hG4bK-carol".to_string())
+            .to("<sip:carol@ims.example.com>;tag=scscf".to_string())
+            .from("<sip:carol@ims.example.com>;tag=carol".to_string())
+            .call_id("carol@host".to_string())
+            .cseq("1 REGISTER".to_string());
+        for contact in contacts {
+            builder = builder.header("Contact", (*contact).to_string());
+        }
+        if let Some(expires) = expires {
+            builder = builder.header("Expires", expires.to_string());
+        }
+        PyReply::new(Arc::new(Mutex::new(
+            builder.content_length(0).build().unwrap(),
+        )))
+    }
+
+    fn expires_of(py_reg: &PyRegistrar, uri: &str) -> Option<u64> {
+        py_reg
+            .lookup_str("sip:carol@ims.example.com")
+            .into_iter()
+            .find(|contact| contact.uri() == uri)
+            .map(|contact| contact.expires())
+    }
+
+    /// RFC 3261 §10.3 step 8: the grant is the Contact's `expires` parameter;
+    /// a 2xx without a top-level `Expires` is not an error.
+    #[test]
+    fn save_proxy_reads_the_grant_from_the_reply_contact() {
+        let py_reg = PyRegistrar::new(make_registrar());
+        let request = proxied_register(&["<sip:carol@10.0.0.3:5060>"], Some("600000"));
+        let reply = registrar_reply(&["<sip:carol@10.0.0.3:5060>;expires=600"], None);
+
+        py_reg.save_proxy(&request, &reply, vec![], None).unwrap();
+
+        let expires = expires_of(&py_reg, "sip:carol@10.0.0.3:5060").expect("cached");
+        assert!(
+            (625..=632).contains(&expires),
+            "expires {expires} should be ~632 (grant 600 + grace 32)"
+        );
+    }
+
+    /// The 2xx to a de-REGISTER names the Contact with `expires=0` and has no
+    /// top-level `Expires`: the binding goes, and nothing is raised.
+    #[test]
+    fn save_proxy_removes_a_binding_the_reply_contact_gives_zero() {
+        let py_reg = PyRegistrar::new(make_registrar());
+        let contact = "<sip:carol@10.0.0.3:5060>";
+        py_reg
+            .save_proxy(
+                &proxied_register(&[contact], Some("600000")),
+                &registrar_reply(&["<sip:carol@10.0.0.3:5060>;expires=600"], None),
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(py_reg.is_registered_str("sip:carol@ims.example.com"));
+
+        let request = proxied_register(&[contact], Some("0"));
+        let reply = registrar_reply(&["<sip:carol@10.0.0.3:5060>;expires=0"], None);
+        py_reg.save_proxy(&request, &reply, vec![], None).unwrap();
+        assert!(!py_reg.is_registered_str("sip:carol@ims.example.com"));
+    }
+
+    /// Each Contact gets its own grant: its `expires` parameter, else the
+    /// top-level `Expires`. A Contact the 2xx lists with `expires=0` goes,
+    /// the others stay. Contacts are matched by URI (scheme, user, host
+    /// case-insensitively, port with the default filled in).
+    #[test]
+    fn save_proxy_gives_each_contact_its_own_grant() {
+        let py_reg = PyRegistrar::new(make_registrar());
+        let request = proxied_register(
+            &[
+                "<sip:carol@10.0.0.3:5060>",
+                "<sip:carol@10.0.0.4:5070>",
+                "<sip:carol@10.0.0.5>",
+            ],
+            Some("600000"),
+        );
+        let reply = registrar_reply(
+            &[
+                "<sip:carol@10.0.0.3:5060>;expires=600",
+                "<sip:carol@10.0.0.4:5070>",
+                "<sip:carol@10.0.0.5:5060>;expires=1200",
+            ],
+            Some("3600"),
+        );
+        py_reg.save_proxy(&request, &reply, vec![], None).unwrap();
+
+        let near = |uri: &str, grant: u64| {
+            let expires = expires_of(&py_reg, uri).expect("cached");
+            assert!(
+                (grant + 25..=grant + 32).contains(&expires),
+                "{uri}: expires {expires} should be ~{grant} + 32"
+            );
+        };
+        near("sip:carol@10.0.0.3:5060", 600);
+        near("sip:carol@10.0.0.4:5070", 3600);
+        near("sip:carol@10.0.0.5", 1200);
+
+        // One of them de-registered; the others stay.
+        let request = proxied_register(&["<sip:carol@10.0.0.4:5070>;expires=0"], None);
+        let reply = registrar_reply(
+            &[
+                "<sip:carol@10.0.0.3:5060>;expires=590",
+                "<sip:carol@10.0.0.4:5070>;expires=0",
+                "<sip:carol@10.0.0.5:5060>;expires=1190",
+            ],
+            None,
+        );
+        py_reg.save_proxy(&request, &reply, vec![], None).unwrap();
+        assert_eq!(expires_of(&py_reg, "sip:carol@10.0.0.4:5070"), None);
+        near("sip:carol@10.0.0.3:5060", 600);
+        near("sip:carol@10.0.0.5", 1200);
+    }
+
+    /// No `expires` on the Contact and no top-level `Expires`: the grant is
+    /// unknown, so save_proxy still raises and caches nothing.
+    #[test]
+    fn save_proxy_without_any_grant_still_raises() {
+        let py_reg = PyRegistrar::new(make_registrar());
+        let request = proxied_register(&["<sip:carol@10.0.0.3:5060>"], Some("600"));
+        let reply = registrar_reply(&["<sip:carol@10.0.0.3:5060>"], None);
+        assert!(py_reg.save_proxy(&request, &reply, vec![], None).is_err());
+        let reply = registrar_reply(&[], None);
+        assert!(py_reg.save_proxy(&request, &reply, vec![], None).is_err());
+        assert!(!py_reg.is_registered_str("sip:carol@ims.example.com"));
     }
 
     #[test]

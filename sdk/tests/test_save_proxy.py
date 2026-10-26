@@ -107,3 +107,45 @@ def test_save_proxy_does_not_call_request_reply():
     reply = _fake_reply("3600")
 
     registrar.save_proxy(request, reply)  # must not raise
+
+
+def _reply_with_contacts(contacts: list[str], expires: str | None = None):
+    """The upstream's 200 OK listing ``contacts``, as the engine reads it."""
+    headers = {"Expires": expires} if expires is not None else {}
+    return SimpleNamespace(
+        status_code=200,
+        get_header=lambda name: (
+            contacts[0] if name == "Contact" and contacts else headers.get(name)
+        ),
+        get_headers=lambda name: contacts if name == "Contact" else [],
+        relay=lambda: None,
+    )
+
+
+def test_save_proxy_reads_the_grant_from_the_reply_contact():
+    """RFC 3261 §10.3 step 8: the grant may be only on the Contact."""
+    registrar = _fresh_registrar()
+    request = _fake_register("sip:alice@ims.example.com")
+    reply = _reply_with_contacts(["<sip:alice@10.0.0.1:5060>;expires=600"])
+
+    assert registrar.save_proxy(request, reply) is True
+    assert registrar.is_registered("sip:alice@ims.example.com")
+
+
+def test_save_proxy_contact_expires_zero_clears_without_an_expires_header():
+    registrar = _fresh_registrar()
+    request = _fake_register("sip:alice@ims.example.com")
+    registrar.save_proxy(request, _fake_reply("3600"))
+
+    reply = _reply_with_contacts(["<sip:alice@10.0.0.1:5060>;expires=0"])
+    assert registrar.save_proxy(request, reply) is True
+    assert not registrar.is_registered("sip:alice@ims.example.com")
+
+
+def test_save_proxy_raises_when_the_contact_carries_no_expires_either():
+    registrar = _fresh_registrar()
+    request = _fake_register("sip:alice@ims.example.com")
+    reply = _reply_with_contacts(["<sip:alice@10.0.0.1:5060>"])
+
+    with pytest.raises(ValueError, match="expiration"):
+        registrar.save_proxy(request, reply)
