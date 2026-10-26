@@ -159,6 +159,15 @@ impl PyPresence {
     ///         A dialog rebuilt from stored state (IMS restoration, TS 23.380
     ///         §4.6.3, which keeps no CSeq) starts high enough for the
     ///         subscriber to accept its next NOTIFY (RFC 3261 §12.2.2).
+    ///     version: The version the dialog's next event-state document
+    ///         carries (RFC 3680 §5.2), handed out by :meth:`next_version`.
+    ///         ``0`` (the default) for a new subscription.  Restoration keeps
+    ///         no version either (TS 29.229 Subscription-Info holds the
+    ///         Call-ID, From, To, Record-Route and Contact only), so a rebuilt
+    ///         dialog passes one above any it could have sent, as it does for
+    ///         ``local_cseq``: a subscriber that sees a version more than one
+    ///         higher than its own takes it, processes the document, and
+    ///         SHOULD refresh for full state.
     ///
     /// Both URI arguments default to ``resource`` when omitted, which is
     /// correct for any package where the subscriber watches an AoR directly
@@ -168,7 +177,7 @@ impl PyPresence {
     ///
     /// Returns:
     ///     Subscription ID string.
-    #[pyo3(signature = (subscriber, resource, event, expires, call_id, from_tag, to_tag, route_set=None, local_uri=None, remote_uri=None, local_cseq=0))]
+    #[pyo3(signature = (subscriber, resource, event, expires, call_id, from_tag, to_tag, route_set=None, local_uri=None, remote_uri=None, local_cseq=0, version=0))]
     #[allow(clippy::too_many_arguments)]
     fn subscribe_dialog(
         &self,
@@ -183,6 +192,7 @@ impl PyPresence {
         local_uri: Option<String>,
         remote_uri: Option<String>,
         local_cseq: u32,
+        version: u32,
     ) -> PyResult<String> {
         // Each NOTIFY carries these as its `Route`, which takes `name-addr`
         // values (RFC 3261 §20.34): one per entry, whatever form it came in.
@@ -203,6 +213,7 @@ impl PyPresence {
             remote_uri.map(|uri| strip_nameaddr(&uri)),
         );
         subscription.local_cseq = local_cseq;
+        subscription.next_version = version;
         self.store.add_subscription(subscription);
         Ok(subscription_id)
     }
@@ -260,6 +271,35 @@ impl PyPresence {
     ///     The subscription ID string, or None if no live dialog matches.
     fn find_by_dialog(&self, call_id: &str, from_tag: &str) -> Option<String> {
         self.store.find_subscription_by_dialog(call_id, from_tag)
+    }
+
+    /// The version for the next event-state document sent on a subscription,
+    /// advancing its count (RFC 3680 §5.2: "Versions start at 0, and
+    /// increment by one for each new document sent to a subscriber.  Versions
+    /// are scoped within a subscription.").
+    ///
+    /// The store owns one count per subscription, so every NOTIFY a script
+    /// builds a reginfo body for takes the next one:
+    ///
+    /// ```python
+    /// body = registrar.reginfo_xml(aor, state="partial",
+    ///                              version=presence.next_version(sub_id))
+    /// await presence.notify(sub_id, body=body,
+    ///                       content_type="application/reginfo+xml")
+    /// ```
+    ///
+    /// Take the version only for a document that is sent: each call advances
+    /// the count, and a version the subscriber never sees reads to it as a
+    /// gap (it then asks for full state).
+    ///
+    /// Args:
+    ///     subscription_id: The subscription ID.
+    ///
+    /// Returns:
+    ///     The version (``int``, 0 for the first document), or ``None`` for an
+    ///     unknown subscription.  A removed subscription's count goes with it.
+    fn next_version(&self, subscription_id: &str) -> Option<u32> {
+        self.store.next_version(subscription_id)
     }
 
     /// List subscribers (watchers) for a resource.
@@ -859,6 +899,7 @@ mod tests {
                 Some(format!("<{aor}>")),
                 Some(format!("<{aor}>;tag=ftag-ue")),
                 0,
+                0,
             )
             .expect("a subscription");
 
@@ -894,6 +935,7 @@ mod tests {
                 None,
                 None,
                 1_792_310_400,
+                0,
             )
             .expect("a subscription");
         let dialog = store.prepare_notify(&sub_id).expect("dialog state");
@@ -912,7 +954,7 @@ mod tests {
         let aor = "sip:001010000000001@ims.example.com";
         let sub_id = presence
             .subscribe_dialog(
-                contact, aor, "reg", 7200, "call-2", "ftag", "notif", None, None, None, 0,
+                contact, aor, "reg", 7200, "call-2", "ftag", "notif", None, None, None, 0, 0,
             )
             .expect("a subscription");
 
@@ -944,6 +986,7 @@ mod tests {
                 Some("<sip:alice@example.com>".to_string()),
                 Some("<sip:bob@example.com>".to_string()),
                 0,
+                0,
             )
             .expect("a subscription");
 
@@ -972,6 +1015,7 @@ mod tests {
                 Some(route_set.into_iter().map(str::to_string).collect()),
                 None,
                 None,
+                0,
                 0,
             )
         };
@@ -1021,6 +1065,7 @@ mod tests {
                 None,
                 None,
                 0,
+                0,
             )
             .expect("a subscription");
 
@@ -1039,6 +1084,107 @@ mod tests {
         assert!(presence.unsubscribe(&resolved));
         assert!(presence.find_by_dialog("call-abc", "ftag-alice").is_none());
         assert_eq!(presence.subscription_count(), 0);
+    }
+
+    fn reg_subscription(presence: &PyPresence, call_id: &str, version: u32) -> String {
+        presence
+            .subscribe_dialog(
+                "sip:watcher@192.0.2.7:5060",
+                "sip:001010000000001@ims.example.com",
+                "reg",
+                600,
+                call_id,
+                "ftag",
+                "notif",
+                None,
+                None,
+                None,
+                0,
+                version,
+            )
+            .expect("a subscription")
+    }
+
+    /// RFC 3680 §5.2: versions start at 0 and go up by one per document, per
+    /// subscription.
+    #[test]
+    fn next_version_counts_per_subscription() {
+        let presence = PyPresence::new(make_store());
+        let first = reg_subscription(&presence, "call-v1", 0);
+        let second = reg_subscription(&presence, "call-v2", 0);
+        assert_eq!(presence.next_version(&first), Some(0));
+        assert_eq!(presence.next_version(&first), Some(1));
+        assert_eq!(presence.next_version(&second), Some(0));
+        assert_eq!(presence.next_version(&first), Some(2));
+        assert!(presence.unsubscribe(&first));
+        assert_eq!(presence.next_version(&first), None);
+        assert_eq!(presence.next_version(&second), Some(1));
+    }
+
+    /// A dialog rebuilt from stored state, which keeps no version, continues
+    /// from the version it is given.
+    #[test]
+    fn a_rebuilt_dialog_continues_from_the_version_it_is_given() {
+        let presence = PyPresence::new(make_store());
+        let restored = reg_subscription(&presence, "call-restored-v", 1_792_310_400);
+        assert_eq!(presence.next_version(&restored), Some(1_792_310_400));
+        assert_eq!(presence.next_version(&restored), Some(1_792_310_401));
+    }
+
+    /// `presence.next_version` from Python on several threads while another
+    /// keeps forcing garbage collections: the call takes the store's entry lock
+    /// only, never waits attached, and every version is handed out once. Runs
+    /// in a child process with a budget, so a regression fails instead of
+    /// hanging.
+    #[test]
+    fn next_version_from_scripts_survives_forced_collections() {
+        use crate::script::stop_the_world_tests::{collect_garbage_until, in_child};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        if !in_child(
+            concat!(
+                module_path!(),
+                "::next_version_from_scripts_survives_forced_collections"
+            ),
+            Duration::from_secs(60),
+        ) {
+            return;
+        }
+
+        pyo3::Python::initialize();
+        let presence = PyPresence::new(make_store());
+        let subscription_id = reg_subscription(&presence, "call-gc", 0);
+        let presence = Python::attach(|python| Py::new(python, presence).expect("namespace"));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let collector = collect_garbage_until(Arc::clone(&stop));
+        let takers: Vec<_> = (0..4)
+            .map(|_| {
+                let presence = Python::attach(|python| presence.clone_ref(python));
+                let subscription_id = subscription_id.clone();
+                std::thread::spawn(move || {
+                    Python::attach(|python| {
+                        (0..500)
+                            .map(|_| {
+                                presence
+                                    .bind(python)
+                                    .call_method1("next_version", (subscription_id.as_str(),))
+                                    .and_then(|version| version.extract::<u32>())
+                                    .expect("a version")
+                            })
+                            .collect::<Vec<u32>>()
+                    })
+                })
+            })
+            .collect();
+        let mut versions: Vec<u32> = takers
+            .into_iter()
+            .flat_map(|taker| taker.join().expect("the taker ran"))
+            .collect();
+        stop.store(true, Ordering::SeqCst);
+        collector.join().expect("the collector ran");
+        versions.sort_unstable();
+        assert_eq!(versions, (0..2000).collect::<Vec<u32>>());
     }
 
     #[test]

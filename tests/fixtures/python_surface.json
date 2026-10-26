@@ -1529,6 +1529,11 @@
         "kind": "method_descriptor",
         "sig": "($self, entity)"
       },
+      "next_version": {
+        "doc": "The version for the next event-state document sent on a subscription,",
+        "kind": "method_descriptor",
+        "sig": "($self, subscription_id)"
+      },
       "notify": {
         "doc": "Send an in-dialog NOTIFY for a subscription (RFC 3265 \u00a73.2.2).",
         "kind": "method_descriptor",
@@ -1557,7 +1562,7 @@
       "subscribe_dialog": {
         "doc": "Create a subscription with full dialog state from a SUBSCRIBE request.",
         "kind": "method_descriptor",
-        "sig": "($self, subscriber, resource, event, expires, call_id, from_tag, to_tag, route_set=None, local_uri=None, remote_uri=None, local_cseq=0)"
+        "sig": "($self, subscriber, resource, event, expires, call_id, from_tag, to_tag, route_set=None, local_uri=None, remote_uri=None, local_cseq=0, version=0)"
       },
       "subscribers": {
         "doc": "List subscribers (watchers) for a resource.",
