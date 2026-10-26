@@ -8,6 +8,7 @@
 
 pub mod backend;
 pub(crate) mod contact_index;
+pub(crate) mod proxy_grant;
 pub mod reginfo;
 pub mod restore_eviction;
 pub(crate) mod update;
