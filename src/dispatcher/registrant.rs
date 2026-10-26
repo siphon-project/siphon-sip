@@ -1,6 +1,7 @@
 //! Responses to the outbound REGISTER client (`src/registrant/`): the
 //! registrar's answer, and the IMS AKA challenge it may carry.
 use super::*;
+use crate::registrant::Deregistration;
 
 /// Extract the `expires=` parameter value from a Contact header value.
 ///
@@ -34,6 +35,16 @@ pub(super) fn handle_registrant_response(
     // 17.1.2.2); the REGISTER is still in flight and Timer F still bounds it.
     // A P-CSCF emits a 100 Trying once Timer E reaches T2 (RFC 4320 4.2), and
     // reading that as the outcome failed the refresh and dropped its SA set.
+    // A retransmitted final response is absorbed by the client transaction
+    // (RFC 3261 17.1.2.2): acting on a repeated 401 again would start a second
+    // authentication.
+    if !drive_register_transaction(message, status_code, state) {
+        debug!(
+            status_code,
+            "registrant: response absorbed by its client transaction"
+        );
+        return;
+    }
     if status_code < 200 {
         debug!(
             status_code,
@@ -77,6 +88,15 @@ fn handle_answer(
             return;
         }
     };
+
+    // Shutdown (see `registrant::lifecycle`): the final answer to a
+    // de-REGISTER ends it, a challenge to one is answered below with
+    // `Expires: 0`.
+    let deregistration = registrant.deregistration(&aor);
+    if deregistration == Deregistration::InFlight && !matches!(status_code, 401 | 407) {
+        registrant.finish_deregistration(&aor, status_code);
+        return;
+    }
 
     let is_aka = registrant.auth_mode(&aor) == Some(crate::registrant::AuthMode::Aka);
 
@@ -163,6 +183,15 @@ fn handle_answer(
             }
 
             registrant.handle_success(&aor, expires);
+            // A REGISTER that was in flight at shutdown got its binding: clear
+            // it at once, over the SA set the answer just settled.
+            if deregistration == Deregistration::Owed {
+                let defaults =
+                    crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs);
+                if let Some(built) = registrant.take_owed_deregistration(&aor, defaults) {
+                    send_registrant_request(registrant, &aor, &built, state);
+                }
+            }
         }
         401 | 407 => {
             // Parse challenge header
@@ -210,7 +239,7 @@ fn handle_answer(
                         &aor,
                         defaults,
                         &challenge,
-                        registrant.interval_for(&aor),
+                        registrant.challenge_expires(&aor),
                         None,
                     )
                 } else {
@@ -219,7 +248,7 @@ fn handle_answer(
                         defaults,
                         &challenge,
                         status_code == 407,
-                        registrant.interval_for(&aor),
+                        registrant.challenge_expires(&aor),
                     )
                 };
 
@@ -228,15 +257,7 @@ fn handle_answer(
                     // entry's own address, or the first UDP listener), so the
                     // retry carries the source its Via names; it used to leave
                     // from whichever socket was the default.
-                    let data = bytes::Bytes::from(built.message.to_bytes());
-                    send_outbound_from(
-                        data,
-                        built.transport,
-                        built.destination,
-                        crate::transport::ConnectionId::default(),
-                        built.source_local_addr,
-                        state,
-                    );
+                    send_registrant_request(registrant, &aor, &built, state);
                 } else {
                     registrant.handle_failure(&aor, status_code, retry_after);
                 }
@@ -291,7 +312,7 @@ pub(super) fn handle_registrant_ipsec_challenge(
         aor,
         crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs),
         challenge,
-        registrant.interval_for(aor),
+        registrant.challenge_expires(aor),
         verify.as_deref(),
     );
     let Some(built) = built else {
@@ -301,15 +322,7 @@ pub(super) fn handle_registrant_ipsec_challenge(
     // An invalid challenge is answered over the set the UE already has, or
     // unprotected, and sets up no temporary set (TS 24.229 5.1.1.5.3).
     if built.challenge_rejected {
-        let data = bytes::Bytes::from(built.message.to_bytes());
-        send_outbound_from(
-            data,
-            built.transport,
-            built.destination,
-            crate::transport::ConnectionId::default(),
-            built.source_local_addr,
-            state,
-        );
+        send_registrant_request(registrant, aor, &built, state);
         return;
     }
     let (retry_message, destination, transport) =
@@ -359,6 +372,11 @@ pub(super) fn handle_registrant_ipsec_challenge(
     registrant.begin_authentication(aor, &authorization);
 
     let data = bytes::Bytes::from(retry_message.to_bytes());
+    let call_id = retry_message
+        .headers
+        .get("Call-ID")
+        .cloned()
+        .unwrap_or_default();
     let outbound = state.outbound.clone();
     // Sent from the task below, past `send_outbound_from`'s capture.
     let capture = TaskCapture::for_task(state, transport, Some(source));
@@ -366,6 +384,12 @@ pub(super) fn handle_registrant_ipsec_challenge(
     let aor_task = aor.to_string();
 
     tokio::spawn(async move {
+        // The install below is a kernel round trip: shutdown, or the entry's
+        // removal, may have come first, and then nothing registers.
+        if !registrant_task.registration_live(&aor_task, &call_id) {
+            debug!(aor = %aor_task, "IPsec UE: registration ended before its protected REGISTER; not sent");
+            return;
+        }
         let sa = match sa {
             Some(sa) => sa,
             None => {
@@ -384,9 +408,6 @@ pub(super) fn handle_registrant_ipsec_challenge(
             registrant_task.handle_failure(&aor_task, 0, None);
             return;
         }
-        if let Some(capture) = &capture {
-            capture.capture(destination, transport, &data);
-        }
         let outbound_message = crate::transport::OutboundMessage {
             followups: None,
             connection_id: crate::transport::ConnectionId::default(),
@@ -397,8 +418,158 @@ pub(super) fn handle_registrant_ipsec_challenge(
             server_name: None,
             verify_server: None,
         };
+        // Under its client transaction, so over UDP it is retransmitted from
+        // this same protected client port, through the set just installed.
+        if let Err(error) = registrant_task.open_transaction(&retry_message, &outbound_message) {
+            warn!(aor = %aor_task, %error, "IPsec UE: protected REGISTER not sent");
+            registrant_task.handle_failure(&aor_task, 0, None);
+            return;
+        }
+        if let Some(capture) = &capture {
+            capture.capture(destination, transport, &outbound_message.data);
+        }
         if let Err(error) = outbound.send(outbound_message) {
             warn!(aor = %aor_task, %error, "IPsec UE: failed to send protected REGISTER");
+        }
+    });
+}
+
+/// Whether `branch` is the Via branch of a REGISTER the registrant sent.
+pub(super) fn is_register_branch(branch: &str) -> bool {
+    branch.starts_with("z9hG4bK-reg-")
+}
+
+/// Send a REGISTER the dispatcher built (a challenge answered) under its client
+/// transaction (see [`crate::registrant::RegisterTransactions`]), so over UDP
+/// it is retransmitted from the socket it left from.
+fn send_registrant_request(
+    registrant: &crate::registrant::RegistrantManager,
+    aor: &str,
+    built: &crate::registrant::BuiltRegister,
+    state: &DispatcherState,
+) {
+    let data = bytes::Bytes::from(built.message.to_bytes());
+    let message = crate::transport::OutboundMessage {
+        followups: None,
+        connection_id: crate::transport::ConnectionId::default(),
+        transport: built.transport,
+        destination: built.destination,
+        data: data.clone(),
+        source_local_addr: built.source_local_addr,
+        server_name: None,
+        verify_server: None,
+    };
+    if let Err(error) = registrant.open_transaction(&built.message, &message) {
+        warn!(aor = %aor, %error, "registrant: REGISTER not sent");
+        registrant.handle_failure(aor, 0, None);
+        return;
+    }
+    send_outbound_from(
+        data,
+        built.transport,
+        built.destination,
+        crate::transport::ConnectionId::default(),
+        built.source_local_addr,
+        state,
+    );
+}
+
+/// The dispatcher's transaction layer as the registrant sends under it: a
+/// REGISTER opens a non-INVITE client transaction whose timers the sweep fires
+/// ([`super::timers::fire_expired_timers`]), Timer E re-sending the octets that
+/// went out, from the same local address, and Timer F ending it
+/// ([`registrant_transaction_timed_out`]).
+pub(crate) struct RegisterTransactionLayer {
+    transactions: Arc<TransactionManager>,
+    timer_wheel: Arc<DashMap<String, Box<TimerEntry>>>,
+}
+
+impl RegisterTransactionLayer {
+    pub(crate) fn of(state: &DispatcherState) -> Self {
+        Self {
+            transactions: Arc::clone(&state.transaction_manager),
+            timer_wheel: Arc::clone(&state.timer_wheel),
+        }
+    }
+}
+
+impl crate::registrant::RegisterTransactions for RegisterTransactionLayer {
+    fn open(
+        &self,
+        request: &SipMessage,
+        message: &crate::transport::OutboundMessage,
+    ) -> Result<(), String> {
+        let (key, actions) = self.transactions.new_client_transaction(
+            request,
+            message.data.clone(),
+            crate::transaction::state::Transport::from(message.transport),
+        )?;
+        // The first send is the caller's; only the timers are armed here:
+        // Timer F always, Timer E over UDP only (RFC 3261 17.1.2.2).
+        for action in actions {
+            if let Action::StartTimer(name, duration) = action {
+                self.timer_wheel.insert(
+                    format!("{key}:{name:?}"),
+                    Box::new(TimerEntry {
+                        key: key.clone(),
+                        name,
+                        fires_at: std::time::Instant::now() + duration,
+                        destination: Some(message.destination),
+                        transport: Some(message.transport),
+                        connection_id: Some(message.connection_id),
+                        source_local_addr: message.source_local_addr,
+                    }),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Feed a response on a registrant branch to its REGISTER's client
+/// transaction. `false` when the transaction absorbed it (a repeat of the final
+/// response it already passed on), which the registrant must not act on twice;
+/// `true` otherwise, including for a response with no transaction left.
+fn drive_register_transaction(
+    message: &SipMessage,
+    status_code: u16,
+    state: &DispatcherState,
+) -> bool {
+    let Ok(key) = TransactionManager::key_from_message(message) else {
+        return true;
+    };
+    let event = if status_code < 200 {
+        NictEvent::Provisional(message.clone())
+    } else {
+        NictEvent::FinalResponse(message.clone())
+    };
+    let Ok(actions) = state
+        .transaction_manager
+        .process_client_event(&key, ClientEvent::Nict(event))
+    else {
+        return true;
+    };
+    process_timer_actions(&actions, &key, None, None, None, None, state);
+    actions
+        .iter()
+        .any(|action| matches!(action, Action::PassToTu(_)))
+}
+
+/// Timer F of a registrant REGISTER fired (RFC 3261 17.1.2.2): the entry
+/// still waiting on that branch fails as on any other failure. Run off the
+/// timer sweep ([`super::tasks::post_expiry`]): a failure re-resolves the
+/// registrar, which can block.
+pub(super) fn registrant_transaction_timed_out(key: &TransactionKey, state: &DispatcherState) {
+    let Some(registrant) = state.registrant_manager.clone() else {
+        return;
+    };
+    let branch = key.branch.clone();
+    super::tasks::post_expiry(state, move |state| {
+        if registrant.transaction_timed_out(&branch).is_some() {
+            // The temporary SA set the failure abandoned.
+            if let Some(ipsec) = state.ipsec_manager.as_ref() {
+                registrant.spawn_sa_deletions(ipsec, state.local_addr.ip());
+            }
         }
     });
 }
@@ -452,3 +623,7 @@ mod sa_lifecycle_tests;
 #[cfg(test)]
 #[path = "registrant_mt_tests.rs"]
 mod mt_tests;
+
+#[cfg(test)]
+#[path = "registrant_transaction_tests.rs"]
+mod transaction_tests;

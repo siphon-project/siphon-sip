@@ -20,6 +20,7 @@ mod egress;
 #[cfg(test)]
 pub(crate) use egress::{established_ue, rotate_sa_set};
 pub mod entry_config;
+mod lifecycle;
 pub mod messages;
 pub mod pacing;
 pub mod protected;
@@ -30,12 +31,13 @@ mod status;
 pub(crate) mod test_support;
 
 pub use egress::UeEgress;
+pub use lifecycle::{Deregistration, RegisterTransactions};
 pub use messages::{BuiltRegister, EgressDefaults};
 pub use pacing::RefreshWindow;
 pub use protected::{PortDegradation, SaDeletion, UeExchange, UeSaKey, UeSaSets};
 pub use refresh::{
-    deregister_all, registration_loop, retire_ue_security_associations, RegistrationLoopContext,
-    SHUTDOWN_ANSWER_WAIT,
+    await_deregistrations, deregister_all, registration_loop, retire_ue_security_associations,
+    RegistrationLoopContext, SHUTDOWN_ANSWER_WAIT,
 };
 pub use status::RegistrantStatus;
 
@@ -48,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::{self, DigestChallenge, NonceCounter};
 use std::net::IpAddr;
@@ -499,8 +501,12 @@ pub struct RegistrantEntry {
     pub failure_count: u32,
     /// The status of the last failed attempt, cleared by a success.
     pub last_failure_status: Option<u16>,
-    /// When the last REGISTER was sent (for transaction timeout detection).
-    pub last_sent_at: Option<Instant>,
+    /// The Via branch of the REGISTER in flight, set when one with
+    /// `Expires > 0` is built. Its client transaction's Timer F names it when
+    /// the REGISTER goes unanswered ([`RegistrantManager::transaction_timed_out`]).
+    pub in_flight_branch: Option<String>,
+    /// Where this entry is in the shutdown de-registration (see [`lifecycle`]).
+    pub deregistration: Deregistration,
     /// Consecutive invalid AKA challenges answered (TS 24.229 5.1.1.5.12).
     pub invalid_challenges: u32,
     /// Who created this entry.
@@ -586,7 +592,8 @@ impl RegistrantEntry {
             call_id: format!("reg-{}", uuid::Uuid::new_v4()),
             failure_count: 0,
             last_failure_status: None,
-            last_sent_at: None,
+            in_flight_branch: None,
+            deregistration: Deregistration::NotStarted,
             invalid_challenges: 0,
             origin: EntryOrigin::Script,
             source_fingerprint: None,
@@ -739,6 +746,12 @@ pub struct RegistrantManager {
     /// `registrant.max_registers_per_sec`: cap on new REGISTERs the loop
     /// starts per second. `None` = no cap and the five-second tick.
     max_registers_per_sec: Option<u32>,
+    /// Set once shutdown begins (see [`lifecycle`]): no REGISTER with
+    /// `Expires > 0` is started from then on.
+    shutting_down: std::sync::atomic::AtomicBool,
+    /// The client transaction layer every REGISTER is sent under, attached by
+    /// the dispatcher (see [`lifecycle`]).
+    transactions: std::sync::OnceLock<Arc<dyn RegisterTransactions>>,
 }
 
 /// Everything [`registration_loop`] needs to put a REGISTER on the wire.
@@ -786,6 +799,8 @@ impl RegistrantManager {
             address_lock: std::sync::Mutex::new(()),
             refresh_window: RefreshWindow::HALF,
             max_registers_per_sec: None,
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
+            transactions: std::sync::OnceLock::new(),
         }
     }
 
@@ -899,7 +914,11 @@ impl RegistrantManager {
     pub fn add(&self, entry: RegistrantEntry) {
         let aor = entry.aor.clone();
         if let Err(reason) = self.try_add(entry) {
-            error!(aor = %aor, "registrant refused: {reason}");
+            if self.is_shutting_down() {
+                debug!(aor = %aor, "registrant refused: {reason}");
+            } else {
+                error!(aor = %aor, "registrant refused: {reason}");
+            }
         }
     }
 
@@ -970,6 +989,9 @@ impl RegistrantManager {
     ///
     /// Returns `false` when the AoR is gone or is not the source's to change.
     pub fn update_from_source(&self, mut entry: RegistrantEntry) -> bool {
+        if self.is_shutting_down() {
+            return false;
+        }
         let carried = self.entries.get(&entry.aor).and_then(|existing| {
             (existing.origin == EntryOrigin::Source).then(|| {
                 (
@@ -995,19 +1017,6 @@ impl RegistrantManager {
         true
     }
 
-    /// Build the `Expires: 0` REGISTER that clears one entry's binding.
-    ///
-    /// `None` when the entry is unknown, was never registered (nothing to
-    /// clear), or the loop has not started yet, so there is no egress to build
-    /// a Via and Contact from.
-    fn build_deregistration(&self, aor: &str) -> Option<BuiltRegister> {
-        let egress = self.egress.get()?;
-        if self.entries.get(aor)?.state != RegistrantState::Registered {
-            return None;
-        }
-        self.build_register(aor, egress.defaults(), 0)
-    }
-
     /// Get number of entries.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -1031,8 +1040,12 @@ impl RegistrantManager {
             .collect()
     }
 
-    /// Force an immediate refresh for a specific AoR.
+    /// Force an immediate refresh for a specific AoR. `false` for an unknown
+    /// AoR, and for every AoR once shutdown has begun.
     pub fn refresh(&self, aor: &str) -> bool {
+        if self.is_shutting_down() {
+            return false;
+        }
         if let Some(mut entry) = self.entries.get_mut(aor) {
             entry.next_attempt = Instant::now();
             entry.state = RegistrantState::Unregistered;
@@ -1171,7 +1184,7 @@ impl RegistrantManager {
             entry.failure_count = 0;
             entry.last_failure_status = None;
             entry.backoff = Duration::from_secs(5);
-            entry.last_sent_at = None;
+            entry.in_flight_branch = None;
             entry.invalid_challenges = 0;
             info!(
                 aor = %entry.aor,
@@ -1180,7 +1193,13 @@ impl RegistrantManager {
                 "registered successfully"
             );
             let aor_owned = entry.aor.clone();
+            // During shutdown a binding the registrar just granted is cleared
+            // straight away (see `lifecycle`); nothing acts on it meanwhile.
+            let shutting_down = entry.deregistration != Deregistration::NotStarted;
             drop(entry);
+            if shutting_down {
+                return;
+            }
             if was_registered {
                 self.emit_event(RegistrantEvent::Refreshed { aor: aor_owned });
             } else {
@@ -1199,6 +1218,11 @@ impl RegistrantManager {
     /// registrar stops sending `Retry-After` we resume climbing from where we
     /// were rather than resetting.
     pub fn handle_failure(&self, aor: &str, status_code: u16, retry_after: Option<Duration>) {
+        if self.deregistration_owed_or_in_flight(aor) {
+            // Shutting down: nothing is retried, the de-registration is over.
+            self.finish_deregistration(aor, status_code);
+            return;
+        }
         if let Some(mut entry) = self.entries.get_mut(aor) {
             self.abandon_ipsec_exchange(&mut entry);
             entry.state = RegistrantState::Failed;
@@ -1280,6 +1304,9 @@ impl RegistrantManager {
     /// Longest-overdue first, so a loop that may only start some of them per
     /// tick (`max_registers_per_sec`) never starves the same few.
     pub fn entries_due_at(&self, now: Instant) -> Vec<String> {
+        if self.is_shutting_down() {
+            return Vec::new();
+        }
         let mut due: Vec<(Instant, String)> = self
             .entries
             .iter()
@@ -1296,29 +1323,6 @@ impl RegistrantManager {
             .collect();
         due.sort();
         due.into_iter().map(|(_, aor)| aor).collect()
-    }
-
-    /// RFC 3261 Timer F — non-INVITE transaction timeout (32 seconds).
-    const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(32);
-
-    /// Find entries stuck in `Registering` or `Challenging` past the
-    /// transaction timeout (RFC 3261 Timer F, 32s).  The registration
-    /// loop should treat these as transport-level failures.
-    pub fn entries_timed_out(&self) -> Vec<String> {
-        let now = Instant::now();
-        self.entries
-            .iter()
-            .filter(|entry| {
-                matches!(
-                    entry.state,
-                    RegistrantState::Registering | RegistrantState::Challenging
-                ) && entry
-                    .last_sent_at
-                    .map(|sent| now.duration_since(sent) > Self::TRANSACTION_TIMEOUT)
-                    .unwrap_or(false)
-            })
-            .map(|entry| entry.aor.clone())
-            .collect()
     }
 
     /// Build de-registration (Expires: 0) for all active entries.
@@ -2328,35 +2332,32 @@ mod tests {
     }
 
     #[test]
-    fn build_register_sets_last_sent_at() {
+    fn build_register_records_the_branch_in_flight() {
         let manager = make_manager();
         manager.add(make_entry("sip:alice@carrier.com"));
+        let in_flight = || {
+            manager
+                .entries
+                .get("sip:alice@carrier.com")
+                .unwrap()
+                .in_flight_branch
+                .clone()
+        };
+        assert!(in_flight().is_none());
 
-        // Before building: no last_sent_at
-        assert!(manager
-            .entries
-            .get("sip:alice@carrier.com")
-            .unwrap()
-            .last_sent_at
-            .is_none());
+        let built = manager
+            .build_register(
+                "sip:alice@carrier.com",
+                EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
+                3600,
+            )
+            .unwrap();
 
-        manager.build_register(
-            "sip:alice@carrier.com",
-            EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
-            3600,
-        );
-
-        // After building: last_sent_at should be set
-        assert!(manager
-            .entries
-            .get("sip:alice@carrier.com")
-            .unwrap()
-            .last_sent_at
-            .is_some());
+        assert_eq!(in_flight(), Some(built.branch));
     }
 
     #[test]
-    fn success_clears_last_sent_at() {
+    fn success_clears_the_branch_in_flight() {
         let manager = make_manager();
         manager.add(make_entry("sip:alice@carrier.com"));
 
@@ -2365,59 +2366,52 @@ mod tests {
             EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
             3600,
         );
-        assert!(manager
-            .entries
-            .get("sip:alice@carrier.com")
-            .unwrap()
-            .last_sent_at
-            .is_some());
-
         manager.handle_success("sip:alice@carrier.com", 3600);
         assert!(manager
             .entries
             .get("sip:alice@carrier.com")
             .unwrap()
-            .last_sent_at
+            .in_flight_branch
             .is_none());
     }
 
     #[test]
-    fn entries_timed_out_not_triggered_before_timeout() {
+    fn a_timer_f_on_another_branch_fails_nothing() {
         let manager = make_manager();
         manager.add(make_entry("sip:alice@carrier.com"));
-
-        // Send a REGISTER (sets state to Registering + last_sent_at)
         manager.build_register(
             "sip:alice@carrier.com",
             EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
             3600,
         );
 
-        // Should not be timed out yet (just sent)
-        assert!(manager.entries_timed_out().is_empty());
+        assert_eq!(manager.transaction_timed_out("z9hG4bK-reg-other"), None);
+        assert_eq!(
+            manager.state("sip:alice@carrier.com"),
+            Some(RegistrantState::Registering)
+        );
     }
 
     #[test]
-    fn entries_timed_out_triggered_after_timeout() {
+    fn a_timer_f_on_the_branch_in_flight_fails_the_entry() {
         let manager = make_manager();
         manager.add(make_entry("sip:alice@carrier.com"));
+        let built = manager
+            .build_register(
+                "sip:alice@carrier.com",
+                EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
+                3600,
+            )
+            .unwrap();
 
-        manager.build_register(
-            "sip:alice@carrier.com",
-            EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
-            3600,
+        assert_eq!(
+            manager.transaction_timed_out(&built.branch).as_deref(),
+            Some("sip:alice@carrier.com")
         );
-
-        // Simulate passage of time by backdating last_sent_at
-        manager
-            .entries
-            .get_mut("sip:alice@carrier.com")
-            .unwrap()
-            .last_sent_at = Some(Instant::now() - Duration::from_secs(33));
-
-        let timed_out = manager.entries_timed_out();
-        assert_eq!(timed_out.len(), 1);
-        assert_eq!(timed_out[0], "sip:alice@carrier.com");
+        assert_eq!(
+            manager.state("sip:alice@carrier.com"),
+            Some(RegistrantState::Failed)
+        );
     }
 
     #[test]
@@ -2494,19 +2488,23 @@ mod tests {
     }
 
     #[test]
-    fn entries_timed_out_not_triggered_for_registered() {
+    fn a_late_timer_f_does_not_fail_a_registered_entry() {
         let manager = make_manager();
         manager.add(make_entry("sip:alice@carrier.com"));
-
-        // Registered entries should never time out (even with stale last_sent_at)
+        let built = manager
+            .build_register(
+                "sip:alice@carrier.com",
+                EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
+                3600,
+            )
+            .unwrap();
         manager.handle_success("sip:alice@carrier.com", 3600);
-        manager
-            .entries
-            .get_mut("sip:alice@carrier.com")
-            .unwrap()
-            .last_sent_at = Some(Instant::now() - Duration::from_secs(60));
 
-        assert!(manager.entries_timed_out().is_empty());
+        assert_eq!(manager.transaction_timed_out(&built.branch), None);
+        assert_eq!(
+            manager.state("sip:alice@carrier.com"),
+            Some(RegistrantState::Registered)
+        );
     }
 
     // -- IMS AKA registration (Phase 1) --

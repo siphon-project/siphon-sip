@@ -2851,11 +2851,15 @@ class MockRegistrar:
 
         Differs from :meth:`save` in three ways:
 
-        1. The contact lifetime is read from the **reply's** ``Expires``
-           header (the registrar's grant per RFC 3261 §10.3 step 8), not
-           the request's (the UE's ask).  UEs commonly ask for
-           ``600000`` s; the registrar caps to a sensible value, and
-           mirroring that cap locally is incorrect — the proxy must
+        1. Each contact's lifetime is the **reply's** grant (RFC 3261
+           §10.3 step 8), not the request's (the UE's ask): the
+           ``expires`` parameter on the reply's Contact for that binding
+           (matched by URI), else the reply's ``Expires`` header.  A
+           Contact the reply gives ``expires=0`` is removed, so the 2xx
+           to a de-REGISTER that carries only
+           ``Contact: <...>;expires=0`` clears the binding.  UEs commonly
+           ask for ``600000`` s; the registrar caps to a sensible value,
+           and mirroring that cap locally is incorrect — the proxy must
            trust the upstream's decision.
         2. The local ``max_expires`` cap is **not** applied.  The
            registrar of record has already capped, and a tighter local
@@ -2874,19 +2878,20 @@ class MockRegistrar:
         expiry has a transaction-timer window to land before the proxy
         forgets.
 
-        ``Expires: 0`` on the reply clears the binding (de-REGISTER
-        path).
+        ``Expires: 0`` on the reply with no Contact ``expires``
+        parameter clears the binding too (de-REGISTER path).
 
         Args:
             request: The original REGISTER (read for AoR + Contact list).
-            reply: The upstream 200 OK (read for granted ``Expires``).
+            reply: The upstream 200 OK (read for each Contact's
+                ``expires`` parameter and the ``Expires`` header).
             aliases: IMS implicit registration set, same shape as
                 :meth:`save` ``aliases=`` — see that method's docs.
 
         Raises:
-            ValueError: when the reply has no parseable ``Expires``
-                header (the registrar of record must include the
-                granted ``Expires`` per RFC 3261 §10.3 step 8).
+            ValueError: when the reply gives a contact no expiration at
+                all: no ``expires`` parameter on its Contact and no
+                ``Expires`` header.  Nothing is cached then.
 
         Example::
 
@@ -2897,18 +2902,28 @@ class MockRegistrar:
                                          aliases=raw_uris or [])
                 reply.relay()
         """
-        # Pull the granted Expires from the reply.  Mirror the Rust-side
-        # validation so scripts fail identically in unit tests.
+        # The grant: the reply Contact's ``expires`` parameter, else its
+        # Expires header.  The mock caches one contact per AoR, so it takes
+        # the longest grant any reply Contact carries.  Mirrors the engine's
+        # refusal so scripts fail identically in unit tests.
         granted_raw = None
         if hasattr(reply, "get_header"):
             granted_raw = reply.get_header("Expires")
-        if granted_raw is None:
+        contact_grants = [
+            int(match.group(1))
+            for value in _header_values(reply, "Contact")
+            for match in re.finditer(r">[^,]*?;\s*expires=(\d+)", value, re.I)
+        ]
+        if contact_grants:
+            granted = max(contact_grants)
+        elif granted_raw is not None:
+            granted = int(granted_raw)
+        else:
             raise ValueError(
-                "save_proxy: reply has no parseable Expires header — "
-                "the registrar of record must include the granted "
-                "Expires per RFC 3261 §10.3 step 8"
+                "save_proxy: the reply gives no expiration for the contact: "
+                "no expires parameter on its Contact and no Expires header "
+                "(RFC 3261 §10.3 step 8)"
             )
-        granted = int(granted_raw)
 
         raw_aor = str(request.to_uri) if request.to_uri else str(request.ruri)
         aor = self._resolve_alias(self._normalize_aor(raw_aor))
@@ -8502,8 +8517,10 @@ class MockRegistration:
                 transport tls (udp and tcp take one); when another AoR already registers
                 from the same ``(local_addr, ue_port_c)`` (``ue_port_c`` is
                 None without ipsec, so two non-ipsec entries cannot share an
-                address); or when `refresh_window` breaks
-                ``0 < low <= high < 1`` — mirroring the Rust binding.
+                address); when `refresh_window` breaks
+                ``0 < low <= high < 1``; or once the process is shutting down
+                (it de-registered everything and registers nothing again) —
+                mirroring the Rust binding.
             TypeError: when `refresh_window` is not a tuple of two numbers.
 
         Example::
@@ -8603,8 +8620,10 @@ class MockRegistration:
 
         Raises:
             ValueError: `local_addr` is not an IP address; another AoR already
-                registers from it with the same ``ue_port_c``; or the entry's
-                transport is tls (udp and tcp take an address).
+                registers from it with the same ``ue_port_c``; the entry's
+                transport is tls (udp and tcp take an address); or the
+                process is shutting down and the address would change (a move
+                starts a fresh registration).
 
         Example::
 
@@ -8707,7 +8726,12 @@ class MockRegistration:
         return removed
 
     def refresh(self, aor: str) -> bool:
-        """Force an immediate re-registration for an AoR."""
+        """Force an immediate re-registration for an AoR.
+
+        Returns:
+            False when there is no such registration, and for every AoR once
+            the process is shutting down (no registration starts then).
+        """
         return aor in self._entries
 
     def list(self) -> list[dict]:

@@ -98,8 +98,10 @@ impl PyRegistration {
     ///         the registrant default.
     ///
     /// Raises ValueError for an address another entry already registers from
-    /// with the same ue_port_c, a local_addr on transport "tls", or a bad
-    /// refresh window. Secrets (password, k, op, opc) are never logged.
+    /// with the same ue_port_c, a local_addr on transport "tls", a bad
+    /// refresh window, or once the process is shutting down (it de-registered
+    /// everything and registers nothing again). Secrets (password, k, op, opc)
+    /// are never logged.
     // Wide by necessity: outbound registration exposes the full carrier-trunk
     // + AKA + IPsec credential set as keyword arguments to scripts.
     #[allow(clippy::too_many_arguments)]
@@ -285,8 +287,8 @@ impl PyRegistration {
     /// entry falls back to the process's address.
     ///
     /// Returns False when there is no such registration. Raises ValueError for
-    /// an address another entry already uses with the same ue_port_c, or for a
-    /// TLS registration.
+    /// an address another entry already uses with the same ue_port_c, for a
+    /// TLS registration, or for a move once the process is shutting down.
     #[pyo3(signature = (aor, local_addr))]
     fn set_local_addr(&self, aor: &str, local_addr: Option<&str>) -> PyResult<bool> {
         let local_addr = local_addr
@@ -332,7 +334,8 @@ impl PyRegistration {
         self.inner.remove(aor).is_some()
     }
 
-    /// Force an immediate re-registration for an AoR.
+    /// Force an immediate re-registration for an AoR. False when there is no
+    /// such registration, and for every AoR once the process is shutting down.
     fn refresh(&self, aor: &str) -> bool {
         self.inner.refresh(aor)
     }

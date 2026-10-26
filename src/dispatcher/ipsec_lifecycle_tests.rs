@@ -43,7 +43,7 @@ pub(super) const ANSWER: &str = concat!(
 const T1: Duration = Duration::from_millis(2);
 
 /// Comfortably past Timer J (64*T1 = 128 ms).
-const PAST_TIMER_J: Duration = Duration::from_millis(600);
+pub(super) const PAST_TIMER_J: Duration = Duration::from_millis(600);
 
 pub(super) fn p_cscf(script: &str) -> (Proxy, Arc<IpsecManager>) {
     p_cscf_with_client_ports(script, "5064")
@@ -149,7 +149,7 @@ fn register(ue: SocketAddr, call_id: &str, cseq: u32, expires: u32) -> String {
 
 /// The UE sends `raw`; the registrar answers the relayed REGISTER with
 /// `status_code` and `extra` headers. Returns what the UE was sent.
-fn registrar_answers(
+pub(super) fn registrar_answers(
     proxy: &Proxy,
     ue: SocketAddr,
     raw: &str,

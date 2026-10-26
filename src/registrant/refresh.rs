@@ -82,6 +82,9 @@ pub async fn registration_loop(manager: Arc<RegistrantManager>, context: Registr
         manager.note_kernel_spis(ipsec.kernel_spi_snapshot().await);
         manager.install_ipsec(ipsec);
     }
+    // Every REGISTER goes under a client transaction of the dispatcher's
+    // (see `lifecycle`), which attaches its layer as it starts.
+    manager.transactions_attached().await;
 
     loop {
         tokio::time::sleep(tick_interval).await;
@@ -101,7 +104,7 @@ fn run_tick(
     // as possible.
     for built in manager.take_pending_deregistrations() {
         debug!(destination = %built.destination, "sending de-REGISTER for a removed registrant");
-        send_registrant_message(&context.outbound, egress, built);
+        send_registrant_message(manager, &context.outbound, egress, built);
     }
 
     // SAs of entries that moved off an address (before the new address's
@@ -109,6 +112,14 @@ fn run_tick(
     // those of removed entries whose de-REGISTER went unanswered.
     manager.expire_teardowns(std::time::Instant::now());
     delete_queued_sas(manager, context, egress);
+
+    // Shutting down: nothing is started, and the sockets and connections stay
+    // as they are, so the de-REGISTERs, their retransmissions and their
+    // answers (a challenge among them) still have them. They close with the
+    // process.
+    if manager.is_shutting_down() {
+        return;
+    }
 
     // Sockets for every entry that registers from an address of its own. An
     // entry whose socket cannot bind sits this tick out.
@@ -124,15 +135,8 @@ fn run_tick(
     // this trunk over.
     force_refresh_lost_connections(manager, &context.connection_pool);
 
-    // Time out entries stuck in Registering/Challenging (RFC 3261 Timer F —
-    // 32s). Catches dead sockets where no response ever arrives, and a per-UE
-    // address that left the host (its sends fail in the kernel).
-    for aor in manager.entries_timed_out() {
-        warn!(aor = %aor, "REGISTER transaction timed out — no response received");
-        manager.handle_failure(&aor, 0, None);
-    }
-    // The temporary SA sets the timeouts abandoned.
-    delete_queued_sas(manager, context, egress);
+    // An unanswered REGISTER is retransmitted and timed out by its client
+    // transaction (RFC 3261 Timer E / Timer F), not here: see `lifecycle`.
 
     let now = tokio::time::Instant::now();
     for aor in manager.entries_due() {
@@ -152,7 +156,7 @@ fn run_tick(
             continue;
         };
         debug!(aor = %aor, branch = %built.branch, "sending REGISTER");
-        if let Err(error) = context.outbound.send(outbound_message(egress, built)) {
+        if let Err(error) = send_register(manager, &context.outbound, egress, &built) {
             warn!(aor = %aor, %error, "failed to send REGISTER");
             manager.handle_failure(&aor, 0, None);
         }
@@ -357,7 +361,7 @@ pub(super) fn force_refresh_lost_connections(
 }
 
 /// The wire form of a built REGISTER, HEP-captured.
-fn outbound_message(egress: &RegistrantEgress, built: BuiltRegister) -> OutboundMessage {
+fn outbound_message(egress: &RegistrantEgress, built: &BuiltRegister) -> OutboundMessage {
     let data = Bytes::from(built.message.to_bytes());
 
     if let Some(ref hep) = egress.hep_sender {
@@ -388,17 +392,33 @@ fn outbound_message(egress: &RegistrantEgress, built: BuiltRegister) -> Outbound
     }
 }
 
-/// Put one built registrant message on the wire, with HEP capture.
+/// Put a built REGISTER on the wire under its client transaction (see
+/// [`RegistrantManager::open_transaction`]), with HEP capture.
+fn send_register(
+    manager: &RegistrantManager,
+    outbound: &OutboundRouter,
+    egress: &RegistrantEgress,
+    built: &BuiltRegister,
+) -> Result<(), String> {
+    let message = outbound_message(egress, built);
+    manager.open_transaction(&built.message, &message)?;
+    outbound.send(message).map_err(|error| error.to_string())
+}
+
+/// Put one built de-registration on the wire.
 ///
 /// Shared by the two de-registration paths — an entry removed at run time, and
 /// shutdown. Both are fire-and-forget: the entry is already gone, so there is
-/// nothing left to record a failure against.
+/// nothing left to record a failure against beyond the log.
 fn send_registrant_message(
+    manager: &RegistrantManager,
     outbound: &OutboundRouter,
     egress: &RegistrantEgress,
     built: BuiltRegister,
 ) {
-    let _ = outbound.send(outbound_message(egress, built));
+    if let Err(error) = send_register(manager, outbound, egress, &built) {
+        warn!(destination = %built.destination, %error, "failed to send de-REGISTER");
+    }
 }
 
 /// Clear every outbound binding this node holds, for shutdown.
@@ -408,44 +428,64 @@ fn send_registrant_message(
 /// transport before the process exits. Signalling the loop instead would race
 /// its 5-second sleep against `std::process::exit`.
 ///
-/// Every entry is removed, as [`RegistrantManager::remove`] does: a registered
-/// one queues its de-REGISTER, which leaves from the address it registered
-/// from (its own `local_addr` included), an IMS UE's over its SA set, whose
-/// sets then wait for the answer; the sets of any other go at once (see
-/// [`retire_ue_security_associations`]). Removing them also keeps the loop,
-/// which runs on through the drain, from refreshing a binding this just
-/// cleared.
+/// Shutdown begins first ([`RegistrantManager::begin_shutdown`]), before a
+/// de-REGISTER leaves, so nothing registers again afterwards: not the loop's
+/// refresh or retry, not a source reconcile or a script adding an entry or
+/// moving one to a new address, not a challenge answered meanwhile.
+///
+/// Every registered entry sends `Expires: 0` on its registration's Call-ID
+/// (TS 24.229 5.1.1.6), from the address it registered from (its own
+/// `local_addr` included) and, for an IMS UE, over its SA set; one whose
+/// REGISTER is in flight sends it when that is answered (see the `lifecycle`
+/// module). The entries are kept rather than removed: their answers, a
+/// challenge to answer among them, have to find them, and the loop keeps
+/// their sockets open while they do. De-REGISTERs of entries removed before
+/// the shutdown and not yet sent go out too.
 ///
 /// Returns how many de-registrations were sent.
 pub fn deregister_all(manager: &RegistrantManager, outbound: &OutboundRouter) -> usize {
     let Some(egress) = manager.egress.get() else {
         // The loop never started, so nothing ever registered.
+        manager.begin_shutdown();
         return 0;
     };
 
-    let aors: Vec<String> = manager
-        .entries
-        .iter()
-        .map(|entry| entry.aor.clone())
-        .collect();
-    for aor in aors {
-        manager.remove(&aor);
-    }
-
-    // Anything removed but not yet sent goes out too: this is the last chance
-    // to clear those bindings.
     let mut sent = 0;
-    for built in manager.take_pending_deregistrations() {
-        send_registrant_message(outbound, egress, built);
+    let removed = manager.take_pending_deregistrations();
+    for built in manager
+        .begin_deregistration(egress.defaults())
+        .into_iter()
+        .chain(removed)
+    {
+        send_registrant_message(manager, outbound, egress, built);
         sent += 1;
     }
     sent
 }
 
 /// How long shutdown waits, from the de-REGISTERs [`deregister_all`] sent, for
-/// their answers to release the SA sets the de-REGISTERs rode (TS 24.229
-/// 5.1.1.6.1: the UE deletes them once nothing is registered over them).
-pub const SHUTDOWN_ANSWER_WAIT: Duration = Duration::from_secs(4);
+/// them to end ([`await_deregistrations`]): answered, a challenge to one
+/// answered too, and the SA sets they rode released (TS 24.229 5.1.1.6.1: the
+/// UE deletes them once nothing is registered over them). Long enough for
+/// Timer E to resend a lost one several times and for a challenge round trip
+/// over a slow network; with [`SHUTDOWN_DELETE_BOUND`] still inside the
+/// 30-second stop grace of a typical container runtime.
+pub const SHUTDOWN_ANSWER_WAIT: Duration = Duration::from_secs(20);
+
+/// Wait, until `deadline`, for every shutdown de-registration to end (see
+/// [`deregister_all`]). `false` when some had not by then.
+pub async fn await_deregistrations(
+    manager: &RegistrantManager,
+    deadline: tokio::time::Instant,
+) -> bool {
+    while manager.deregistrations_pending() {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    true
+}
 
 /// The most shutdown spends deleting the SA sets left after that wait.
 const SHUTDOWN_DELETE_BOUND: Duration = Duration::from_secs(5);
@@ -468,7 +508,9 @@ pub async fn retire_ue_security_associations(
     let (Some(ipsec), Some(egress)) = (manager.ipsec.get().cloned(), manager.egress.get()) else {
         return 0;
     };
-    while !manager.sa_deletions_settled() && tokio::time::Instant::now() < answers_by {
+    while (manager.deregistrations_pending() || !manager.sa_deletions_settled())
+        && tokio::time::Instant::now() < answers_by
+    {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     manager.surrender_all_sa_sets();

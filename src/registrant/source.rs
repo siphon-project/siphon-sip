@@ -559,10 +559,17 @@ pub struct ReconcileReport {
 /// Errors only when the source itself could not be read. That is deliberately
 /// distinct from an empty list: treating an outage as "no trunks" would
 /// de-register the whole estate because a database was briefly down.
+///
+/// Once shutdown has begun it does nothing: the shutdown de-registered every
+/// trunk and removed it, and reading the source then would add them all back
+/// and register them from a process that is going away.
 pub async fn reconcile_once(
     manager: &std::sync::Arc<super::RegistrantManager>,
     source: &RegistrantSource,
 ) -> Result<ReconcileReport, String> {
+    if manager.is_shutting_down() {
+        return Ok(ReconcileReport::default());
+    }
     let rows = source.fetch().await?;
 
     let mut desired = Vec::with_capacity(rows.len());
@@ -719,6 +726,10 @@ pub async fn reconcile_loop(
             }
         };
         tokio::time::sleep(delay).await;
+        if manager.is_shutting_down() {
+            info!("registrant shutting down: no longer following the configured source");
+            return;
+        }
     }
 }
 

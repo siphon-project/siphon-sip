@@ -32,6 +32,14 @@ Each refusal is logged at warn and counted in
 `too_many_contacts`, `invalid_aor`, `invalid_wildcard`). `registrar.save_proxy()` never answers a
 request, so it still raises `ValueError` for the same conditions.
 
+`registrar.save_proxy()` caches what the registrar of record granted, read from
+its 2xx (RFC 3261 §10.3 step 8): each contact gets the `expires` parameter on
+the reply's Contact for that binding (matched by URI), else the reply's
+`Expires` header. A contact the reply gives `expires=0` is removed, so the 2xx
+to a de-REGISTER that carries only `Contact: <...>;expires=0` clears the
+binding. It raises `ValueError`, caching nothing, only when a contact has
+neither.
+
 ## `registrar` namespace
 
 ::: siphon_sdk.mock_module.MockRegistrar

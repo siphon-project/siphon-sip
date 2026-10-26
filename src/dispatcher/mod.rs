@@ -62,6 +62,8 @@ mod in_dialog;
 mod inbound;
 mod inbound_filter;
 mod intercept;
+#[cfg(test)]
+mod ipsec_dereg_tests;
 mod ipsec_lifecycle;
 #[cfg(test)]
 mod ipsec_lifecycle_tests;
@@ -842,6 +844,12 @@ pub async fn run(
     let _ = drain.call_actors.set(Arc::clone(&state.call_actors));
 
     install_charging_hooks(&state);
+
+    // Every REGISTER the registrant sends goes under a client transaction of
+    // this layer, so it is retransmitted and timed out like any other request.
+    if let Some(registrant) = state.registrant_manager.as_ref() {
+        registrant.attach_transactions(Arc::new(RegisterTransactionLayer::of(&state)));
+    }
 
     // Published now as well as on the sweep, so the limit gauges are right
     // from the first scrape rather than thirty seconds in.

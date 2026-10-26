@@ -439,6 +439,11 @@ pub(super) fn process_timer_actions_with_followups(
                 let timer_id = format!("{}:{:?}", key, name);
                 state.timer_wheel.remove(&timer_id);
             }
+            // The registrant's own REGISTER, not a proxied branch: its entry
+            // fails instead (Timer F, RFC 3261 §17.1.2.2).
+            Action::Timeout if is_register_branch(&key.branch) => {
+                registrant_transaction_timed_out(key, state);
+            }
             Action::Timeout => {
                 // RFC 3261 §16.7 step 2: when a client transaction times out
                 // (Timer B for INVITE, Timer F otherwise), the proxy MUST

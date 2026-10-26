@@ -1,7 +1,8 @@
 //! What a 2xx to a REGISTER means for the UE's security associations: the
 //! pair it came over now carries a registration, or, when the REGISTER
-//! removed the last binding the UE held over it, goes once the server
-//! transaction is over (3GPP TS 24.229 clause 5.2.5.1). The rules are in
+//! removed the last binding the UE held over it, the binding goes at once and
+//! the pair once the server transaction is over (3GPP TS 24.229 clause
+//! 5.2.5.1). The rules are in
 //! [`crate::ipsec::retire`]; this is where the dispatcher, which sees the
 //! response leave, starts them. It runs whether the script relayed the
 //! response or answered the REGISTER itself.
@@ -10,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::error;
+use tracing::{debug, error};
 
 use super::DispatcherState;
 use crate::ipsec::retire::{Pending, RetireCondition};
@@ -34,7 +35,21 @@ pub(super) fn on_register_2xx(
     if !manager.has_sa(&ue.ip(), ue.port()) {
         return;
     }
-    if removes_every_binding(&register.headers) {
+    let deregistered = deregistered(&register.headers);
+    if let Some(deregistered) = &deregistered {
+        forget_deregistered_bindings(register, ue, deregistered);
+    }
+    if deregistered.is_some_and(|deregistered| deregistered.every_named) {
+        // TS 24.229 clause 5.2.5.1 step 2: "When all of the public user
+        // identities that were registered by this UE are deregistered, the
+        // P-CSCF shall delete any security associations ... towards the UE,
+        // after the server transaction (as defined in RFC 3261 [26])
+        // pertaining to this deregistration terminates". TS 33.203 clause
+        // 7.4.2a: "The P-CSCF shall delete all SAs it holds that are
+        // associated with a particular IMPI once all the associated IMPUs are
+        // de-registered." The 200 leaves over the pair; the retirement waits
+        // out the server transaction, then deletes the pair by its own SPIs,
+        // unless a binding of another identity is still registered over it.
         manager.retire_pair(
             ue.ip(),
             ue.port(),
@@ -225,32 +240,89 @@ fn server_transaction_lifetime(state: &DispatcherState, transport: Transport) ->
     }
 }
 
-/// Whether a REGISTER removes every binding it names (RFC 3261 §10.2.2): a
-/// `Contact: *` with `Expires: 0`, or Contacts that each end up with an
-/// expiration of zero, from their own `expires` parameter or else from the
-/// `Expires` header. A REGISTER without a Contact is a query, and one that
-/// cannot be read removes nothing.
-pub(super) fn removes_every_binding(headers: &SipHeaders) -> bool {
+/// The 2xx to a REGISTER from `ue` that de-registered contact addresses has
+/// left: the P-CSCF's own binding of each goes now. TS 24.229 clause 5.2.5.1
+/// step 1: "remove the binding between the public user identity found in the
+/// To header field (together with the implicitly registered public user
+/// identities) and the contact address indicated in the Contact header field".
+///
+/// The script may have removed it already (`registrar.save_proxy` with the
+/// 2xx), and then nothing is left to do here. When it did not (no call, or one
+/// refused because the 2xx carries the expiration on the Contact rather than
+/// in an `Expires` header), the binding outlived the de-registration as a live
+/// binding over the pair, so the retirement scheduled with it found the UE
+/// still registered and kept the pair until the binding expired.
+fn forget_deregistered_bindings(
+    register: &SipMessage,
+    ue: SocketAddr,
+    deregistered: &Deregistered,
+) {
+    let Some(registrar) = crate::script::api::registrar_arc() else {
+        return;
+    };
+    let Some(aor) = register
+        .headers
+        .to()
+        .and_then(|to| NameAddr::parse(to).ok())
+        .map(|to| to.uri.to_string())
+    else {
+        return;
+    };
+    let removed = registrar.remove_contacts_from(&aor, ue, deregistered.contacts.as_deref());
+    if removed > 0 {
+        debug!(
+            ue = %ue,
+            removed,
+            "IPsec: bindings de-registered over the pair removed (TS 24.229 clause 5.2.5.1)"
+        );
+    }
+}
+
+/// What a REGISTER de-registers (RFC 3261 §10.2.2).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Deregistered {
+    /// The URIs of the Contacts given an expiration of zero; `None` for a
+    /// `Contact: *` with `Expires: 0`, which takes every one.
+    contacts: Option<Vec<String>>,
+    /// Whether every Contact the REGISTER names is de-registered.
+    every_named: bool,
+}
+
+/// What a REGISTER de-registers: a `Contact: *` with `Expires: 0`, or the
+/// Contacts that end up with an expiration of zero, from their own `expires`
+/// parameter or else from the `Expires` header. `None` when it de-registers
+/// nothing: a registration, a query (no Contact), or one that cannot be read.
+pub(super) fn deregistered(headers: &SipHeaders) -> Option<Deregistered> {
     let expires_header = headers
         .get("Expires")
         .and_then(|value| value.trim().parse::<u32>().ok());
-    let Some(values) = headers.get_all("Contact") else {
-        return false;
-    };
+    let values = headers.get_all("Contact")?;
     let mut contacts = Vec::new();
     for value in values {
         if value.trim() == "*" {
-            return expires_header == Some(0);
+            return (expires_header == Some(0)).then_some(Deregistered {
+                contacts: None,
+                every_named: true,
+            });
         }
-        match NameAddr::parse_multi(value) {
-            Ok(parsed) => contacts.extend(parsed),
-            Err(_) => return false,
-        }
+        contacts.extend(NameAddr::parse_multi(value).ok()?);
     }
-    !contacts.is_empty()
-        && contacts
-            .iter()
-            .all(|contact| contact.expires.or(expires_header) == Some(0))
+    let named = contacts.len();
+    let zero: Vec<String> = contacts
+        .into_iter()
+        .filter(|contact| contact.expires.or(expires_header) == Some(0))
+        .map(|contact| contact.uri.to_string())
+        .collect();
+    (!zero.is_empty()).then_some(Deregistered {
+        every_named: zero.len() == named,
+        contacts: Some(zero),
+    })
+}
+
+/// Whether a REGISTER removes every binding it names ([`deregistered`]).
+#[cfg(test)]
+fn removes_every_binding(headers: &SipHeaders) -> bool {
+    deregistered(headers).is_some_and(|deregistered| deregistered.every_named)
 }
 
 #[cfg(test)]
@@ -317,6 +389,36 @@ mod tests {
             ("Contact", "<not a uri"),
             ("Expires", "0"),
         ])));
+    }
+
+    /// The Contacts given an expiration of zero are the ones de-registered,
+    /// whether or not every named Contact is; a wildcard names none.
+    #[test]
+    fn the_contacts_given_zero_are_the_ones_de_registered() {
+        assert_eq!(
+            deregistered(&headers(&[(
+                "Contact",
+                "<sip:ue@198.51.100.7:6101>;expires=0, <sip:ue@198.51.100.7:6103>;expires=600"
+            )])),
+            Some(Deregistered {
+                contacts: Some(vec!["sip:ue@198.51.100.7:6101".to_string()]),
+                every_named: false,
+            })
+        );
+        assert_eq!(
+            deregistered(&headers(&[("Contact", "*"), ("Expires", "0")])),
+            Some(Deregistered {
+                contacts: None,
+                every_named: true,
+            })
+        );
+        assert_eq!(
+            deregistered(&headers(&[
+                ("Contact", "<sip:ue@198.51.100.7:6101>"),
+                ("Expires", "600"),
+            ])),
+            None
+        );
     }
 
     /// A parameter of the URI is not the Contact's expiration.
