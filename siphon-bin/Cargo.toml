@@ -62,7 +62,7 @@ siphon-http = { git = "https://github.com/siphon-project/siphon-http", tag = "v2
 # default build pulls neither pyo3 nor siphon), so the composing binary asks for
 # it explicitly. Its pyo3 pin tracks siphon-sip's — both link the `python` native
 # library and cargo allows one version of a `links` crate per graph.
-siphon-sigtran = { git = "https://github.com/siphon-project/siphon-sigtran", tag = "v4.1.0", optional = true, features = ["python"] }
+siphon-sigtran = { git = "https://github.com/siphon-project/siphon-sigtran", tag = "v5.1.0", optional = true, features = ["python"] }
 
 clap = { version = "4", features = ["derive"] }
 # No `tracing` dep: this package's only code runs at builder time, before
