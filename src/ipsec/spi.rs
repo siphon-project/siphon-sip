@@ -373,9 +373,11 @@ impl IpsecManager {
     }
 
     /// A pair re-created under the same UE address and port with other SPIs
-    /// leaves its old states behind. Delete them, then give back the SPIs the
-    /// new pair no longer uses; in that order, so a later owner's state is
-    /// never hit.
+    /// (a retransmitted REGISTER challenged again) leaves its old states, and
+    /// the policies on a P-CSCF client port of its own, behind. Delete them
+    /// now, by its own SPIs and selectors, then give back the SPIs the new
+    /// pair no longer uses; in that order, so a later owner's state is never
+    /// hit.
     pub(super) async fn retire_replaced_pair(
         &self,
         replaced: SecurityAssociationPair,
@@ -393,6 +395,7 @@ impl IpsecManager {
             };
             self.del_sa(source, &destination, spi).await.ok();
         }
+        self.delete_policies_left_by(&replaced).await;
         let stale = replaced
             .local_inbound_spis()
             .into_iter()

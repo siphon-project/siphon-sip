@@ -206,15 +206,12 @@ pub async fn delete_sa_sets(
         let key = deletion.key;
         let installed = ipsec
             .get_sa(&ue_addr, key.ue_port_c)
-            .is_some_and(|sa| sa.spi_uc == key.spi_uc && sa.spi_us == key.spi_us);
-        if !installed {
+            .filter(|sa| sa.spi_uc == key.spi_uc && sa.spi_us == key.spi_us);
+        let Some(installed) = installed else {
             continue;
-        }
-        match ipsec.delete_sa_pair(&ue_addr, key.ue_port_c).await {
-            Ok(()) => deleted += 1,
-            Err(error) => {
-                warn!(%ue_addr, ue_port_c = key.ue_port_c, %error, "IPsec UE: failed to delete an SA set");
-            }
+        };
+        if ipsec.delete_installation(&installed).await {
+            deleted += 1;
         }
     }
     deleted

@@ -1485,7 +1485,7 @@
         "sig": "($self, *, hard_lifetime_secs=None)"
       },
       "cleanup": {
-        "doc": "Tear down all four XFRM states + policies for this pair.",
+        "doc": "Tear down all four XFRM states + policies for this pair, named by its",
         "kind": "method_descriptor",
         "sig": "($self)"
       },

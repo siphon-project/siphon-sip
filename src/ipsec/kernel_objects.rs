@@ -648,6 +648,27 @@ impl IpsecManager {
         }
     }
 
+    /// Delete the policies of `replaced`, a pair a newer one just replaced on
+    /// the same UE client port, that no live pair of the UE holds under the
+    /// same kernel key. With one P-CSCF protected client port the newer pair
+    /// holds all four selectors; with a port of its own (`ipsec.pcscf_port_c`
+    /// listing several) the policies of SA #3 and #4 on the replaced pair's
+    /// port are no one's any more and would stay in the kernel for good.
+    pub(super) async fn delete_policies_left_by(&self, replaced: &SecurityAssociationPair) {
+        let held: Vec<SecurityAssociationPair> = self
+            .associations
+            .iter()
+            .filter(|entry| entry.value().ue_addr == replaced.ue_addr)
+            .map(|entry| entry.value().clone())
+            .collect();
+        let orphaned: Vec<KernelObject> = kernel_objects(replaced)
+            .into_iter()
+            .filter(|object| matches!(object, KernelObject::Policy { .. }))
+            .filter(|object| !held.iter().any(|pair| shares_key(pair, object)))
+            .collect();
+        self.delete_kernel_objects(&orphaned).await;
+    }
+
     /// Tear down `sa`, which has already left `associations` and was in use
     /// or not as `sa_in_use` says, without taking a kernel object another
     /// live pair of the same UE holds.

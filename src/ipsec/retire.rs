@@ -39,7 +39,7 @@ use std::time::Duration;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use tokio::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::{IpsecManager, SecurityAssociationPair};
 
@@ -520,9 +520,12 @@ impl IpsecManager {
         let closed = self
             .close_unshared_connections(pair, &[pair.ue_port_c, pair.ue_port_s], reason)
             .await;
-        if let Err(error) = self.delete_sa_pair(&pair.ue_addr, pair.ue_port_c).await {
-            warn!(ue = %pair.ue_addr, ue_port_c = pair.ue_port_c, %error,
-                "IPsec: SA pair deletion failed");
+        // As this installation: the connections closing is a wait, and a pair
+        // re-created on the port meanwhile is not the one retired.
+        if !self.delete_installation(pair).await {
+            debug!(ue = %pair.ue_addr, ue_port_c = pair.ue_port_c,
+                "IPsec: SA pair replaced while retiring, the new one kept");
+            return;
         }
         info!(
             ue = %pair.ue_addr,

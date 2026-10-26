@@ -13248,6 +13248,10 @@ class MockPendingSA:
         ``None`` (default) preserves the original metadata-only
         transition.
 
+        When a newer challenge replaced this pair on the UE's protected
+        client port, siphon does nothing in the kernel: the newer pair is
+        not re-pinned or superseded through this one.
+
         In the mock, this only updates ``self.expires_secs`` so tests
         can assert the script wired the grant through correctly.
         """
@@ -13258,10 +13262,24 @@ class MockPendingSA:
             self.expires_secs = hard_lifetime_secs
 
     async def cleanup(self) -> None:
+        """Tear down this pair's four XFRM states and policies.
+
+        Only this pair, named by its own SPIs: when a retransmitted
+        REGISTER was challenged again, the newer pair that replaced this
+        one on the UE's protected client port is left alone (3GPP TS
+        33.203 clause 7.4).  Idempotent.  ``ipsec.stash`` runs it on a
+        stashed entry that expires or is displaced.
+        """
         self.is_cleaned = True
         self.is_active = False
 
     async def refresh(self, av_new: MockAuthVectorHandle) -> None:
+        """Re-key the pair with a new authentication vector.
+
+        Raises ``ValueError`` when the PendingSA was cleaned up, or when
+        a newer challenge replaced its pair on the UE's protected client
+        port (siphon only; the mock does not model replacement).
+        """
         if self.is_cleaned:
             raise ValueError("PendingSA already cleaned up")
         av_new._take()  # consume the new AV
