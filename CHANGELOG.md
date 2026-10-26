@@ -17,6 +17,10 @@ entry, but a working config keeps working.
 
 - **crypto-bigint 0.7.9.** 0.7.7 (pulled in by the p256 0.14 bump) was yanked; both lockfiles move to 0.7.9, a patch release.
 
+### Fixed
+
+- **No `SyntaxWarning` at startup on Python 3.12+.** A docstring example in the embedded `siphon` package (`b2bua.on_invite(request_uri=r"^sip:\+?881")`) sat in a non-raw docstring, so every process printed `"\+" is an invalid escape sequence` while loading it. The docstring is raw now; nothing changed at runtime.
+
 ## [1.15.4] — 2026-10-25
 
 ### Added
