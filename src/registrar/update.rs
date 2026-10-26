@@ -564,6 +564,36 @@ impl Registrar {
         true
     }
 
+    /// Remove the live UE bindings of `aor` (implicit-set aliases resolved, as
+    /// a lookup does) that were registered from `source` and whose Contact URI
+    /// is one of `contact_uris`, or every one from `source` when it is `None`
+    /// (a `Contact: *`). Each goes as [`remove_contact`](Self::remove_contact)
+    /// removes it. Returns how many were removed.
+    ///
+    /// A P-CSCF on the 200 to a UE's de-REGISTER (3GPP TS 24.229 clause
+    /// 5.2.5.1 step 1) removes the binding between the identity in To and
+    /// "the contact address registered via this P-CSCF via the respective
+    /// security associations": that UE's, never another device's binding of
+    /// the same identity.
+    pub fn remove_contacts_from(
+        &self,
+        aor: &str,
+        source: SocketAddr,
+        contact_uris: Option<&[String]>,
+    ) -> usize {
+        let doomed: Vec<String> = self
+            .lookup(aor)
+            .into_iter()
+            .filter(|contact| contact.source_addr == Some(source))
+            .map(|contact| contact.uri.to_string())
+            .filter(|uri| contact_uris.is_none_or(|named| named.iter().any(|name| name == uri)))
+            .collect();
+        doomed
+            .iter()
+            .filter(|uri| self.remove_contact(aor, uri))
+            .count()
+    }
+
     /// `Retry-After` for a REGISTER refused for too many contacts: the seconds
     /// until the soonest live binding on `aor` expires and frees a slot,
     /// clamped by [`clamp_retry_after`].
@@ -1094,6 +1124,55 @@ mod tests {
         // A registrar configured to grant nothing still answers a usable delay.
         assert_eq!(clamp_retry_after(Some(30), 0), 1);
         assert_eq!(clamp_retry_after(None, 0), 1);
+    }
+
+    /// Only the named contacts registered from that source go; `None` takes
+    /// every one from it; another device's binding of the identity stays.
+    #[test]
+    fn remove_contacts_from_takes_only_that_sources_named_bindings() {
+        let registrar = Registrar::default();
+        let aor = "sip:001010000000077@ims.example.invalid";
+        let ue: std::net::SocketAddr = "192.0.2.70:6100".parse().expect("an address");
+        let other_device: std::net::SocketAddr = "192.0.2.71:6100".parse().expect("an address");
+        let save = |user: &str, source: std::net::SocketAddr| {
+            registrar
+                .save_with_source(
+                    aor,
+                    crate::sip::parser::parse_uri_standalone(&format!(
+                        "sip:{user}@{}:6101",
+                        source.ip()
+                    ))
+                    .expect("a URI"),
+                    600,
+                    1.0,
+                    format!("{user}-call"),
+                    1,
+                    Some(source),
+                    Some(Transport::Udp),
+                )
+                .expect("saved");
+        };
+        save("first", ue);
+        save("second", ue);
+        save("device", other_device);
+        let uris = |source: std::net::SocketAddr| -> Vec<String> {
+            registrar
+                .lookup(aor)
+                .into_iter()
+                .filter(|contact| contact.source_addr == Some(source))
+                .map(|contact| contact.uri.to_string())
+                .collect()
+        };
+
+        let named = vec!["sip:first@192.0.2.70:6101".to_string()];
+        assert_eq!(registrar.remove_contacts_from(aor, ue, Some(&named)), 1);
+        assert_eq!(uris(ue), ["sip:second@192.0.2.70:6101"]);
+        // Named, but registered from another source: left alone.
+        let foreign = vec!["sip:device@192.0.2.71:6101".to_string()];
+        assert_eq!(registrar.remove_contacts_from(aor, ue, Some(&foreign)), 0);
+        assert_eq!(registrar.remove_contacts_from(aor, ue, None), 1);
+        assert!(uris(ue).is_empty());
+        assert_eq!(uris(other_device), ["sip:device@192.0.2.71:6101"]);
     }
 
     #[test]

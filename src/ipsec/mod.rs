@@ -2047,6 +2047,14 @@ impl IpsecManager {
         self.lifecycle.pending_len()
     }
 
+    /// The per-pair lifecycle stores (pairs noted registered, predecessors,
+    /// scheduled retirements) and the pairs kept for a network
+    /// de-registration's NOTIFY, for tests outside this module.
+    pub(crate) fn test_lifecycle_sizes(&self) -> (usize, usize, usize, usize) {
+        let (registered, predecessors, retiring) = self.lifecycle.sizes();
+        (registered, predecessors, retiring, self.network_dereg.len())
+    }
+
     /// The mock kernel's op log, for tests outside this module.
     pub(crate) fn test_kernel_ops(&self) -> Vec<String> {
         self.mock().ops.clone()

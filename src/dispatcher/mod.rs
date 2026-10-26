@@ -62,6 +62,8 @@ mod in_dialog;
 mod inbound;
 mod inbound_filter;
 mod intercept;
+#[cfg(test)]
+mod ipsec_dereg_tests;
 mod ipsec_lifecycle;
 #[cfg(test)]
 mod ipsec_lifecycle_tests;
