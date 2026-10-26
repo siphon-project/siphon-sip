@@ -11463,6 +11463,18 @@ def _is_terminated_subscription_state(subscription_state: str) -> bool:
     return rest == "" or rest.startswith(";") or rest[:1].isspace()
 
 
+# Final responses to a NOTIFY that end its subscription (RFC 6665 §4.2.2),
+# plus 408, which counts as the transaction timeout (RFC 5057 §5.1, note 4).
+_NOTIFY_FAILURES_ENDING_SUBSCRIPTION = frozenset(
+    [404, 405, 408, 410, 416, 480, 481, 482, 483, 484, 485, 489, 501, 604]
+)
+
+
+def _notify_ends_subscription(status: Optional[int]) -> bool:
+    """Mirror of the production rule: ``None`` is Timer F expiring."""
+    return status is None or status in _NOTIFY_FAILURES_ENDING_SUBSCRIPTION
+
+
 class MockPresence:
     """Mock ``presence`` namespace — SIP presence publish/subscribe for testing.
 
@@ -11488,6 +11500,12 @@ class MockPresence:
         from siphon_sdk.mock_module import get_presence
         p = get_presence()
         p.clear()
+
+    Answer the next NOTIFYs as a subscriber would, to test what a script does
+    once a subscription ends::
+
+        p.set_notify_response(481)   # the subscriber lost the dialog
+        p.set_notify_response(None)  # no answer: Timer F expires
     """
 
     def __init__(self) -> None:
@@ -11495,6 +11513,7 @@ class MockPresence:
         self._subscriptions: dict[str, dict] = {}  # id -> {subscriber, resource, event}
         self._notifications: list[dict[str, Any]] = []  # sent NOTIFYs
         self._next_sub_id: int = 0
+        self._notify_response: Optional[int] = 200
 
     def publish(self, entity: str, pidf_xml: str, expires: int = 3600) -> str:
         """Publish a presence document for a presentity.
@@ -11688,21 +11707,59 @@ class MockPresence:
 
     def notify(self, subscription_id: str, body: Optional[str] = None,
                content_type: Optional[str] = None,
-               subscription_state: str = "active") -> None:
-        """Send an in-dialog NOTIFY for a subscription.
+               subscription_state: str = "active",
+               wait_for_response: bool = False,
+               timeout_ms: int = 2000) -> Optional[int]:
+        """Send an in-dialog NOTIFY for a subscription.  Awaitable.
 
-        In the mock, this records the notification for test assertions.
+        In the mock, this records the notification for test assertions and
+        answers it with the status set by :meth:`set_notify_response` (200
+        unless set).
 
         When ``subscription_state`` indicates a terminated subscription
         (RFC 6665 §4.1.3 — bare ``"terminated"`` or
         ``"terminated;reason=..."``) the subscription is also removed from
         the store, mirroring the production auto-GC behavior.
 
+        The NOTIFY's final response is always acted on, whether or not the
+        script waits for it.  A subscriber that lost the dialog answers 481;
+        that, any other of the responses RFC 6665 §4.2.2 names (404, 405, 410,
+        416, 480-485, 489, 501, 604), a 408, or no final response before
+        Timer F removes the subscription, in the background, so the next
+        :meth:`subscribers` no longer lists it.  It is counted in
+        ``siphon_presence_subscriptions_removed_total{reason}``
+        (``notify_rejected`` / ``notify_timeout``).  A refresh that arrives
+        while the NOTIFY is out keeps the subscription: the subscriber still
+        holds the dialog.  Any other failure (a 5xx, say) only failed the
+        transaction and keeps it.
+
         Args:
             subscription_id: The subscription ID from ``subscribe_dialog()``.
             body: Optional body string (reginfo XML, PIDF XML, etc.).
             content_type: Content-Type of the body.
             subscription_state: Subscription-State header value (default ``"active"``).
+            wait_for_response: ``False`` (the default) resolves as soon as the
+                NOTIFY is handed to the transport, as it always has; the
+                removal above happens without the script.  ``True`` resolves
+                to the final status code instead.  Do not wait on the initial
+                NOTIFY inside the SUBSCRIBE handler that accepts the
+                subscription: that NOTIFY is held until the handler's 200 OK
+                is out (RFC 6665 §4.1.2.3), so the wait only ends at
+                ``timeout_ms``.
+            timeout_ms: How long ``wait_for_response=True`` waits before
+                resolving to ``None``.
+
+        Returns:
+            ``None``; with ``wait_for_response=True`` the final status
+            (``int``), or ``None`` when none arrived within ``timeout_ms``.
+
+        Example::
+
+            status = await presence.notify(sub_id, body=xml,
+                                           content_type="application/reginfo+xml",
+                                           wait_for_response=True)
+            if status == 481:
+                log.info("watcher gone, subscription removed")
         """
         async def _run():
             self._notifications.append({
@@ -11713,8 +11770,19 @@ class MockPresence:
             })
             if _is_terminated_subscription_state(subscription_state):
                 self._subscriptions.pop(subscription_id, None)
+            status = self._notify_response
+            if _notify_ends_subscription(status):
+                self._subscriptions.pop(subscription_id, None)
+            return status if wait_for_response else None
 
         return _run()
+
+    def set_notify_response(self, status: Optional[int]) -> None:
+        """Answer the NOTIFYs that follow with ``status`` (test helper).
+
+        ``None`` models a subscriber that never answers: Timer F expires.
+        """
+        self._notify_response = status
 
     def terminate(self, subscription_id: str, reason: Optional[str] = None,
                   body: Optional[str] = None,
@@ -11838,6 +11906,7 @@ class MockPresence:
         self._subscriptions.clear()
         self._notifications.clear()
         self._next_sub_id = 0
+        self._notify_response = 200
 
 
 class MockSrs:

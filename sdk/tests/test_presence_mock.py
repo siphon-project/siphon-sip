@@ -141,3 +141,47 @@ def test_find_by_dialog_ignores_non_dialog_subscription():
     presence.subscribe("sip:alice@ims.example.com", "sip:alice@ims.example.com",
                        event="reg", expires=3600)
     assert presence.find_by_dialog("", "") is None
+
+
+def _reg_subscription(presence):
+    return presence.subscribe_dialog(
+        subscriber="sip:watcher@192.0.2.7:5060",
+        resource="sip:001010000000001@ims.example.com",
+        event="reg",
+        expires=600,
+        call_id="notify-outcome",
+        from_tag="ft",
+        to_tag="nt",
+    )
+
+
+def test_notify_answered_481_removes_the_subscription():
+    presence = _fresh_presence()
+    sub_id = _reg_subscription(presence)
+    presence.set_notify_response(481)
+    status = run(presence.notify(sub_id, body="<reginfo/>", wait_for_response=True))
+    assert status == 481
+    assert presence.subscribers("sip:001010000000001@ims.example.com") == []
+
+
+def test_notify_timeout_removes_the_subscription():
+    presence = _fresh_presence()
+    sub_id = _reg_subscription(presence)
+    presence.set_notify_response(None)
+    assert run(presence.notify(sub_id)) is None
+    assert presence.subscription_count() == 0
+
+
+def test_notify_200_or_5xx_keeps_the_subscription():
+    presence = _fresh_presence()
+    sub_id = _reg_subscription(presence)
+    assert run(presence.notify(sub_id, wait_for_response=True)) == 200
+    presence.set_notify_response(503)
+    assert run(presence.notify(sub_id, wait_for_response=True)) == 503
+    assert presence.subscription_count() == 1
+
+
+def test_notify_without_waiting_resolves_to_none():
+    presence = _fresh_presence()
+    sub_id = _reg_subscription(presence)
+    assert run(presence.notify(sub_id)) is None

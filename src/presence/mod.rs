@@ -6,12 +6,14 @@
 //!
 //! Uses `DashMap` for lock-free concurrent access from multiple Tokio tasks.
 
+pub mod metrics;
 pub mod pidf;
 pub mod rls;
 pub mod winfo;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -109,6 +111,20 @@ pub struct Subscription {
     /// a UUID userpart and a port, which is exactly the difference a validating
     /// baseband rejects.
     pub remote_uri: Option<String>,
+    /// Which incarnation of the subscription this is: assigned when it is
+    /// added to a store and again on every refresh, from one process-wide
+    /// counter, so no two incarnations ever share a value.  A NOTIFY records
+    /// the generation it was sent under; its failure ends the subscription
+    /// only while that generation is still current (see
+    /// [`PresenceStore::remove_subscription_if_current`]).
+    pub generation: u64,
+}
+
+/// Source of [`Subscription::generation`] values.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Subscription {
@@ -139,6 +155,7 @@ impl Subscription {
             local_cseq: 0,
             local_uri: None,
             remote_uri: None,
+            generation: 0,
         }
     }
 
@@ -182,6 +199,7 @@ impl Subscription {
             local_cseq: 0,
             local_uri,
             remote_uri,
+            generation: 0,
         }
     }
 
@@ -259,6 +277,7 @@ impl Subscription {
         );
         self.expires = expires;
         self.created_at = Instant::now();
+        self.generation = next_generation();
     }
 }
 
@@ -297,6 +316,55 @@ fn generate_etag(entity: &str, body: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Why a NOTIFY's failure ended its subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyFailure {
+    /// A final response from the set RFC 6665 §4.2.2 names.
+    Rejected,
+    /// No final response before Timer F, or a 408.
+    TimedOut,
+}
+
+impl NotifyFailure {
+    /// Every value, for exporting each metric series at zero.
+    pub const ALL: [NotifyFailure; 2] = [NotifyFailure::Rejected, NotifyFailure::TimedOut];
+
+    /// The `reason` label of `siphon_presence_subscriptions_removed_total`.
+    pub fn label(self) -> &'static str {
+        match self {
+            NotifyFailure::Rejected => "notify_rejected",
+            NotifyFailure::TimedOut => "notify_timeout",
+        }
+    }
+}
+
+/// Whether the outcome of a NOTIFY transaction ends its subscription:
+/// `Some(status)` for the final response, `None` when none came before Timer
+/// F.
+///
+/// RFC 6665 §4.2.2:
+///
+/// > If the NOTIFY request fails due to expiration of SIP Timer F
+/// > (transaction timeout), the notifier SHOULD remove the subscription.
+/// >
+/// > If the NOTIFY transaction fails due to the receipt of a 404, 405,
+/// > 410, 416, 480-485, 489, 501, or 604 response to the NOTIFY request,
+/// > the notifier MUST remove the corresponding subscription.
+///
+/// 481 is the one a subscriber that lost the dialog answers with (§4.1.3:
+/// "it MUST return a 481 (Subscription does not exist) response").  A 408
+/// response counts as the timeout itself: "Receiving a 408 will have the same
+/// effect on usages and dialogs as a real transaction timeout" (RFC 5057
+/// §5.1, note 4).  Any other failure is a complaint about the transaction
+/// only and keeps the subscription.
+pub fn notify_failure(outcome: Option<u16>) -> Option<NotifyFailure> {
+    match outcome {
+        None | Some(408) => Some(NotifyFailure::TimedOut),
+        Some(404 | 405 | 410 | 416 | 480..=485 | 489 | 501 | 604) => Some(NotifyFailure::Rejected),
+        Some(_) => None,
+    }
+}
+
 /// Dialog state required to build an in-dialog NOTIFY, as returned by
 /// [`PresenceStore::prepare_notify`].
 #[derive(Debug, Clone)]
@@ -316,6 +384,8 @@ pub struct NotifyDialogState {
     pub to_tag: String,
     pub route_set: Vec<String>,
     pub cseq: u32,
+    /// The subscription's generation when the NOTIFY was prepared.
+    pub generation: u64,
 }
 
 /// Concurrent presence store — manages subscriptions and published documents.
@@ -342,7 +412,8 @@ impl PresenceStore {
     }
 
     /// Add a subscription and register it in the watchers map.
-    pub fn add_subscription(&self, subscription: Subscription) {
+    pub fn add_subscription(&self, mut subscription: Subscription) {
+        subscription.generation = next_generation();
         let resource = subscription.resource.clone();
         let subscription_id = subscription.id.clone();
 
@@ -388,6 +459,7 @@ impl PresenceStore {
             to_tag: subscription.to_tag.clone().unwrap_or_default(),
             route_set: subscription.route_set.clone(),
             cseq,
+            generation: subscription.generation,
         })
     }
 
@@ -395,18 +467,38 @@ impl PresenceStore {
     pub fn remove_subscription(&self, id: &str) {
         if let Some((_, subscription)) = self.subscriptions.remove(id) {
             debug!(subscription_id = %id, "removing subscription");
-
-            // Remove from watchers list for this resource.
-            if let Some(mut watcher_list) = self.watchers.get_mut(&subscription.resource) {
-                watcher_list.retain(|watcher_id| watcher_id != id);
-            }
-
-            // Clean up empty watcher entries.
-            self.watchers
-                .remove_if(&subscription.resource, |_key, watcher_list| {
-                    watcher_list.is_empty()
-                });
+            self.forget_watcher(id, &subscription.resource);
         }
+    }
+
+    /// Remove a subscription only while `generation` is still its current one,
+    /// and say whether it was removed.
+    ///
+    /// For a NOTIFY whose failure ends the subscription (RFC 6665 §4.2.2): the
+    /// response arrives a round trip, or a whole Timer F, after the NOTIFY
+    /// left.  A refresh SUBSCRIBE that landed meanwhile proves the subscriber
+    /// still holds the dialog and moves the subscription to a new generation,
+    /// so the late failure leaves it alone.  An id that is already gone is a
+    /// no-op returning `false`.
+    pub fn remove_subscription_if_current(&self, id: &str, generation: u64) -> bool {
+        let Some((_, subscription)) = self
+            .subscriptions
+            .remove_if(id, |_, subscription| subscription.generation == generation)
+        else {
+            return false;
+        };
+        debug!(subscription_id = %id, "removing subscription after a failed NOTIFY");
+        self.forget_watcher(id, &subscription.resource);
+        true
+    }
+
+    /// Drop `id` from the watchers of `resource`, and the entry once empty.
+    fn forget_watcher(&self, id: &str, resource: &str) {
+        if let Some(mut watcher_list) = self.watchers.get_mut(resource) {
+            watcher_list.retain(|watcher_id| watcher_id != id);
+        }
+        self.watchers
+            .remove_if(resource, |_key, watcher_list| watcher_list.is_empty());
     }
 
     /// Refresh a subscription's expiry. Returns `true` if the subscription was found.

@@ -305,6 +305,7 @@ Scrape `/metrics`. The handful that matter operationally:
 | `siphon_gateway_source_last_success_timestamp_seconds` | `time() - <gauge> > 3 * refresh_secs`, or the gauge is `0` | The carriers this node routes over are stale — it kept the last set it read, correctly, and nothing else says the controller has been unreachable for hours. `0` means it has *never* been read, so a node that booted against a dead controller has no carriers from the source at all. |
 | `siphon_gateway_source_failures_total` | sustained `rate() > 0` | Reads are failing now. Pair with the timestamp above, which says for how long. |
 | `siphon_registrant_source_*` | same pair, same thresholds | Outbound trunk registrations, tracked separately: a node can route over stale carriers with current registrations, or the reverse. |
+| `siphon_presence_subscriptions_removed_total{reason}` | `rate()` jumps with no matching drop in registrations | Subscriptions the notifier dropped because their NOTIFY failed (RFC 6665 §4.2.2): `notify_rejected` for a 481 and the other codes §4.2.2 names, `notify_timeout` for no final response before Timer F or a 408. A burst after a subscriber-side restart is expected (those watchers re-SUBSCRIBE); a steady rate means NOTIFYs are being sent to dialogs the subscribers no longer hold, or not reaching them at all. |
 
 The allocator exposes its own numbers alongside those, and they answer different
 questions — reading only one is how a fragmentation problem gets misfiled as a
