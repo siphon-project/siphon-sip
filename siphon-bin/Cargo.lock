@@ -3176,8 +3176,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-http"
-version = "2.0.0"
-source = "git+https://github.com/siphon-project/siphon-http?tag=v2.0.0#5b6d287f8c36f3ce9dd8439dda13ac2c6e5ec35c"
+version = "2.2.0"
+source = "git+https://github.com/siphon-project/siphon-http?tag=v2.2.0#dabc8b292942f239bc393241a485db4942638a21"
 dependencies = [
  "async-trait",
  "axum",
@@ -3243,7 +3243,7 @@ dependencies = [
 [[package]]
 name = "siphon-sip"
 version = "1.15.4"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#14f800de698170e3fee0763d939330eea803bc1e"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#446f5292f0daf173af7bfdbf1445cba362f05821"
 dependencies = [
  "aes",
  "arc-swap",
