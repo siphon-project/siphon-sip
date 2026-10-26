@@ -87,16 +87,27 @@ fn p_cscf() -> (
 }
 
 async fn install(manager: &IpsecManager, ue: IpAddr, port_us: u16, port_pc: u16) {
+    install_with_client_port(manager, ue, UE_PORT_C, port_us, port_pc).await;
+}
+
+/// [`install`] with the UE's protected client port `port_uc`.
+async fn install_with_client_port(
+    manager: &IpsecManager,
+    ue: IpAddr,
+    port_uc: u16,
+    port_us: u16,
+    port_pc: u16,
+) {
     let (spi_pc, spi_ps) = manager.allocate_spi_pair().expect("room in the partition");
     let sa = SecurityAssociationPair {
         ue_addr: ue,
         pcscf_addr: pcscf_ip(),
-        ue_port_c: UE_PORT_C,
+        ue_port_c: port_uc,
         ue_port_s: port_us,
         pcscf_port_c: port_pc,
         pcscf_port_s: PORT_PS,
-        spi_uc: 71_000,
-        spi_us: 81_000,
+        spi_uc: 71_000 + u32::from(port_uc),
+        spi_us: 81_000 + u32::from(port_uc),
         spi_pc,
         spi_ps,
         ealg: EncryptionAlgorithm::Null,
@@ -333,4 +344,101 @@ async fn without_the_p_cscf_tcp_connection_the_notify_stays_on_udp_with_the_reas
         .collect();
     assert_eq!(to_ue.len(), 1, "the NOTIFY still goes, over UDP");
     assert_eq!(to_ue[0].transport, Transport::Udp);
+}
+
+/// No connection reaches `listener` within a moment: nothing was opened to it.
+async fn assert_never_connected(listener: &tokio::net::TcpListener) {
+    let accepted = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+    assert!(
+        accepted.is_err(),
+        "a TCP connection was opened to the UE: {:?}",
+        accepted.map(|result| result.map(|(_, peer)| peer))
+    );
+}
+
+/// A UE that just de-registered (TS 24.229 clause 5.2.5.1): its pair is kept
+/// only for the transactions still pending on it, and the UE has dropped its
+/// own. An over-MTU request to it opens no TCP connection over the old set.
+///
+/// Before: the switch took any pair the destination matched, so it connected
+/// from the protected client port to the UE's protected server port, which the
+/// UE no longer serves.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_over_mtu_request_over_a_pair_being_retired_opens_no_tcp_connection() {
+    let _watchdog = watchdog("over-MTU NOTIFY over a retiring pair");
+    let (dispatcher, manager, _inbound) = p_cscf();
+    let ue: IpAddr = "127.0.0.63".parse().expect("an address");
+    let port_pc = free_port(pcscf_ip());
+    let listener = tokio::net::TcpListener::bind((ue, 0))
+        .await
+        .expect("the UE's protected server port");
+    let port_us = listener.local_addr().expect("bound").port();
+    install(&manager, ue, port_us, port_pc).await;
+    assert!(manager.retire_pair(
+        ue,
+        UE_PORT_C,
+        Duration::from_secs(30),
+        crate::ipsec::retire::RetireCondition::Unregistered,
+        "de-registered",
+    ));
+
+    let log = relay_logged(&dispatcher, &notify(ue, "reg-event-63"));
+    assert!(log.contains("not in use"), "the reason is logged:\n{log}");
+    assert_never_connected(&listener).await;
+    let sent: Vec<OutboundMessage> = dispatcher.udp.try_iter().collect();
+    assert!(
+        sent.iter()
+            .any(|sent| sent.destination.ip() == ue && sent.data.starts_with(b"NOTIFY")),
+        "the NOTIFY still goes, over UDP"
+    );
+}
+
+/// The destination is the client port of a pair an authentication still in
+/// progress set up beside the set in use: the UE may not hold it yet, so
+/// nothing is opened over it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_over_mtu_request_to_a_pending_pairs_flow_opens_no_tcp_connection() {
+    let _watchdog = watchdog("over-MTU NOTIFY to a pending pair");
+    let (dispatcher, manager, _inbound) = p_cscf();
+    let ue: IpAddr = "127.0.0.64".parse().expect("an address");
+    let port_pc = free_port(pcscf_ip());
+    let listener = tokio::net::TcpListener::bind((ue, 0))
+        .await
+        .expect("the UE's protected server port");
+    let port_us = listener.local_addr().expect("bound").port();
+    install_with_client_port(&manager, ue, 6200, port_us, port_pc).await;
+    install(&manager, ue, port_us, port_pc).await;
+    assert!(
+        manager.is_pending(&ue, UE_PORT_C),
+        "the new pair is pending"
+    );
+
+    relay_logged(&dispatcher, &notify(ue, "reg-event-64"));
+    assert_never_connected(&listener).await;
+}
+
+/// The UE's pair is gone and only its binding still names its protected
+/// ports: no TCP path is taken to them, over the association or probed in
+/// clear. The request itself is refused at egress, as any request in clear to
+/// such a port is.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_over_mtu_request_to_the_ports_of_a_deleted_pair_opens_no_tcp_connection() {
+    let _watchdog = watchdog("over-MTU NOTIFY to a deleted pair");
+    let (dispatcher, manager, _inbound) = p_cscf();
+    let ue: IpAddr = "127.0.0.65".parse().expect("an address");
+    let port_pc = free_port(pcscf_ip());
+    // The request goes to the client port the binding names; a listener there
+    // answers the unbound reachability probe.
+    let listener = tokio::net::TcpListener::bind((ue, UE_PORT_C))
+        .await
+        .expect("the UE's protected client port");
+    let port_us = free_port(ue);
+    install(&manager, ue, port_us, port_pc).await;
+    manager
+        .delete_sa_pair(&ue, UE_PORT_C)
+        .await
+        .expect("deleted");
+
+    relay_logged(&dispatcher, &notify(ue, "reg-event-65"));
+    assert_never_connected(&listener).await;
 }

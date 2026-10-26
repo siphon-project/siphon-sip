@@ -37,6 +37,12 @@ impl AwaitingNotify {
         self.pairs.remove(key);
     }
 
+    /// Whether the pair at contact key `key` is kept for the NOTIFY reporting
+    /// its network de-registration.
+    pub(super) fn awaits(&self, key: &str) -> bool {
+        self.pairs.contains_key(key)
+    }
+
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.pairs.len()

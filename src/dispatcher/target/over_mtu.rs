@@ -16,6 +16,13 @@
 //! the Via names the protected server port as for any request to the UE. When
 //! the connection cannot be opened, or the association carries no TCP, the
 //! request stays on UDP and the reason is logged.
+//!
+//! Only a pair in use for the destination's own flow (the UE's address and
+//! that port) opens the connection: not a pair still pending, nor an old set
+//! being retired after a de-registration, nor the ports of a pair already gone.
+//! And only requests come here (RFC 3261 clause 18.1.1): a response goes back
+//! over the transport its request came in on, to its source (clause 18.2.2),
+//! and is never moved to TCP.
 
 use super::*;
 
@@ -69,8 +76,33 @@ fn protected_over_mtu(
         return ProtectedOverMtu::NotProtected;
     }
     let Some(pair) = manager.find_sa_by_ue(&destination.ip(), destination.port()) else {
+        // A UE protected port whose pair is gone: the request is refused at
+        // egress, and a probe would send a SYN in clear to a port the UE only
+        // reads over the association (TS 33.203 clause 7.1).
+        if manager.is_barred_flow(destination) {
+            debug!(
+                serialized_len, mtu, %destination,
+                "transport: over-MTU request to a UE protected port whose security association \
+                 is gone; no TCP path is opened"
+            );
+            return ProtectedOverMtu::KeepUdp;
+        }
         return ProtectedOverMtu::NotProtected;
     };
+    // Only a pair the UE uses carries a new connection: not one an
+    // authentication in progress set up, which the UE may not hold yet, nor an
+    // old set kept for the transactions still pending on it, which a UE that
+    // de-registered has already dropped.
+    if !manager.opens_connections_over(&pair) {
+        warn!(
+            serialized_len, mtu, %destination,
+            ue_port_c = pair.ue_port_c,
+            ue_port_s = pair.ue_port_s,
+            "transport: forced UDP over-MTU send (the UE's security association for this flow \
+             is not in use: pending, or being retired)"
+        );
+        return ProtectedOverMtu::KeepUdp;
+    }
     match pair.tcp_flow_to_ue() {
         crate::ipsec::FlowToUe::NotProtected => ProtectedOverMtu::NotProtected,
         crate::ipsec::FlowToUe::Unusable(protocol) => {
