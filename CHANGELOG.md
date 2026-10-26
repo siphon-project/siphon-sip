@@ -20,6 +20,7 @@ entry, but a working config keeps working.
 ### Fixed
 
 - **No `SyntaxWarning` at startup on Python 3.12+.** A docstring example in the embedded `siphon` package (`b2bua.on_invite(request_uri=r"^sip:\+?881")`) sat in a non-raw docstring, so every process printed `"\+" is an invalid escape sequence` while loading it. The docstring is raw now; nothing changed at runtime.
+- **P-CSCF: no TCP connection over a security association the UE no longer (or not yet) holds.** The RFC 3261 §18.1.1 over-MTU switch toward a protected UE opened a connection from the protected client port to the UE's protected server port whenever the destination matched any pair, including an old set kept only for its pending transactions after a de-registration and a pair a challenge just set up. A UE that had de-registered refused that connect, and the request went fragmented over UDP after it. The switch now takes only a pair in use for that exact flow (UE address and port) and not being retired; a pair kept for the NOTIFY of a network de-registration still qualifies (TS 24.229 clause 5.2.5.2). The ports of a pair already deleted get no TCP probe at all, protected or in clear. Responses never take this path: a response goes back over the transport and listener its request came in on, to its source (RFC 3261 §18.2.2, RFC 3581), so the challenge to an initial REGISTER sent unprotected is answered unprotected over UDP whatever its size, while the UE's previous pair is still being retired.
 
 ## [1.15.4] — 2026-10-25
 

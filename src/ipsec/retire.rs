@@ -254,6 +254,23 @@ impl IpsecManager {
             .is_some_and(|entry| entry.value().spis == spis_of(pair))
     }
 
+    /// Whether a new connection to the UE may be opened over `pair`: a
+    /// P-CSCF pair in use (not one an authentication in progress set up and
+    /// the UE may not hold yet) that is not being retired (an old set kept
+    /// only for the transactions still pending on it, whose connections go
+    /// with it), unless it is kept for the NOTIFY of a network
+    /// de-registration, which the UE still holds it for (TS 24.229 clause
+    /// 5.2.5.2 NOTE 2).
+    pub(crate) fn opens_connections_over(&self, pair: &SecurityAssociationPair) -> bool {
+        if pair.role != super::SaRole::PCscf || !self.is_in_use(pair) {
+            return false;
+        }
+        !self.is_retiring(pair)
+            || self
+                .network_dereg
+                .awaits(&Self::contact_key(&pair.ue_addr, pair.ue_port_c))
+    }
+
     /// Note that a registrar binding was registered over the pair at
     /// `(ue_addr, ue_port_c)`, so it is retired once no live binding holds it
     /// ([`reconcile_registrations`](Self::reconcile_registrations)). Returns

@@ -52,6 +52,13 @@ impl DeletedFlows {
         self.ports.len()
     }
 
+    /// Whether `destination` is a remembered port whose bar still runs at `now`.
+    pub(super) fn bars(&self, destination: SocketAddr, now: Instant) -> bool {
+        self.ports
+            .get(&destination)
+            .is_some_and(|flow| flow.until > now)
+    }
+
     pub(super) fn prune(&self, now: Instant) {
         self.ports.retain(|_, flow| flow.until > now);
     }

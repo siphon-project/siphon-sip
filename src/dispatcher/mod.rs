@@ -93,6 +93,8 @@ mod sweep;
 mod target;
 mod tasks;
 mod timers;
+#[cfg(test)]
+mod unprotected_response_tests;
 
 #[cfg(test)]
 mod a_leg_reliable_provisional_tests;

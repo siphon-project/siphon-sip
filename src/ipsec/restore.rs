@@ -139,6 +139,27 @@ impl IpsecManager {
         true
     }
 
+    /// Whether `destination` is a UE protected port whose pair is gone (deleted
+    /// here, or lost with a previous process) and that no pair covers again: a
+    /// request to it is refused at egress ([`refuses_unprotected_send`]), so
+    /// nothing is opened toward it either. Read only; the egress check forgets
+    /// what is over.
+    ///
+    /// [`refuses_unprotected_send`]: Self::refuses_unprotected_send
+    pub(crate) fn is_barred_flow(&self, destination: SocketAddr) -> bool {
+        let now = Instant::now();
+        let barred = self.deleted_flows.bars(destination, now)
+            || self
+                .orphaned_flows
+                .endpoints
+                .get(&destination)
+                .is_some_and(|until| *until > now);
+        barred
+            && self
+                .find_sa_by_ue(&destination.ip(), destination.port())
+                .is_none()
+    }
+
     /// Forget the barred endpoints whose binding would have expired by now.
     /// Called from the periodic sweep, so the set drains on its own.
     pub fn prune_orphaned_flows(&self) {
