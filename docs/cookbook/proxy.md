@@ -58,6 +58,7 @@ async def route(request):
 |---|---|
 | `request.relay()` / `request.relay("sip:next@host")` | Forward to the next hop (or an explicit target). Like Kamailio `t_relay()`. |
 | `request.fork(targets, strategy="parallel"\|"sequential")` | Fork to many targets; first 2xx wins (parallel) or try in order (sequential). |
+| `request.relay(..., no_response_ms=4000)` | Give up on a branch that sends no response at all within that time, as a `408` (see [below](#failing-over-from-a-next-hop-that-never-answers)). `fork()` takes it too. |
 | `request.record_route()` | Insert this proxy into the dialog's route set so in-dialog requests come back. |
 | `request.loose_route()` | Consume the top `Route` and route the request onward (RFC 3261 §16.12). |
 | `request.reply(code, reason)` | Send a response from the proxy. |
@@ -95,6 +96,55 @@ instead of seeing the error. Returning without any of them drops silently.
 Re-targeting is bounded at 8 attempts per transaction (nothing in the protocol
 bounds a chain of fresh client transactions), after which the failure is
 forwarded.
+
+## Failing over from a next hop that never answers
+
+A branch whose next hop sends nothing back normally ends at Timer B (INVITE)
+or Timer F (anything else): 32 s, then a `408` into `@proxy.on_failure`. That
+is too slow when the script has somewhere else to go. `no_response_ms=` on
+`relay()` or `fork()` ends the branch sooner:
+
+```python
+@proxy.on_request("INVITE")
+def route(request):
+    request.relay(next_hop, no_response_ms=4000)
+
+@proxy.on_failure
+def failure_route(request, reply):
+    if reply.status_code == 408:
+        request.relay(backup_hop, no_response_ms=4000)   # try the other one
+    else:
+        reply.relay()
+```
+
+This is the check an S-CSCF needs for HSS based P-CSCF restoration (3GPP TS
+24.229 §5.4.3.3): a terminating request the P-CSCF does not answer at all
+"within a configurable time", which NOTE 24 puts below Timer B and Timer F.
+
+- **Only silence counts.** Any response stops the timer, a `100 Trying`
+  included. An INVITE that rang and then went quiet is left to Timer C
+  (`transaction.timer_c_secs`).
+- **The failure is a Timer B / F failure.** The branch ends as a locally
+  generated `408 Request Timeout` that goes through the same RFC 3261 §16.7
+  handling: `@proxy.on_failure`, the relay's own `on_failure=`, fork
+  aggregation. A parallel fork keeps waiting on its other branches, and a
+  sequential fork moves straight on to the next target, which gets the same
+  bound.
+- **No CANCEL before a provisional.** RFC 3261 §9.1 does not allow one, so the
+  INVITE is just no longer retransmitted. If the next hop answers late with a
+  provisional, that provisional is sent the CANCEL and is not forwarded, and
+  the final response that follows is ACKed and absorbed. A late 2xx is
+  forwarded, as every 2xx is (§16.7 step 5).
+- **The bound must be below the transaction timeout.** Below Timer B (32 s)
+  for an INVITE, below Timer F (`transaction.timeout_secs`, else 32 s) for
+  anything else. A value at or over it, zero, a negative one, or any value on
+  an ACK raises `ValueError`. It is refused rather than clamped, so the
+  number the script runs on is the number it wrote.
+- The caller's CANCEL, or another fork branch answering first, stops the
+  timer as well.
+
+`fork()` takes `on_reply=` and `on_failure=` the way `relay()` does; for a fork
+`on_failure` runs once, with the best failure, when every branch has failed.
 
 And to touch responses on the way back (rewrite headers, strip internal info):
 

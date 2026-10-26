@@ -305,6 +305,7 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
             flow,
             send_socket,
             strip,
+            no_response,
         } => {
             // RFC 3261 §16.2: a stateful proxy SHOULD send 100 Trying
             // immediately upon receiving an INVITE to stop UAC retransmissions.
@@ -343,6 +344,7 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
                 flow.as_ref(),
                 send_socket.as_ref(),
                 strip,
+                *no_response,
             );
             proxy_dialog_after_relay(&request_message, state);
         }
@@ -353,6 +355,7 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
             strategy,
             send_socket,
             strip,
+            no_response,
         } => {
             if targets.is_empty() {
                 warn!("fork with empty targets list");
@@ -409,6 +412,7 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
                     on_reply_cb,
                     on_failure_cb,
                     strip,
+                    *no_response,
                 );
                 proxy_dialog_after_relay(&request_message, state);
             }

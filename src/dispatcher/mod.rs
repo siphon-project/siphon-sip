@@ -293,6 +293,8 @@ mod proxy_flow_ack_tests;
 #[cfg(test)]
 mod proxy_late_answer_tests;
 #[cfg(test)]
+mod proxy_no_response_tests;
+#[cfg(test)]
 mod proxy_non_invite_timeout_tests;
 #[cfg(test)]
 mod proxy_protocol_tests;

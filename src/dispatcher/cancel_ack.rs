@@ -98,6 +98,14 @@ pub(super) fn cancel_fork_branches(
 fn cancel_proxy_branch(client_key: &TransactionKey, reasons: &[String], state: &DispatcherState) {
     use crate::transaction::state::CancelOutcome;
 
+    // The branch is being given up on anyway: a no-response timer on it would
+    // only answer it a second time.
+    if state.transaction_manager.disarm_no_response(client_key) {
+        state
+            .timer_wheel
+            .remove(&format!("{}:{:?}", client_key, TimerName::NoResponse));
+    }
+
     match state
         .transaction_manager
         .cancel_invite_client(client_key, reasons)
@@ -304,6 +312,7 @@ pub(super) fn start_next_fork_branch(
         branch_path,
         send_socket,
         strip,
+        no_response,
     ) = {
         let session = match session_arc.read() {
             Ok(s) => s,
@@ -326,6 +335,7 @@ pub(super) fn start_next_fork_branch(
                 .unwrap_or_default(),
             session.fork_send_socket.clone(),
             session.fork_strip.clone(),
+            session.fork_no_response,
         )
     };
 
@@ -368,6 +378,7 @@ pub(super) fn start_next_fork_branch(
             send_socket.as_ref(),
             state,
             &strip,
+            no_response,
         );
     }
 }

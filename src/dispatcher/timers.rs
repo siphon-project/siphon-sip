@@ -276,6 +276,12 @@ pub(super) fn fire_expired_timers_at(state: &DispatcherState, now: std::time::In
             TimerName::E => Some(ClientEvent::Nict(NictEvent::TimerE)),
             TimerName::F => Some(ClientEvent::Nict(NictEvent::TimerF)),
             TimerName::K => Some(ClientEvent::Nict(NictEvent::TimerK)),
+            // Ends the branch down the same `Action::Timeout` path as Timer B /
+            // Timer F, so the script's failure handling sees the same `408`.
+            TimerName::NoResponse if entry.key.method == crate::sip::message::Method::Invite => {
+                Some(ClientEvent::Ict(IctEvent::NoResponse))
+            }
+            TimerName::NoResponse => Some(ClientEvent::Nict(NictEvent::NoResponse)),
             _ => None,
         };
 

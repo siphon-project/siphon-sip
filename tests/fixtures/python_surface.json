@@ -2098,7 +2098,7 @@
       "fork": {
         "doc": "Fork to multiple targets.",
         "kind": "method_descriptor",
-        "sig": "($self, targets, strategy=\"parallel\", send_socket=None, strip=None)"
+        "sig": "($self, targets, strategy=\"parallel\", send_socket=None, strip=None, no_response_ms=None, on_reply=None, on_failure=None)"
       },
       "from_gateway": {
         "doc": "True when this request's source IP is a member of the resolved",
@@ -2186,7 +2186,7 @@
       "relay": {
         "doc": "Relay the request to its Request-URI, or to an explicit next-hop,",
         "kind": "method_descriptor",
-        "sig": "($self, next_hop=None, on_reply=None, on_failure=None, flow=None, send_socket=None, strip=None)"
+        "sig": "($self, next_hop=None, on_reply=None, on_failure=None, flow=None, send_socket=None, strip=None, no_response_ms=None)"
       },
       "remove_from_header_list": {
         "doc": "Remove a specific value from a multi-value (comma-separated) header.",

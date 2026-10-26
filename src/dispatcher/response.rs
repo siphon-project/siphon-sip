@@ -490,6 +490,20 @@ pub(super) fn handle_response(
                         );
                         return;
                     }
+                    // A provisional on an INVITE the no-response timer gave up
+                    // on: its branch has had its `408`, and the CANCEL this
+                    // provisional released (RFC 3261 §9.1) went above.
+                    if !should_forward
+                        && key.method == crate::sip::message::Method::Invite
+                        && state.transaction_manager.invite_client_gave_up(key)
+                    {
+                        debug!(
+                            branch = %branch,
+                            status = status_code,
+                            "provisional for a branch given up on before any response: absorbed"
+                        );
+                        return;
+                    }
                 }
                 Err(_) => {
                     // No transaction found — fall through to normal processing
@@ -676,7 +690,8 @@ pub(super) fn handle_response(
                                 source_addr.port(),
                                 Arc::clone(&state.local_domains),
                             )
-                            .with_self_identity(Arc::clone(&state.self_identity));
+                            .with_self_identity(Arc::clone(&state.self_identity))
+                            .with_client_timeouts(state.transaction_manager.timers());
                             // Replay the inbound flow capture so
                             // registrar.save(flow_token=…) /
                             // request.relay(flow=…) called from the
@@ -1365,7 +1380,8 @@ pub(super) fn run_reply_handlers(
         source_addr.port(),
         Arc::clone(&state.local_domains),
     )
-    .with_self_identity(Arc::clone(&state.self_identity));
+    .with_self_identity(Arc::clone(&state.self_identity))
+    .with_client_timeouts(state.transaction_manager.timers());
     // Replay the inbound flow capture so `@proxy.on_reply` handlers
     // that call `registrar.save(flow_token=…)` /
     // `registrar.save_proxy(flow_token=…)` see the same listener
@@ -1489,7 +1505,8 @@ pub(super) fn run_proxy_cancel_handlers(
         source_addr.port(),
         Arc::clone(&state.local_domains),
     )
-    .with_self_identity(Arc::clone(&state.self_identity));
+    .with_self_identity(Arc::clone(&state.self_identity))
+    .with_client_timeouts(state.transaction_manager.timers());
     py_request_obj.set_local_port(inbound_local_addr.port());
     py_request_obj.set_inbound_flow(inbound_local_addr, inbound_connection_id.0);
 

@@ -13,6 +13,11 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **`no_response_ms=` on `request.relay()` and `request.fork()`: give up on a branch that sends nothing back.** A next hop silent for that many milliseconds (no response of any kind, a `100 Trying` counts) has its branch ended as a locally generated `408 Request Timeout`, which goes down the same RFC 3261 §16.7 path a Timer B / Timer F expiry takes: `@proxy.on_failure`, the relay's `on_failure=`, fork aggregation, a sequential fork's next target. A script can fail over in seconds instead of 32 s, which is what an S-CSCF needs to detect an unresponsive P-CSCF for HSS based P-CSCF restoration (3GPP TS 24.229 §5.4.3.3, a time "less than timer B and timer F"). The request stops being retransmitted; an INVITE is not CANCELled before a provisional (RFC 3261 §9.1), and a provisional that arrives after the give-up is sent the CANCEL and not forwarded. Once any response has arrived the bound no longer applies (an INVITE that rang and went quiet stays Timer C's). The value must be below Timer B for an INVITE and below Timer F (`transaction.timeout_secs`) otherwise; a value at or over it, a non-positive one, or one on an ACK raises `ValueError` rather than being clamped.
+- **`request.fork()` takes `on_reply=` and `on_failure=`**, the per-request callbacks `relay()` already took. For a fork, `on_failure` runs once, with the best failure, when every branch has failed.
+
 ### Security
 
 - **crypto-bigint 0.7.9.** 0.7.7 (pulled in by the p256 0.14 bump) was yanked; both lockfiles move to 0.7.9, a patch release.

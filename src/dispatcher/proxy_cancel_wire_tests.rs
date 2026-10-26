@@ -90,6 +90,7 @@ fn relayed_from_the_pinned_listener(
         flow,
         send_socket,
         &[],
+        None,
     );
     let mut sent = sent_to(&proxy, SILENT);
     assert_eq!(sent.len(), 1, "the INVITE");
