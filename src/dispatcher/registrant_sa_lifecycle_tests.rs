@@ -362,8 +362,13 @@ async fn shutdown_deletes_every_set_answered_or_not_within_its_bound() {
         crate::registrant::deregister_all(&harness.registrant, &harness.dispatcher.state.outbound);
     assert_eq!(sent, 1, "UE 2 was mid-authentication, not registered");
     assert!(
-        harness.registrant.is_empty(),
+        harness.registrant.entries_due().is_empty(),
         "the loop has nothing left to refresh"
+    );
+    assert_eq!(
+        harness.registrant.deregistration(&impu(2)),
+        crate::registrant::Deregistration::Owed,
+        "UE 2 de-registers once its REGISTER in flight is answered"
     );
     let deregistration = harness.sent().await;
     assert!(header(&deregistration, "Expires").is_some_and(|value| value == "0"));
@@ -507,5 +512,10 @@ async fn every_store_drains_to_zero_across_lifecycle_cycles() {
         assert_eq!(harness.ipsec.test_kernel_live_count(), 0, "cycle {cycle}");
         assert_eq!(harness.ipsec.test_spi_owner_count(), 0, "cycle {cycle}");
         harness.sqn = 0;
+        if cycle % 2 == 1 {
+            // A shut-down registrant registers nothing again, as the process it
+            // belongs to is going away: the next cycle is the next process.
+            harness = Harness::new();
+        }
     }
 }

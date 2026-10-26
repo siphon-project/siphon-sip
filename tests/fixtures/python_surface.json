@@ -1804,7 +1804,7 @@
         "sig": "(func)"
       },
       "refresh": {
-        "doc": "Force an immediate re-registration for an AoR.",
+        "doc": "Force an immediate re-registration for an AoR. False when there is no",
         "kind": "method_descriptor",
         "sig": "($self, aor)"
       },

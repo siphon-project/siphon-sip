@@ -7,7 +7,7 @@ mod admin_start;
 mod bootstrap;
 pub mod config_reload;
 mod python_thread;
-mod shutdown_sequence;
+pub(crate) mod shutdown_sequence;
 use shutdown_sequence::run_shutdown_sequence;
 mod event_clock;
 mod sbi_callbacks;

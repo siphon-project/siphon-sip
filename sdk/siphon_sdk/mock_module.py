@@ -8502,8 +8502,10 @@ class MockRegistration:
                 transport tls (udp and tcp take one); when another AoR already registers
                 from the same ``(local_addr, ue_port_c)`` (``ue_port_c`` is
                 None without ipsec, so two non-ipsec entries cannot share an
-                address); or when `refresh_window` breaks
-                ``0 < low <= high < 1`` — mirroring the Rust binding.
+                address); when `refresh_window` breaks
+                ``0 < low <= high < 1``; or once the process is shutting down
+                (it de-registered everything and registers nothing again) —
+                mirroring the Rust binding.
             TypeError: when `refresh_window` is not a tuple of two numbers.
 
         Example::
@@ -8603,8 +8605,10 @@ class MockRegistration:
 
         Raises:
             ValueError: `local_addr` is not an IP address; another AoR already
-                registers from it with the same ``ue_port_c``; or the entry's
-                transport is tls (udp and tcp take an address).
+                registers from it with the same ``ue_port_c``; the entry's
+                transport is tls (udp and tcp take an address); or the
+                process is shutting down and the address would change (a move
+                starts a fresh registration).
 
         Example::
 
@@ -8707,7 +8711,12 @@ class MockRegistration:
         return removed
 
     def refresh(self, aor: str) -> bool:
-        """Force an immediate re-registration for an AoR."""
+        """Force an immediate re-registration for an AoR.
+
+        Returns:
+            False when there is no such registration, and for every AoR once
+            the process is shutting down (no registration starts then).
+        """
         return aor in self._entries
 
     def list(self) -> list[dict]:

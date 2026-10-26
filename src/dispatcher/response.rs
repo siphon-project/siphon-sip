@@ -63,7 +63,7 @@ pub(super) fn handle_response(
         if let Some(top_via_raw) = message.headers.get("Via") {
             if let Ok(vias) = Via::parse_multi(top_via_raw) {
                 if let Some(branch) = vias.first().and_then(|v| v.branch.as_deref()) {
-                    if branch.starts_with("z9hG4bK-reg-") {
+                    if is_register_branch(branch) {
                         handle_registrant_response(
                             registrant,
                             &message,

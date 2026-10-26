@@ -110,6 +110,15 @@ impl TransactionManager {
         self.transactions.len()
     }
 
+    /// Number of active transactions whose key passes `counted`. A full scan,
+    /// for a periodic check, not a per-message path.
+    pub fn count_where(&self, counted: impl Fn(&TransactionKey) -> bool) -> usize {
+        self.transactions
+            .iter()
+            .filter(|entry| counted(entry.key()))
+            .count()
+    }
+
     /// Check if a transaction exists for the given key.
     pub fn contains(&self, key: &TransactionKey) -> bool {
         self.transactions.contains_key(key)

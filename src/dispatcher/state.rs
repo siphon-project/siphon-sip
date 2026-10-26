@@ -586,11 +586,16 @@ impl DrainState {
 
     /// Number of (transactions, b2bua_calls) currently active. Returns
     /// `(0, 0)` until the dispatcher has registered its managers.
+    ///
+    /// The registrant's own REGISTERs are not counted: shutdown waits for its
+    /// de-registrations separately, under a bound of their own
+    /// (`registrant::await_deregistrations`), and one left unanswered must not
+    /// hold the drain until its Timer F.
     pub fn active_counts(&self) -> (usize, usize) {
         let txs = self
             .transaction_manager
             .get()
-            .map(|tm| tm.count())
+            .map(|tm| tm.count_where(|key| !super::is_register_branch(&key.branch)))
             .unwrap_or(0);
         let calls = self
             .call_actors

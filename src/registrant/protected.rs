@@ -614,7 +614,7 @@ impl RegistrantManager {
         }
         if expires > 0 {
             entry.state = RegistrantState::Registering;
-            entry.last_sent_at = Some(Instant::now());
+            entry.in_flight_branch = Some(branch.clone());
         }
         match builder.build() {
             Ok(message) => Some(BuiltRegister {

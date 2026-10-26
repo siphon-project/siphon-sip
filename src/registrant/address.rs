@@ -82,11 +82,18 @@ fn keys_collide(ours: &(IpAddr, Vec<u16>), theirs: &(IpAddr, Vec<u16>)) -> bool 
 impl RegistrantManager {
     /// Add an entry, refusing one whose `local_addr` cannot be used: it is
     /// neither UDP nor TCP, or another entry (not one with the same AoR, which this replaces)
-    /// already registers from the same address and protected client port.
+    /// already registers from the same address and protected client port. Once
+    /// shutdown has begun every entry is refused (see `lifecycle`).
     ///
     /// An entry that requires an address and has none starts in
     /// [`RegistrantState::AwaitingAddress`].
     pub fn try_add(&self, mut entry: RegistrantEntry) -> Result<(), String> {
+        if self.is_shutting_down() {
+            return Err(format!(
+                "{}: the registrant is shutting down and starts no new registration",
+                entry.aor
+            ));
+        }
         let _guard = self
             .address_lock
             .lock()
@@ -188,6 +195,12 @@ impl RegistrantManager {
         };
         if current == local_addr {
             return Ok(true);
+        }
+        // A move starts a fresh registration from the new address.
+        if self.is_shutting_down() {
+            return Err(format!(
+                "{aor}: the registrant is shutting down and starts no new registration"
+            ));
         }
         if local_addr.is_some() && !own_address_transport(transport) {
             return Err(transport_error(aor, transport));
@@ -418,7 +431,7 @@ fn reset_for_new_address(entry: &mut RegistrantEntry, local_addr: Option<IpAddr>
     };
     entry.next_attempt = Instant::now();
     entry.expires_at = None;
-    entry.last_sent_at = None;
+    entry.in_flight_branch = None;
     entry.failure_count = 0;
     entry.last_failure_status = None;
     entry.backoff = std::time::Duration::from_secs(5);

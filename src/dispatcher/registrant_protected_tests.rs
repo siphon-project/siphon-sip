@@ -450,10 +450,10 @@ async fn an_unanswered_protected_refresh_falls_back_to_unprotected_after_timer_f
 
     let built = harness.register(&impu(1));
     assert!(built.protected);
-    test_support::backdate_last_sent(&harness.registrant, &impu(1), Duration::from_secs(33));
-    let timed_out = harness.registrant.entries_timed_out();
-    assert_eq!(timed_out, vec![impu(1)]);
-    harness.registrant.handle_failure(&impu(1), 0, None);
+    assert_eq!(
+        harness.registrant.transaction_timed_out(&built.branch),
+        Some(impu(1))
+    );
 
     test_support::make_due(&harness.registrant, &impu(1));
     let fallback = harness.register(&impu(1));
