@@ -602,9 +602,18 @@ banned and refused at the transport before its next INVITE is parsed.
   "args": { "direction": "ingress", "max_duration_ms": 60000, "silence_ms": 4000 } }
 ```
 
-Records the call's **decoded** audio to a wav file and replies with a
+Records the call's **decoded** audio to a file and replies with a
 `recording_id`. `record_stop {recording_id?}` finishes one, or every recording
 on the call when the id is absent.
+
+`format` is `wav` (16-bit PCM, the default) or `ogg_opus` (Opus in Ogg, RFC
+7845: about a seventh of the size, for a file that leaves the node).
+`bitrate_bps` sets the Opus target, 6000 to 510000 (RFC 6716 §2.1.1), default
+16000 per channel; it is refused with `wav` and outside that range, never
+ignored or clamped. `ogg_opus` needs an engine that lists `record_ogg_opus` in
+`node_info` (siphon-rtp 0.15.0): siphon asks first and refuses the verb
+otherwise, because an older engine cannot parse the format and would close the
+control connection rather than refuse the one command.
 
 `max_duration_ms` and `silence_ms` are the two stop conditions a voicemail
 greeting announces — "you have sixty seconds" and "stop talking and we'll hang

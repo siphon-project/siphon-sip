@@ -311,6 +311,8 @@ mod proxy_timer_c_tests;
 #[cfg(test)]
 mod public_api_surface;
 #[cfg(test)]
+mod recording_finished_event_tests;
+#[cfg(test)]
 mod refer_answer_tests;
 #[cfg(test)]
 mod relay_connection_hold_tests;

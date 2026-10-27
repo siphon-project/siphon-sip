@@ -4725,6 +4725,7 @@ class MockRtpEngine:
         self._media_timeout_handlers: list[dict[str, Any]] = []
         self._ws_tee_started_handlers: list[dict[str, Any]] = []
         self._ws_tee_ended_handlers: list[dict[str, Any]] = []
+        self._recording_finished_handlers: list[dict[str, Any]] = []
         self._play_finished_handlers: list[dict[str, Any]] = []
         self._ws_bridge_started_handlers: list[dict[str, Any]] = []
         self._ws_bridge_ended_handlers: list[dict[str, Any]] = []
@@ -5587,15 +5588,22 @@ class MockRtpEngine:
     async def start_recording(self, target: Any, path: Optional[str] = None,
                               direction: str = "ingress", channels: str = "mono",
                               max_duration_ms: Optional[int] = None,
-                              silence_ms: Optional[int] = None, scope: Optional[str] = None) -> str:
-        """Start recording what the caller says to a 16-bit PCM WAV file.
+                              silence_ms: Optional[int] = None, scope: Optional[str] = None,
+                              format: str = "wav",
+                              bitrate_bps: Optional[int] = None) -> str:
+        """Start recording the call's decoded audio to a file.
 
         Returns on the engine's accept with the ``recording_id``; the recording
         runs until :meth:`stop_recording`, ``max_duration_ms``, ``silence_ms``
-        or the end of the call. Works on a call the engine answered itself
-        (``answer_local``), which is what a voicemail box is. ``direction`` is
-        ``"ingress"`` (default), ``"egress"`` or ``"both"``; ``channels``
-        ``"mono"`` or ``"stereo"``. Native **siphon-rtp** backend only.
+        or the end of the call. ``format`` is ``"wav"`` (16-bit PCM, the
+        default) or ``"ogg_opus"`` (Opus in Ogg, about a seventh of the size);
+        ``bitrate_bps`` sets the Opus target, 6000 to 510000, and is refused
+        with ``"wav"``. Works on a call the engine answered itself
+        (``answer_local``), which is what a voicemail box is, and on a relayed
+        call, where ``channels="stereo"`` puts each party on its own channel.
+        ``direction`` is ``"ingress"`` (default), ``"egress"`` or ``"both"``;
+        ``channels`` ``"mono"`` or ``"stereo"``. Native **siphon-rtp** backend
+        only, and ``ogg_opus`` needs siphon-rtp 0.15.0 or later.
 
         In the mock the id is ``"rec-<n>"`` and the recording is pending until
         the test calls :meth:`finish_recording`.
@@ -5605,6 +5613,13 @@ class MockRtpEngine:
         only one is anchored, else the node's call. ``ValueError`` when
         invalid, or on a B2BUA ``Call``.
         """
+        if format not in ("wav", "ogg_opus"):
+            raise ValueError(f"format {format!r} is wav or ogg_opus")
+        if bitrate_bps is not None:
+            if format != "ogg_opus":
+                raise ValueError("bitrate_bps is an ogg_opus setting")
+            if not 6_000 <= bitrate_bps <= 510_000:
+                raise ValueError(f"bitrate_bps {bitrate_bps} is outside 6000 to 510000")
         if direction not in ("ingress", "egress", "both"):
             raise ValueError(f"direction {direction!r} is ingress, egress or both")
         if channels not in ("mono", "stereo"):
@@ -5618,19 +5633,33 @@ class MockRtpEngine:
             "op": "start_recording", "call_id": call_id, "from_tag": from_tag,
             "recording_id": recording_id, "path": path, "direction": direction,
             "channels": channels, "max_duration_ms": max_duration_ms,
-            "silence_ms": silence_ms,
+            "silence_ms": silence_ms, "format": format, "bitrate_bps": bitrate_bps,
         })
         return recording_id
 
     def finish_recording(self, recording_id: str, *, path: Optional[str] = None,
-                         duration_ms: int = 0, reason: str = "stopped") -> None:
-        """Test helper: the engine reports ``recording_id`` ended and closed."""
+                         duration_ms: int = 0, reason: str = "stopped",
+                         scope: Optional[str] = None) -> int:
+        """Test helper: the engine reports ``recording_id`` ended and closed.
+
+        Resolves a :meth:`wait_recording` on it and fires the matching
+        :meth:`on_recording_finished` handlers with the call and tag the
+        recording was started on. Returns how many handlers fired.
+        """
         finished = getattr(self, "finished_recordings", {})
         finished[recording_id] = {
             "recording_id": recording_id, "path": path,
             "duration_ms": duration_ms, "reason": reason,
         }
         self.finished_recordings = finished
+        started = next((call for call in self.media_calls
+                        if call.get("op") == "start_recording"
+                        and call.get("recording_id") == recording_id), None)
+        if started is None:
+            return 0
+        return self.fire_recording_finished(
+            started["call_id"], started["from_tag"], recording_id,
+            path=path, reason=reason, duration_ms=duration_ms, scope=scope)
 
     async def wait_recording(self, target: Any, recording_id: str,
                              timeout_ms: int = 3_600_000, scope: Optional[str] = None) -> Optional[dict]:
@@ -5654,7 +5683,9 @@ class MockRtpEngine:
                      direction: str = "ingress", channels: str = "mono",
                      max_duration_ms: Optional[int] = None,
                      silence_ms: Optional[int] = None,
-                     timeout_ms: Optional[int] = None, scope: Optional[str] = None) -> Optional[dict]:
+                     timeout_ms: Optional[int] = None, scope: Optional[str] = None,
+                     format: str = "wav",
+                     bitrate_bps: Optional[int] = None) -> Optional[dict]:
         """Record and wait for the closed file: :meth:`start_recording` then
         :meth:`wait_recording`.
 
@@ -5671,7 +5702,8 @@ class MockRtpEngine:
         """
         recording_id = await self.start_recording(
             target, path=path, direction=direction, channels=channels,
-            max_duration_ms=max_duration_ms, silence_ms=silence_ms, scope=scope)
+            max_duration_ms=max_duration_ms, silence_ms=silence_ms, scope=scope,
+            format=format, bitrate_bps=bitrate_bps)
         return await self.wait_recording(target, recording_id, scope=scope)
 
     async def stop_recording(self, target: Any,
@@ -7332,6 +7364,61 @@ class MockRtpEngine:
             fired += 1
         return fired
 
+    def on_recording_finished(self, func_or_none: Any = None, *,
+                              call_id: Optional[str] = None,
+                              from_tag: Optional[str] = None) -> Any:
+        """Register a handler for **recording finished** events: a recording's
+        file is closed and can be read, moved or uploaded.
+
+        Fires once per recording the engine accepted, whoever started it and
+        however it ended. ``reason`` is ``"stopped"``, ``"max_duration"``,
+        ``"silence"``, ``"call_ended"``, ``"bridged"`` or ``"error"``; ``path``
+        is ``None`` only when the recording aborted before a file existed.
+        ``call_id`` is the SIP Call-ID of the party the recording was on.
+
+        Delivered by the native **siphon-rtp** backend only.
+
+        Usage::
+
+            @rtpengine.on_recording_finished
+            async def closed(call_id, from_tag, recording_id, path, reason, duration_ms):
+                if path and duration_ms > 0:
+                    await archive(call_id, path)
+        """
+        def decorator(fn: Any) -> Any:
+            self._recording_finished_handlers.append({
+                "fn": fn,
+                "call_id": call_id,
+                "from_tag": from_tag,
+            })
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def fire_recording_finished(self, call_id: str, from_tag: str, recording_id: str,
+                                path: Optional[str] = None, reason: str = "stopped",
+                                duration_ms: int = 0, scope: Optional[str] = None) -> int:
+        """Test helper: fire a recording-finished event.  Returns the number of
+        handlers that matched (and were invoked).
+
+        ``scope``: fire it as an event of a leg anchored under that
+        per-call scope; a handler that accepts a ``scope`` keyword is
+        given it, any other is called as before.
+        """
+        fired = 0
+        for entry in self._recording_finished_handlers:
+            if entry["call_id"] is not None and entry["call_id"] != call_id:
+                continue
+            if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
+                continue
+            # A handler that picks the file up is usually async; it runs to
+            # completion here, as the runtime runs it.
+            _run_async(_call_media_handler(entry["fn"], (call_id, from_tag, recording_id, path,
+                                                         reason, duration_ms), scope))
+            fired += 1
+        return fired
+
     def on_play_finished(self, func_or_none: Any = None, *,
                          call_id: Optional[str] = None,
                          from_tag: Optional[str] = None) -> Any:
@@ -7538,6 +7625,7 @@ class MockRtpEngine:
         self._media_timeout_handlers.clear()
         self._ws_tee_started_handlers.clear()
         self._ws_tee_ended_handlers.clear()
+        self._recording_finished_handlers.clear()
         self._play_finished_handlers.clear()
         self._ws_bridge_started_handlers.clear()
         self._ws_bridge_ended_handlers.clear()

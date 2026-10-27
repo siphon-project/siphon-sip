@@ -884,6 +884,33 @@ async fn record_start_rejects_unknown_selectors() {
     }
 }
 
+/// A format or bitrate the caller would not get is refused before the call is
+/// touched, in the caller's own words.
+#[tokio::test]
+async fn record_start_rejects_a_format_or_bitrate_it_cannot_honour() {
+    let channel = channel();
+    for (args, needle) in [
+        (serde_json::json!({"format": "mp3"}), "mp3"),
+        (serde_json::json!({"bitrate_bps": 16000}), "ogg_opus"),
+        (
+            serde_json::json!({"format": "ogg_opus", "bitrate_bps": 1000}),
+            "1000",
+        ),
+        (
+            serde_json::json!({"format": "ogg_opus", "bitrate_bps": "fast"}),
+            "fast",
+        ),
+    ] {
+        match record_start(&channel, &args).await {
+            ControlResult::Error { code, message, .. } => {
+                assert_eq!(code, ControlErrorCode::BadRequest, "{args}: {message}");
+                assert!(message.contains(needle), "{args}: {message}");
+            }
+            other => panic!("{args} should be a bad request, got {other:?}"),
+        }
+    }
+}
+
 /// With no media session there is nothing to record; the typed `not_found`
 /// is what tells an app to anchor the leg first rather than retry.
 #[tokio::test]

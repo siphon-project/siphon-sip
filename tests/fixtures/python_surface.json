@@ -2655,6 +2655,11 @@
         "kind": "method_descriptor",
         "sig": "($self, func_or_none=None, *, call_id=None, from_tag=None)"
       },
+      "on_recording_finished": {
+        "doc": "Register a handler for **recording finished** events: a recording's",
+        "kind": "method_descriptor",
+        "sig": "($self, func_or_none=None, *, call_id=None, from_tag=None)"
+      },
       "on_text": {
         "doc": "Register a handler for **RFC 4103 real-time text** (T.140) increments.",
         "kind": "method_descriptor",
@@ -2708,7 +2713,7 @@
       "record": {
         "doc": "Record what the caller says and wait until the file is closed: a dict",
         "kind": "method_descriptor",
-        "sig": "($self, target, path=None, direction=\"ingress\", channels=\"mono\", max_duration_ms=None, silence_ms=None, timeout_ms=None, scope=None)"
+        "sig": "($self, target, path=None, direction=\"ingress\", channels=\"mono\", max_duration_ms=None, silence_ms=None, timeout_ms=None, scope=None, format=\"wav\", bitrate_bps=None)"
       },
       "set_play_gain": {
         "doc": "Retune the playout gain of a playback that is already running \u2014 how a",
@@ -2723,7 +2728,7 @@
       "start_recording": {
         "doc": "Start recording what the caller says to a file, returning the engine's",
         "kind": "method_descriptor",
-        "sig": "($self, target, path=None, direction=\"ingress\", channels=\"mono\", max_duration_ms=None, silence_ms=None, scope=None)"
+        "sig": "($self, target, path=None, direction=\"ingress\", channels=\"mono\", max_duration_ms=None, silence_ms=None, scope=None, format=\"wav\", bitrate_bps=None)"
       },
       "stop_media": {
         "doc": "Send a `stop media` command \u2014 stop prompt playback on the monologue",
