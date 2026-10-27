@@ -241,6 +241,14 @@ class Route:
     anyone shows progress it does not have; ``True`` puts that one carrier back
     on failing over at ``timeout_secs``.  Omitted from the JSON when ``False``."""
 
+    record: bool = False
+    """Whether the routing answer asked for this call to be recorded when this
+    carrier carries it.
+
+    siphon starts nothing on its own: read it off ``call.active_route`` in
+    ``@b2bua.on_answer`` and start the recording there
+    (``rtpengine.start_recording``).  Omitted from the JSON when ``False``."""
+
     def is_routable(self) -> bool:
         """A route is routable if it names a gateway group, next-hop, or R-URI."""
         return bool(self.gateway_group or self.next_hop or self.ruri)
@@ -273,6 +281,8 @@ class Route:
             out["reroute_causes"] = list(self.reroute_causes)
         if self.reroute_after_progress:
             out["reroute_after_progress"] = True
+        if self.record:
+            out["record"] = True
         return out
 
     @classmethod
@@ -296,6 +306,7 @@ class Route:
             cdr_fields=dict(data.get("cdr_fields", {})),
             reroute_causes=list(data.get("reroute_causes", [])),
             reroute_after_progress=bool(data.get("reroute_after_progress", False)),
+            record=bool(data.get("record", False)),
         )
 
 

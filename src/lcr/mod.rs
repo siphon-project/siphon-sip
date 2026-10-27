@@ -296,6 +296,16 @@ pub struct Route {
     /// puts that one carrier back on failing over at `timeout_secs`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reroute_after_progress: bool,
+    /// Ask for this call to be recorded when this carrier carries it.
+    ///
+    /// siphon starts nothing on its own: the script reads it off
+    /// `call.active_route` once the call is answered and starts the recording
+    /// it wants (`rtpengine.start_recording`), so there is one place a
+    /// recording is started from whatever asked for it. On every route of an
+    /// answer when the call as a whole is to be recorded, whichever carrier
+    /// wins.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub record: bool,
     /// The whole `From` this attempt presents, dialog tag included, when a
     /// controller `dial` target named an identity of its own.
     ///
@@ -782,9 +792,10 @@ mod tests {
         let json = r#"{ "carrier_id": "carrier-a", "gateway_group": "pool-a",
             "tech_prefix": "1010288", "number_policy": "pstn-national@2026",
             "headers": { "X-Account": "42" }, "cdr_fields": { "billing_id": "B-9" },
-            "reroute_causes": [404, 503], "reroute_after_progress": true }"#;
+            "reroute_causes": [404, 503], "reroute_after_progress": true, "record": true }"#;
         let route: Route = serde_json::from_str(json).expect("parse route");
         assert!(route.reroute_after_progress);
+        assert!(route.record);
         assert_eq!(route.tech_prefix.as_deref(), Some("1010288"));
         assert_eq!(route.number_policy.as_deref(), Some("pstn-national@2026"));
         assert_eq!(
@@ -815,6 +826,8 @@ mod tests {
         assert!(!wire.contains("tech_prefix"));
         assert!(!wire.contains("reroute_causes"));
         assert!(!wire.contains("reroute_after_progress"));
+        assert!(!minimal.record, "a call is recorded only when the API asks");
+        assert!(!wire.contains("record"));
     }
 
     #[test]

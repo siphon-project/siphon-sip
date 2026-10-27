@@ -108,6 +108,7 @@ one of `gateway_group` / `next_hop` / `ruri`.
 | `cdr_fields` | object? | Fields siphon auto-stamps onto the CDR when this carrier wins (no per-field script). |
 | `reroute_causes` | int[]? | SIP codes from this carrier that fail over to the next (overrides per-gateway + global). |
 | `reroute_after_progress` | bool? | `true` fails this carrier over at `timeout_secs` even after it has sent a 101-199, for a carrier that plays its own ringback before it has reached anyone. Default `false`. Omitted when `false`. |
+| `record` | bool? | `true` asks for the call to be recorded when this carrier carries it. siphon starts nothing itself: the script reads `call.active_route.record` in `@b2bua.on_answer` and starts the recording (`rtpengine.start_recording`). Set it on every route of an answer to record the call whichever carrier wins. Default `false`. Omitted when `false`. |
 
 Top-level:
 

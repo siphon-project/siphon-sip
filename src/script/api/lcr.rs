@@ -140,6 +140,16 @@ impl PyRoute {
         self.inner.reroute_after_progress
     }
 
+    /// Whether the routing answer asked for this call to be recorded.
+    ///
+    /// siphon starts nothing on its own; read it off ``call.active_route`` in
+    /// ``@b2bua.on_answer`` and start the recording there
+    /// (``rtpengine.start_recording``).
+    #[getter]
+    fn record(&self) -> bool {
+        self.inner.record
+    }
+
     /// Per-minute rate (for CDR / charging).
     #[getter]
     fn rate(&self) -> Option<f64> {
