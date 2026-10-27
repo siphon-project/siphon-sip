@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.15.5] — 2026-10-27
+
 ### Added
 
 - **`b2bua.reoffer()` and `b2bua.session_sdp()`: tell one party something about the session it did not ask about.** `await b2bua.reoffer(call_id, sdp=None, leg="caller", timeout_ms=32000)` re-INVITEs the caller (or with `leg="callee"` the answered callee) with `sdp`, or the session in force toward it, under siphon's own `o=` at the dialog's next version (RFC 3264 §8), and resolves to the final status; `491` without anything sent when an INVITE toward that party is already in progress (RFC 3261 §14.1), `None` on no final response. The other party is told nothing, and neither is the media engine where the call is anchored: the party's answer to the session in force is not an answer to anything the engine offered, and handing it over drew an engine refusal. A 2xx makes the offer the session in force. `b2bua.session_sdp(call_id, leg="caller")` reads that session, for a script that re-offers it with one attribute changed. Works from any context, event callbacks included. Mirrored in the SDK mock (`reoffers`, `reoffer_status`, `session_sdps`).
