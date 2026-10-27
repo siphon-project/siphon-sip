@@ -10,8 +10,8 @@ use siphon_control_client::proto::media_flags::{MediaFlags, VadEngine};
 use siphon_control_client::proto::sip::{PeerHangupPolicy, PlayRepeat};
 use siphon_control_client::sip::{
     AorRing, DialOffer, DialOnAnswer, DialStrategy, DialTarget, OriginateMedia, OriginatePrivacy,
-    PlaySource, RecordChannels, RecordDirection, Ringback, RouteTarget, SessionRefresher,
-    SessionTimer, StreamChannels, StreamDirection, StreamMode, TargetIdentity,
+    PlaySource, RecordChannels, RecordDirection, RecordFormat, Ringback, RouteTarget,
+    SessionRefresher, SessionTimer, StreamChannels, StreamDirection, StreamMode, TargetIdentity,
 };
 
 /// Extract one `route` target: a bare URI `str`, or a dict
@@ -382,6 +382,18 @@ pub(crate) fn extract_record_channels(
         Some(name) => RecordChannels::from_name(&name).map(Some).ok_or_else(|| {
             PyValueError::new_err(format!(
                 "record channels must be \"mono\" or \"stereo\", not {name:?}"
+            ))
+        }),
+    }
+}
+
+/// Parse `record_start(format=...)`.
+pub(crate) fn extract_record_format(format: Option<String>) -> PyResult<Option<RecordFormat>> {
+    match format {
+        None => Ok(None),
+        Some(name) => RecordFormat::from_name(&name).map(Some).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "record format must be \"wav\" or \"ogg_opus\", not {name:?}"
             ))
         }),
     }

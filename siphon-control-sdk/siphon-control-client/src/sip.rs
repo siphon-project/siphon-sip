@@ -42,7 +42,9 @@ pub use crate::dial::{
     DialOffer, DialOnAnswer, DialOptions, DialStrategy, DialTarget, Dialing, Ringback,
     TargetIdentity,
 };
-pub use crate::recording::{RecordChannels, RecordDirection, RecordOptions, Recording};
+pub use crate::recording::{
+    RecordChannels, RecordDirection, RecordFormat, RecordOptions, Recording,
+};
 pub use crate::route_target::RouteTarget;
 use crate::server::{ControlServer, ServerConfig};
 use crate::session::CommandTransport;
@@ -2586,7 +2588,9 @@ mod tests {
                     .channels(RecordChannels::Stereo)
                     .max_duration_ms(60_000)
                     .silence_ms(4_000)
-                    .path("/var/spool/siphon/greeting.wav"),
+                    .path("/var/spool/siphon/greeting.ogg")
+                    .format(RecordFormat::OggOpus)
+                    .bitrate_bps(24_000),
             )
             .await
             .expect("record_start");
@@ -2601,7 +2605,9 @@ mod tests {
                 "channels": "stereo",
                 "max_duration_ms": 60_000,
                 "silence_ms": 4_000,
-                "path": "/var/spool/siphon/greeting.wav",
+                "path": "/var/spool/siphon/greeting.ogg",
+                "format": "ogg_opus",
+                "bitrate_bps": 24_000,
             })
         );
         assert_eq!(recording.recording_id.as_deref(), Some("rec-1"));

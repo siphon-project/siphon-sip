@@ -13,6 +13,10 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **Control SDKs 0.12.0: `record_start` takes a format and an Opus bitrate.** The server has taken `format` (`"wav"` or `"ogg_opus"`) and `bitrate_bps` since 1.15.5, but the typed SDKs could send neither, so a controller wanting an Ogg Opus file had to write the frame by hand. Rust `RecordOptions::format(RecordFormat::OggOpus)` / `.bitrate_bps(…)`, Python `call.record_start(format="ogg_opus", bitrate_bps=…)`, TypeScript `recordStart({ format: "ogg_opus", bitrateBps })`. Left unset, both stay off the wire and the server's defaults apply (`wav`, its per-channel Opus default). The range and the `wav` refusal stay the server's; Python refuses an unknown format name locally, as it does an unknown direction. `RecordOptions` gains two public fields, so code building it as a struct literal needs `..Default::default()`.
+
 ## [1.15.5] — 2026-10-27
 
 ### Added

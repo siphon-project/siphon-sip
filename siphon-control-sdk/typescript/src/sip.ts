@@ -1007,6 +1007,13 @@ export type RecordDirection = "ingress" | "egress" | "both";
 /** The channel layout of the recorded file. */
 export type RecordChannels = "mono" | "stereo";
 
+/**
+ * The file a recording is written as: `"wav"` (the server's default) or
+ * `"ogg_opus"` (RFC 7845), about a seventh of the size. An engine that cannot
+ * write Ogg Opus refuses the verb.
+ */
+export type RecordFormat = "wav" | "ogg_opus";
+
 /** Optional shaping for {@link Call.recordStart}. */
 export interface RecordOptions {
   /** Which side to record (`"ingress"` server-side when unset). */
@@ -1019,6 +1026,14 @@ export interface RecordOptions {
   silenceMs?: number;
   /** Where the engine writes the file. */
   path?: string;
+  /** The file format (`"wav"` server-side when unset). */
+  format?: RecordFormat;
+  /**
+   * Opus target bitrate in bits per second, `"ogg_opus"` only. The server
+   * refuses it with `"wav"` and outside 6000 to 510000 (RFC 6716 §2.1.1);
+   * unset is its per-channel default.
+   */
+  bitrateBps?: number;
 }
 
 /** What the server answers an accepted `record_start` with. */
@@ -1204,6 +1219,8 @@ export function recordStartArgs(options?: RecordOptions): Record<string, unknown
   if (options.maxDurationMs !== undefined) args.max_duration_ms = options.maxDurationMs;
   if (options.silenceMs !== undefined) args.silence_ms = options.silenceMs;
   if (options.path !== undefined) args.path = options.path;
+  if (options.format !== undefined) args.format = options.format;
+  if (options.bitrateBps !== undefined) args.bitrate_bps = options.bitrateBps;
   return args;
 }
 
@@ -2036,7 +2053,8 @@ export class Call {
   }
 
   /**
-   * Record this call's decoded audio to a wav file.
+   * Record this call's decoded audio to a file: wav by default, or Ogg Opus
+   * with `format: "ogg_opus"`.
    *
    * The reply names the `recordingId` a later {@link Call.recordStop}
    * addresses. It is **not** the file: `RecordingFinished` fires when the file
