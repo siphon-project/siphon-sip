@@ -51,6 +51,16 @@ class TestContract:
         assert data["reroute_after_progress"] is True
         assert Route.from_dict(data) == route
 
+    def test_record_defaults_off_and_round_trips(self):
+        # A call is recorded only when the API asks, and an API that never
+        # sets the field sends nothing.
+        assert Route(carrier_id="c", next_hop="sip:h").record is False
+        assert "record" not in Route(carrier_id="c", next_hop="sip:h").to_dict()
+        route = Route(carrier_id="carrier-a", gateway_group="pool-a", record=True)
+        data = route.to_dict()
+        assert data["record"] is True
+        assert Route.from_dict(data) == route
+
     def test_request_from_to_aliasing(self):
         request = LcrRequest(
             call_id="c", from_uri="sip:a@h", to_uri="sip:b@h",
