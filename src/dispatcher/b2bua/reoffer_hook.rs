@@ -154,13 +154,18 @@ pub fn run_reoffer_hook(
         "INVITE"
     };
     let offer = sdp_in_body(message_content_type(message), &message.body);
-    let facts = Arc::new(ReofferFacts::read(
+    let mut facts = ReofferFacts::read(
         method,
         offerer.from_a_leg,
         offer.as_deref(),
         in_force,
         early,
-    ));
+    );
+    facts.session = offerer
+        .read(call_id, state, |leg| leg.dialog.last_sent_sdp.clone())
+        .flatten()
+        .map(|sdp| String::from_utf8_lossy(&sdp).into_owned());
+    let facts = Arc::new(facts);
     let kept = answered.then(|| Arc::clone(&facts));
     if handlers.is_empty() {
         return ReofferHook::relay(kept);

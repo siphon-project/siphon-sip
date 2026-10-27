@@ -678,7 +678,8 @@ pub fn refuse_too_brief_refresh(
 /// the copy relayed to the originator, and it gets siphon's answer on the
 /// originator's dialog ([`negotiate_relayed_session_timer`]). A re-INVITE that
 /// carried the offer a refresh drew completes that refresh
-/// ([`complete_refresh_offer_relay`]).
+/// ([`complete_refresh_offer_relay`]), and a script's own re-offer hands its
+/// final status to the script ([`settle_reoffer`]).
 #[allow(clippy::too_many_arguments)]
 pub fn settle_reinvite_response(
     call_id: &str,
@@ -690,6 +691,8 @@ pub fn settle_reinvite_response(
     snapshot: &BLegResponseSnapshot,
     state: &DispatcherState,
 ) {
+    // A script waiting on a re-offer of its own learns how it ended.
+    settle_reoffer(&snapshot.branch, status_code);
     session_timer_on_response(
         call_id,
         !is_a2b,

@@ -1,0 +1,28 @@
+# SIPhon RFC 7866 recording awareness — see examples/recording_awareness.py
+#
+# A B2BUA anchored on the native siphon-rtp engine, which records the decoded
+# call in Ogg Opus when the caller asks with a=recordpref or a routing answer
+# says so. The caller's preference is stripped from everything relayed, so the
+# far party never sees it.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+  tcp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "voice.example.com"
+
+advertised_address: "voice.example.com"
+
+script:
+  path: "examples/recording_awareness.py"
+
+media:
+  backend: siphon-rtp
+  sdp_strip_attributes: ["recordpref"]
+  siphon_rtp:
+    address: "127.0.0.1:8080"     # siphon-rtp --control
+    timeout_ms: 2000

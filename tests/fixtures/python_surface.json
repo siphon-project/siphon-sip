@@ -113,6 +113,11 @@
         "kind": "method_descriptor",
         "sig": "($self, call_id, target, replaces=None)"
       },
+      "reoffer": {
+        "doc": "Re-offer one party of a call by its SIP Call-ID: a re-INVITE in the",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, sdp=None, leg=\"caller\", timeout_ms=32000)"
+      },
       "replace_peer": {
         "doc": "Replace one leg of an answered call with a freshly dialed target,",
         "kind": "method_descriptor",
@@ -122,6 +127,11 @@
         "doc": "Send an INFO (RFC 6086) in the caller's dialog of a call (on a call",
         "kind": "method_descriptor",
         "sig": "($self, call_id, body=None, content_type=None, headers=None, timeout_ms=5000, leg=\"caller\", with_body=False)"
+      },
+      "session_sdp": {
+        "doc": "The session in force toward one party of a call, by its SIP Call-ID:",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, leg=\"caller\")"
       },
       "terminate": {
         "doc": "Imperatively end a B2BUA call by its SIP Call-ID, sending an in-dialog",
@@ -1883,6 +1893,10 @@
       },
       "sdp": {
         "doc": "The offer's SDP as the party sent it, or ``None`` for an offerless",
+        "kind": "getset_descriptor"
+      },
+      "session_sdp": {
+        "doc": "The description siphon last sent the offering party, the session in",
         "kind": "getset_descriptor"
       },
       "side": {

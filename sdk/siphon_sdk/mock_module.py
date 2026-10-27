@@ -1201,6 +1201,9 @@ class MockB2bua:
         # Records b2bua.send_info(...) calls, and the status they resolve to.
         self.sent_infos: list[dict] = []
         self.info_status: Optional[int] = 200
+        self.reoffers: list[dict] = []
+        self.reoffer_status: Optional[int] = 200
+        self.session_sdps: dict = {}
         self.info_body: bytes = b""
         self.info_content_type: Optional[str] = None
 
@@ -1210,6 +1213,9 @@ class MockB2bua:
         self.refer_reports.clear()
         self.sent_infos.clear()
         self.info_status = 200
+        self.reoffers.clear()
+        self.reoffer_status = 200
+        self.session_sdps.clear()
         self.info_body = b""
         self.info_content_type = None
         self.terminates.clear()
@@ -1722,6 +1728,52 @@ class MockB2bua:
         if with_body:
             return (self.info_status, self.info_body, self.info_content_type)
         return self.info_status
+
+    def session_sdp(self, call_id: str, leg: str = "caller") -> Optional[str]:
+        """The session in force toward one party of a call, by its SIP Call-ID:
+        the description siphon last sent the caller, or with ``leg="callee"``
+        the answered callee. None when the call or party is unknown or siphon
+        has sent it none.
+
+        In the mock, what the test put in ``session_sdps[(call_id, leg)]``.
+        """
+        if leg not in ("caller", "callee"):
+            raise ValueError(f'b2bua.session_sdp(leg=…) is "caller" or "callee" (got {leg!r})')
+        return self.session_sdps.get((call_id, leg))
+
+    async def reoffer(self, call_id: str, sdp: Optional[str] = None,
+                      leg: str = "caller", timeout_ms: int = 32000) -> Optional[int]:
+        """Re-offer one party of a call by its SIP Call-ID: a re-INVITE in the
+        caller's dialog (on a call siphon answered itself, its only dialog), or
+        with ``leg="callee"`` in the answered callee's, carrying ``sdp``, or the
+        session in force toward that party when ``sdp`` is None. siphon puts its
+        own ``o=`` on it. The other party is told nothing.
+
+        For telling a party something about the session it did not ask about:
+        RFC 7866's ``a=record``, when a recording starts or stops on its own.
+
+        Returns:
+            Optional[int]: the final status code, ``491`` without anything sent
+                when an INVITE toward that party is already in progress (wait
+                and send again), or None when no final response arrived in
+                ``timeout_ms``.
+
+        Raises:
+            ValueError: the call is unknown (``not_found``), or the party's
+                dialog is not established or was never sent a session
+                (``invalid_state``).
+
+        In the mock, records ``{"call_id", "sdp", "leg"}`` on ``reoffers`` and
+        returns ``reoffer_status`` (200).
+
+        Usage::
+
+            status = await b2bua.reoffer(call_id, sdp=session + "a=record:off\\r\\n")
+        """
+        if leg not in ("caller", "callee"):
+            raise ValueError(f'b2bua.reoffer(leg=…) is "caller" or "callee" (got {leg!r})')
+        self.reoffers.append({"call_id": call_id, "sdp": sdp, "leg": leg})
+        return self.reoffer_status
 
     def terminate(self, call_id: str, reason: str = "Normal Clearing") -> bool:
         """Imperatively end a B2BUA call by its SIP Call-ID.

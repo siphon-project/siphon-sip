@@ -111,8 +111,28 @@ def direction_of(sdp: Optional[str]) -> Optional[str]:
     }[(send, receive)]
 
 
+#: Attributes whose change renegotiates a stream rather than repeating it: a
+#: key exchange, an ICE restart, a grouping. A trickled candidate is not one.
+_RENEGOTIATING = ("crypto", "key-mgmt", "fingerprint", "setup", "ice-ufrag",
+                  "ice-pwd", "group", "mid")
+
+
+def _renegotiating(sdp: str) -> list[str]:
+    lines = []
+    for line in sdp.replace("\r\n", "\n").split("\n"):
+        if not line.startswith("a="):
+            continue
+        name = line[2:].split(":", 1)[0].strip().lower()
+        if name in _RENEGOTIATING:
+            lines.append(line[2:].strip())
+    return lines
+
+
 def classify(offer: Optional[str], in_force: Optional[str]) -> str:
-    """What ``offer`` does to ``in_force``: hold, resume, refresh or change."""
+    """What ``offer`` does to ``in_force``: hold, resume, refresh or change.
+
+    Keeping the streams but restarting ICE, re-keying or regrouping them is a
+    change: the session in force is not an answer to it."""
     if not offer:
         return "refresh"
 
@@ -122,7 +142,7 @@ def classify(offer: Optional[str], in_force: Optional[str]) -> str:
 
     if not in_force:
         return "change" if receives(offer) else "hold"
-    if _streams(offer) == _streams(in_force):
+    if _streams(offer) == _streams(in_force) and _renegotiating(offer) == _renegotiating(in_force):
         return "refresh"
     was, now = receives(in_force), receives(offer)
     if was and not now:
@@ -147,8 +167,10 @@ class Reoffer:
         side: str = "a",
         early: bool = False,
         request: Optional[Request] = None,
+        session_sdp: Optional[str] = None,
     ) -> None:
         self._sdp = sdp or None
+        self._session_sdp = session_sdp or None
         self._method = method
         self._side = side
         self._early = early
@@ -211,8 +233,22 @@ class Reoffer:
     def kind(self) -> str:
         """``"hold"``, ``"resume"``, ``"refresh"`` or ``"change"``, read against
         the session in force stream by stream (a refresh on a held call that
-        repeats ``sendonly`` is ``"refresh"``, not a second hold)."""
+        repeats ``sendonly`` is ``"refresh"``, not a second hold). An ICE
+        restart, new keys or a new grouping make it ``"change"``; an attribute
+        that renegotiates nothing, such as ``a=recordpref``, does not."""
         return self._kind
+
+    @property
+    def session_sdp(self) -> Optional[str]:
+        """The description siphon last sent the offering party, the session in
+        force toward it; ``None`` before siphon has sent it one.
+
+        What :meth:`answer` answers from, and what a script edits when its
+        answer differs in one attribute only (RFC 7866's ``a=record``) on a
+        stream :meth:`answer` cannot answer for itself (keyed, ICE, grouped).
+        Repeating it answers only an offer that renegotiates nothing, which is
+        what a ``"refresh"`` is."""
+        return self._session_sdp
 
     @property
     def early(self) -> bool:

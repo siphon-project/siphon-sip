@@ -29,6 +29,10 @@ pub struct ReofferFacts {
     /// Whether it crossed between early dialogs, before the call was answered
     /// (an UPDATE, RFC 3311 §5.1).
     pub early: bool,
+    /// The description siphon last sent the offering party: the session in
+    /// force toward it (`Dialog::last_sent_sdp`), which an answer siphon gives
+    /// here is built from. `None` before siphon has sent that party one.
+    pub session: Option<String>,
 }
 
 impl ReofferFacts {
@@ -54,6 +58,7 @@ impl ReofferFacts {
             previous_direction: previous.as_ref().and_then(effective_direction),
             kind: classify(offered.as_ref(), previous.as_ref()),
             early,
+            session: None,
         }
     }
 
