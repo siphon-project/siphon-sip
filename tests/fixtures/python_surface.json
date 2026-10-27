@@ -2475,6 +2475,10 @@
         "doc": "Per-minute rate (for CDR / charging).",
         "kind": "getset_descriptor"
       },
+      "record": {
+        "doc": "Whether the routing answer asked for this call to be recorded.",
+        "kind": "getset_descriptor"
+      },
       "reroute_after_progress": {
         "doc": "Whether this carrier fails over at `timeout_secs` even after it has shown progress.",
         "kind": "getset_descriptor"
