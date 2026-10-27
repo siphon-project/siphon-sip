@@ -506,13 +506,43 @@ async fn stop(channel: &ChannelRef) -> ControlResult {
     }
 }
 
-/// `record_start` — record the call's decoded audio to a wav file.
+/// `record_start` — record the call's decoded audio to a file: wav unless
+/// `format` asks for `ogg_opus`.
 ///
 /// Not the same thing as `li.record()`, which is SIPREC: that hands a recording
 /// *server* its own leg. This writes a file, which is what a voicemail box is,
 /// and it works on a single-leg engine-terminated call.
 pub(super) async fn record_start(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
-    use crate::rtpengine::events::{RecordingChannels, RecordingDirection, RecordingRequest};
+    use crate::rtpengine::events::{
+        check_recording_bitrate, RecordingChannels, RecordingDirection, RecordingFormat,
+        RecordingRequest,
+    };
+
+    let format = match args.get("format").and_then(|value| value.as_str()) {
+        None => RecordingFormat::Wav,
+        Some(name) => match RecordingFormat::parse(name) {
+            Ok(format) => format,
+            Err(reason) => return ControlResult::error(ControlErrorCode::BadRequest, reason),
+        },
+    };
+    let bitrate_bps = match args.get("bitrate_bps") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => match value
+            .as_u64()
+            .and_then(|bitrate| u32::try_from(bitrate).ok())
+        {
+            Some(bitrate) => Some(bitrate),
+            None => {
+                return ControlResult::error(
+                    ControlErrorCode::BadRequest,
+                    format!("bitrate_bps {value} is a whole number of bits per second"),
+                )
+            }
+        },
+    };
+    if let Err(reason) = check_recording_bitrate(format, bitrate_bps) {
+        return ControlResult::error(ControlErrorCode::BadRequest, reason);
+    }
 
     let direction = match args.get("direction").and_then(|value| value.as_str()) {
         None | Some("ingress") => RecordingDirection::Ingress,
@@ -540,6 +570,8 @@ pub(super) async fn record_start(channel: &ChannelRef, args: &serde_json::Value)
         .and_then(|value| value.as_str())
         .map(str::to_string);
     let request = RecordingRequest {
+        format,
+        bitrate_bps,
         direction,
         channels,
         max_duration_ms: args.get("max_duration_ms").and_then(|v| v.as_u64()),

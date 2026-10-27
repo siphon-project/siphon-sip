@@ -39,7 +39,7 @@ use tracing::{trace, warn};
 
 use super::client::PlayMediaSource;
 use super::error::RtpEngineError;
-use super::events::{RecordingChannels, RecordingDirection, RecordingRequest, RtpEngineEvent};
+use super::events::{RecordingRequest, RtpEngineEvent};
 use super::profile::{NgFlags, WsTeeDirection, WsVadEngine};
 
 /// Reserved request id for the hand-shake frames a connection sends before it
@@ -53,6 +53,7 @@ mod events;
 mod far_leg;
 mod identity;
 mod per_call;
+mod recording;
 mod scope;
 mod waiters;
 use connection::connection_manager;
@@ -489,39 +490,25 @@ impl SiphonRtpClient {
         Ok(String::from_utf8_lossy(&answer_sdp).into_owned())
     }
 
-    /// Start recording decoded audio to a wav file, returning the engine's
+    /// Start recording decoded audio to a file, returning the engine's
     /// `recording_id`.
     ///
-    /// Deliberately wav rather than the pcap `record_call` flag: a pcap is an
-    /// audit artefact of the wire, and a voicemail message is a product
-    /// artefact somebody plays back. It works on a single-leg
-    /// (`answer_local`) call, which is what a voicemail box is.
+    /// Decoded rather than the pcap `record_call` flag: a pcap is an audit
+    /// artefact of the wire, and a recording somebody plays back is a product
+    /// artefact. It works on a single-leg (`answer_local`) call, which is what a
+    /// voicemail box is, and on a two-leg relay. An `ogg_opus` file is asked for
+    /// only from an engine that says it can write one ([`recording`]).
     pub async fn start_recording(
         &self,
         call_id: &str,
         from_tag: &str,
         request: &RecordingRequest<'_>,
     ) -> Result<String, RtpEngineError> {
+        if recording::needs_feature_check(request.format) {
+            recording::require_ogg_opus(self.request_in(None, Command::NodeInfo).await?)?;
+        }
         let result = self
-            .request(Command::StartRecording {
-                call_id: call_id.to_string(),
-                from_tag: from_tag.to_string(),
-                recording_dir: None,
-                format: Some(siphon_rtp_proto::RecordingFormat::Wav),
-                direction: Some(match request.direction {
-                    RecordingDirection::Ingress => siphon_rtp_proto::RecordingDirection::Ingress,
-                    RecordingDirection::Egress => siphon_rtp_proto::RecordingDirection::Egress,
-                    RecordingDirection::Both => siphon_rtp_proto::RecordingDirection::Both,
-                }),
-                channels: Some(match request.channels {
-                    RecordingChannels::Mono => siphon_rtp_proto::RecordingChannels::Mono,
-                    RecordingChannels::Stereo => siphon_rtp_proto::RecordingChannels::Stereo,
-                }),
-                max_duration_ms: request.max_duration_ms,
-                silence_ms: request.silence_ms,
-                path: request.path.map(str::to_string),
-                bitrate_bps: None, // an Opus setting, refused on a wav recording
-            })
+            .request(recording::start_command(call_id, from_tag, request))
             .await?;
         match result {
             CmdResult::Ok {

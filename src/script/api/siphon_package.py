@@ -1194,6 +1194,31 @@ class _RtpEngineNamespace:
             return decorator(func_or_none)
         return decorator
 
+    def on_recording_finished(self, func_or_none=None, *, call_id=None, from_tag=None):
+        """Register a handler for recording finished events.
+
+        Fires once per recording the engine accepted, when its file is closed,
+        whoever started it and however it ended. ``call_id`` is the SIP Call-ID
+        of the party the recording was on.
+
+        Usage:
+            @rtpengine.on_recording_finished
+            async def closed(call_id, from_tag, recording_id, path, reason, duration_ms):
+                ...
+
+            @rtpengine.on_recording_finished(call_id="abc")
+            def closed_one(call_id, from_tag, recording_id, path, reason, duration_ms):
+                ...
+        """
+        def decorator(fn):
+            is_async = _asyncio.iscoroutinefunction(fn)
+            metadata = {"call_id": call_id, "from_tag": from_tag}
+            _registry.register("rtpengine.on_recording_finished", None, fn, is_async, metadata)
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
 
 # ---------------------------------------------------------------------------
 # Gateway namespace (stub — replaced by Rust when gateway is configured)

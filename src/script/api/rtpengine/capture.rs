@@ -1,10 +1,11 @@
-//! What a script takes in from a call it answered itself: the caller's audio
-//! as a file (`start_recording`, `record`, `wait_recording`,
-//! `stop_recording`) and the digits the caller keys (`read_digits`).
+//! What a script takes in from a call: its audio as a file (`start_recording`,
+//! `record`, `wait_recording`, `stop_recording`) and the digits the caller keys
+//! (`read_digits`).
 //!
-//! A voicemail box or an IVR is the far end of the call (`answer_local`), so
-//! the engine holds the caller's decoded audio and detects the RFC 4733
-//! events; these verbs hand both to the script. The waiting is done in Rust,
+//! A voicemail box or an IVR is the far end of the call (`answer_local`); a
+//! relayed call is recorded the same way, both parties on their own channel
+//! when `channels` is stereo. The engine holds the decoded audio and detects the
+//! RFC 4733 events; these verbs hand both to the script. The waiting is done in Rust,
 //! keyed by the recording or the call (the media backend's waiters), not in
 //! script state shared between workers. siphon-rtp only; the other backends
 //! answer "not supported by this media backend".
@@ -17,7 +18,8 @@ use pyo3::types::PyDict;
 use tracing::debug;
 
 use crate::rtpengine::events::{
-    RecordingChannels, RecordingDirection, RecordingFinished, RecordingRequest,
+    check_recording_bitrate, RecordingChannels, RecordingDirection, RecordingFinished,
+    RecordingFormat, RecordingRequest,
 };
 use crate::rtpengine::siphon_rtp::DigitReadLimits;
 use crate::rtpengine::MediaBackend;
@@ -31,6 +33,8 @@ const RECORD_WAIT_MARGIN_MS: u64 = 10_000;
 
 /// The recording options a script passes, checked.
 pub(super) struct RecordingOptions {
+    pub format: RecordingFormat,
+    pub bitrate_bps: Option<u32>,
     pub path: Option<String>,
     pub direction: RecordingDirection,
     pub channels: RecordingChannels,
@@ -39,13 +43,20 @@ pub(super) struct RecordingOptions {
 }
 
 impl RecordingOptions {
+    #[allow(clippy::too_many_arguments)]
     pub fn parse(
+        format: &str,
+        bitrate_bps: Option<u32>,
         path: Option<String>,
         direction: &str,
         channels: &str,
         max_duration_ms: Option<u64>,
         silence_ms: Option<u64>,
     ) -> PyResult<Self> {
+        let format =
+            RecordingFormat::parse(format).map_err(pyo3::exceptions::PyValueError::new_err)?;
+        check_recording_bitrate(format, bitrate_bps)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
         let direction = match direction {
             "ingress" => RecordingDirection::Ingress,
             "egress" => RecordingDirection::Egress,
@@ -71,6 +82,8 @@ impl RecordingOptions {
             ));
         }
         Ok(Self {
+            format,
+            bitrate_bps,
             path,
             direction,
             channels,
@@ -100,6 +113,8 @@ pub(super) async fn start(
     verb: &str,
 ) -> PyResult<String> {
     let request = RecordingRequest {
+        format: options.format,
+        bitrate_bps: options.bitrate_bps,
         direction: options.direction,
         channels: options.channels,
         max_duration_ms: options.max_duration_ms,
@@ -206,15 +221,51 @@ mod tests {
 
     #[test]
     fn recording_options_are_checked() {
-        let options = RecordingOptions::parse(None, "ingress", "mono", Some(120_000), Some(5000))
-            .expect("valid");
+        let options = RecordingOptions::parse(
+            "wav",
+            None,
+            None,
+            "ingress",
+            "mono",
+            Some(120_000),
+            Some(5000),
+        )
+        .expect("valid");
         assert_eq!(options.direction, RecordingDirection::Ingress);
+        assert_eq!(options.format, RecordingFormat::Wav);
         assert_eq!(options.default_wait_ms(), 130_000);
-        let unbounded = RecordingOptions::parse(None, "both", "stereo", None, None).expect("valid");
+        let unbounded = RecordingOptions::parse("wav", None, None, "both", "stereo", None, None)
+            .expect("valid");
         assert_eq!(unbounded.default_wait_ms(), DEFAULT_RECORD_WAIT_MS);
-        assert!(RecordingOptions::parse(None, "inbound", "mono", None, None).is_err());
-        assert!(RecordingOptions::parse(None, "ingress", "quad", None, None).is_err());
-        assert!(RecordingOptions::parse(None, "ingress", "mono", Some(0), None).is_err());
+        let parse = |direction, channels, max_duration_ms| {
+            RecordingOptions::parse(
+                "wav",
+                None,
+                None,
+                direction,
+                channels,
+                max_duration_ms,
+                None,
+            )
+        };
+        assert!(parse("inbound", "mono", None).is_err());
+        assert!(parse("ingress", "quad", None).is_err());
+        assert!(parse("ingress", "mono", Some(0)).is_err());
+    }
+
+    #[test]
+    fn a_recording_can_be_ogg_opus_and_only_then_take_a_bitrate() {
+        let ogg =
+            RecordingOptions::parse("ogg_opus", Some(24_000), None, "both", "stereo", None, None)
+                .expect("valid");
+        assert_eq!(ogg.format, RecordingFormat::OggOpus);
+        assert_eq!(ogg.bitrate_bps, Some(24_000));
+        let parse = |format, bitrate_bps| {
+            RecordingOptions::parse(format, bitrate_bps, None, "both", "stereo", None, None)
+        };
+        assert!(parse("mp3", None).is_err());
+        assert!(parse("wav", Some(24_000)).is_err());
+        assert!(parse("ogg_opus", Some(600_000)).is_err());
     }
 
     #[test]

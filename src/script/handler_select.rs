@@ -164,6 +164,25 @@ impl ScriptState {
             .collect()
     }
 
+    /// Return all `RtpEngineOnRecordingFinished` handlers whose optional
+    /// call-id/from-tag filters match the event.  `None` filters match
+    /// everything.
+    pub fn recording_finished_handlers(&self, call_id: &str, from_tag: &str) -> Vec<&HandlerEntry> {
+        self.handlers
+            .iter()
+            .filter(|h| match &h.kind {
+                HandlerKind::RtpEngineOnRecordingFinished {
+                    call_id: filter_cid,
+                    from_tag: filter_ftag,
+                } => {
+                    filter_cid.as_deref().is_none_or(|v| v == call_id)
+                        && filter_ftag.as_deref().is_none_or(|v| v == from_tag)
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
     /// Return all `RtpEngineOnPlayFinished` handlers whose optional
     /// call-id/from-tag filters match the event.  `None` filters match
     /// everything.
