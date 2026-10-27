@@ -119,12 +119,36 @@ impl PyReoffer {
     ///   ``0.0.0.0``; TS 24.610 §4.5.2),
     /// - ``"resume"``: it receives again,
     /// - ``"refresh"``: nothing changes; no offer, or the same streams,
-    ///   addresses and directions (a session refresh, RFC 4028 §10, which on
-    ///   a held call repeats ``sendonly`` and is not a second hold),
-    /// - ``"change"``: anything else (a codec, an address, a stream).
+    ///   addresses and directions, keys, ICE credentials and grouping (a
+    ///   session refresh, RFC 4028 §10, which on a held call repeats
+    ///   ``sendonly`` and is not a second hold). An attribute that
+    ///   renegotiates nothing, such as RFC 7866's ``a=recordpref`` or a
+    ///   trickled candidate, leaves it a refresh,
+    /// - ``"change"``: anything else (a codec, an address, a stream, an ICE
+    ///   restart, new keys, a new grouping).
     #[getter]
     fn kind(&self) -> &str {
         self.facts.kind.as_str()
+    }
+
+    /// The description siphon last sent the offering party, the session in
+    /// force toward it, as text; ``None`` before siphon has sent it one.
+    ///
+    /// It is what ``offer.answer()`` answers from, and what a script edits
+    /// when the answer has to differ from it in one attribute only, such as
+    /// RFC 7866's ``a=record``, on a stream ``offer.answer()`` cannot answer
+    /// for itself (keyed, ICE, grouped). Repeating it is a valid answer only to
+    /// an offer that renegotiates nothing, which is what a ``"refresh"`` is.
+    ///
+    /// ```python
+    /// @b2bua.on_reoffer
+    /// def toggle(call, offer):
+    ///     if offer.kind == "refresh" and offer.session_sdp:
+    ///         offer.answer(sdp=offer.session_sdp)
+    /// ```
+    #[getter]
+    fn session_sdp(&self) -> Option<String> {
+        self.facts.session.clone()
     }
 
     /// Whether the offer crossed before the call was answered: an UPDATE

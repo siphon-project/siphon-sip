@@ -142,10 +142,48 @@ fn streams(sdp: &SdpBody) -> Vec<StreamShape> {
         .collect()
 }
 
+/// Attributes whose change renegotiates a stream rather than repeating it: a
+/// key exchange (RFC 4568, RFC 8842), an ICE restart (RFC 8839 §4.4.1.1.1), a
+/// grouping (RFC 9143). A candidate is not one: a trickled candidate adds to
+/// the session without restarting it.
+const RENEGOTIATING_ATTRIBUTES: [&str; 8] = [
+    "crypto",
+    "key-mgmt",
+    "fingerprint",
+    "setup",
+    "ice-ufrag",
+    "ice-pwd",
+    "group",
+    "mid",
+];
+
+/// Every renegotiating attribute line of `sdp`, session and media level, in
+/// the order it carries them.
+fn renegotiating(sdp: &SdpBody) -> Vec<&str> {
+    let named = |line: &&str| {
+        let name = line.split(':').next().unwrap_or(line).trim();
+        RENEGOTIATING_ATTRIBUTES
+            .iter()
+            .any(|renegotiating| name.eq_ignore_ascii_case(renegotiating))
+    };
+    sdp.session_lines
+        .iter()
+        .chain(
+            sdp.media_sections
+                .iter()
+                .flat_map(|section| section.other_attrs.iter()),
+        )
+        .filter_map(|line| line.strip_prefix("a="))
+        .filter(named)
+        .collect()
+}
+
 /// What `offer` does to `in_force`, the description its sender last gave on
 /// the dialog. `None` for an offerless request (RFC 3261 §14.1), which is a
 /// refresh whatever its 2xx brings. Without a description in force an offer
-/// that receives nothing is a hold and any other a change.
+/// that receives nothing is a hold and any other a change. An offer that keeps
+/// the streams but restarts ICE, re-keys or regroups them is a change: the
+/// session in force is not an answer to it.
 pub fn classify(offer: Option<&SdpBody>, in_force: Option<&SdpBody>) -> ReofferKind {
     let Some(offer) = offer else {
         return ReofferKind::Refresh;
@@ -160,7 +198,7 @@ pub fn classify(offer: Option<&SdpBody>, in_force: Option<&SdpBody>) -> ReofferK
             ReofferKind::Hold
         };
     };
-    if streams(offer) == streams(in_force) {
+    if streams(offer) == streams(in_force) && renegotiating(offer) == renegotiating(in_force) {
         return ReofferKind::Refresh;
     }
     match (receives(in_force), receives(offer)) {
@@ -311,6 +349,64 @@ mod tests {
         assert_eq!(classify(Some(&bumped), Some(&held)), ReofferKind::Refresh);
         assert_eq!(classify(None, Some(&held)), ReofferKind::Refresh);
         assert_eq!(classify(None, None), ReofferKind::Refresh);
+    }
+
+    fn webrtc(extra: &str) -> SdpBody {
+        SdpBody::parse(&format!(
+            "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nt=0 0\r\n\
+             a=group:BUNDLE 0\r\na=fingerprint:sha-256 AB:CD\r\n\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 192.0.2.10\r\n\
+             a=mid:0\r\na=ice-ufrag:uf1\r\na=ice-pwd:pw1\r\na=setup:actpass\r\n\
+             a=rtpmap:111 opus/48000/2\r\na=candidate:1 1 udp 1 192.0.2.10 40000 typ host\r\n\
+             {extra}"
+        ))
+    }
+
+    /// An attribute that renegotiates nothing (RFC 7866's `a=recordpref`, a
+    /// trickled candidate) leaves a refresh a refresh; one that restarts ICE,
+    /// re-keys or regroups makes it a change, so a session in force is never
+    /// repeated as the answer to an offer that renegotiates it.
+    #[test]
+    fn a_restart_or_a_rekey_is_a_change_and_anything_else_stays_a_refresh() {
+        let in_force = webrtc("");
+        assert_eq!(
+            classify(Some(&webrtc("a=recordpref:on\r\n")), Some(&in_force)),
+            ReofferKind::Refresh
+        );
+        let trickled = webrtc("a=candidate:2 1 udp 1 192.0.2.10 40002 typ host\r\n");
+        assert_eq!(
+            classify(Some(&trickled), Some(&in_force)),
+            ReofferKind::Refresh
+        );
+        for (from, to) in [
+            ("a=ice-ufrag:uf1", "a=ice-ufrag:uf2"),
+            ("a=ice-pwd:pw1", "a=ice-pwd:pw2"),
+            ("a=fingerprint:sha-256 AB:CD", "a=fingerprint:sha-256 EF:01"),
+            ("a=setup:actpass", "a=setup:active"),
+            ("a=group:BUNDLE 0", "a=group:BUNDLE 0 1"),
+        ] {
+            let renegotiated = SdpBody::parse(&in_force.to_string().replace(from, to));
+            assert_eq!(
+                classify(Some(&renegotiated), Some(&in_force)),
+                ReofferKind::Change,
+                "{to}"
+            );
+        }
+        let rekeyed_sdes = (
+            audio("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AAAA\r\n"),
+            audio("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:BBBB\r\n"),
+        );
+        assert_eq!(
+            classify(Some(&rekeyed_sdes.1), Some(&rekeyed_sdes.0)),
+            ReofferKind::Change
+        );
+        // A hold that also restarts ICE is still read as the hold it is.
+        let held = SdpBody::parse(
+            &webrtc("a=sendonly\r\n")
+                .to_string()
+                .replace("a=ice-ufrag:uf1", "a=ice-ufrag:uf2"),
+        );
+        assert_eq!(classify(Some(&held), Some(&in_force)), ReofferKind::Hold);
     }
 
     #[test]

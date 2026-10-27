@@ -389,6 +389,45 @@ async fn a_takeover_with_the_scripts_answer_sends_it() {
     assert!(!sdp.contains("o=- 1 1 "), "siphon's own o=: {sdp}");
 }
 
+/// An offer that only adds an attribute renegotiating nothing (RFC 7866's
+/// `a=recordpref`) is a refresh, and a script answers it from the session in
+/// force with one attribute of its own (`a=record`, the state it reports),
+/// relaying nothing to the other party.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_is_answered_from_the_session_in_force_the_script_edits() {
+    let call = call_deciding(
+        83160,
+        concat!(
+            "if offer.kind == \"refresh\" and offer.session_sdp:\n",
+            "        offer.answer(offer.session_sdp + \"a=record:on\\r\\n\")",
+        ),
+    );
+    let caller = caller_of(&call);
+    acks(&call.dispatcher.state, &caller);
+    let sent = offers(
+        &call,
+        &caller,
+        "INVITE",
+        2,
+        Some(&caller_sdp(&call, "a=recordpref:on\r\n")),
+    );
+    assert!(
+        written(&call, "X-Offered").is_some_and(|seen| seen.starts_with("INVITE a refresh")),
+        "{:?}",
+        written(&call, "X-Offered")
+    );
+    let sdp = body_of(&response_to_phone(&sent, call.a.1, 200));
+    assert!(sdp.ends_with("a=record:on\r\n"), "{sdp}");
+    assert!(
+        sdp.contains(&format!("c=IN IP4 {}", host_of(call.b.1))),
+        "the session in force toward the caller is the callee's: {sdp}"
+    );
+    assert!(
+        sent_with(&sent, call.b.1, Method::Invite).is_none(),
+        "nothing is relayed to the callee"
+    );
+}
+
 /// An offerless re-INVITE taken over gets the session in force as siphon's
 /// offer in the 200 (RFC 3261 §14.1).
 #[tokio::test(flavor = "multi_thread")]
@@ -661,4 +700,176 @@ async fn an_async_handler_decides_the_offer() {
         Some(403)
     );
     assert!(sent_with(&sent, call.b.1, Method::Invite).is_none());
+}
+
+/// `b2bua.reoffer()` sends the caller the session in force with what the
+/// script changed (RFC 7866's `a=record`), under siphon's `o=`, tells the
+/// callee nothing, hands the script the caller's final status, and makes the
+/// offer the session in force. A second one while the first is pending is not
+/// sent (RFC 3261 §14.1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_reoffer_reaches_the_caller_alone_and_settles_with_its_status() {
+    let call = call_deciding(83170, "pass");
+    let caller = caller_of(&call);
+    acks(&call.dispatcher.state, &caller);
+    let state = &call.dispatcher.state;
+    let internal = call.call_id();
+    let session = state
+        .call_actors
+        .clone_leg(&internal, true)
+        .and_then(|leg| leg.dialog.last_sent_sdp)
+        .expect("a session in force toward the caller");
+    assert_eq!(
+        super::b2bua::b2bua_session_sdp("no-such-call@example.com", true),
+        None
+    );
+    let mut offer = session.clone();
+    offer.extend_from_slice(b"a=record:on\r\n");
+
+    let reoffered = tokio::task::block_in_place(|| {
+        super::b2bua::reoffer_leg(state, &internal, true, Some(offer))
+    })
+    .expect("sent");
+    let (branch, status) = match reoffered {
+        super::b2bua::Reoffered::Sent { branch, status } => (branch, status),
+        super::b2bua::Reoffered::Crossing => panic!("nothing was pending"),
+    };
+    let sent = wire(&call.dispatcher);
+    let reinvite = sent_with(&sent, call.a.1, Method::Invite).expect("the caller is re-INVITEd");
+    let body = body_of(&reinvite);
+    assert!(body.ends_with("a=record:on\r\n"), "{body}");
+    assert!(!body.contains("o=- 1 1 "), "siphon's own o=: {body}");
+    assert!(
+        sent_with(&sent, call.b.1, Method::Invite).is_none(),
+        "the callee is told nothing"
+    );
+
+    let crossing =
+        tokio::task::block_in_place(|| super::b2bua::reoffer_leg(state, &internal, true, None))
+            .expect("refused as crossing, not as an error");
+    assert!(matches!(crossing, super::b2bua::Reoffered::Crossing));
+    assert!(
+        sent_with(&wire(&call.dispatcher), call.a.1, Method::Invite).is_none(),
+        "nothing crossing was sent"
+    );
+
+    answers(&call, call.a.1, &reinvite, &caller_sdp(&call, ""));
+    let status = tokio::time::timeout(std::time::Duration::from_secs(2), status)
+        .await
+        .expect("settled")
+        .expect("a status");
+    assert_eq!(status, 200, "branch {branch}");
+    let in_force = state
+        .call_actors
+        .clone_leg(&internal, true)
+        .and_then(|leg| leg.dialog.last_sent_sdp)
+        .expect("in force");
+    assert!(
+        String::from_utf8_lossy(&in_force).ends_with("a=record:on\r\n"),
+        "the accepted offer is the session in force"
+    );
+    assert!(
+        matches!(
+            tokio::task::block_in_place(|| super::b2bua::reoffer_leg(state, &internal, true, None)),
+            Ok(super::b2bua::Reoffered::Sent { .. })
+        ),
+        "the 200 ended the INVITE in progress"
+    );
+}
+
+/// On a call anchored on a media engine, a script's re-offer is the session in
+/// force with what the script changed, which the engine did not make: the
+/// caller's answer to it is not the engine's to take, and is not sent there,
+/// as an answer siphon gives itself is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_reoffer_on_an_anchored_call_leaves_the_media_engine_alone() {
+    let engine = NativeTestEngine::start().await;
+    let call = anchored_on(call_deciding(83180, "pass"), &engine, OPEN).await;
+    let caller = caller_of(&call);
+    acks(&call.dispatcher.state, &caller);
+    let state = &call.dispatcher.state;
+    let internal = call.call_id();
+    let before = (
+        engine.commands("reoffer").len(),
+        engine.commands("answer").len(),
+    );
+    let reoffered =
+        tokio::task::block_in_place(|| super::b2bua::reoffer_leg(state, &internal, true, None))
+            .expect("sent");
+    let status = match reoffered {
+        super::b2bua::Reoffered::Sent { status, .. } => status,
+        super::b2bua::Reoffered::Crossing => panic!("nothing was pending"),
+    };
+    let reinvite = sent_with(&wire(&call.dispatcher), call.a.1, Method::Invite)
+        .expect("the caller is re-INVITEd");
+    answers(&call, call.a.1, &reinvite, &caller_sdp(&call, ""));
+    let status = tokio::time::timeout(std::time::Duration::from_secs(2), status)
+        .await
+        .expect("settled")
+        .expect("a status");
+    assert_eq!(status, 200);
+    assert_eq!(
+        (
+            engine.commands("reoffer").len(),
+            engine.commands("answer").len()
+        ),
+        before,
+        "the engine is told nothing"
+    );
+}
+
+/// The waiters `b2bua.reoffer()` leaves for a final status drain: a re-offer
+/// answered, one the script stopped waiting for (its `timeout_ms`) and then
+/// answered late, and one refused as crossing all leave nothing behind. Checked
+/// per branch, since the waiter map is shared with every other test.
+#[tokio::test(flavor = "multi_thread")]
+async fn script_reoffer_waiters_drain_after_answered_and_abandoned_reoffers() {
+    const ROUNDS: usize = 50;
+    let call = call_deciding(83190, "pass");
+    let caller = caller_of(&call);
+    acks(&call.dispatcher.state, &caller);
+    let state = &call.dispatcher.state;
+    let internal = call.call_id();
+    let mut branches = Vec::with_capacity(2 * ROUNDS);
+
+    for round in 0..2 * ROUNDS {
+        let abandoned = round % 2 == 1;
+        let reoffered =
+            tokio::task::block_in_place(|| super::b2bua::reoffer_leg(state, &internal, true, None))
+                .expect("sent");
+        let (branch, status) = match reoffered {
+            super::b2bua::Reoffered::Sent { branch, status } => (branch, status),
+            super::b2bua::Reoffered::Crossing => panic!("round {round}: nothing was pending"),
+        };
+        assert!(super::b2bua::is_script_reoffer(&branch), "round {round}");
+        let crossing =
+            tokio::task::block_in_place(|| super::b2bua::reoffer_leg(state, &internal, true, None))
+                .expect("refused as crossing");
+        assert!(matches!(crossing, super::b2bua::Reoffered::Crossing));
+        // The script stops waiting before the caller answers: what a
+        // `timeout_ms` that runs out does.
+        let status = if abandoned {
+            super::b2bua::forget_reoffer(&branch);
+            None
+        } else {
+            Some(status)
+        };
+        let reinvite = sent_with(&wire(&call.dispatcher), call.a.1, Method::Invite)
+            .expect("the caller is re-INVITEd");
+        answers(&call, call.a.1, &reinvite, &caller_sdp(&call, ""));
+        if let Some(status) = status {
+            let code = tokio::time::timeout(std::time::Duration::from_secs(2), status)
+                .await
+                .expect("settled")
+                .expect("a status");
+            assert_eq!(code, 200, "round {round}");
+        }
+        branches.push(branch);
+    }
+
+    let left: Vec<&String> = branches
+        .iter()
+        .filter(|branch| super::b2bua::is_script_reoffer(branch))
+        .collect();
+    assert!(left.is_empty(), "waiters never released: {left:?}");
 }

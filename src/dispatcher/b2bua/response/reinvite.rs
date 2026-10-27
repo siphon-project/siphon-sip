@@ -519,8 +519,12 @@ pub fn rewrite_reinvite_answer_sdp(
     }
 
     // RTPEngine: rewrite re-INVITE 2xx response SDP through answer.
-    // Mirrors the offer processing done on the request side.
-    if (200..300).contains(&status_code) && !message.body.is_empty() {
+    // Mirrors the offer processing done on the request side, which a script's
+    // re-offer did not take: its answer is not the engine's.
+    if (200..300).contains(&status_code)
+        && !message.body.is_empty()
+        && !is_script_reoffer(&snapshot.branch)
+    {
         if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) = (
             &state.rtpengine_set,
             &state.rtpengine_sessions,

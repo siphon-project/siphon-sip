@@ -124,3 +124,37 @@ def answered(call, offer):
         assert result.request is None
         with pytest.raises(RuntimeError):
             result.answer()
+
+
+WEBRTC = (
+    "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nt=0 0\r\n"
+    "a=group:BUNDLE 0\r\na=fingerprint:sha-256 AB:CD\r\n"
+    "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 192.0.2.10\r\n"
+    "a=mid:0\r\na=ice-ufrag:uf1\r\na=ice-pwd:pw1\r\na=setup:actpass\r\n"
+    "a=rtpmap:111 opus/48000/2\r\n"
+)
+
+
+def test_a_recordpref_only_offer_is_a_refresh_and_an_ice_restart_a_change():
+    assert classify(WEBRTC + "a=recordpref:on\r\n", WEBRTC) == "refresh"
+    assert classify(WEBRTC.replace("uf1", "uf2"), WEBRTC) == "change"
+    assert classify(WEBRTC.replace("AB:CD", "EF:01"), WEBRTC) == "change"
+
+
+def test_a_refresh_is_answered_from_the_session_in_force_with_one_attribute_more(harness):
+    harness.load_source(
+        """
+from siphon import b2bua
+
+@b2bua.on_reoffer
+def toggle(call, offer):
+    if offer.kind == "refresh" and offer.session_sdp:
+        offer.answer(offer.session_sdp + "a=record:on\\r\\n")
+"""
+    )
+    session = ("v=0\r\no=- 7 7 IN IP4 198.51.100.1\r\ns=-\r\nc=IN IP4 198.51.100.1\r\n"
+               "t=0 0\r\nm=audio 30000 RTP/AVP 0\r\n")
+    offer = harness.send_reoffer(sdp=TALKING + "a=recordpref:on\r\n", previous_sdp=TALKING,
+                                 session_sdp=session)
+    assert offer.session_sdp == session
+    assert offer.decision == ("answer", session + "a=record:on\r\n")

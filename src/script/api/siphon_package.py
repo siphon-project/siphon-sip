@@ -487,6 +487,49 @@ class _B2buaNamespace:
         return control.send_info(call_id, body, content_type, headers, timeout_ms, leg,
                                  with_body)
 
+    def session_sdp(self, call_id, leg="caller"):
+        """The session in force toward one party of a call, by its SIP Call-ID:
+        the description siphon last sent the caller, or with ``leg="callee"``
+        the answered callee, as text. ``None`` when the call or party is
+        unknown or siphon has sent it none. What :meth:`reoffer` sends when
+        given no ``sdp``, and what a script edits when it re-offers one
+        attribute changed."""
+        control = object.__getattribute__(self, "__dict__").get("_control")
+        if control is None:
+            return None
+        return control.session_sdp(call_id, leg)
+
+    def reoffer(self, call_id, sdp=None, leg="caller", timeout_ms=32000):
+        """Re-offer one party of a call by its SIP Call-ID: a re-INVITE in the
+        caller's dialog (on a call siphon answered itself, its only dialog), or
+        with ``leg="callee"`` in the answered callee's, carrying ``sdp``, or the
+        session in force toward that party when ``sdp`` is ``None``. siphon puts
+        its own ``o=`` on it. The other party is told nothing, and neither is
+        the media engine where the call is anchored: the party's answer to the
+        session in force does not move the media.
+
+        For telling a party something about the session it did not ask about:
+        RFC 7866's ``a=record``, when a recording starts or stops on its own.
+
+        Returns:
+            An awaitable of the final status code (int), ``491`` without
+            anything sent when an INVITE toward that party is already in
+            progress (wait and send again), or ``None`` when no final response
+            arrives within ``timeout_ms``.
+
+        Raises:
+            ValueError: the call is unknown (``not_found``), or the party's
+                dialog is not established or was never sent a session
+                (``invalid_state``).
+
+        Usage:
+            status = await b2bua.reoffer(call_id, sdp=session + "a=record:off\\r\\n")
+        """
+        control = object.__getattribute__(self, "__dict__").get("_control")
+        if control is None:
+            raise ValueError("b2bua.reoffer(): not_found: no B2BUA running")
+        return control.reoffer(call_id, sdp, leg, timeout_ms)
+
     def replace_peer(
         self,
         call_id,

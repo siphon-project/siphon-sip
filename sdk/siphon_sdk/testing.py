@@ -1008,13 +1008,15 @@ class SipTestHarness:
         side: str = "a",
         early: bool = False,
         request: Optional[Request] = None,
+        session_sdp: Optional[str] = None,
         **kwargs: Any,
     ) -> Reoffer:
         """Dispatch an in-dialog offer to ``@b2bua.on_reoffer`` handlers.
 
         Builds a :class:`~siphon_sdk.reoffer.Reoffer` for a re-INVITE (or an
         UPDATE with ``method="UPDATE"``) from ``side`` carrying ``sdp``, read
-        against ``previous_sdp`` (the session that party had in force), and
+        against ``previous_sdp`` (the session that party had in force), with
+        ``session_sdp`` as what siphon last sent that party, and
         calls the handlers with ``(call, offer)``. Returns the offer: its
         :attr:`~siphon_sdk.reoffer.Reoffer.decision` is ``("relay",)``,
         ``("reject", code, reason)`` or ``("answer", sdp)``. A handler that
@@ -1035,6 +1037,7 @@ class SipTestHarness:
             side=side,
             early=early,
             request=request,
+            session_sdp=session_sdp,
         )
         for fn, is_async in mock_module.get_registry().get("b2bua.on_reoffer"):
             try:

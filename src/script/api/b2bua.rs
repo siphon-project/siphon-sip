@@ -461,6 +461,96 @@ impl PyB2buaControl {
         })
     }
 
+    /// The session in force toward one party of a call, by its SIP Call-ID:
+    /// the description siphon last sent the caller, or with `leg="callee"` the
+    /// answered callee, as text. `None` when the call or party is unknown or
+    /// siphon has sent it none. What `b2bua.reoffer()` sends when given no
+    /// `sdp`, and what a script edits when it re-offers one attribute changed.
+    #[pyo3(signature = (call_id, leg="caller"))]
+    fn session_sdp(&self, call_id: &str, leg: &str) -> PyResult<Option<String>> {
+        let on_a_leg = match leg {
+            "caller" => true,
+            "callee" => false,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "b2bua.session_sdp(leg=…) is \"caller\" or \"callee\" (got {other:?})"
+                )))
+            }
+        };
+        Ok(crate::dispatcher::b2bua_session_sdp(call_id, on_a_leg)
+            .map(|sdp| String::from_utf8_lossy(&sdp).into_owned()))
+    }
+
+    /// Re-offer one party of a call by its SIP Call-ID: a re-INVITE in the
+    /// caller's dialog (on a call siphon answered itself, its only dialog), or
+    /// with `leg="callee"` in the answered callee's, carrying `sdp`, or the
+    /// session in force toward that party when `sdp` is `None`. siphon puts its
+    /// own `o=` on it at the dialog's next version (RFC 3264 §8). The other
+    /// party is told nothing, and neither is the media engine where the call
+    /// is anchored: the offer is the session in force, and the party's answer
+    /// to it does not move the media.
+    ///
+    /// For telling a party something about the session it did not ask about:
+    /// RFC 7866's `a=record`, when a recording starts or stops on its own.
+    ///
+    /// Awaitable: resolves to the final status code (an int), `491` without
+    /// anything sent when an INVITE toward that party is already in progress
+    /// (RFC 3261 §14.1: wait and send again), or `None` when no final response
+    /// arrives within `timeout_ms`. Raises `ValueError` when the call is
+    /// unknown (`not_found`), the party's dialog is not established or no
+    /// session was ever sent it (`invalid_state`).
+    ///
+    /// ```python
+    /// status = await b2bua.reoffer(call_id, sdp=session + "a=record:off\r\n")
+    /// ```
+    #[pyo3(signature = (call_id, sdp=None, leg="caller", timeout_ms=32000))]
+    fn reoffer<'py>(
+        &self,
+        python: Python<'py>,
+        call_id: &str,
+        sdp: Option<String>,
+        leg: &str,
+        timeout_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        use pyo3::exceptions::PyValueError;
+        let on_a_leg = match leg {
+            "caller" => true,
+            "callee" => false,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "b2bua.reoffer(leg=…) is \"caller\" or \"callee\" (got {other:?})"
+                )))
+            }
+        };
+        let reoffered =
+            crate::dispatcher::b2bua_reoffer(call_id, on_a_leg, sdp.map(String::into_bytes))
+                .map_err(|refusal| PyValueError::new_err(format!("b2bua.reoffer(): {refusal}")))?;
+        crate::script::awaitable(python, async move {
+            let status = match reoffered {
+                crate::dispatcher::Reoffered::Crossing => Some(491),
+                crate::dispatcher::Reoffered::Sent { branch, status } => {
+                    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), status)
+                        .await
+                    {
+                        Ok(Ok(code)) => Some(code),
+                        _ => {
+                            crate::dispatcher::forget_reoffer(&branch);
+                            None
+                        }
+                    }
+                }
+            };
+            Ok(crate::script::Deferred::build(
+                move |python| -> PyResult<Py<PyAny>> {
+                    Ok(match status {
+                        Some(code) => code.into_pyobject(python)?.into_any().unbind(),
+                        None => python.None(),
+                    })
+                },
+            ))
+        })
+    }
+
     #[pyo3(signature = (call_id, target, replaces=None))]
     fn refer(
         &self,
