@@ -515,6 +515,41 @@ the same shape as `@rtpengine.on_dtmf`.
     DTMF, so `@rtpengine.on_media_timeout` does not fire under rtpengine yet —
     see [Media engines](../media-engines.md).
 
+### Record a relayed call
+
+On siphon-rtp, `rtpengine.start_recording` records a relayed call as well as a
+call the engine answered itself. With `channels="stereo"` and
+`direction="both"` each party is on its own channel. `format="ogg_opus"` writes
+Opus in Ogg, about a seventh of the size of a WAV, which is the one to pick for a
+file that leaves the node; it needs siphon-rtp 0.15.0 or later, and siphon
+refuses it on an older engine rather than send a frame the engine cannot parse.
+
+Start it once the call is answered, and pick the file up in
+`@rtpengine.on_recording_finished` rather than waiting in the handler that
+started it, so a long call does not hold a handler open:
+
+```python
+from siphon import b2bua, rtpengine, log
+
+@b2bua.on_answer
+async def answered(call, reply):
+    await rtpengine.answer(reply, call=call)
+    await rtpengine.start_recording(call, format="ogg_opus", channels="stereo",
+                                    direction="both",
+                                    path=f"/var/spool/recordings/{call.call_id}.opus")
+
+@rtpengine.on_recording_finished
+async def recording_closed(call_id, from_tag, recording_id, path, reason, duration_ms):
+    if path is None or duration_ms == 0:
+        log.warn(f"{call_id}: recording {recording_id} left no audio ({reason})")
+        return
+    log.info(f"{call_id}: {path} closed after {duration_ms} ms ({reason})")
+```
+
+`call_id` is the SIP Call-ID of the party the recording was on, the key the
+call's CDR carries. The file is written by the engine, so a script reading it
+needs the same directory mounted where the engine writes it.
+
 ## See also
 
 - Real examples: [`examples/proxy_rtpengine.py`](https://github.com/siphon-project/siphon-sip/blob/main/examples/proxy_rtpengine.py), [`examples/b2bua_rtpengine.py`](https://github.com/siphon-project/siphon-sip/blob/main/examples/b2bua_rtpengine.py).

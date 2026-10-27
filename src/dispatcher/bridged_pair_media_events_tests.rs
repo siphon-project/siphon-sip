@@ -442,7 +442,9 @@ async fn a_recording_ended_by_a_bridge_is_not_reported_as_the_call_ending() {
             reason: "call_ended",
             duration_ms: 9000,
         },
-    );
+        None,
+    )
+    .await;
     let (caller, phone) = pair.published();
     assert_eq!(names(&caller), ["RecordingFinished"], "{caller:?}");
     assert_eq!(caller[0].1["reason"], "bridged");
@@ -472,7 +474,9 @@ async fn a_recording_ended_by_a_bridge_is_not_reported_as_the_call_ending() {
             reason: "call_ended",
             duration_ms: 3000,
         },
-    );
+        None,
+    )
+    .await;
     let (caller, _) = pair.published();
     assert_eq!(names(&caller), ["RecordingFinished"], "{caller:?}");
     assert_eq!(caller[0].1["reason"], "call_ended");

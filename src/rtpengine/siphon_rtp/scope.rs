@@ -341,7 +341,7 @@ mod tests {
     use crate::rtpengine::client::PlayMediaSource;
     use crate::rtpengine::error::RtpEngineError;
     use crate::rtpengine::events::{
-        RecordingChannels, RecordingDirection, RecordingRequest, RtpEngineEvent,
+        RecordingChannels, RecordingDirection, RecordingFormat, RecordingRequest, RtpEngineEvent,
     };
     use crate::rtpengine::profile::{NgFlags, WsTeeDirection};
     use siphon_rtp_proto::{Command, ConferenceRole, Request};
@@ -640,9 +640,7 @@ mod tests {
                 &RecordingRequest {
                     direction: RecordingDirection::Both,
                     channels: RecordingChannels::Mono,
-                    max_duration_ms: None,
-                    silence_ms: None,
-                    path: None,
+                    ..RecordingRequest::default()
                 },
             )
             .await;
@@ -1193,5 +1191,92 @@ mod tests {
             next_event(&mut events).await.is_none(),
             "the read took the leg's digits"
         );
+    }
+
+    /// An ogg_opus recording is asked for only after the engine says it can
+    /// write one: an engine that predates the format cannot parse the variant
+    /// and closes the whole control connection, taking every call's control
+    /// with it. A wav recording asks nothing, as before.
+    #[tokio::test]
+    async fn an_ogg_opus_recording_is_sent_only_to_an_engine_that_lists_the_feature() {
+        let ogg = RecordingRequest {
+            format: RecordingFormat::OggOpus,
+            bitrate_bps: Some(24_000),
+            direction: RecordingDirection::Both,
+            channels: RecordingChannels::Stereo,
+            ..RecordingRequest::default()
+        };
+
+        let mut capable = FakeEngine::with_features(&["relay", "record_ogg_opus"]).await;
+        let (recorder, _events) = client(&capable, None, 2_000);
+        recorder
+            .offer("call-1", "tag-a", b"v=0\r\n", &NgFlags::default())
+            .await
+            .expect("offer");
+        let recording_id = recorder
+            .start_recording("call-1", "tag-a", &ogg)
+            .await
+            .expect("an engine with the feature records");
+        assert!(recording_id.starts_with("rec-"), "{recording_id}");
+        let frames = capable.frames().await;
+        let start = frames
+            .iter()
+            .find(|frame| frame.contains(r#""command":"start_recording""#))
+            .expect("the recording was asked for");
+        assert!(start.contains(r#""format":"ogg_opus""#), "{start}");
+        assert!(start.contains(r#""bitrate_bps":24000"#), "{start}");
+        assert!(start.contains(r#""channels":"stereo""#), "{start}");
+        let node_info = frames
+            .iter()
+            .position(|frame| frame.contains(r#""command":"node_info""#))
+            .expect("the feature was checked");
+        let started = frames
+            .iter()
+            .position(|frame| frame.contains(r#""command":"start_recording""#))
+            .expect("started");
+        assert!(node_info < started, "checked before asking: {frames:?}");
+
+        let mut older = FakeEngine::with_features(&["relay"]).await;
+        let (refuser, _events) = client(&older, None, 2_000);
+        refuser
+            .offer("call-1", "tag-a", b"v=0\r\n", &NgFlags::default())
+            .await
+            .expect("offer");
+        let refused = refuser
+            .start_recording("call-1", "tag-a", &ogg)
+            .await
+            .expect_err("an engine without the feature is not asked");
+        assert!(refused.to_string().contains("record_ogg_opus"), "{refused}");
+        let frames = older.frames().await;
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame.contains(r#""command":"start_recording""#)),
+            "nothing the engine cannot parse reached it: {frames:?}"
+        );
+
+        let mut plain = FakeEngine::with_features(&["relay"]).await;
+        let (wav_recorder, _events) = client(&plain, None, 2_000);
+        wav_recorder
+            .offer("call-1", "tag-a", b"v=0\r\n", &NgFlags::default())
+            .await
+            .expect("offer");
+        wav_recorder
+            .start_recording("call-1", "tag-a", &RecordingRequest::default())
+            .await
+            .expect("a wav recording");
+        let frames = plain.frames().await;
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame.contains(r#""command":"node_info""#)),
+            "a wav recording asks nothing: {frames:?}"
+        );
+        let start = frames
+            .iter()
+            .find(|frame| frame.contains(r#""command":"start_recording""#))
+            .expect("started");
+        assert!(start.contains(r#""format":"wav""#), "{start}");
+        assert!(!start.contains("bitrate_bps"), "{start}");
     }
 }

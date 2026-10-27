@@ -25,7 +25,7 @@ pub fn spawn_rtpengine_events(
                         on_dtmf(&state_for_events, dtmf, scope).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::RecordingFinished(recording) => {
-                        on_recording_finished(&state_for_events, recording);
+                        on_recording_finished(&state_for_events, recording, scope).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::MediaTimeout {
                         call_id,
@@ -1156,15 +1156,19 @@ pub(super) fn recording_end_reason(engine: &'static str, retired_for_bridge: boo
     }
 }
 
-/// A recording's file is closed. Tell the controller that owns the call.
+/// A recording's file is closed. Tell the controller that owns the call, and
+/// the script's `@rtpengine.on_recording_finished` handlers.
 ///
-/// The event exists because the *closed* file is what a controller can act on:
-/// attaching the audio to an email on the `record_stop` reply would race a
-/// half-written one. Forwarded to the channel owner, which is the only thing
-/// that knows what the recording was for.
-pub(super) fn on_recording_finished(
+/// The event exists because the *closed* file is what a controller or a script
+/// can act on: attaching the audio to an email on the `record_stop` reply, or
+/// uploading it when the call ends, would race a half-written one. The handlers
+/// see the SIP Call-ID of the party the recording was on, which is the key the
+/// call's records carry; the engine's own call-id is that only on an ordinary
+/// call.
+pub(super) async fn on_recording_finished(
     state: &DispatcherState,
     mut recording: crate::rtpengine::events::RecordingFinished,
+    scope: Option<CallScope>,
 ) {
     recording.reason = recording_end_reason(
         recording.reason,
@@ -1178,4 +1182,59 @@ pub(super) fn on_recording_finished(
         "media engine finished a recording"
     );
     publish_recording_finished(state, &recording);
+    // A tag that names no single party still leaves a closed file somebody has
+    // to deal with, so the handlers get the engine's call-id rather than nothing.
+    let call_id = engine_event_channel(state, &recording.call_id, &recording.from_tag)
+        .unwrap_or_else(|| recording.call_id.clone());
+    let engine = Arc::clone(&state.engine);
+    if engine
+        .state()
+        .recording_finished_handlers(&call_id, &recording.from_tag)
+        .is_empty()
+    {
+        return;
+    }
+    run_event_handler("rtpengine.on_recording_finished", move || {
+        let engine_state = engine.state();
+        let handlers = engine_state.recording_finished_handlers(&call_id, &recording.from_tag);
+        pyo3::Python::attach(|python| {
+            for handler in handlers {
+                let callable = handler.callable.bind(python);
+                let result = crate::script::handler_keyword::call_with_optional_keyword(
+                    python,
+                    callable,
+                    (
+                        call_id.as_str(),
+                        recording.from_tag.as_str(),
+                        recording.recording_id.as_str(),
+                        recording.path.as_deref(),
+                        recording.reason,
+                        recording.duration_ms,
+                    ),
+                    6,
+                    "scope",
+                    scope.as_ref().map(CallScope::as_str),
+                );
+                match result {
+                    Ok(ret) => {
+                        if handler.is_async {
+                            if let Err(error) = run_coroutine(python, &ret) {
+                                tracing::error!(
+                                    error = %crate::script::error_report::describe(python, &error),
+                                    "async rtpengine.on_recording_finished handler error"
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            error = %crate::script::error_report::describe(python, &error),
+                            "rtpengine.on_recording_finished handler failed"
+                        );
+                    }
+                }
+            }
+        });
+    })
+    .await;
 }

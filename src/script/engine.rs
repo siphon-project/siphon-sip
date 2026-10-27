@@ -186,6 +186,15 @@ pub enum HandlerKind {
         call_id: Option<String>,
         from_tag: Option<String>,
     },
+    /// `@rtpengine.on_recording_finished` — a recording's file is closed, for
+    /// any reason (stopped, a cap reached, the call ended, an error). Fires once
+    /// per recording the engine accepted, whoever started it.
+    ///
+    /// ``call_id`` (the SIP Call-ID) and ``from_tag`` are optional filters.
+    RtpEngineOnRecordingFinished {
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    },
     /// `@rtpengine.on_play_finished` — a playback ended. Fires for every play
     /// the engine accepted, including a fire-and-forget one, so a script that
     /// acts when a prompt ends has something to hang that on rather than a
@@ -1223,6 +1232,17 @@ fn extract_handlers(python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<V
                     .and_then(|meta| meta.get_item("from_tag").ok())
                     .and_then(|v| v.extract().ok());
                 HandlerKind::RtpEngineOnWsTeeEnded { call_id, from_tag }
+            }
+            "rtpengine.on_recording_finished" => {
+                let call_id: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("call_id").ok())
+                    .and_then(|v| v.extract().ok());
+                let from_tag: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("from_tag").ok())
+                    .and_then(|v| v.extract().ok());
+                HandlerKind::RtpEngineOnRecordingFinished { call_id, from_tag }
             }
             "rtpengine.on_play_finished" => {
                 let call_id: Option<String> = metadata
@@ -2409,6 +2429,37 @@ async def specific_end(call_id, from_tag, stream_id, reason, frames_sent, frames
             })
             .expect("filtered ws-tee-ended handler registered");
         assert!(specific.is_async);
+    }
+
+    #[test]
+    fn rtpengine_on_recording_finished_registers_and_filters() {
+        let source = r#"
+from siphon import rtpengine
+
+@rtpengine.on_recording_finished
+def any_recording(call_id, from_tag, recording_id, path, reason, duration_ms):
+    pass
+
+@rtpengine.on_recording_finished(call_id="abc")
+async def one_call(call_id, from_tag, recording_id, path, reason, duration_ms):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 2);
+        assert_eq!(state.recording_finished_handlers("xyz", "tag").len(), 1);
+        assert_eq!(state.recording_finished_handlers("abc", "tag").len(), 2);
+        assert!(state.ws_tee_ended_handlers("abc", "tag").is_empty());
+        let filtered = state
+            .handlers
+            .iter()
+            .find(|h| {
+                matches!(
+                    &h.kind,
+                    HandlerKind::RtpEngineOnRecordingFinished { call_id: Some(c), .. } if c == "abc"
+                )
+            })
+            .expect("filtered recording handler registered");
+        assert!(filtered.is_async);
     }
 
     #[test]

@@ -1056,9 +1056,63 @@ pub enum RecordingChannels {
     Stereo,
 }
 
+/// The file a recording is written as.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RecordingFormat {
+    /// 16-bit linear PCM. What a voicemail box plays back.
+    #[default]
+    Wav,
+    /// Opus in Ogg (RFC 7845): about a seventh of the size, for a recording
+    /// that leaves the node. Needs an engine that lists `record_ogg_opus`.
+    OggOpus,
+}
+
+impl RecordingFormat {
+    /// The name the script and the control plane use.
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "wav" => Ok(Self::Wav),
+            "ogg_opus" => Ok(Self::OggOpus),
+            other => Err(format!("format {other:?} is wav or ogg_opus")),
+        }
+    }
+}
+
+/// Check a format and the bitrate asked for with it.
+///
+/// A bitrate means something to Opus only, so it is refused with any other
+/// format rather than ignored, and outside Opus' own range (RFC 6716 §2.1.1)
+/// rather than clamped: either way the caller would not get the file it asked
+/// for. The engine refuses both too; checking here keeps the error in the
+/// caller's words and the request off the wire.
+pub fn check_recording_bitrate(
+    format: RecordingFormat,
+    bitrate_bps: Option<u32>,
+) -> Result<(), String> {
+    let Some(bitrate_bps) = bitrate_bps else {
+        return Ok(());
+    };
+    if format != RecordingFormat::OggOpus {
+        return Err("bitrate_bps is an ogg_opus setting".to_string());
+    }
+    let range = siphon_rtp_proto::RECORDING_OPUS_BITRATE_BPS_MIN
+        ..=siphon_rtp_proto::RECORDING_OPUS_BITRATE_BPS_MAX;
+    if !range.contains(&bitrate_bps) {
+        return Err(format!(
+            "bitrate_bps {bitrate_bps} is outside {} to {}",
+            range.start(),
+            range.end()
+        ));
+    }
+    Ok(())
+}
+
 /// What to record, and when to stop by itself.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RecordingRequest<'a> {
+    pub format: RecordingFormat,
+    /// Opus target bitrate; `None` is the engine's per-channel default.
+    pub bitrate_bps: Option<u32>,
     pub direction: RecordingDirection,
     pub channels: RecordingChannels,
     /// Stop after this much audio. The limit a voicemail greeting announces.
@@ -1068,4 +1122,33 @@ pub struct RecordingRequest<'a> {
     pub silence_ms: Option<u64>,
     /// Explicit output path. The directory must already exist.
     pub path: Option<&'a str>,
+}
+
+#[cfg(test)]
+mod recording_format_tests {
+    use super::{check_recording_bitrate, RecordingFormat};
+
+    #[test]
+    fn a_format_is_named_wav_or_ogg_opus() {
+        assert_eq!(RecordingFormat::parse("wav"), Ok(RecordingFormat::Wav));
+        assert_eq!(
+            RecordingFormat::parse("ogg_opus"),
+            Ok(RecordingFormat::OggOpus)
+        );
+        assert!(RecordingFormat::parse("opus").is_err());
+        assert!(RecordingFormat::parse("pcap").is_err());
+        assert_eq!(RecordingFormat::default(), RecordingFormat::Wav);
+    }
+
+    #[test]
+    fn a_bitrate_is_refused_outside_ogg_opus_and_outside_the_opus_range() {
+        assert!(check_recording_bitrate(RecordingFormat::Wav, None).is_ok());
+        assert!(check_recording_bitrate(RecordingFormat::OggOpus, None).is_ok());
+        assert!(check_recording_bitrate(RecordingFormat::OggOpus, Some(6_000)).is_ok());
+        assert!(check_recording_bitrate(RecordingFormat::OggOpus, Some(510_000)).is_ok());
+        let wav = check_recording_bitrate(RecordingFormat::Wav, Some(16_000)).unwrap_err();
+        assert!(wav.contains("ogg_opus"), "{wav}");
+        assert!(check_recording_bitrate(RecordingFormat::OggOpus, Some(5_999)).is_err());
+        assert!(check_recording_bitrate(RecordingFormat::OggOpus, Some(510_001)).is_err());
+    }
 }

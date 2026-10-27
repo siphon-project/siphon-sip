@@ -1544,14 +1544,19 @@ impl PyRtpEngine {
     /// until :meth:`stop_recording`, ``max_duration_ms``, ``silence_ms`` or
     /// the end of the call. :meth:`wait_recording` waits for its end.
     ///
-    /// The engine decodes the audio and writes a 16-bit PCM WAV. It works on a
-    /// call the engine answered itself (``answer_local``), which is what a
-    /// voicemail box is. ``path`` names the file (its directory must exist);
-    /// without one the engine picks a name in its recording directory.
-    /// ``direction`` is ``"ingress"`` (what the caller sent, the default),
-    /// ``"egress"`` (what the engine played) or ``"both"``. ``scope`` names
-    /// the leg as for :meth:`play_media`. Native **siphon-rtp** backend only.
-    #[pyo3(signature = (target, path=None, direction="ingress", channels="mono", max_duration_ms=None, silence_ms=None, scope=None))]
+    /// The engine decodes the audio and writes ``format``: ``"wav"`` (16-bit
+    /// PCM, the default) or ``"ogg_opus"`` (Opus in Ogg, about a seventh of the
+    /// size, for a file that leaves the node; ``bitrate_bps`` sets its target,
+    /// 6000 to 510000, default 16000 per channel). It works on a call the engine
+    /// answered itself (``answer_local``), which is what a voicemail box is, and
+    /// on a relayed call, where ``channels="stereo"`` puts each party on its own
+    /// channel. ``path`` names the file (its directory must exist); without one
+    /// the engine picks a name in its recording directory. ``direction`` is
+    /// ``"ingress"`` (what the parties sent, the default), ``"egress"`` (what
+    /// they were sent) or ``"both"``. ``scope`` names the leg as for
+    /// :meth:`play_media`. Native **siphon-rtp** backend only, and ``ogg_opus``
+    /// needs an engine that lists ``record_ogg_opus`` (siphon-rtp 0.15.0).
+    #[pyo3(signature = (target, path=None, direction="ingress", channels="mono", max_duration_ms=None, silence_ms=None, scope=None, format="wav", bitrate_bps=None))]
     #[allow(clippy::too_many_arguments)]
     fn start_recording<'py>(
         &self,
@@ -1563,8 +1568,12 @@ impl PyRtpEngine {
         max_duration_ms: Option<u64>,
         silence_ms: Option<u64>,
         scope: Option<&str>,
+        format: &str,
+        bitrate_bps: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let options = capture::RecordingOptions::parse(
+            format,
+            bitrate_bps,
             path,
             direction,
             channels,
@@ -1602,7 +1611,7 @@ impl PyRtpEngine {
     /// if message and message["duration_ms"] > 0:
     ///     keep(message["path"])
     /// ```
-    #[pyo3(signature = (target, path=None, direction="ingress", channels="mono", max_duration_ms=None, silence_ms=None, timeout_ms=None, scope=None))]
+    #[pyo3(signature = (target, path=None, direction="ingress", channels="mono", max_duration_ms=None, silence_ms=None, timeout_ms=None, scope=None, format="wav", bitrate_bps=None))]
     #[allow(clippy::too_many_arguments)]
     fn record<'py>(
         &self,
@@ -1615,8 +1624,12 @@ impl PyRtpEngine {
         silence_ms: Option<u64>,
         timeout_ms: Option<u64>,
         scope: Option<&str>,
+        format: &str,
+        bitrate_bps: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let options = capture::RecordingOptions::parse(
+            format,
+            bitrate_bps,
             path,
             direction,
             channels,
@@ -3115,6 +3128,52 @@ impl PyRtpEngine {
         event_decorator(
             python,
             "rtpengine.on_ws_tee_ended",
+            func_or_none,
+            call_id,
+            from_tag,
+        )
+    }
+
+    /// Register a handler for **recording finished** events: a recording's
+    /// file is closed and can be read, moved or uploaded.
+    ///
+    /// Fires once per recording the engine accepted, whoever started it and
+    /// however it ended. ``reason`` is ``"stopped"``, ``"max_duration"``,
+    /// ``"silence"``, ``"call_ended"``, ``"bridged"`` or ``"error"``; ``path``
+    /// is ``None`` only when the recording aborted before a file existed, and
+    /// ``duration_ms`` is the audio actually written. ``call_id`` is the SIP
+    /// Call-ID of the party the recording was on, the key the call's records
+    /// carry. Waiting for the file here rather than in the handler that started
+    /// it keeps a long recording from holding a handler open for the length of
+    /// the call.
+    ///
+    /// Delivered by the native **siphon-rtp** backend only.
+    ///
+    /// ```python,ignore
+    /// @rtpengine.on_recording_finished
+    /// async def recording_closed(call_id, from_tag, recording_id, path, reason, duration_ms):
+    ///     if path and duration_ms > 0:
+    ///         await archive(call_id, path)
+    /// ```
+    ///
+    /// Args:
+    ///     func_or_none: When applied directly
+    ///         (``@rtpengine.on_recording_finished``) this is the function.
+    ///         When called with keyword filters the return value is a
+    ///         decorator.
+    ///     call_id: Optional SIP Call-ID filter.
+    ///     from_tag: Optional from-tag filter.
+    #[pyo3(signature = (func_or_none=None, *, call_id=None, from_tag=None))]
+    fn on_recording_finished<'py>(
+        &self,
+        python: Python<'py>,
+        func_or_none: Option<Py<PyAny>>,
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        event_decorator(
+            python,
+            "rtpengine.on_recording_finished",
             func_or_none,
             call_id,
             from_tag,
