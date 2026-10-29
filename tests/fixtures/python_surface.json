@@ -2556,7 +2556,7 @@
       "conference_answer": {
         "doc": "Seat a participant the focus called out, on its answer to the offer",
         "kind": "method_descriptor",
-        "sig": "($self, conference_id, call, answer_sdp)"
+        "sig": "($self, conference_id, call, answer_sdp, received_from=None)"
       },
       "conference_bridge": {
         "doc": "Link two live rooms: ``direction`` ``\"both\"``, ``\"a_to_b\"`` (room A is",

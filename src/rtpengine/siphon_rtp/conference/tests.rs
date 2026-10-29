@@ -516,9 +516,13 @@ fn lacks_received_from(request: &Value) -> Value {
     listing(request, &["conference_seat"])
 }
 
+fn nat_address() -> std::net::IpAddr {
+    "198.51.100.20".parse().expect("an address")
+}
+
 fn behind_nat() -> NgFlags {
     NgFlags {
-        received_from: Some("198.51.100.20".parse().expect("an address")),
+        received_from: Some(nat_address()),
         ..NgFlags::default()
     }
 }
@@ -546,16 +550,43 @@ async fn a_seat_behind_nat_is_refused_by_an_engine_that_ignores_received_from() 
         matches!(joined, RtpEngineError::Unsupported { .. }),
         "{joined}"
     );
-    let offered = client
-        .conference_offer("room-1", "bob", ConferenceRole::Talker, &behind_nat())
+    let answered = client
+        .conference_answer("room-1", "bob", ANSWER, Some(nat_address()))
         .await
         .expect_err("refused");
     assert!(
-        matches!(offered, RtpEngineError::Unsupported { .. }),
-        "{offered}"
+        matches!(answered, RtpEngineError::Unsupported { .. }),
+        "{answered}"
     );
     assert!(engine.frames("conference_join").is_empty());
-    assert!(engine.frames("conference_offer").is_empty());
+    assert!(engine.frames("conference_answer").is_empty());
+}
+
+/// A called-out participant's address arrives with its answer, so it rides
+/// on `conference_answer` itself to an engine that honours it.
+#[tokio::test]
+async fn an_answered_seat_behind_nat_carries_received_from_on_the_answer() {
+    let engine = FakeEngine::start(lists_received_from, Vec::new()).await;
+    let (client, _events) = client(&engine);
+
+    client
+        .conference_answer("room-1", "bob", ANSWER, Some(nat_address()))
+        .await
+        .expect("seated");
+    let answers = engine.frames("conference_answer");
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0]["received_from"], json!("198.51.100.20"));
+
+    client
+        .conference_answer("room-1", "carol", ANSWER, None)
+        .await
+        .expect("seated");
+    assert!(
+        engine.frames("conference_answer")[1]
+            .get("received_from")
+            .is_none(),
+        "absent, not null, without an address"
+    );
 }
 
 /// An engine that lists `conference_received_from` is sent the seat with the

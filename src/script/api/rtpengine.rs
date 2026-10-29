@@ -1959,15 +1959,20 @@ impl PyRtpEngine {
     /// ``bytes``, e.g. ``reply.body`` in ``@b2bua.on_answer``). Raises
     /// ``ValueError`` when the engine refuses the answer (a codec it did not
     /// offer, a rejected stream, no offer pending); the offered seat is freed.
-    #[pyo3(signature = (conference_id, call, answer_sdp))]
+    /// ``received_from`` is the IP the participant's answer came from (e.g.
+    /// ``reply.source_ip``), for a participant behind NAT whose ``c=`` is
+    /// private: the seat takes its media from there and sends the mix there.
+    /// An engine that does not list ``conference_received_from`` refuses it.
+    #[pyo3(signature = (conference_id, call, answer_sdp, received_from=None))]
     fn conference_answer<'py>(
         &self,
         python: Python<'py>,
         conference_id: String,
         call: &Bound<'py, PyAny>,
         answer_sdp: &Bound<'py, PyAny>,
+        received_from: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        conference::answer(self, python, conference_id, call, answer_sdp)
+        conference::answer(self, python, conference_id, call, answer_sdp, received_from)
     }
 
     /// Play a ``file``, ``blob`` or ``tone`` into a room, heard by every seat,

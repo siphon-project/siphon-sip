@@ -6583,7 +6583,11 @@ class MockRtpEngine:
         return self._conference_offer_sdp
 
     async def conference_answer(
-        self, conference_id: str, call: Any, answer_sdp: Union[str, bytes]
+        self,
+        conference_id: str,
+        call: Any,
+        answer_sdp: Union[str, bytes],
+        received_from: Optional[str] = None,
     ) -> bool:
         """Seat a participant the focus called out, on its answer to the offer
         :meth:`conference_offer` made.
@@ -6591,18 +6595,32 @@ class MockRtpEngine:
         ``call`` names the seat: the ``(call_id, seat_tag)`` pair of the call
         that carried the offer (its teardown, ``rtpengine.delete(call)``, then
         leaves the room). ``answer_sdp`` is the participant's answer, e.g.
-        ``reply.body`` in ``@b2bua.on_answer``.
+        ``reply.body`` in ``@b2bua.on_answer``. ``received_from`` is the IP the
+        answer came from (``reply.source_ip``), for a participant behind NAT
+        whose ``c=`` is private: the seat takes its media from there and sends
+        the mix there. Recorded on the seat as ``received_from``.
 
         Returns:
             ``True`` once seated.
 
         Raises:
             ValueError: no offer is pending for the seat, the answer is empty,
-                or the engine refused it (a codec it did not offer, a
-                rejected stream); the offered seat is freed.
+                ``received_from`` is not an IP address, or the engine refused
+                it (a codec it did not offer, a rejected stream); the offered
+                seat is freed.
         """
         if not conference_id:
             raise ValueError("rtpengine.conference_answer(conference_id) is empty")
+        if received_from is not None:
+            import ipaddress
+
+            try:
+                ipaddress.ip_address(received_from)
+            except ValueError:
+                raise ValueError(
+                    "rtpengine.conference_answer(received_from) is an IP address, "
+                    f"got {received_from!r}"
+                ) from None
         call_id, seat_tag = self._conference_seat_of(call)
         if not answer_sdp:
             raise ValueError("rtpengine.conference_answer needs the participant's answer SDP")
@@ -6612,7 +6630,7 @@ class MockRtpEngine:
                 "rtpengine.conference_answer refused: no offer is pending for this seat"
             )
         room = self.conferences.setdefault(conference_id, {})
-        room[seat_tag] = {"call_id": call_id, **offered}
+        room[seat_tag] = {"call_id": call_id, **offered, "received_from": received_from}
         self.operations.append(("conference_answer", conference_id))
         self.media_calls.append({
             "op": "conference_answer",

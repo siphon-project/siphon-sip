@@ -429,8 +429,18 @@ pub(super) fn answer<'py>(
     conference_id: String,
     call: &Bound<'py, PyAny>,
     answer_sdp: &Bound<'py, PyAny>,
+    received_from: Option<String>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conference_id = room_id(conference_id, "conference_answer(conference_id)")?;
+    let received_from = received_from
+        .map(|address| {
+            address.parse::<std::net::IpAddr>().map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "rtpengine.conference_answer(received_from) is an IP address, got {address:?}"
+                ))
+            })
+        })
+        .transpose()?;
     let (call_id, seat) = seat_of(conference_id, call)?;
     let answer_sdp = super::super::request::extract_body_bytes(answer_sdp)?;
     if answer_sdp.is_empty() {
@@ -442,7 +452,7 @@ pub(super) fn answer<'py>(
     let client = Arc::clone(&engine.client);
     crate::script::awaitable(python, async move {
         client
-            .conference_answer(&call_id, seat.clone(), &answer_sdp)
+            .conference_answer(&call_id, seat.clone(), &answer_sdp, received_from)
             .await
             .map_err(|error| match &error {
                 RtpEngineError::EngineError(_) => pyo3::exceptions::PyValueError::new_err(format!(
