@@ -122,6 +122,11 @@ pub struct ReginfoContact {
     /// RFC 3680 §5.3.2 so watchers see the same capability advertisement
     /// the registrar received.  Empty `Vec` when there is nothing to emit.
     pub params: Vec<(String, Option<String>)>,
+    /// Call-ID of the REGISTER that created or last refreshed the binding
+    /// (RFC 3680 §5.3 `callid`, TS 24.229 §5.4.2.1.2).
+    pub callid: Option<String>,
+    /// CSeq number of that REGISTER (RFC 3680 §5.3 `cseq`).
+    pub cseq: Option<u64>,
 }
 
 /// A single AoR registration entry.
@@ -184,6 +189,12 @@ impl ReginfoBody {
                 if let Some(q) = contact.q {
                     output.push_str(&format!(" q=\"{q:.1}\""));
                 }
+                if let Some(callid) = &contact.callid {
+                    output.push_str(&format!(" callid=\"{}\"", xml_escape(callid)));
+                }
+                if let Some(cseq) = contact.cseq {
+                    output.push_str(&format!(" cseq=\"{cseq}\""));
+                }
                 output.push_str(">\n");
                 output.push_str(&format!("      <uri>{}</uri>\n", xml_escape(&contact.uri),));
                 // RFC 3680 §5.3.2 — surface RFC 3840 feature tags and
@@ -219,7 +230,25 @@ impl ReginfoBody {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build a full-state reginfo document from current registrar contacts.
+/// Build a full-state reginfo document for one address of record.
+///
+/// The same document as [`build_full_reginfo_for_identities`] with an implicit
+/// registration set of one identity.
+pub fn build_full_reginfo(
+    aor: &str,
+    contacts: &[Contact],
+    version: u32,
+    include_as_contacts: bool,
+) -> ReginfoBody {
+    build_full_reginfo_for_identities(&[aor], contacts, version, include_as_contacts)
+}
+
+/// Build a full-state reginfo document for an implicit registration set.
+///
+/// TS 24.229 §5.4.2.1.2: one `<registration>` element per public user
+/// identity of the set (`identities`, in order, each once), each carrying the
+/// contacts registered for the set. A UE that registered one identity of the
+/// set looks for that identity's element.
 ///
 /// `contacts` should be the merged view (UE + AS) from `Registrar::lookup_all`,
 /// so the registration state below can see whether any UE binding exists.
@@ -236,8 +265,12 @@ impl ReginfoBody {
 /// genuinely registers on the user's behalf. Emitting them anyway showed the UE
 /// several `state="active" event="registered"` contacts against its own IMPU
 /// that it never created, indistinguishable from its own binding.
-pub fn build_full_reginfo(
-    aor: &str,
+///
+/// Each `<contact>` carries the Call-ID and CSeq of the REGISTER behind it and
+/// every Contact-header parameter as `<unknown-param>`, `+sip.instance` and
+/// `reg-id` included (TS 24.229 §5.4.2.1.2, RFC 3680 §5.3).
+pub fn build_full_reginfo_for_identities<S: AsRef<str>>(
+    identities: &[S],
     contacts: &[Contact],
     version: u32,
     include_as_contacts: bool,
@@ -255,28 +288,55 @@ pub fn build_full_reginfo(
         .iter()
         .filter(|contact| !contact.is_expired())
         .filter(|contact| include_as_contacts || contact.kind == ContactKind::Ue)
-        .map(|contact| ReginfoContact {
-            uri: contact.uri.to_string(),
-            state: ContactState::Active,
-            event: ContactEvent::Registered,
-            expires: Some(contact.remaining_seconds()),
-            q: Some(contact.q),
-            params: contact.params.clone(),
-        })
+        .map(reginfo_contact)
         .collect();
 
-    // Generate a stable registration ID from the AoR.
-    let id = format!("reg-{:x}", hash_aor(aor));
+    let mut registrations: Vec<Registration> = Vec::with_capacity(identities.len());
+    for identity in identities {
+        let identity = identity.as_ref();
+        if registrations
+            .iter()
+            .any(|registration| registration.aor == identity)
+        {
+            continue;
+        }
+        registrations.push(Registration {
+            aor: identity.to_string(),
+            // Stable per identity across NOTIFYs.
+            id: format!("reg-{:x}", hash_aor(identity)),
+            state: registration_state,
+            contacts: reginfo_contacts.clone(),
+        });
+    }
 
     ReginfoBody {
         version,
         state: ReginfoState::Full,
-        registrations: vec![Registration {
-            aor: aor.to_string(),
-            id,
-            state: registration_state,
-            contacts: reginfo_contacts,
-        }],
+        registrations,
+    }
+}
+
+/// One registrar binding as a reginfo `<contact>`.
+fn reginfo_contact(contact: &Contact) -> ReginfoContact {
+    // `Contact::params` holds every Contact-header parameter except the two
+    // the registrar keeps in their own fields; the document carries them all.
+    let mut params = Vec::with_capacity(contact.params.len() + 2);
+    if let Some(instance) = &contact.sip_instance {
+        params.push(("+sip.instance".to_string(), Some(instance.to_string())));
+    }
+    if let Some(reg_id) = contact.reg_id {
+        params.push(("reg-id".to_string(), Some(reg_id.to_string())));
+    }
+    params.extend(contact.params.iter().cloned());
+    ReginfoContact {
+        uri: contact.uri.to_string(),
+        state: ContactState::Active,
+        event: ContactEvent::Registered,
+        expires: Some(contact.remaining_seconds()),
+        q: Some(contact.q),
+        params,
+        callid: Some(contact.call_id.to_string()),
+        cseq: Some(u64::from(contact.cseq)),
     }
 }
 
@@ -458,6 +518,8 @@ pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
                         };
                         let expires = attr_optional_u64(&element, "expires")?;
                         let q = attr_optional_f32(&element, "q")?;
+                        let callid = attr_optional_str(&element, "callid")?;
+                        let cseq = attr_optional_u64(&element, "cseq")?;
                         // The contact's URI may live as an attribute on
                         // <contact> directly (some implementations emit
                         // it that way) or as the inner <uri> element
@@ -480,6 +542,8 @@ pub fn parse_reginfo(xml: &str) -> Result<ReginfoBody, ReginfoParseError> {
                             expires,
                             q,
                             params: Vec::new(),
+                            callid,
+                            cseq,
                         });
                         if is_empty {
                             if let Some(contact) = current_contact.take() {
@@ -887,6 +951,8 @@ mod tests {
             expires: Some(1800),
             q: Some(0.5),
             params: Vec::new(),
+            callid: None,
+            cseq: None,
         };
         let body = ReginfoBody {
             version: 2,
@@ -1100,6 +1166,8 @@ mod tests {
                             Some("\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"".to_string()),
                         ),
                     ],
+                    callid: None,
+                    cseq: None,
                 }],
             }],
         };
@@ -1204,6 +1272,8 @@ mod tests {
                 ),
                 ("vendor.x".to_string(), Some("y".to_string())),
             ],
+            callid: None,
+            cseq: None,
         };
         let body = ReginfoBody {
             version: 1,
@@ -1218,5 +1288,116 @@ mod tests {
         let xml = body.to_xml();
         let reparsed = parse_reginfo(&xml).unwrap();
         assert_eq!(reparsed.registrations[0].contacts[0].params, contact.params);
+    }
+
+    // TS 24.229 §5.4.2.1.2: the S-CSCF's reg-event NOTIFY carries one
+    // <registration> element per public user identity of the implicit
+    // registration set, each with the contacts registered for it, and each
+    // <contact> its Call-ID, CSeq and Contact-header parameters. A UE that
+    // registered one identity of the set reads the document per identity.
+
+    const IMPLICIT_SET: [&str; 3] = [
+        "sip:+15550100@ims.mnc001.mcc001.3gppnetwork.org",
+        "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org",
+        "tel:+15550100",
+    ];
+
+    #[test]
+    fn a_registration_per_identity_of_the_implicit_set() {
+        let contacts = vec![make_contact("sip:alice@10.0.0.1:5060", 3600)];
+        let body = build_full_reginfo_for_identities(&IMPLICIT_SET, &contacts, 0, false);
+
+        let aors: Vec<&str> = body.registrations.iter().map(|r| r.aor.as_str()).collect();
+        assert_eq!(
+            aors, IMPLICIT_SET,
+            "one registration per identity, in set order"
+        );
+        for registration in &body.registrations {
+            assert_eq!(registration.state, RegistrationState::Active);
+            assert_eq!(registration.contacts.len(), 1, "{}", registration.aor);
+        }
+        let ids: std::collections::HashSet<&str> =
+            body.registrations.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "registration ids are distinct per identity");
+    }
+
+    #[test]
+    fn an_identity_listed_twice_is_one_registration() {
+        let contacts = vec![make_contact("sip:alice@10.0.0.1:5060", 3600)];
+        let identities = [IMPLICIT_SET[0], IMPLICIT_SET[2], IMPLICIT_SET[0]];
+        let body = build_full_reginfo_for_identities(&identities, &contacts, 0, false);
+        assert_eq!(body.registrations.len(), 2);
+    }
+
+    #[test]
+    fn an_implicit_set_without_ue_binding_is_terminated_for_every_identity() {
+        let contacts = vec![make_as_contact("mmtel.ims.example.com", None)];
+        let body = build_full_reginfo_for_identities(&IMPLICIT_SET, &contacts, 0, false);
+        assert!(body
+            .registrations
+            .iter()
+            .all(|r| r.state == RegistrationState::Terminated && r.contacts.is_empty()));
+    }
+
+    #[test]
+    fn the_single_aor_builder_is_the_set_of_one() {
+        let contacts = vec![make_contact("sip:alice@10.0.0.1:5060", 3600)];
+        let single = build_full_reginfo("sip:alice@ims.example.com", &contacts, 4, false);
+        let set =
+            build_full_reginfo_for_identities(&["sip:alice@ims.example.com"], &contacts, 4, false);
+        assert_eq!(single.to_xml(), set.to_xml());
+    }
+
+    #[test]
+    fn a_contact_carries_its_callid_and_cseq() {
+        let mut contact = make_contact("sip:alice@10.0.0.1:5060", 3600);
+        contact.call_id = "a84b4c76e66710".into();
+        contact.cseq = 7;
+        let xml = build_full_reginfo("sip:alice@ims.example.com", &[contact], 0, false).to_xml();
+        assert!(xml.contains(r#"callid="a84b4c76e66710""#), "{xml}");
+        assert!(xml.contains(r#"cseq="7""#), "{xml}");
+    }
+
+    #[test]
+    fn a_contact_carries_its_instance_and_reg_id() {
+        let mut contact = make_contact("sip:alice@10.0.0.1:5060", 3600);
+        contact.sip_instance = Some(r#""<urn:gsma:imei:35209900-176148-0>""#.into());
+        contact.reg_id = Some(1);
+        contact.params = vec![("+g.3gpp.smsip".to_string(), None)];
+        let xml = build_full_reginfo("sip:alice@ims.example.com", &[contact], 0, false).to_xml();
+        assert!(
+            xml.contains(concat!(
+                r#"<unknown-param name="+sip.instance">"#,
+                "&quot;&lt;urn:gsma:imei:35209900-176148-0&gt;&quot;</unknown-param>",
+            )),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<unknown-param name="reg-id">1</unknown-param>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<unknown-param name="+g.3gpp.smsip"/>"#),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn callid_cseq_and_instance_survive_a_round_trip() {
+        let mut contact = make_contact("sip:alice@10.0.0.1:5060", 3600);
+        contact.call_id = "a84b4c76e66710".into();
+        contact.cseq = 7;
+        contact.sip_instance = Some(r#""<urn:gsma:imei:35209900-176148-0>""#.into());
+        let xml = build_full_reginfo_for_identities(&IMPLICIT_SET, &[contact], 0, false).to_xml();
+        let reparsed = parse_reginfo(&xml).unwrap();
+        assert_eq!(reparsed.registrations.len(), 3);
+        let parsed = &reparsed.registrations[2].contacts[0];
+        assert_eq!(parsed.callid.as_deref(), Some("a84b4c76e66710"));
+        assert_eq!(parsed.cseq, Some(7));
+        assert!(parsed
+            .params
+            .iter()
+            .any(|(name, value)| name == "+sip.instance"
+                && value.as_deref() == Some(r#""<urn:gsma:imei:35209900-176148-0>""#)));
     }
 }
