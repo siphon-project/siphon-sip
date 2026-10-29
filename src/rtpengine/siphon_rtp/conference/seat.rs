@@ -23,36 +23,56 @@ use crate::rtpengine::error::RtpEngineError;
 /// What an engine that serves `conference_seat` lists in `node_info.features`.
 pub(crate) const CONFERENCE_SEAT_FEATURE: &str = "conference_seat";
 
-/// The refusal for an engine that does not list the feature: the verb is not
-/// sent, and the caller reports it as not implemented here.
-fn engine_lacks_the_verb() -> RtpEngineError {
-    RtpEngineError::Unsupported {
-        operation: "conference_seat",
-        backend: "siphon-rtp (an engine that does not list conference_seat)",
-    }
-}
+/// What an engine lists in `node_info.features` when a seat it answers or
+/// offers honours the profile's received-from address (the participant behind
+/// NAT whose `c=` names a private address): it admits that party's media from
+/// there and sends the mix back there, as a two-party answer does.
+pub(crate) const CONFERENCE_RECEIVED_FROM_FEATURE: &str = "conference_received_from";
 
 /// Whether a `node_info` answer lists `conference_seat`.
 pub(crate) fn require_conference_seat(result: CmdResult) -> Result<(), RtpEngineError> {
+    require_feature(
+        result,
+        CONFERENCE_SEAT_FEATURE,
+        "conference_seat",
+        "siphon-rtp (an engine that does not list conference_seat)",
+    )
+}
+
+/// Whether a `node_info` answer lists `conference_received_from`. An engine
+/// without it would seat a NATed participant on its private `c=` address and
+/// drop every packet it sends, so such a seat is refused rather than made.
+pub(crate) fn require_seat_received_from(result: CmdResult) -> Result<(), RtpEngineError> {
+    require_feature(
+        result,
+        CONFERENCE_RECEIVED_FROM_FEATURE,
+        "a conference seat with received_from",
+        "siphon-rtp (an engine that does not list conference_received_from)",
+    )
+}
+
+/// Whether a `node_info` answer lists `feature`; refused as `operation` not
+/// implemented by `backend` when it does not, so nothing is sent.
+fn require_feature(
+    result: CmdResult,
+    feature: &str,
+    operation: &'static str,
+    backend: &'static str,
+) -> Result<(), RtpEngineError> {
     match result {
-        CmdResult::NodeInfo { node }
-            if node
-                .features
-                .iter()
-                .any(|feature| feature == CONFERENCE_SEAT_FEATURE) =>
-        {
+        CmdResult::NodeInfo { node } if node.features.iter().any(|listed| listed == feature) => {
             Ok(())
         }
         CmdResult::NodeInfo { node } => {
             tracing::warn!(
                 version = %node.version,
-                "conference_seat asked for, but the media engine does not list \
-                 '{CONFERENCE_SEAT_FEATURE}' in node_info features"
+                "{operation} asked for, but the media engine does not list \
+                 '{feature}' in node_info features"
             );
-            Err(engine_lacks_the_verb())
+            Err(RtpEngineError::Unsupported { operation, backend })
         }
         CmdResult::Error { reason } => Err(RtpEngineError::EngineError(format!(
-            "node_info refused while checking for conference_seat: {reason}"
+            "node_info refused while checking for {feature}: {reason}"
         ))),
         other => Err(RtpEngineError::Protocol(format!(
             "unexpected '{}' response for node_info",

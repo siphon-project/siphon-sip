@@ -13,6 +13,10 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A conference seat behind NAT is refused rather than seated deaf.** `rtpengine.conference_join` (and `conference_offer`) sent the profile's received-from address, but siphon-rtp up to 0.15.4 ignored it on a seat and gated the seat on the offer's `c=`, so a participant advertising a private address had every packet dropped and the mix sent to nowhere, with nothing telling the script. When the profile carries a received-from address, siphon now asks the engine for `conference_received_from` in `node_info` first and refuses the seat (`unsupported`) on an engine without it; on one that lists it the seat is made with the address, as a two-party answer is.
+
 ## [1.15.6] — 2026-10-29
 
 ### Added

@@ -49,6 +49,9 @@ impl SiphonRtpClient {
         role: ConferenceRole,
         flags: &NgFlags,
     ) -> Result<String, RtpEngineError> {
+        if flags.received_from.is_some() {
+            seat::require_seat_received_from(self.request_in(None, Command::NodeInfo).await?)?;
+        }
         let result = self
             .conference_request(Command::ConferenceJoin {
                 conference_id: conference_id.to_string(),
@@ -136,6 +139,9 @@ impl SiphonRtpClient {
         role: ConferenceRole,
         flags: &NgFlags,
     ) -> Result<String, RtpEngineError> {
+        if flags.received_from.is_some() {
+            seat::require_seat_received_from(self.request_in(None, Command::NodeInfo).await?)?;
+        }
         let result = self
             .conference_request(Command::ConferenceOffer {
                 conference_id: conference_id.to_string(),
