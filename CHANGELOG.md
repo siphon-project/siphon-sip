@@ -13,6 +13,10 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The reg-event `reginfo` document carries every public identity of the implicit registration set, and each contact's Call-ID, CSeq and `+sip.instance`.** `registrar.reginfo_xml()` rendered one `<registration>`, for the AoR asked for, so a UE that registered another identity of the set (a temporary IMPU, a `tel:` alias) found no element for it. It now renders one `<registration>` per identity of the set (the AoR asked for first, then the associated URIs the registrar holds), each with the set's contacts (TS 24.229 §5.4.2.1.2). Each `<contact>` carries `callid` and `cseq` of the REGISTER behind it (RFC 3680 §5.3) and every Contact-header parameter as `<unknown-param>`, `+sip.instance` and `reg-id` included, which the registrar keeps in their own fields and had left out. `reginfo::build_full_reginfo_for_identities()` builds such a document; `build_full_reginfo()` is that with a set of one. The parser reads `callid` and `cseq` back.
+
 ## [1.15.5] — 2026-10-27
 
 ### Added

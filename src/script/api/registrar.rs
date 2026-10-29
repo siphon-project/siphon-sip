@@ -1593,7 +1593,14 @@ impl PyRegistrar {
             "partial" => reginfo::ReginfoState::Partial,
             _ => reginfo::ReginfoState::Full,
         };
-        let body = reginfo::build_full_reginfo(&aor, &contacts, version, include_as_contacts);
+        // TS 24.229 §5.4.2.1.2: a <registration> per identity of the implicit set.
+        let identities = reginfo::implicit_set(&aor, self.inner.associated_uris(&aor));
+        let body = reginfo::build_full_reginfo_for_identities(
+            &identities,
+            &contacts,
+            version,
+            include_as_contacts,
+        );
         // Override the state from the builder (which always uses Full)
         let body = reginfo::ReginfoBody {
             state: reginfo_state,
@@ -4032,6 +4039,75 @@ mod tests {
 
             assert!(registrar.save(&mut request, false, vec![], None).unwrap());
             assert!(registrar.lookup_str(AOR).is_empty());
+        }
+    }
+
+    /// TS 24.229 §5.4.2.1.2: the document a UE subscribed to carries one
+    /// <registration> per identity of its implicit registration set, so a UE
+    /// that registered any identity of the set finds its own.
+    #[test]
+    fn reginfo_xml_has_a_registration_per_identity_of_the_implicit_set() {
+        let registrar = make_registrar();
+        let (mut request, py_reg) = make_register_request(
+            "<sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>",
+            "<sip:001010000000001@192.0.2.10:5060>;+sip.instance=\"<urn:gsma:imei:35209900-176148-0>\"",
+            &registrar,
+        );
+        py_reg
+            .save(
+                &mut request,
+                false,
+                vec![
+                    "sip:+15550100@ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+                    "tel:+15550100".to_string(),
+                ],
+                None,
+            )
+            .unwrap();
+        py_reg
+            .set_associated_uris(
+                "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org",
+                vec![
+                    "<sip:+15550100@ims.mnc001.mcc001.3gppnetwork.org>".to_string(),
+                    "<sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>".to_string(),
+                    "<tel:+15550100>".to_string(),
+                ],
+            )
+            .unwrap();
+
+        let xml = py_reg
+            .reginfo_xml(
+                "sip:+15550100@ims.mnc001.mcc001.3gppnetwork.org",
+                "full",
+                0,
+                false,
+            )
+            .unwrap();
+        let body = reginfo::parse_reginfo(&xml).unwrap();
+        let aors: Vec<&str> = body.registrations.iter().map(|r| r.aor.as_str()).collect();
+        assert_eq!(aors.len(), 3, "{xml}");
+        for identity in [
+            "sip:+15550100@ims.mnc001.mcc001.3gppnetwork.org",
+            "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org",
+            "tel:+15550100",
+        ] {
+            assert!(aors.contains(&identity), "{identity} missing from {xml}");
+        }
+        assert_eq!(
+            aors[0], "sip:+15550100@ims.mnc001.mcc001.3gppnetwork.org",
+            "asked-for AoR first"
+        );
+        for registration in &body.registrations {
+            let contact = &registration.contacts[0];
+            assert_eq!(contact.callid.as_deref(), Some("reg-call@host"));
+            assert_eq!(contact.cseq, Some(1));
+            assert!(
+                contact
+                    .params
+                    .iter()
+                    .any(|(name, _)| name == "+sip.instance"),
+                "{xml}"
+            );
         }
     }
 }
