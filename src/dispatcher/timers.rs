@@ -174,6 +174,7 @@ pub(super) fn sweep_b2bua_retransmits_at(state: &DispatcherState, now: std::time
             }
             Due::GaveUp {
                 key,
+                data,
                 destination,
                 attempts,
             } => {
@@ -190,6 +191,9 @@ pub(super) fn sweep_b2bua_retransmits_at(state: &DispatcherState, now: std::time
                 // CANCEL is ever sent.
                 if key.method == crate::sip::message::Method::Invite {
                     state.call_actors.invite_transaction_timed_out(&key.branch);
+                    // A re-INVITE tracked on a call ends as the 408 it
+                    // stands for (§8.1.3.1).
+                    super::b2bua::reinvite_timed_out(&key.branch, &data, destination, state);
                 }
             }
         }

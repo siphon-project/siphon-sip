@@ -13,6 +13,10 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A re-INVITE the far party never answers ends at Timer B as a `408`.** When a re-INVITE siphon sent one party of a B2BUA call (relayed from the other party, or its own: a session refresh, a media re-anchor, `b2bua.reoffer()`) drew no response at all, Timer B stopped its retransmissions and nothing else happened. The party's leg stayed marked as having an INVITE in progress for the rest of the call, so every later re-INVITE toward it was answered `491`; the party that sent a relayed one was never answered; and `b2bua.reoffer()` resolved only through its own `timeout_ms`. It now ends as the `408` the timeout stands for (RFC 3261 §17.1.1.2, §8.1.3.1): the dialog keeps its session (§14.1), the next re-INVITE toward the party goes out, a relayed one's originator is answered `408`, and `b2bua.reoffer()` resolves to `408`. Nothing is ACKed to the silent party, since it sent nothing. Over TCP/TLS/WS, where Timer B also runs, the same holds.
+
 ## [1.15.5] — 2026-10-27
 
 ### Added

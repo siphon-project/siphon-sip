@@ -2,6 +2,17 @@
 
 use crate::dispatcher::*;
 
+/// Where a final response to a tracked re-INVITE came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReinviteResponseOrigin {
+    /// Received from the party the re-INVITE was sent to.
+    Wire,
+    /// The `408` siphon stands in for when Timer B ends the re-INVITE with no
+    /// response at all (RFC 3261 §17.1.1.2, §8.1.3.1). Nothing came from the
+    /// party, so nothing is ACKed to it.
+    TimerB,
+}
+
 /// A response to a re-INVITE siphon forwarded between the legs. Returns
 /// `true` when the response was consumed here.
 pub fn forward_reinvite_response(
@@ -12,6 +23,30 @@ pub fn forward_reinvite_response(
     response_source: SocketAddr,
     state: &DispatcherState,
     snapshot: &BLegResponseSnapshot,
+) -> bool {
+    forward_reinvite_response_from(
+        call_id,
+        branch,
+        message,
+        status_code,
+        response_source,
+        state,
+        snapshot,
+        ReinviteResponseOrigin::Wire,
+    )
+}
+
+/// [`forward_reinvite_response`] for a response from `origin`.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_reinvite_response_from(
+    call_id: &str,
+    branch: &str,
+    message: &mut SipMessage,
+    status_code: u16,
+    response_source: SocketAddr,
+    state: &DispatcherState,
+    snapshot: &BLegResponseSnapshot,
+    origin: ReinviteResponseOrigin,
 ) -> bool {
     // Detect re-INVITE responses: target_uri starts with "reinvite:".
     // Re-INVITE tracking legs don't have actors — handled directly below.
@@ -399,14 +434,12 @@ pub fn forward_reinvite_response(
                 .set_pending_reinvite(call_id, /*on_a_leg=*/ !is_a2b, false);
         } else if status_code >= 300 {
             // Non-2xx: ACK is hop-by-hop — reuse the SAME branch as the
-            // forwarded re-INVITE (RFC 3261 §17.1.1.3).
-            send_reinvite_ack(branch.to_string(), state);
-            debug!(
-                call_id = %call_id,
-                direction = direction,
-                status = status_code,
-                "B2BUA: sent ACK to responder for re-INVITE non-2xx"
-            );
+            // forwarded re-INVITE (RFC 3261 §17.1.1.3). A Timer B 408 was
+            // never sent by the responder, so there is nothing to ACK.
+            if origin == ReinviteResponseOrigin::Wire {
+                send_reinvite_ack(branch.to_string(), state);
+                debug!(%call_id, direction, status_code, "B2BUA: ACKed re-INVITE non-2xx");
+            }
             // The re-INVITE failed, so the dialog keeps the session it had
             // (RFC 3261 §14.1) and owes nothing further: release its BYE too.
             release_owed_reinvite_ack(responder_dialog_call_id.as_deref(), state);
