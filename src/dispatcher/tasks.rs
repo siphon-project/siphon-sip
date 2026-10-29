@@ -240,6 +240,7 @@ pub(crate) fn spawn_timer_sweep(
                             check_pending_inbound_refer_timeouts(state);
                             check_answered_refer_expiry(state);
                             check_controller_refer_timeouts(state);
+                            check_orphaned_adoptions(state);
                             check_orphaned_ro_sessions(state);
                             check_deferred_referrer_byes(state);
                         });

@@ -187,14 +187,16 @@ fn the_public_surface_is_pinned() {
     // / `b2bua_progress_call_anchored` keep their signatures and send none),
     // plus the 4 crate-internal items `b2bua.reoffer()` and
     // `b2bua.session_sdp()` go through: the two entry points, `Reoffered`, and
-    // `forget_reoffer` for a script that stops waiting.
+    // `forget_reoffer` for a script that stops waiting, plus the 2
+    // crate-internal items `b2bua.adopt_replaced()` goes through: its entry
+    // point and `AdoptRequest`.
     // All additive, so a minor-compatible change — recorded here because that
     // is the tripwire.
     assert_eq!(
         declared + re_exported,
-        116,
+        118,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 116. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 118. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

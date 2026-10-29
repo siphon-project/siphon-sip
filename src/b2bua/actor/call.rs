@@ -423,6 +423,10 @@ pub struct CallActor {
     /// out-of-process app decides, and the answer-deadline sweep applies the
     /// handoff default action (not the 408 path) if the app never acts.
     pub control_app: Option<String>,
+    /// The digest identity the caller authenticated as in `@b2bua.on_invite`.
+    pub auth_user: Option<String>,
+    /// Set once this call was merged into a conference room (`b2bua.adopt_replaced`).
+    pub adoption: Option<Adoption>,
     /// Set while a controller-issued `dial` owns this call's outcome.
     ///
     /// A `dial` rings B-legs while the caller stays unanswered and parked, so
@@ -608,6 +612,8 @@ impl CallActor {
             auth_passthrough: false,
             route_sequence: None,
             control_app: None,
+            auth_user: None,
+            adoption: None,
             control_dial: false,
             control_dial_media: false,
             control_dial_offer: None,

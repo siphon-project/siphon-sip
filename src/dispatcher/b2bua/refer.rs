@@ -1043,6 +1043,14 @@ pub fn handle_b2bua_refer_on(
     // Which side referred decides which side survives, and therefore what the
     // surviving pair's media profile has to be (see `accept_refer(profile=…)`).
     py_call.set_refer_from_a_leg(from_a_leg);
+    // The call the `Replaces` names, read here and not from the handler: a
+    // store read while attached to Python is what script-dispatch rule 4 bans.
+    py_call.set_refer_replaces_call(refer_to.replaces.as_ref().and_then(|replaces| {
+        state
+            .call_actors
+            .replaced_dialog_party(&replaces.call_id, &replaces.from_tag, &replaces.to_tag)
+            .map(|(party, _)| party)
+    }));
 
     let (action, ignored_overrides) = Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {

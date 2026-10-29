@@ -257,6 +257,58 @@ fn x3_command(command: &Command) -> (Option<Recorded>, Option<String>, bool, boo
     }
 }
 
+/// The engine's `node_info` answer to request `id`, listing `features`.
+fn node_info_answer(id: u64, features: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "result": "node_info",
+        "node": {
+            "node_id": "engine-1",
+            "version": "0.14.0",
+            "media_addresses": ["192.0.2.10"],
+            "codecs": ["PCMU"],
+            "features": features,
+            "max_sessions": 0,
+            "draining": false,
+        },
+    })
+}
+
+/// What the engine records of a `conference_seat`: a leg of a live call
+/// moved into a room, which needs the call held.
+fn seat_command(command: &Command) -> (Option<Recorded>, Option<String>, bool, bool) {
+    match command {
+        Command::ConferenceSeat {
+            call_id,
+            from_tag,
+            conference_id,
+            ..
+        } => (
+            Some(Recorded {
+                detail: Some(conference_id.clone()),
+                ..Recorded::new("conference_seat", call_id, from_tag)
+            }),
+            None,
+            false,
+            true,
+        ),
+        _ => (None, None, false, false),
+    }
+}
+
+/// The engine's refusal of a `conference_seat` into a full room: one whose id
+/// starts `full-`.
+fn seat_refusal(command: &Command) -> Option<String> {
+    match command {
+        Command::ConferenceSeat { conference_id, .. } if conference_id.starts_with("full-") => {
+            Some(format!(
+                "conference_seat: conference {conference_id} is full"
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// The `play_id` the engine hands the first playback it accepts; each later one
 /// gets the next.
 pub(crate) const NATIVE_ENGINE_FIRST_PLAY_ID: u64 = 7001;
@@ -276,6 +328,13 @@ impl NativeTestEngine {
     /// Start the engine on a loopback port. Serves every connection the client
     /// opens until the test's runtime ends.
     pub(crate) async fn start() -> NativeTestEngine {
+        NativeTestEngine::start_with_features(&["relay", "scope", "conference_seat"]).await
+    }
+
+    /// [`NativeTestEngine::start`] for an engine whose `node_info` lists
+    /// `features`: one from before a verb leaves the verb's feature out.
+    pub(crate) async fn start_with_features(features: &[&str]) -> NativeTestEngine {
+        let features: Vec<String> = features.iter().map(|feature| feature.to_string()).collect();
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a loopback listener");
@@ -292,6 +351,7 @@ impl NativeTestEngine {
         ));
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
+                let features = features.clone();
                 let recorded = Arc::clone(&recorded);
                 let held = Arc::clone(&held);
                 let grown = Arc::clone(&grown);
@@ -326,19 +386,7 @@ impl NativeTestEngine {
                         };
                         // An engine that keys calls by scope says so.
                         if matches!(request.command, Command::NodeInfo) {
-                            let node_info = serde_json::json!({
-                                "id": request.id,
-                                "result": "node_info",
-                                "node": {
-                                    "node_id": "engine-1",
-                                    "version": "0.14.0",
-                                    "media_addresses": ["192.0.2.10"],
-                                    "codecs": ["PCMU"],
-                                    "features": ["relay", "scope"],
-                                    "max_sessions": 0,
-                                    "draining": false,
-                                },
-                            });
+                            let node_info = node_info_answer(request.id, &features);
                             let Ok(bytes) = frame::encode(&node_info) else {
                                 return;
                             };
@@ -351,7 +399,10 @@ impl NativeTestEngine {
                         // What the command is, what SDP an accepted one answers
                         // with, and what it does to the calls the engine holds.
                         let grown_call = grown_call_command(&request.command, &grown);
-                        let refusal = grown_call.as_ref().and_then(|grown| grown.refusal.clone());
+                        let refusal = grown_call
+                            .as_ref()
+                            .and_then(|grown| grown.refusal.clone())
+                            .or_else(|| seat_refusal(&request.command));
                         let (record, sdp, creates, needs_call) = match &request.command {
                             _ if grown_call.is_some() => grown_call
                                 .map(|grown| (Some(grown.record), grown.sdp, false, true))
@@ -485,6 +536,7 @@ impl NativeTestEngine {
                             Command::AttachX3 { .. } | Command::DetachX3 { .. } => {
                                 x3_command(&request.command)
                             }
+                            Command::ConferenceSeat { .. } => seat_command(&request.command),
                             _ => (None, None, false, false),
                         };
                         let mut refused = false;
@@ -598,6 +650,14 @@ impl NativeTestEngine {
     /// The engine's control address.
     pub(crate) fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    /// Hold the unscoped `call_id` as if an `offer` had created it: a call a
+    /// test builds without dialling it.
+    pub(crate) fn admit(&self, call_id: &str) {
+        if let Ok(mut live) = self.live.lock() {
+            live.insert((None, call_id.to_string()));
+        }
     }
 
     /// How many calls the engine holds.

@@ -44,10 +44,16 @@ pub(super) fn calls_json(store: &crate::b2bua::actor::CallActorStore) -> serde_j
             .iter()
             .filter(|leg| !leg.is_tracking_leg())
             .collect();
-        let b_party = real_b_legs
-            .first()
-            .and_then(|leg| leg.dialog.target_uri.as_deref())
-            .map(display_party);
+        // A call merged into a conference room (`b2bua.adopt_replaced`) has
+        // the room where its other party was.
+        let room = call.adoption.as_ref().filter(|adoption| adoption.seated);
+        let b_party = match room {
+            Some(adoption) => Some(format!("conference:{}", adoption.conference_id)),
+            None => real_b_legs
+                .first()
+                .and_then(|leg| leg.dialog.target_uri.as_deref())
+                .map(display_party),
+        };
 
         // Durations are derived from monotonic `Instant`s — the call actor keeps
         // no wall-clock stamp — so these are elapsed seconds and the client
@@ -97,6 +103,11 @@ pub(super) fn calls_json(store: &crate::b2bua::actor::CallActorStore) -> serde_j
             // `null` rather than `false` where the feature is not in play, so the
             // dashboard can tell "not configured" from "configured and off".
             "control_app": call.control_app,
+            "conference": room.map(|adoption| serde_json::json!({
+                "conference_id": adoption.conference_id,
+                "adopted_by": adoption.owner_call_id,
+                "ends_with_adopter": adoption.ends_with_owner,
+            })),
             "recording": call.li_record,
             "transfer": call.transfer.as_ref().map(|transfer| {
                 serde_json::json!({
@@ -316,5 +327,43 @@ mod tests {
         // The tracking pseudo-leg is excluded from both the callee and the count.
         assert_eq!(calls[0]["b_party"], "sip:bob@10.0.0.2:5060");
         assert_eq!(calls[0]["b_legs"], 1);
+    }
+
+    /// A call merged into a conference room shows the room as its peer.
+    #[test]
+    fn calls_json_shows_an_adopted_calls_peer_as_the_room() {
+        use crate::b2bua::actor::{Adoption, CallActorStore, Leg, TransportInfo};
+        use crate::transport::{ConnectionId, Transport};
+
+        let store = CallActorStore::new();
+        let mut a_leg = Leg::new_a_leg(
+            "adopted@192.0.2.20".to_string(),
+            "fromtag".to_string(),
+            "z9hG4bKadopted".to_string(),
+            TransportInfo {
+                remote_addr: "192.0.2.20:5060".parse().expect("a literal address"),
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+                local_addr: None,
+            },
+        );
+        a_leg.dialog.remote_to_uri = Some("<sip:15550100077@example.com>;tag=far".to_string());
+        let id = store.create_call(a_leg);
+        if let Some(mut call) = store.get_call_mut(&id) {
+            call.adoption = Some(Adoption {
+                conference_id: "room-7".to_string(),
+                owner_call_id: "conference-dialog".to_string(),
+                ends_with_owner: true,
+                alias_call_id: None,
+                seated: true,
+            });
+        }
+        let json = calls_json(&store);
+        let call = &json.as_array().expect("an array")[0];
+        assert_eq!(call["a_party"], "sip:15550100077@example.com");
+        assert_eq!(call["b_party"], "conference:room-7");
+        assert_eq!(call["conference"]["conference_id"], "room-7");
+        assert_eq!(call["conference"]["adopted_by"], "conference-dialog");
+        assert_eq!(call["conference"]["ends_with_adopter"], true);
     }
 }

@@ -233,7 +233,11 @@ async fn on_media_timeout(
     reason: &'static str,
     scope: Option<CallScope>,
 ) {
-    // The media engine owns the call and reaped it on timeout
+    // A call merged into a room (`b2bua.adopt_replaced`) is the one call the
+    // engine keeps allocated past its timeout: it is ended here through its
+    // normal path, whose delete frees the seat. Its session stays for that.
+    let adopted = scope.is_none() && end_adopted_call_on_media_timeout(state, &call_id);
+    // Otherwise the media engine owns the call and reaped it on timeout
     // (the reaper removes the call *before* emitting this
     // event), so drop our own per-call media bookkeeping now.
     // The teardown that any @rtpengine.on_media_timeout handler
@@ -251,6 +255,7 @@ async fn on_media_timeout(
                 store.remove(&call_id);
             }
         }
+        None if adopted => {}
         None => {
             clear_media_session_on_timeout(state.rtpengine_sessions.as_ref(), &call_id);
         }

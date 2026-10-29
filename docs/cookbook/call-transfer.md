@@ -691,6 +691,12 @@ A second REFER on the call while the first awaits its report is answered
 (default 60, at most 180) is reported for with `503 Service Unavailable`.
 `complete_refer` returns `False` when there is nothing left to report on.
 
+When the Refer-To carries a `Replaces` naming a call this same node holds (a
+handset merging its calls into a conference here), `await
+b2bua.adopt_replaced(call, room)` carries it out and resolves to the code to
+report: see [Merging calls this node already
+holds](conference-focus.md#merging-calls-this-node-already-holds).
+
 ## 5. Outbound: IVR / TAS offload
 
 siphon can also *originate* a `REFER`. Answer the call, play a prompt, then hand

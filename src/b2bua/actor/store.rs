@@ -16,6 +16,7 @@ use crate::sip::message::SipMessage;
 
 use super::*;
 
+mod adoption;
 mod cancelled;
 pub use cancelled::{ZombieCancelledLeg, CANCELLED_BRANCH_LIFETIME};
 mod by_branch;
@@ -23,6 +24,7 @@ mod by_dialog;
 mod dial_branch;
 mod dialog_watch;
 mod failure;
+pub use adoption::{AdoptedSwap, AdoptionIndex};
 pub use failure::FailureConclusion;
 mod fork;
 mod replacement;
@@ -65,6 +67,8 @@ pub struct CallActorStore {
     calls: DashMap<String, Box<CallActor>>,
     /// SIP identifier routing table.
     pub registry: LegRegistry,
+    /// Which merged calls end with which conference dialog ([`adoption`]).
+    pub(super) adoptions: AdoptionIndex,
     /// Post-CANCEL glare absorber (RFC 3261 §9.1): a 2xx that raced our CANCEL
     /// is ACKed + BYEd here, keyed by B-leg SIP Call-ID.
     pub zombie_cancelled: DashMap<String, ZombieCancelledLeg>,
@@ -89,6 +93,7 @@ impl CallActorStore {
         Self {
             calls: DashMap::new(),
             registry: LegRegistry::new(),
+            adoptions: AdoptionIndex::default(),
             zombie_cancelled: DashMap::new(),
             deferred_cancels: std::sync::atomic::AtomicUsize::new(0),
             terminated: DashMap::new(),
@@ -1258,6 +1263,7 @@ impl CallActorStore {
     /// peer can be the one whose BYE loses the race.
     pub fn remove_call(&self, call_id: &str) {
         if let Some((_, mut call)) = self.calls.remove(call_id) {
+            self.adoption_ended(call_id, &call);
             // Every dialog a registered AoR had on the call is over. The same
             // funnel as the billing below, for the same reason: every ended call
             // passes through here, whichever path ended it.

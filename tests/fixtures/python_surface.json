@@ -94,6 +94,11 @@
     },
     "AuthVectorHandle": {},
     "B2buaControl": {
+      "adopt_replaced": {
+        "doc": "Merge the call a REFER's `Replaces` names into a conference room on this",
+        "kind": "method_descriptor",
+        "sig": "($self, call, conference_id, role=\"talker\", on_owner_leave=\"end\")"
+      },
       "bridge": {
         "doc": "Join two answered calls this process owns, so the two parties hear each",
         "kind": "method_descriptor",
@@ -305,6 +310,10 @@
       },
       "refer_replaces": {
         "doc": "Replaces info from the Refer-To header (for attended transfer).",
+        "kind": "getset_descriptor"
+      },
+      "refer_replaces_call": {
+        "doc": "What siphon knows of the call the `Replaces` names, when this node",
         "kind": "getset_descriptor"
       },
       "refer_side": {

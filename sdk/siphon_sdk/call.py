@@ -600,6 +600,38 @@ class Call:
         """
         return self._refer_replaces
 
+    @property
+    def refer_replaces_call(self) -> Optional[dict]:
+        """What siphon knows of the call the ``Replaces`` names, when this
+        node holds it: the facts :meth:`b2bua.adopt_replaced` compares with the
+        dialog the REFER came in.
+
+        A dict with ``call_id``, ``leg`` (``"caller"`` or ``"callee"``: which
+        leg of that call the dialog is), ``source`` (``"ip:port"``),
+        ``transport``, ``from_uri`` (the party's own URI on the dialog) and
+        ``auth_user`` (``None`` on a leg siphon dialled). ``None`` outside
+        ``@b2bua.on_refer``, without a ``Replaces``, or when no call here has
+        the dialog. A script can refuse more than siphon does; it cannot
+        accept what siphon refuses.
+
+        In the mock, read off the calls ``b2bua.hold_call(...)`` registered.
+
+        Example::
+
+            @b2bua.on_refer
+            async def on_refer(call):
+                held = call.refer_replaces_call
+                if held is not None and held["transport"] != "tls":
+                    call.reject_refer(403, "Forbidden")
+                    return
+                call.accept_refer(mode="script")
+                status = await b2bua.adopt_replaced(call, "room-1")
+                b2bua.complete_refer(call.call_id, status)
+        """
+        from siphon_sdk import mock_module
+
+        return mock_module.get_b2bua().replaces_call_facts(self._refer_replaces)
+
     # -- Call control ----------------------------------------------------------
 
     async def ro_authorize(

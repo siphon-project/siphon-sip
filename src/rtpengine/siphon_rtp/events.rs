@@ -18,12 +18,26 @@ use super::super::events::{
 };
 use super::ws_tee_direction_from_proto;
 
+/// The key an event is delivered under: the call it names, or the room when it
+/// names no call. A seated call leg carries both and stays the call's.
+fn call_or_room(call_id: String, conference_id: Option<String>) -> String {
+    match conference_id {
+        Some(room) if call_id.is_empty() => room,
+        _ => call_id,
+    }
+}
+
 /// Convert a proto [`Event`] to siphon's [`RtpEngineEvent`].
 ///
 /// `Event::Dtmf` is a field-for-field twin of [`DtmfEvent`]; `MediaTimeout`
 /// maps to the dedicated variant. A conference room's events are keyed by the
 /// room: its DTMF already arrives with the room id as the call-id, and a room
-/// playback's end is given the same shape. `CallQuality` is not modelled by a
+/// playback's end is given the same shape. A call whose leg `conference_seat`
+/// moved into a room (`b2bua.adopt_replaced`) is still a call, and the engine
+/// names it by its own `call_id` beside the room's `conference_id`: those
+/// events stay keyed by the call, so they reach the call's own handlers and
+/// its teardown. A seat that has no call (an empty `call_id`, which only a
+/// `media_timeout` for a joined seat carries) is keyed by the room. `CallQuality` is not modelled by a
 /// typed handler yet, so it surfaces through `Unknown` (logged, not dropped)
 /// carrying its stream identifier — a typed Python handler is a follow-up.
 pub(super) fn convert_event(event: Event) -> RtpEngineEvent {
@@ -32,12 +46,13 @@ pub(super) fn convert_event(event: Event) -> RtpEngineEvent {
             call_id,
             from_tag,
             to_tag,
+            conference_id,
             digit,
             duration_ms,
             volume,
             source,
         } => RtpEngineEvent::Dtmf(DtmfEvent {
-            call_id,
+            call_id: call_or_room(call_id, conference_id),
             from_tag,
             to_tag,
             digit,
@@ -66,9 +81,10 @@ pub(super) fn convert_event(event: Event) -> RtpEngineEvent {
         Event::MediaTimeout {
             call_id,
             from_tag,
+            conference_id,
             reason,
         } => RtpEngineEvent::MediaTimeout {
-            call_id,
+            call_id: call_or_room(call_id, conference_id),
             from_tag,
             reason: match reason {
                 siphon_rtp_proto::MediaTimeoutReason::NoMedia => "no_media",
@@ -268,10 +284,11 @@ pub(super) fn convert_event(event: Event) -> RtpEngineEvent {
             from_tag,
             to_tag,
             leg,
+            conference_id,
             source,
             signalled,
         } => RtpEngineEvent::MediaStarted(MediaStartedEvent {
-            call_id,
+            call_id: call_or_room(call_id, conference_id),
             from_tag,
             to_tag,
             // Not `#[non_exhaustive]` upstream: a call has exactly two engine
