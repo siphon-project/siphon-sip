@@ -430,7 +430,12 @@ where
         let taken = {
             let mut pending = self.shared.pending();
             pending.oldest = None;
-            std::mem::take(&mut pending.writes)
+            let taken = std::mem::take(&mut pending.writes);
+            // Counted as held before the map's lock is let go, so a write
+            // never leaves the pending count between leaving the map and
+            // joining the backlog (the exact count is stored below).
+            self.shared.held.fetch_add(taken.len(), Ordering::SeqCst);
+            taken
         };
         let now = Instant::now();
         if now.duration_since(self.pruned_at) >= Duration::from_secs(1) {
@@ -619,5 +624,104 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Probe;
+
+    impl QueuedWrite for Probe {
+        fn label(&self) -> &'static str {
+            "probe"
+        }
+    }
+
+    /// Takes about a millisecond per batch, so a write is held for a while
+    /// between the drainer taking it and the count of applied writes moving.
+    struct SlowSink {
+        applied: Arc<AtomicUsize>,
+    }
+
+    impl WriteSink<String, Probe> for SlowSink {
+        async fn apply_batch(&self, writes: &[(&String, &Probe)]) -> Vec<Result<(), BackendError>> {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            self.applied.fetch_add(writes.len(), Ordering::SeqCst);
+            writes.iter().map(|_| Ok(())).collect()
+        }
+    }
+
+    /// `pending_writes` never reads zero while a write taken by the drainer has
+    /// not been applied: a write leaving the shared map is counted as held
+    /// before the map's lock is let go. Sampled from another thread while the
+    /// drainer runs, since the gap it guards was between two statements.
+    #[test]
+    fn a_write_the_drainer_took_is_pending_until_applied() {
+        const WRITES: usize = 400;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let (handle, mut drainer) = queue::<String, Probe>(QueueKind::Registrar);
+        let applied = Arc::new(AtomicUsize::new(0));
+        let sink = SlowSink {
+            applied: Arc::clone(&applied),
+        };
+        let drain = runtime.spawn(async move {
+            loop {
+                match drainer.next_event().await {
+                    DrainEvent::Closed => {
+                        drainer.finish(&sink).await;
+                        break;
+                    }
+                    DrainEvent::Write | DrainEvent::Retry => drainer.attempt(&sink).await,
+                }
+            }
+        });
+
+        let enqueued = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let (handle, enqueued, applied, stop) = (
+                handle.clone(),
+                Arc::clone(&enqueued),
+                Arc::clone(&applied),
+                Arc::clone(&stop),
+            );
+            std::thread::spawn(move || {
+                let mut undercounts = 0usize;
+                while !stop.load(Ordering::SeqCst) {
+                    let before = enqueued.load(Ordering::SeqCst);
+                    if handle.pending_writes() == 0 && applied.load(Ordering::SeqCst) < before {
+                        undercounts += 1;
+                    }
+                }
+                undercounts
+            })
+        };
+
+        for index in 0..WRITES {
+            let sequence = handle.sequence();
+            handle.enqueue(format!("aor-{index}"), "probe", Probe, sequence);
+            enqueued.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while applied.load(Ordering::SeqCst) < WRITES && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        stop.store(true, Ordering::SeqCst);
+        let undercounts = sampler.join().expect("the sampler");
+        drop(handle);
+        runtime.block_on(drain).expect("the drainer");
+
+        assert_eq!(applied.load(Ordering::SeqCst), WRITES);
+        assert_eq!(
+            undercounts, 0,
+            "pending_writes read zero while a taken write was not yet applied"
+        );
     }
 }

@@ -530,7 +530,11 @@ fn reload_cycles_do_not_leak() {
 }
 
 fn measure_reload_cycles() {
-    const CYCLES: usize = 1_000;
+    // A batch large enough that a per-reload leak dominates the runner's own
+    // RSS noise: a fixed step of a megabyte or so on a CI runner, which at
+    // 1 000 reloads sat right on a 1 KB-per-reload budget. The budget per
+    // reload is unchanged; a real leak scales with the batch, noise does not.
+    const CYCLES: usize = 5_000;
     const PER_RELOAD_BUDGET_BYTES: u64 = 1_024;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
