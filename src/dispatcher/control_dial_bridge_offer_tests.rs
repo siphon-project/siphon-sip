@@ -9,7 +9,7 @@
 use super::dial_bridge_test_harness::{
     answered_caller, assert_drained, bridging_dispatcher, caller_sends, command, controller_owning,
     dial, events, events_through, eventually, in_dialog_response, invite_to, names, reinvites_to,
-    sent_until, Caller, CALLER,
+    sent_until, wait_drained, Caller, CALLER,
 };
 use super::originate_test_harness::{
     drain, phone_offer, phone_response, phone_sends, phone_tries, requests_to, socket,
@@ -210,7 +210,7 @@ async fn each_leg_is_offered_its_own_allocation_and_the_winners_answer_joins_the
             .any(|(event, _)| event == "ChannelBridged"),
         "the caller is bridged to the trunk"
     );
-    assert_drained(state);
+    wait_drained(state).await;
 }
 
 /// How a dial with early offers can end without a bridge.
