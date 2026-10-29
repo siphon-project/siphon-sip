@@ -16,6 +16,9 @@ entry, but a working config keeps working.
 ### Added
 
 - **Control SDKs 0.12.0: `record_start` takes a format and an Opus bitrate.** The server has taken `format` (`"wav"` or `"ogg_opus"`) and `bitrate_bps` since 1.15.5, but the typed SDKs could send neither, so a controller wanting an Ogg Opus file had to write the frame by hand. Rust `RecordOptions::format(RecordFormat::OggOpus)` / `.bitrate_bps(…)`, Python `call.record_start(format="ogg_opus", bitrate_bps=…)`, TypeScript `recordStart({ format: "ogg_opus", bitrateBps })`. Left unset, both stay off the wire and the server's defaults apply (`wav`, its per-channel Opus default). The range and the `wav` refusal stay the server's; Python refuses an unknown format name locally, as it does an unknown direction. `RecordOptions` gains two public fields, so code building it as a struct literal needs `..Default::default()`.
+### Fixed
+
+- **The reg-event `reginfo` document carries every public identity of the implicit registration set, and each contact's Call-ID, CSeq and `+sip.instance`.** `registrar.reginfo_xml()` rendered one `<registration>`, for the AoR asked for, so a UE that registered another identity of the set (a temporary IMPU, a `tel:` alias) found no element for it. It now renders one `<registration>` per identity of the set (the AoR asked for first, then the associated URIs the registrar holds), each with the set's contacts (TS 24.229 §5.4.2.1.2). Each `<contact>` carries `callid` and `cseq` of the REGISTER behind it (RFC 3680 §5.3) and every Contact-header parameter as `<unknown-param>`, `+sip.instance` and `reg-id` included, which the registrar keeps in their own fields and had left out. `reginfo::build_full_reginfo_for_identities()` builds such a document; `build_full_reginfo()` is that with a set of one. The parser reads `callid` and `cseq` back.
 
 ## [1.15.5] — 2026-10-27
 
