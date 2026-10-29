@@ -1593,22 +1593,8 @@ impl PyRegistrar {
             "partial" => reginfo::ReginfoState::Partial,
             _ => reginfo::ReginfoState::Full,
         };
-        // TS 24.229 §5.4.2.1.2: a <registration> per public user identity of
-        // the implicit registration set — the AoR asked for first, then the
-        // rest of the set the registrar holds for it.
-        let mut identities = vec![aor.clone()];
-        identities.extend(
-            self.inner
-                .associated_uris(&aor)
-                .into_iter()
-                .map(|uri| {
-                    uri.trim()
-                        .trim_start_matches('<')
-                        .trim_end_matches('>')
-                        .to_string()
-                })
-                .filter(|uri| !uri.is_empty()),
-        );
+        // TS 24.229 §5.4.2.1.2: a <registration> per identity of the implicit set.
+        let identities = reginfo::implicit_set(&aor, self.inner.associated_uris(&aor));
         let body = reginfo::build_full_reginfo_for_identities(
             &identities,
             &contacts,

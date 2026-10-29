@@ -316,6 +316,26 @@ pub fn build_full_reginfo_for_identities<S: AsRef<str>>(
     }
 }
 
+/// The implicit registration set of `aor` as a reg-event document lists it:
+/// `aor` first, then the associated URIs the registrar holds for it (as a
+/// P-Associated-URI carries them, angle brackets off). Duplicates are left to
+/// [`build_full_reginfo_for_identities`], which renders each identity once.
+pub fn implicit_set(aor: &str, associated_uris: Vec<String>) -> Vec<String> {
+    let mut identities = vec![aor.to_string()];
+    identities.extend(
+        associated_uris
+            .into_iter()
+            .map(|uri| {
+                uri.trim()
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string()
+            })
+            .filter(|uri| !uri.is_empty()),
+    );
+    identities
+}
+
 /// One registrar binding as a reginfo `<contact>`.
 fn reginfo_contact(contact: &Contact) -> ReginfoContact {
     // `Contact::params` holds every Contact-header parameter except the two
@@ -1399,5 +1419,18 @@ mod tests {
             .iter()
             .any(|(name, value)| name == "+sip.instance"
                 && value.as_deref() == Some(r#""<urn:gsma:imei:35209900-176148-0>""#)));
+    }
+
+    #[test]
+    fn the_implicit_set_puts_the_aor_first_and_strips_brackets() {
+        let set = implicit_set(
+            IMPLICIT_SET[0],
+            vec![
+                format!("<{}>", IMPLICIT_SET[1]),
+                " <tel:+15550100> ".to_string(),
+                "<>".to_string(),
+            ],
+        );
+        assert_eq!(set, vec![IMPLICIT_SET[0], IMPLICIT_SET[1], IMPLICIT_SET[2]]);
     }
 }
