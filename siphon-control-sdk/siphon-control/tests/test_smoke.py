@@ -1661,12 +1661,18 @@ def test_record_verbs_roundtrip():
                     channels="stereo",
                     max_duration_ms=60_000,
                     silence_ms=4_000,
-                    path="/var/spool/siphon/greeting.wav",
+                    path="/var/spool/siphon/greeting.ogg",
+                    format="ogg_opus",
+                    bitrate_bps=24_000,
                 )
                 await call.record_stop(recording_id=started["recording_id"])
                 await call.record_start()
                 await call.record_stop()
-                for kwargs in ({"direction": "inbound"}, {"channels": "quad"}):
+                for kwargs in (
+                    {"direction": "inbound"},
+                    {"channels": "quad"},
+                    {"format": "mp3"},
+                ):
                     try:
                         call.record_start(**kwargs)
                     except ValueError as error:
@@ -1690,7 +1696,9 @@ def test_record_verbs_roundtrip():
                 "channels": "stereo",
                 "max_duration_ms": 60_000,
                 "silence_ms": 4_000,
-                "path": "/var/spool/siphon/greeting.wav",
+                "path": "/var/spool/siphon/greeting.ogg",
+                "format": "ogg_opus",
+                "bitrate_bps": 24_000,
             }
             assert frames[1]["verb"] == "record_stop"
             assert frames[1]["args"] == {"recording_id": "rec-1"}
@@ -1700,7 +1708,8 @@ def test_record_verbs_roundtrip():
             # Absent, not null — which is what makes the server stop every
             # recording on the call rather than one named `null`.
             assert frames[3]["args"] == {}
-            assert len(refused) == 2, refused
+            assert len(refused) == 3, refused
+            assert "ogg_opus" in refused[2], refused
 
             client.shutdown()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):

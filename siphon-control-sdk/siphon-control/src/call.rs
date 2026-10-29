@@ -15,7 +15,7 @@ use siphon_control_client::sip::{
 use crate::args::{
     build_play_source, extract_dial_offer, extract_dial_on_answer, extract_dial_strategy,
     extract_dial_targets, extract_headers, extract_play_repeat, extract_privacy,
-    extract_record_channels, extract_record_direction, extract_route_target,
+    extract_record_channels, extract_record_direction, extract_record_format, extract_route_target,
     extract_stream_channels, extract_stream_direction, extract_stream_mode, optional_media_flags,
     parse_peer_hangup,
 };
@@ -1264,7 +1264,10 @@ impl Call {
     ///
     /// ``direction`` is ``"ingress"`` (the default: what the parties *sent*,
     /// which is what a recorded message is), ``"egress"`` or ``"both"``;
-    /// ``channels`` is ``"mono"`` (default) or ``"stereo"``.
+    /// ``channels`` is ``"mono"`` (default) or ``"stereo"``; ``format`` is
+    /// ``"wav"`` (default) or ``"ogg_opus"``, about a seventh of the size, and
+    /// ``bitrate_bps`` its Opus bitrate (6000 to 510000, ``ogg_opus`` only).
+    /// An engine that cannot write Ogg Opus refuses the verb.
     /// ``max_duration_ms`` and ``silence_ms`` are the two stop conditions a
     /// voicemail greeting announces, and the engine evaluates both where the
     /// decoded audio already is. Each left out takes the server's own default.
@@ -1275,7 +1278,8 @@ impl Call {
     /// rtpengine / rtpproxy raise ``ControlError`` with
     /// ``code == "unsupported_verb"``, and a call with no anchored media session
     /// raises ``"not_found"``.
-    #[pyo3(signature = (direction=None, channels=None, max_duration_ms=None, silence_ms=None, path=None))]
+    #[pyo3(signature = (direction=None, channels=None, max_duration_ms=None, silence_ms=None, path=None, format=None, bitrate_bps=None))]
+    #[allow(clippy::too_many_arguments)]
     fn record_start<'py>(
         &self,
         py: Python<'py>,
@@ -1284,6 +1288,8 @@ impl Call {
         max_duration_ms: Option<u64>,
         silence_ms: Option<u64>,
         path: Option<String>,
+        format: Option<String>,
+        bitrate_bps: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let options = RecordOptions {
             direction: extract_record_direction(direction)?,
@@ -1291,6 +1297,8 @@ impl Call {
             max_duration_ms,
             silence_ms,
             path,
+            format: extract_record_format(format)?,
+            bitrate_bps,
         };
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {

@@ -1532,14 +1532,18 @@ describe("recording args map to the names the server parses", () => {
         channels: "stereo",
         maxDurationMs: 60000,
         silenceMs: 4000,
-        path: "/var/spool/siphon/greeting.wav",
+        path: "/var/spool/siphon/greeting.ogg",
+        format: "ogg_opus",
+        bitrateBps: 24000,
       }),
     ).toEqual({
       direction: "both",
       channels: "stereo",
       max_duration_ms: 60000,
       silence_ms: 4000,
-      path: "/var/spool/siphon/greeting.wav",
+      path: "/var/spool/siphon/greeting.ogg",
+      format: "ogg_opus",
+      bitrate_bps: 24000,
     });
     // `ingress` + `mono` are the server's defaults; pinning them here would stop
     // a caller that asked for nothing from tracking the server it talks to.

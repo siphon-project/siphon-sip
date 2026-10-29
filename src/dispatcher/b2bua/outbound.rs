@@ -216,7 +216,9 @@ pub fn arm_b2bua_retransmit(
     {
         // A reliable transport: nothing to retransmit, but an INVITE's Timer B
         // runs there too (RFC 3261 §17.1.1.2).
-        state.b2bua_retransmits.arm_timeout(key, target, now);
+        state
+            .b2bua_retransmits
+            .arm_timeout(key, data.clone(), target, now);
     }
 }
 
