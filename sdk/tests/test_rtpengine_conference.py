@@ -227,6 +227,26 @@ class TestDialOut:
 
         asyncio.run(run())
 
+    def test_an_answer_behind_nat_names_where_it_came_from(self):
+        import asyncio
+        from siphon_sdk.mock_module import MockRtpEngine
+        engine = MockRtpEngine()
+
+        async def run():
+            await engine.conference_offer("room-3", "erin")
+            with pytest.raises(ValueError):
+                await engine.conference_answer(
+                    "room-3", ("out-3@example.com", "erin"), "v=0\r\n",
+                    received_from="not-an-address",
+                )
+            await engine.conference_answer(
+                "room-3", ("out-3@example.com", "erin"), "v=0\r\n",
+                received_from="198.51.100.20",
+            )
+            assert engine.conferences["room-3"]["erin"]["received_from"] == "198.51.100.20"
+
+        asyncio.run(run())
+
     def test_an_unanswered_offer_is_left(self):
         import asyncio
         from siphon_sdk.mock_module import MockRtpEngine

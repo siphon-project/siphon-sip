@@ -49,6 +49,9 @@ impl SiphonRtpClient {
         role: ConferenceRole,
         flags: &NgFlags,
     ) -> Result<String, RtpEngineError> {
+        if flags.received_from.is_some() {
+            seat::require_seat_received_from(self.request_in(None, Command::NodeInfo).await?)?;
+        }
         let result = self
             .conference_request(Command::ConferenceJoin {
                 conference_id: conference_id.to_string(),
@@ -148,18 +151,27 @@ impl SiphonRtpClient {
         Ok(String::from_utf8_lossy(&offer_sdp).into_owned())
     }
 
-    /// Seat an offered seat on the participant's answer.
+    /// Seat an offered seat on the participant's answer. `received_from` is
+    /// the address the participant's answer came from, for one behind NAT
+    /// whose `c=` is private: the seat then takes its media from there and
+    /// sends the mix there. Sent only to an engine that lists
+    /// `conference_received_from`; any other refuses the seat.
     pub async fn conference_answer(
         &self,
         conference_id: &str,
         from_tag: &str,
         answer_sdp: &str,
+        received_from: Option<std::net::IpAddr>,
     ) -> Result<(), RtpEngineError> {
+        if received_from.is_some() {
+            seat::require_seat_received_from(self.request_in(None, Command::NodeInfo).await?)?;
+        }
         expect_ok(
             self.conference_request(Command::ConferenceAnswer {
                 conference_id: conference_id.to_string(),
                 from_tag: from_tag.to_string(),
                 sdp: answer_sdp.to_string(),
+                received_from,
             })
             .await?,
         )
@@ -386,9 +398,10 @@ impl SiphonRtpClientSet {
         conference_id: &str,
         from_tag: &str,
         answer_sdp: &str,
+        received_from: Option<std::net::IpAddr>,
     ) -> Result<(), RtpEngineError> {
         self.select(&room_affinity_key(conference_id))
-            .conference_answer(conference_id, from_tag, answer_sdp)
+            .conference_answer(conference_id, from_tag, answer_sdp, received_from)
             .await
     }
 

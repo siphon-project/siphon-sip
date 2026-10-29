@@ -260,12 +260,18 @@ impl MediaBackend {
         call_id: &str,
         seat: ConferenceSeat,
         answer_sdp: &str,
+        received_from: Option<std::net::IpAddr>,
     ) -> Result<(), RtpEngineError> {
         let Self::SiphonRtp(set) = self else {
             return Err(self.no_mixer("conference_answer"));
         };
-        set.conference_answer(&seat.conference_id, &seat.from_tag, answer_sdp)
-            .await?;
+        set.conference_answer(
+            &seat.conference_id,
+            &seat.from_tag,
+            answer_sdp,
+            received_from,
+        )
+        .await?;
         SEATS.insert(call_id.to_string(), seat);
         Ok(())
     }

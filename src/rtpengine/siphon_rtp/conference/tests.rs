@@ -488,3 +488,146 @@ async fn every_verb_of_a_room_reaches_the_instance_its_first_seat_went_to() {
         "a forgotten room leaves no affinity behind"
     );
 }
+
+/// An engine whose `node_info` lists `features`; everything else as `accept`.
+fn listing(request: &Value, features: &[&str]) -> Value {
+    if request["command"] == "node_info" {
+        return json!({
+            "result": "node_info",
+            "node": {
+                "node_id": "engine-1",
+                "version": "0.15.5",
+                "media_addresses": [],
+                "codecs": [],
+                "features": features,
+                "max_sessions": 0,
+                "draining": false,
+            },
+        });
+    }
+    accept(request)
+}
+
+fn lists_received_from(request: &Value) -> Value {
+    listing(request, &["conference_seat", "conference_received_from"])
+}
+
+fn lacks_received_from(request: &Value) -> Value {
+    listing(request, &["conference_seat"])
+}
+
+fn nat_address() -> std::net::IpAddr {
+    "198.51.100.20".parse().expect("an address")
+}
+
+fn behind_nat() -> NgFlags {
+    NgFlags {
+        received_from: Some(nat_address()),
+        ..NgFlags::default()
+    }
+}
+
+/// A participant behind NAT advertises a private `c=`, and only the address its
+/// request came from reaches it. An engine that does not seat on that address
+/// would drop everything the participant sends and mix to nowhere, so the seat
+/// is refused before a frame goes out, never made silently.
+#[tokio::test]
+async fn a_seat_behind_nat_is_refused_by_an_engine_that_ignores_received_from() {
+    let engine = FakeEngine::start(lacks_received_from, Vec::new()).await;
+    let (client, _events) = client(&engine);
+
+    let joined = client
+        .conference_join(
+            "room-1",
+            "alice",
+            OFFER,
+            ConferenceRole::Talker,
+            &behind_nat(),
+        )
+        .await
+        .expect_err("refused");
+    assert!(
+        matches!(joined, RtpEngineError::Unsupported { .. }),
+        "{joined}"
+    );
+    let answered = client
+        .conference_answer("room-1", "bob", ANSWER, Some(nat_address()))
+        .await
+        .expect_err("refused");
+    assert!(
+        matches!(answered, RtpEngineError::Unsupported { .. }),
+        "{answered}"
+    );
+    assert!(engine.frames("conference_join").is_empty());
+    assert!(engine.frames("conference_answer").is_empty());
+}
+
+/// A called-out participant's address arrives with its answer, so it rides
+/// on `conference_answer` itself to an engine that honours it.
+#[tokio::test]
+async fn an_answered_seat_behind_nat_carries_received_from_on_the_answer() {
+    let engine = FakeEngine::start(lists_received_from, Vec::new()).await;
+    let (client, _events) = client(&engine);
+
+    client
+        .conference_answer("room-1", "bob", ANSWER, Some(nat_address()))
+        .await
+        .expect("seated");
+    let answers = engine.frames("conference_answer");
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0]["received_from"], json!("198.51.100.20"));
+
+    client
+        .conference_answer("room-1", "carol", ANSWER, None)
+        .await
+        .expect("seated");
+    assert!(
+        engine.frames("conference_answer")[1]
+            .get("received_from")
+            .is_none(),
+        "absent, not null, without an address"
+    );
+}
+
+/// An engine that lists `conference_received_from` is sent the seat with the
+/// address in its profile, the same key a two-party answer carries.
+#[tokio::test]
+async fn a_seat_behind_nat_carries_received_from_to_an_engine_that_honours_it() {
+    let engine = FakeEngine::start(lists_received_from, Vec::new()).await;
+    let (client, _events) = client(&engine);
+
+    client
+        .conference_join(
+            "room-1",
+            "alice",
+            OFFER,
+            ConferenceRole::Talker,
+            &behind_nat(),
+        )
+        .await
+        .expect("seated");
+
+    let joins = engine.frames("conference_join");
+    assert_eq!(joins.len(), 1);
+    assert_eq!(joins[0]["profile"]["received_from"], json!("198.51.100.20"));
+}
+
+/// A seat with no received-from address asks the engine nothing first.
+#[tokio::test]
+async fn a_seat_without_received_from_needs_no_feature_check() {
+    let engine = FakeEngine::start(lacks_received_from, Vec::new()).await;
+    let (client, _events) = client(&engine);
+
+    client
+        .conference_join(
+            "room-1",
+            "alice",
+            OFFER,
+            ConferenceRole::Talker,
+            &NgFlags::default(),
+        )
+        .await
+        .expect("seated");
+    assert!(engine.frames("node_info").is_empty());
+    assert_eq!(engine.frames("conference_join").len(), 1);
+}
