@@ -484,6 +484,22 @@ pub(super) fn reinvites_to(sent: &[Sent], address: &str) -> Vec<SipMessage> {
         .collect()
 }
 
+/// [`assert_drained`] once the dial's own task has let go. A bridge that
+/// forms is reported (`DialAnswered`, `ChannelBridged`) before the dial's
+/// coordinator handles its `Bridged` signal and releases the caller's claim,
+/// so a test that waited only for the events can see the claim for a moment
+/// longer. Still a leak if it is not gone within the harness deadline.
+pub(super) async fn wait_drained(state: &DispatcherState) {
+    eventually(|| {
+        state.dial_bridges.ringing_count() == 0
+            && state.dial_bridges.bridging_count() == 0
+            && state.originate_groups.group_count() == 0
+            && state.originate_groups.leg_count() == 0
+    })
+    .await;
+    assert_drained(state);
+}
+
 /// Nothing a bridge dial keeps is left behind.
 pub(super) fn assert_drained(state: &DispatcherState) {
     assert_eq!(

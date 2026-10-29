@@ -860,17 +860,23 @@ The ETSI lawful-intercept work owes a lot to sipgate's [li-lib-x1x2x3](https://g
 
 On the X2/X3 side, [x2x3PduDissector](https://github.com/hyavari/x2x3PduDissector) is the independent decoder the TS 103 221-2 PDU framing is validated against. A round-trip through our own reader would pass a shared encode/decode bug; feeding the bytes we emit to somebody else's dissector via `tshark` will not. Same principle as the Wireshark cross-checks elsewhere in the stack.
 
-## Platform Partner
+## Partners and sponsors
 
 <p align="center">
-  <a href="https://cellact.nl/"><img src="assets/partners/cellact-arnacon.png" alt="Cellact and Arnacon — SIPhon Platform Partner" width="360"></a>
+  <a href="https://cellact.nl/"><img src="assets/partners/cellact-arnacon.png" alt="Cellact and Arnacon, SIPhon Platform Partner" height="80"></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://sainer.nl/"><img src="assets/sponsors/sainer.png" alt="Sainer, SIPhon sponsor" height="80"></a>
 </p>
 
 SIPhon's continued development is backed by **[Cellact](https://cellact.nl/)** and its
 Web3 telecom project **[Arnacon](https://www.arnacon.com/)** as a **Platform Partner**.
 Arnacon is their decentralized take on telephony: encrypted calls and messaging tied to an
-identity you own instead of a carrier-issued number. Their support helps drive the SIPhon
-roadmap forward.
+identity you own instead of a carrier-issued number.
+
+**[Sainer](https://sainer.nl/)** sponsors SIPhon. Sainer builds an AI phone agent that
+answers, handles and escalates calls in a natural voice, around the clock.
+
+Their support helps drive the SIPhon roadmap forward.
 
 ## Commercial Support
 
@@ -884,8 +890,8 @@ Reach out via [realtime-telecom.nl](https://realtime-telecom.nl) to talk specifi
 ## Sponsors
 
 Ongoing development is backed by **[Real Time Telecom B.V.](https://realtime-telecom.nl)**,
-SIPhon's founding sponsor, with **[Cellact / Arnacon](https://www.arnacon.com/)** as a
-[Platform Partner](#platform-partner). Need a particular feature built or fast-tracked? Feature
+SIPhon's founding sponsor, together with **[Cellact / Arnacon](https://www.arnacon.com/)**
+and **[Sainer](https://sainer.nl/)** (see [Partners and sponsors](#partners-and-sponsors)). Need a particular feature built or fast-tracked? Feature
 sponsorship is welcome — use the **Sponsor** button on the repository, or get in touch
 through RTT.
 
