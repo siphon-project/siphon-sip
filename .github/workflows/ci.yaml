@@ -71,6 +71,9 @@ jobs:
           scripts/bundle-python.sh target/python-bundle
           echo "PYO3_PYTHON=$GITHUB_WORKSPACE/target/python-bundle/bin/python3.14t" >> "$GITHUB_ENV"
           echo "RUSTFLAGS=$(scripts/bundle-python.sh --print-rustflags target/python-bundle)" >> "$GITHUB_ENV"
+          # rustdoc links doctests with RUSTDOCFLAGS, never RUSTFLAGS, so
+          # without this every doctest fails to find -lpython3.14t.
+          echo "RUSTDOCFLAGS=$(scripts/bundle-python.sh --print-rustflags target/python-bundle)" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/target/python-bundle/lib" >> "$GITHUB_ENV"
 
       - name: Run tests
