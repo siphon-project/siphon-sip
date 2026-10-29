@@ -75,8 +75,8 @@ pub use server::{ControlServer, ServerConfig};
 pub use sip::{
     AppEvent, AppEventStream, Call, CallEvent, CallStream, DialOffer, DialOptions, DialStrategy,
     DialTarget, Dialing, DtmfOptions, PeerHangupPolicy, PlayOptions, PlaySource, RecordChannels,
-    RecordDirection, RecordOptions, Recording, RouteTarget, SipClient, SipServer, StreamChannels,
-    StreamDirection, StreamMode, StreamOptions,
+    RecordDirection, RecordFormat, RecordOptions, Recording, RouteTarget, SipClient, SipServer,
+    StreamChannels, StreamDirection, StreamMode, StreamOptions,
 };
 
 // Re-export the wire contract so downstreams need only depend on this crate.

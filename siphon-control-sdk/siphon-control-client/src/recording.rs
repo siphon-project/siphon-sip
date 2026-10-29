@@ -3,7 +3,7 @@
 //! Split from [`sip`](crate::sip) for the reason [`originate`](crate::originate)
 //! is: that file is at its size budget.
 //!
-//! This records the call's **decoded** audio to a wav file. It is not
+//! This records the call's **decoded** audio to a file, wav or Ogg Opus. It is not
 //! `li.record()` / SIPREC, which hands a recording *server* its own leg; it
 //! works on a single-leg engine-terminated call, which is what a voicemail box
 //! is. siphon-rtp backend only.
@@ -76,6 +76,37 @@ impl RecordChannels {
     }
 }
 
+/// The file a recording is written as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordFormat {
+    /// 16-bit linear PCM — the server's default, and what a voicemail box plays
+    /// back.
+    Wav,
+    /// Opus in Ogg (RFC 7845): about a seventh of the size, for a recording
+    /// that leaves the node. Needs an engine that writes it (siphon-rtp 0.15.0
+    /// or later); the server refuses the verb on one that does not.
+    OggOpus,
+}
+
+impl RecordFormat {
+    /// The wire token the server parses.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RecordFormat::Wav => "wav",
+            RecordFormat::OggOpus => "ogg_opus",
+        }
+    }
+
+    /// The format called `name`, in any case: `wav` or `ogg_opus`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "wav" => Some(RecordFormat::Wav),
+            "ogg_opus" => Some(RecordFormat::OggOpus),
+            _ => None,
+        }
+    }
+}
+
 /// Optional shaping for [`Call::record_start`]; every field left `None` takes
 /// the server's own default rather than a copy of it pinned here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -90,6 +121,12 @@ pub struct RecordOptions {
     pub silence_ms: Option<u64>,
     /// Where the engine writes the file.
     pub path: Option<String>,
+    /// The file format (`wav` server-side when unset).
+    pub format: Option<RecordFormat>,
+    /// Opus target bitrate in bits per second, `ogg_opus` only. The server
+    /// refuses it with `wav` and outside 6000 to 510000 (RFC 6716 §2.1.1);
+    /// unset is its per-channel default.
+    pub bitrate_bps: Option<u32>,
 }
 
 impl RecordOptions {
@@ -123,6 +160,18 @@ impl RecordOptions {
         self
     }
 
+    /// Write the file in this format.
+    pub fn format(mut self, format: RecordFormat) -> Self {
+        self.format = Some(format);
+        self
+    }
+
+    /// Encode Opus at this many bits per second (`ogg_opus` only).
+    pub fn bitrate_bps(mut self, bitrate_bps: u32) -> Self {
+        self.bitrate_bps = Some(bitrate_bps);
+        self
+    }
+
     fn to_json(&self) -> serde_json::Value {
         let mut args = serde_json::Map::new();
         if let Some(direction) = self.direction {
@@ -140,6 +189,12 @@ impl RecordOptions {
         if let Some(path) = &self.path {
             args.insert("path".to_string(), json!(path));
         }
+        if let Some(format) = self.format {
+            args.insert("format".to_string(), json!(format.as_str()));
+        }
+        if let Some(bitrate_bps) = self.bitrate_bps {
+            args.insert("bitrate_bps".to_string(), json!(bitrate_bps));
+        }
         serde_json::Value::Object(args)
     }
 }
@@ -155,7 +210,8 @@ pub struct Recording {
 }
 
 impl Call {
-    /// Record this call's decoded audio to a wav file.
+    /// Record this call's decoded audio to a file: wav by default, or Ogg Opus
+    /// with [`RecordOptions::format`].
     ///
     /// The reply names the `recording_id` a later [`Call::record_stop`]
     /// addresses. It is **not** the file: `RecordingFinished` fires when the

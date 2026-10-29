@@ -150,6 +150,7 @@ export type {
   Dialing,
   RecordDirection,
   RecordChannels,
+  RecordFormat,
   RecordOptions,
   Recording,
   OriginateMedia,
