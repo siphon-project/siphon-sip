@@ -27,6 +27,7 @@
 //! - `LegRegistry` provides SIP-level routing (Call-ID, branch → internal ID).
 //! - Foundation for API-driven calls: create a `Leg` without an inbound INVITE.
 
+mod adoption;
 mod call;
 mod cancel_deferral;
 mod dial_branch;
@@ -52,6 +53,7 @@ mod tests;
 // `siphon` is a published library crate and `b2bua::actor` is a public path, so
 // every item keeps the name it had when this was one file. The submodules are
 // private: splitting the file must not add a second public path to maintain.
+pub use adoption::*;
 pub use call::*;
 pub use dial_branch::*;
 pub use dialog_watch::*;

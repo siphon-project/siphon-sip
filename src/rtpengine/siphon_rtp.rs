@@ -2870,6 +2870,7 @@ mod tests {
             call_id: "c".into(),
             from_tag: "f".into(),
             to_tag: Some("t".into()),
+            conference_id: None,
             digit: "5".into(),
             duration_ms: 120,
             volume: -8,
@@ -2889,11 +2890,74 @@ mod tests {
         }
     }
 
+    /// A call leg seated in a room by `conference_seat` is still its call:
+    /// its digit, its silence and its first packet are the call's, and a seat
+    /// with no call (a joined participant whose media timed out) is the room's.
+    #[test]
+    fn a_seated_call_legs_events_stay_keyed_by_the_call() {
+        match convert_event(Event::Dtmf {
+            call_id: "adopted@192.0.2.20".into(),
+            from_tag: "far-tag".into(),
+            to_tag: None,
+            conference_id: Some("room-1".into()),
+            digit: "3".into(),
+            duration_ms: 100,
+            volume: -10,
+            source: None,
+        }) {
+            RtpEngineEvent::Dtmf(dtmf) => {
+                assert_eq!(dtmf.call_id, "adopted@192.0.2.20");
+                assert_eq!(dtmf.from_tag, "far-tag");
+            }
+            other => panic!("expected Dtmf, got {other:?}"),
+        }
+        match convert_event(Event::MediaTimeout {
+            call_id: "adopted@192.0.2.20".into(),
+            from_tag: "far-tag".into(),
+            conference_id: Some("room-1".into()),
+            reason: siphon_rtp_proto::MediaTimeoutReason::NoMedia,
+        }) {
+            RtpEngineEvent::MediaTimeout { call_id, .. } => {
+                assert_eq!(call_id, "adopted@192.0.2.20");
+            }
+            other => panic!("expected MediaTimeout, got {other:?}"),
+        }
+        match convert_event(Event::MediaTimeout {
+            call_id: String::new(),
+            from_tag: "seat-7".into(),
+            conference_id: Some("room-1".into()),
+            reason: siphon_rtp_proto::MediaTimeoutReason::NoMedia,
+        }) {
+            RtpEngineEvent::MediaTimeout {
+                call_id, from_tag, ..
+            } => {
+                assert_eq!(call_id, "room-1", "a seat with no call is the room's");
+                assert_eq!(from_tag, "seat-7");
+            }
+            other => panic!("expected MediaTimeout, got {other:?}"),
+        }
+        match convert_event(Event::MediaStarted {
+            call_id: "adopted@192.0.2.20".into(),
+            from_tag: "far-tag".into(),
+            to_tag: None,
+            leg: siphon_rtp_proto::LegSide::Far,
+            conference_id: Some("room-1".into()),
+            source: None,
+            signalled: None,
+        }) {
+            RtpEngineEvent::MediaStarted(started) => {
+                assert_eq!(started.call_id, "adopted@192.0.2.20");
+            }
+            other => panic!("expected MediaStarted, got {other:?}"),
+        }
+    }
+
     #[test]
     fn convert_event_media_timeout() {
         match convert_event(Event::MediaTimeout {
             call_id: "c".into(),
             from_tag: "f".into(),
+            conference_id: None,
             reason: siphon_rtp_proto::MediaTimeoutReason::NoMedia,
         }) {
             RtpEngineEvent::MediaTimeout {
@@ -3643,6 +3707,7 @@ mod tests {
                     call_id: "c1".into(),
                     from_tag: "f1".into(),
                     to_tag: None,
+                    conference_id: None,
                     digit: "7".into(),
                     duration_ms: 80,
                     volume: -10,
@@ -3656,6 +3721,7 @@ mod tests {
                     reason: siphon_rtp_proto::MediaTimeoutReason::NoMedia,
                     call_id: "c2".into(),
                     from_tag: "f2".into(),
+                    conference_id: None,
                 },
             )
             .await;

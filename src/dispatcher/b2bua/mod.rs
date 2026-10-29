@@ -12,6 +12,7 @@
 //! enforces that direction.
 
 mod ack;
+mod adopt_replaced;
 mod b_leg;
 mod bridge;
 mod bridge_offered;
@@ -76,6 +77,7 @@ mod update;
 mod update_media;
 
 pub use ack::*;
+pub use adopt_replaced::*;
 pub use b_leg::*;
 pub use bridge::*;
 pub use bridge_relay::*;

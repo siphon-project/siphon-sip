@@ -330,6 +330,35 @@ impl PyB2buaControl {
         })
     }
 
+    /// Merge the call a REFER's `Replaces` names into a conference room on this
+    /// node (RFC 4579 §5.5): seat its other leg in `conference_id` in place
+    /// (siphon-rtp `conference_seat`, no SIP to that party) and BYE the named
+    /// leg with `Reason: SIP;cause=200;text="Merged into conference"`.
+    ///
+    /// Awaitable; resolves to the status for `b2bua.complete_refer`: `200`,
+    /// `481` (no confirmed dialog here matches, or no `Replaces`), `403` (the
+    /// dialog is not the referrer's), `488` (the engine or the call's state
+    /// refused the seat) or `501` (the backend cannot seat a call's leg). A
+    /// refusal leaves the named call untouched. Raises `ValueError` outside
+    /// `@b2bua.on_refer`, or for a `role` / `on_owner_leave` it does not know.
+    #[pyo3(signature = (call, conference_id, role="talker", on_owner_leave="end"))]
+    fn adopt_replaced<'py>(
+        &self,
+        python: Python<'py>,
+        call: &Bound<'py, PyAny>,
+        conference_id: String,
+        role: &str,
+        on_owner_leave: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = adopt_request(call, conference_id, role, on_owner_leave)?;
+        crate::script::awaitable(python, async move {
+            Ok(match request {
+                Some(request) => crate::dispatcher::b2bua_adopt_replaced(request).await,
+                None => 481,
+            })
+        })
+    }
+
     /// Report the outcome of a REFER accepted with
     /// `call.accept_refer(mode="script")`: the NOTIFY that ends its
     /// subscription (RFC 3515 §2.4.5). `code` must be a final status, 200-699
@@ -660,6 +689,69 @@ impl PyB2buaControl {
 /// with `expires`, `min_se` and `refresher`, each key left out defaulting as in
 /// `call.session_timer()`. `ValueError` for any other key, or a refresher that is
 /// not `uac`, `uas` or `b2bua`.
+/// The `ValueError` for an `adopt_replaced` argument it does not know.
+fn refused(argument: &str, allowed: &str, got: &str) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(format!(
+        "b2bua.adopt_replaced({argument}=…) is {allowed} (got {got:?})"
+    ))
+}
+
+/// Read `b2bua.adopt_replaced`'s arguments: `None` for a REFER with no
+/// `Replaces`, which names no dialog here (481).
+fn adopt_request(
+    call: &Bound<'_, PyAny>,
+    conference_id: String,
+    role: &str,
+    on_owner_leave: &str,
+) -> PyResult<Option<crate::dispatcher::AdoptRequest>> {
+    use crate::rtpengine::backend::ConferenceRole;
+    use pyo3::exceptions::PyValueError;
+    let role = match role {
+        "talker" => ConferenceRole::Talker,
+        "listener" => ConferenceRole::Listener,
+        "muted" => ConferenceRole::Muted,
+        other => {
+            return Err(refused(
+                "role",
+                "\"talker\", \"listener\" or \"muted\"",
+                other,
+            ))
+        }
+    };
+    let ends_with_owner = match on_owner_leave {
+        "end" => true,
+        "keep" => false,
+        other => return Err(refused("on_owner_leave", "\"end\" or \"keep\"", other)),
+    };
+    if conference_id.is_empty() {
+        return Err(PyValueError::new_err(
+            "b2bua.adopt_replaced(conference_id=…) names a room; it is empty",
+        ));
+    }
+    let call = call
+        .extract::<PyRef<'_, crate::script::api::call::PyCall>>()
+        .map_err(|_| {
+            PyValueError::new_err("b2bua.adopt_replaced(call=…) takes the Call of @b2bua.on_refer")
+        })?;
+    if call.refer_to_uri().is_none() {
+        return Err(PyValueError::new_err(
+            "b2bua.adopt_replaced() works on the call of an @b2bua.on_refer handler",
+        ));
+    }
+    Ok(call
+        .refer_for_adoption()
+        .map(
+            |(owner, replaces, referrer_on_a_leg)| crate::dispatcher::AdoptRequest {
+                owner_call_id: owner.to_string(),
+                referrer_on_a_leg,
+                replaces: replaces.clone(),
+                conference_id,
+                role,
+                ends_with_owner,
+            },
+        ))
+}
+
 fn session_timer_from_dict(
     dict: &Bound<'_, pyo3::types::PyDict>,
 ) -> PyResult<crate::script::api::call::SessionTimerOverride> {
@@ -797,6 +889,99 @@ mod tests {
                 .expect("a dict item");
             let error = session_timer_from_dict(&dict).expect_err("an unknown refresher");
             assert!(error.to_string().contains("refresher"), "{error}");
+        });
+    }
+
+    /// `b2bua.adopt_replaced`'s arguments: what it refuses outright, a REFER
+    /// with no `Replaces` (481, nothing to merge), and the request it builds.
+    #[test]
+    fn adopt_replaced_reads_its_arguments_and_the_refer() {
+        use crate::script::api::call::PyCall;
+        use std::sync::{Arc, Mutex};
+        pyo3::Python::initialize();
+        let invite = crate::sip::parser::parse_sip_message_bytes(
+            concat!(
+                "INVITE sip:conf@example.com SIP/2.0\r\n",
+                "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-adopt\r\n",
+                "From: <sip:15550100001@example.com>;tag=a\r\n",
+                "To: <sip:conf@example.com>\r\n",
+                "Call-ID: conf@192.0.2.10\r\n",
+                "CSeq: 1 INVITE\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n",
+            )
+            .as_bytes(),
+        )
+        .expect("an INVITE");
+        let call = |replaces: Option<crate::sip::headers::refer::Replaces>, in_refer: bool| {
+            let mut call = PyCall::new(
+                "owner".to_string(),
+                Arc::new(Mutex::new(invite.clone())),
+                "192.0.2.10".to_string(),
+                "udp".to_string(),
+            );
+            if in_refer {
+                call.set_refer_to("sip:15550100042@example.com".to_string(), replaces);
+                call.set_refer_from_a_leg(true);
+            }
+            call
+        };
+        let replaces = crate::sip::headers::refer::Replaces {
+            call_id: "held@192.0.2.10".into(),
+            to_tag: "ours".into(),
+            from_tag: "theirs".into(),
+            early_only: false,
+        };
+        Python::attach(|python| {
+            let bound = |call: PyCall| Bound::new(python, call).expect("a call").into_any();
+            let refused = |call: PyCall, room: &str, role: &str, leave: &str| {
+                adopt_request(&bound(call), room.to_string(), role, leave)
+                    .expect_err("refused")
+                    .to_string()
+            };
+            assert!(
+                refused(call(Some(replaces.clone()), true), "room", "whisper", "end")
+                    .contains("role")
+            );
+            assert!(refused(
+                call(Some(replaces.clone()), true),
+                "room",
+                "talker",
+                "linger"
+            )
+            .contains("on_owner_leave"));
+            assert!(
+                refused(call(Some(replaces.clone()), true), "", "talker", "end")
+                    .contains("conference_id")
+            );
+            assert!(
+                refused(call(Some(replaces.clone()), false), "room", "talker", "end")
+                    .contains("on_refer")
+            );
+            let not_a_call = pyo3::types::PyString::new(python, "call").into_any();
+            assert!(adopt_request(&not_a_call, "room".into(), "talker", "end").is_err());
+
+            let blind = adopt_request(&bound(call(None, true)), "room".into(), "talker", "end")
+                .expect("read");
+            assert!(blind.is_none(), "no Replaces: nothing to merge, 481");
+
+            let request = adopt_request(
+                &bound(call(Some(replaces.clone()), true)),
+                "room".into(),
+                "muted",
+                "keep",
+            )
+            .expect("read")
+            .expect("a request");
+            assert_eq!(request.owner_call_id, "owner");
+            assert!(request.referrer_on_a_leg);
+            assert_eq!(request.replaces, replaces);
+            assert_eq!(request.conference_id, "room");
+            assert_eq!(
+                request.role,
+                crate::rtpengine::backend::ConferenceRole::Muted
+            );
+            assert!(!request.ends_with_owner);
         });
     }
 }

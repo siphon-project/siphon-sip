@@ -152,6 +152,78 @@ async def merge(room_a, room_b):
 `rtpengine.conference_unbridge(room_a, room_b)` splits them again, whichever
 way the link was made; a link also ends with either room.
 
+## Merging calls this node already holds
+
+A handset's "merge" (RFC 4579 §5.5, TS 24.147) INVITEs the conference factory,
+then REFERs the focus inside that conference dialog once per call it wants in,
+each `Refer-To` carrying a `Replaces` (RFC 3891) that names the handset's own
+dialog with the other party. When those calls run through this same node, the
+focus cannot INVITE itself with the `Replaces`. `b2bua.adopt_replaced` merges
+the call in place instead:
+
+```python
+from siphon import b2bua
+
+ROOMS = {}   # conference dialog Call-ID -> room id, filled at the factory INVITE
+
+
+@b2bua.on_refer
+async def on_refer(call):
+    call.accept_refer(mode="script")
+    status = await b2bua.adopt_replaced(call, ROOMS[call.call_id])
+    b2bua.complete_refer(call.call_id, status)
+```
+
+What it does:
+
+1. Finds the call holding the named dialog, either its caller leg (the
+   subscriber placed the call) or its callee leg (the subscriber was called).
+2. Checks the dialog belongs to the party that sent the REFER. Holding a
+   dialog's identifiers is no authority to take it over (RFC 3891 §5). Both
+   legs carry an `auth_user`: it has to be the same. Otherwise, both on a
+   stream transport: the same connection. Otherwise: the same source address
+   and the same user on both dialogs, which is the rule a deployment that
+   authorises INVITEs by registration source rather than digest runs on.
+   `call.refer_replaces_call` shows the facts compared (Call-ID, which leg,
+   source, transport, From URI, `auth_user`), so a script can refuse more.
+3. Seats the call's other leg, the far party, in the room with siphon-rtp
+   `conference_seat`: same ports, same session, and no SIP toward that party.
+4. Sends the named leg a BYE with
+   `Reason: SIP;cause=200;text="Merged into conference"`.
+
+It resolves to the status the REFER's NOTIFY reports:
+
+| Status | Meaning |
+|---|---|
+| `200` | merged |
+| `481` | no confirmed dialog here matches the `Replaces` (or there is none, or the call is still early) |
+| `403` | the named dialog is not the referrer's |
+| `488` | the engine refused the seat (room full, a codec it cannot mix, a draining node) or the call is being transferred, bridged or merged already |
+| `501` | the media backend is not siphon-rtp, or the engine does not list `conference_seat` |
+
+A refusal leaves the named call exactly as it was. There is no fallback to a
+re-INVITE of the far party.
+
+The merged call stays a call. Its Ro session, `max_call_duration_secs`,
+session timer and CDR carry on, with the far party as its one SIP leg and a
+room seat where its other leg was. A re-INVITE or UPDATE from the far party is
+answered against the session in force (`@b2bua.on_reoffer` sees it first; with
+several handlers each should return early for calls that are not its own, see
+[several handlers](../reference/call.md)), so
+a session refresh gets a `200` with the unchanged session. The far party's BYE,
+a credit teardown, the maximum duration, or a `media_timeout` on the seat end
+the call through its normal path, and the engine `delete` takes the seat out;
+the room carries on with whoever is left. Its digits and quality reports arrive
+under the call's own Call-ID, not the room's. `GET /admin/calls` shows its peer
+as `conference:<room>`.
+
+`on_owner_leave="end"` (the default) ends the merged call, with a BYE carrying
+`Reason: Q.850;cause=16`, when the conference dialog that adopted it ends: the
+referrer pays for both far legs, so a room that outlives it is two other
+parties talking on its credit. `"keep"` leaves it in the room. The link is held
+by siphon, not the script, so it survives a script reload. `role=` is
+`"talker"` (default), `"listener"` or `"muted"`.
+
 ## Calling a participant in
 
 To add someone who has not dialled in (RFC 4579 §5.5, a REFER to the focus

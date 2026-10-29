@@ -427,6 +427,65 @@ class _B2buaNamespace:
             return False
         return control.refer(call_id, target, replaces)
 
+    def adopt_replaced(self, call, conference_id, role="talker", on_owner_leave="end"):
+        """Merge the call a REFER's ``Replaces`` names into a conference room
+        on this node (RFC 4579 §5.5, a handset's "merge").
+
+        Called from ``@b2bua.on_refer`` on the conference dialog, after
+        ``call.accept_refer(mode="script")``. The named dialog is the
+        referrer's own leg of a call this node holds (caller or callee leg).
+        The call's *other* leg, the far party, is seated in ``conference_id``
+        in place (siphon-rtp ``conference_seat``): no SIP goes to that party,
+        its media keeps the same ports and the same session. The named leg is
+        then sent a BYE with ``Reason: SIP;cause=200;text="Merged into
+        conference"`` (RFC 3891).
+
+        The adopted call stays a call: its Ro session, maximum duration,
+        session timer and CDR carry on, with the far party as its one SIP leg.
+        A re-INVITE or UPDATE from the far party is answered against the
+        session in force (``@b2bua.on_reoffer`` sees it first); its BYE, a
+        credit or duration teardown, or the seat going silent ends it through
+        the normal path, which takes the seat out of the room.
+
+        Before anything is touched siphon checks the dialog belongs to the
+        referrer: the same ``auth_user`` when both legs carry one, else the
+        same connection on a stream transport, else the same source address
+        and the same user. ``call.refer_replaces_call`` shows the facts
+        compared, so a script can refuse more; it cannot accept what siphon
+        refuses.
+
+        Args:
+            call: the ``Call`` of the ``@b2bua.on_refer`` handler.
+            conference_id: the room to seat the far party in.
+            role: ``"talker"`` (default), ``"listener"`` or ``"muted"``.
+            on_owner_leave: ``"end"`` (default) tears the adopted call down
+                with a BYE (``Reason: Q.850;cause=16``) when the conference
+                dialog that adopted it ends; ``"keep"`` leaves it in the room.
+
+        Returns:
+            int (awaitable): the status for ``b2bua.complete_refer``: ``200``;
+            ``481`` no confirmed dialog here matches (or no ``Replaces``);
+            ``403`` the dialog is not the referrer's; ``488`` the engine or
+            the call's state refused the seat; ``501`` the media backend is
+            not siphon-rtp or the engine lacks ``conference_seat``. A refusal
+            leaves the named call untouched.
+
+        Raises:
+            ValueError: outside ``@b2bua.on_refer``, an empty
+                ``conference_id``, or an unknown ``role`` / ``on_owner_leave``.
+
+        Usage:
+            @b2bua.on_refer
+            async def on_refer(call):
+                call.accept_refer(mode="script")
+                status = await b2bua.adopt_replaced(call, room_of(call))
+                b2bua.complete_refer(call.call_id, status)
+        """
+        control = object.__getattribute__(self, "__dict__").get("_control")
+        if control is None:
+            raise ValueError("b2bua.adopt_replaced requires a running siphon B2BUA")
+        return control.adopt_replaced(call, conference_id, role, on_owner_leave)
+
     def complete_refer(self, call_id, code, reason=None):
         """Report how a REFER the script accepted with
         ``call.accept_refer(mode="script")`` went, ending its implicit

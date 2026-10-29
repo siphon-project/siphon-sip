@@ -262,7 +262,7 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
     // the A-leg Call-ID (the store key), which is NOT the incoming BYE's Call-ID
     // when the BYE comes from the B-leg (or from the survivor/target after a
     // terminate-transfer re-anchor).
-    let (other_leg, media_key) = match state.call_actors.get_call(&call_id) {
+    let (other_leg, media_key, adopted) = match state.call_actors.get_call(&call_id) {
         Some(call) => {
             let other_leg = if from_a_leg {
                 call.winner
@@ -270,7 +270,11 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
             } else {
                 Some(call.a_leg.clone())
             };
-            (other_leg, call.a_leg.dialog.call_id.clone())
+            (
+                other_leg,
+                call.a_leg.dialog.call_id.clone(),
+                call.adoption.is_some(),
+            )
         }
         None => return,
     };
@@ -313,6 +317,10 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
             }
             None => warn!(call_id = %call_id, "B2BUA: failed to build the other leg's BYE"),
         },
+        // A call merged into a room has its far party as its one leg.
+        None if adopted => {
+            debug!(call_id = %call_id, "B2BUA: adopted call — its seat goes with the media delete")
+        }
         None => warn!(call_id = %call_id, "B2BUA: no winning B-leg for BYE"),
     }
 
@@ -344,4 +352,6 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
     // itself when it arrives (`ack_late_2xx_after_teardown`).
     state.call_actors.remove_call(&call_id);
     state.call_event_receivers.remove(&call_id);
+    // A conference dialog ending ends the calls it adopted.
+    end_orphaned_adoptions(state);
 }

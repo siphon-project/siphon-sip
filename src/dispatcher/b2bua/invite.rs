@@ -1419,9 +1419,9 @@ pub fn apply_handler_side_state(
     // (`auth.require_proxy_digest(call, …)`) authenticated after
     // `cdr_track_b2bua_start` already opened the CDR session, so stamp the
     // username on now — the proxy path gets it at session-build time.
-    if let Some(auth_user) = auth_user {
+    if let Some(auth_user) = &auth_user {
         if let Some(mut session) = state.cdr_sessions.get_mut(call_id) {
-            session.set_auth_user(auth_user);
+            session.set_auth_user(auth_user.clone());
         }
     }
 
@@ -1525,6 +1525,8 @@ pub fn apply_handler_side_state(
     if auth_passthrough {
         call.auth_passthrough = true;
     }
+    // Who the caller is, for `b2bua.adopt_replaced`'s ownership check.
+    call.auth_user = auth_user.or(call.auth_user.take());
     // Added to, never replaced: a header `@b2bua.on_invite` set is still the
     // script's value on the stored INVITE when `@b2bua.on_failure` routes again.
     call.script_shaped_headers.extend(script_shaped_headers);

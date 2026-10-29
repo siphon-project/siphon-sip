@@ -103,6 +103,8 @@ mod a_leg_reliable_provisional_tests;
 #[cfg(test)]
 mod admission_tests;
 #[cfg(test)]
+mod adopt_replaced_tests;
+#[cfg(test)]
 mod advertised_port_tests;
 #[cfg(test)]
 mod answer_after_preview_tests;
@@ -435,17 +437,17 @@ pub use b2bua::{
 // does not grow a surface by accident, published or not.
 pub(crate) use b2bua::{
     any_early_offer, b2bua_accept_refer_call_dialling, b2bua_accept_refer_controller_with_state,
-    b2bua_accept_refer_script, b2bua_answer_call_anchored_with_flags, b2bua_cancel_dial_with_state,
-    b2bua_complete_refer, b2bua_complete_refer_with_state, b2bua_dial_call, b2bua_drop_call,
-    b2bua_media_profile, b2bua_originate_group_create, b2bua_originate_group_start,
-    b2bua_originate_prepare_with_contact_host, b2bua_originate_with_route,
-    b2bua_reject_call_with_headers, b2bua_reoffer, b2bua_replace_peer_dialling, b2bua_send_info,
-    b2bua_session_sdp, b2bua_set_local_contact, b2bua_set_session_timer,
-    b2bua_take_over_is_anchored, bridge_calls_with_state, checked_contact_host,
-    checked_contact_user, dial_answered_payload, dial_branch_identity, dial_branch_summary,
-    dial_bridge_caller, dial_bridge_join, dial_bridge_refuse_phone, dial_bridge_spec,
-    dial_bridge_start, dial_targets_for_aor, forget_reoffer, forget_sent_info,
-    set_caller_contact_host, set_caller_contact_user, CallerContactHostRefusal,
+    b2bua_accept_refer_script, b2bua_adopt_replaced, b2bua_answer_call_anchored_with_flags,
+    b2bua_cancel_dial_with_state, b2bua_complete_refer, b2bua_complete_refer_with_state,
+    b2bua_dial_call, b2bua_drop_call, b2bua_media_profile, b2bua_originate_group_create,
+    b2bua_originate_group_start, b2bua_originate_prepare_with_contact_host,
+    b2bua_originate_with_route, b2bua_reject_call_with_headers, b2bua_reoffer,
+    b2bua_replace_peer_dialling, b2bua_send_info, b2bua_session_sdp, b2bua_set_local_contact,
+    b2bua_set_session_timer, b2bua_take_over_is_anchored, bridge_calls_with_state,
+    checked_contact_host, checked_contact_user, dial_answered_payload, dial_branch_identity,
+    dial_branch_summary, dial_bridge_caller, dial_bridge_join, dial_bridge_refuse_phone,
+    dial_bridge_spec, dial_bridge_start, dial_targets_for_aor, forget_reoffer, forget_sent_info,
+    set_caller_contact_host, set_caller_contact_user, AdoptRequest, CallerContactHostRefusal,
     ControllerReferRefusal, DialBridgeCaller, DialBridgeListener, DialBridgePlan,
     DialBridgeRefusal, DialBridgeSender, DialBridgeSignal, DialBridgeStartError, DialCancelRefusal,
     DialError, DialOffer, DialShaping, DialTarget, DispatcherHandle, DropOutcome,

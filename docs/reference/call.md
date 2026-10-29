@@ -563,8 +563,35 @@ What the handler can do with it:
 Every request is answered. A handler that raises, or an async one that runs
 past `script.handler_timeout_secs`, decides nothing and the offer is relayed.
 A crossing offer is answered `491 Request Pending` (RFC 3261 §14.1) before the
-script would see it. Not shown: a call siphon answered itself (no second
-party) and a leg of a controller bridge.
+script would see it. Not shown: a call siphon answered itself whose media
+session the engine answers for (the engine answers it), and a leg of a
+controller bridge. Shown, with nobody to relay to: a conference seat (above)
+and a call merged into a room with `b2bua.adopt_replaced`, whose far party's
+offer is answered from the session in force when the handler leaves it.
+
+**Several handlers.** Every registered `@b2bua.on_reoffer` handler runs, in
+registration order, on the same `offer` object. Each `offer.answer()` or
+`offer.reject()` replaces the decision before it, so the last handler to
+decide wins. A handler that raises stops the ones after it, and the offer is
+relayed as it arrived: an earlier handler's decision is dropped with it. A
+script with several handlers should have each return early for calls that are
+not its own, a conference handler for the merged or seated calls it tracks,
+the ordinary hold handler for the rest:
+
+```python
+@b2bua.on_reoffer
+def conference_seats(call, offer):
+    if call.call_id not in CONFERENCE_CALLS:
+        return
+    offer.answer()
+
+@b2bua.on_reoffer
+def hold(call, offer):
+    if call.call_id in CONFERENCE_CALLS:
+        return
+    if offer.kind == "hold" and offer.side == "a":
+        offer.answer()
+```
 
 `@b2bua.on_reoffer_answered` adds `offer.status_code`, `offer.answer_sdp` (as
 the offerer was sent it), `offer.answer_direction` and

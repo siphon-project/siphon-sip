@@ -299,6 +299,8 @@ pub struct PyCall {
     /// that survives a transfer is the *peer* of this one, which is what decides
     /// the media profile the surviving pair needs.
     refer_from_a_leg: Option<bool>,
+    /// The party on the dialog `refer_replaces` names, when this node holds it.
+    refer_replaces_call: Option<crate::b2bua::actor::DialogParty>,
     /// Credentials for B-leg digest auth retry (set by Python script).
     outbound_credentials: Option<(String, String)>,
     /// Whether li.record() was called for this call.
@@ -445,6 +447,7 @@ impl PyCall {
             session_timer_override: None,
             refer_to_uri: None,
             refer_from_a_leg: None,
+            refer_replaces_call: None,
             refer_replaces_info: None,
             outbound_credentials: None,
             li_record_flag: false,
@@ -969,6 +972,28 @@ impl PyCall {
     /// firing on_refer).
     pub fn set_refer_from_a_leg(&mut self, from_a_leg: bool) {
         self.refer_from_a_leg = Some(from_a_leg);
+    }
+
+    /// Record the party on the dialog the REFER's `Replaces` names.
+    pub fn set_refer_replaces_call(&mut self, party: Option<crate::b2bua::actor::DialogParty>) {
+        self.refer_replaces_call = party;
+    }
+
+    /// The Refer-To URI, when the call is an `@b2bua.on_refer` handler's.
+    pub(crate) fn refer_to_uri(&self) -> Option<&str> {
+        self.refer_to_uri.as_deref()
+    }
+
+    /// What `b2bua.adopt_replaced` needs off this call: its id, the
+    /// `Replaces` of the REFER it is handling, and the leg the REFER came on.
+    pub(crate) fn refer_for_adoption(
+        &self,
+    ) -> Option<(&str, &crate::sip::headers::refer::Replaces, bool)> {
+        Some((
+            &self.id,
+            self.refer_replaces_info.as_ref()?,
+            self.refer_from_a_leg?,
+        ))
     }
 }
 
@@ -2324,6 +2349,20 @@ impl PyCall {
             }
             None => Ok(None),
         }
+    }
+
+    /// What siphon knows of the call the `Replaces` names, when this node
+    /// holds it: the facts `b2bua.adopt_replaced` compares with the dialog the
+    /// REFER came in. A dict with `call_id`, `leg` (`"caller"` or `"callee"`:
+    /// which leg of that call the dialog is), `source` (`"ip:port"`),
+    /// `transport`, `from_uri` (the party's own URI on the dialog) and
+    /// `auth_user` (`None` on a leg siphon dialled). `None` outside
+    /// `@b2bua.on_refer`, without a `Replaces`, or when no call here has the
+    /// dialog. A script can refuse more than siphon does; it cannot accept
+    /// what siphon refuses.
+    #[getter]
+    fn refer_replaces_call(&self, python: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        super::call_adopt::party_dict(python, self.refer_replaces_call.as_ref())
     }
 
     /// Set outbound credentials for B-leg digest auth.

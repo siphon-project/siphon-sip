@@ -272,6 +272,9 @@ impl MediaBackend {
         // be the one way `ACTIVE_PLAYBACKS` could grow without bound.
         ACTIVE_PLAYBACKS.remove(&(call_id.to_string(), from_tag.to_string()));
         Self::recordings_session_ended(call_id, std::time::Instant::now());
+        // A call whose leg sits in a room is still the engine's call: its
+        // delete below takes the seat out with it.
+        self.seated_call_deleted(call_id);
         // A seated call's media is its seat, which no engine call holds.
         if let Some((left, holds_call)) = self.leave_seat_of(call_id).await {
             if !holds_call {
@@ -291,6 +294,7 @@ impl MediaBackend {
     /// Tear down a whole call by id, for one recovered from [`Self::list`]
     /// whose tags are no longer known.
     pub async fn delete_call(&self, call_id: &str) -> Result<(), RtpEngineError> {
+        self.seated_call_deleted(call_id);
         match self {
             Self::RtpEngine(set) => set.delete_call(call_id).await,
             Self::SiphonRtp(client) => client.delete_call(call_id).await,

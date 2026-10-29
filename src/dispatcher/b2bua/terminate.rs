@@ -210,6 +210,8 @@ pub fn b2bua_terminate_call_inner(
     // itself when it arrives (`ack_late_2xx_after_teardown`).
     state.call_actors.remove_call(internal_call_id);
     state.call_event_receivers.remove(internal_call_id);
+    // A conference dialog ending ends the calls it adopted.
+    end_orphaned_adoptions(state);
     true
 }
 

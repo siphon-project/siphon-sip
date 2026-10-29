@@ -40,6 +40,13 @@ pub struct ConferenceSeat {
 /// engine accepted and cleared by every leave, so it cannot outgrow the seats.
 static SEATS: LazyLock<DashMap<String, ConferenceSeat>> = LazyLock::new(DashMap::new);
 
+/// Calls whose leg `conference_seat` moved into a room (`b2bua.adopt_replaced`),
+/// by engine call-id, with the room. Unlike a [`ConferenceSeat`] such a seat is
+/// still a call the engine holds, so its teardown is the call's own `delete`;
+/// this is kept only so a room this process still has a seat in keeps its
+/// instance. Written by an accepted seat and cleared by the call's delete.
+static SEATED_CALLS: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
+
 /// What the engine says when the seat it is asked to free is not there.
 const NO_SUCH_PARTICIPANT: &str = "no such conference participant";
 
@@ -47,6 +54,56 @@ impl MediaBackend {
     /// The seat the call `call_id` holds, if it holds one.
     pub fn conference_seat(call_id: &str) -> Option<ConferenceSeat> {
         SEATS.get(call_id).map(|seat| seat.clone())
+    }
+
+    /// The room the engine call `engine_call_id` has a leg seated in, when
+    /// [`Self::conference_seat_call`] seated one.
+    pub fn seated_call_room(engine_call_id: &str) -> Option<String> {
+        SEATED_CALLS.get(engine_call_id).map(|room| room.clone())
+    }
+
+    /// Whether this process still knows of a seat in `conference_id`, a
+    /// joined one or a seated call's.
+    fn room_has_seats(conference_id: &str) -> bool {
+        SEATS.iter().any(|held| held.conference_id == conference_id)
+            || SEATED_CALLS
+                .iter()
+                .any(|room| room.value() == conference_id)
+    }
+
+    /// Move the leg `from_tag` of the live engine call `engine_call_id` into
+    /// `conference_id` in place (siphon-rtp `conference_seat`). No SDP is
+    /// exchanged; the call stays the engine's, one-legged, until its `delete`.
+    /// A backend with no mixer, or an engine that does not list the verb, is
+    /// [`RtpEngineError::Unsupported`]; the engine's own refusal is
+    /// [`RtpEngineError::EngineError`] and leaves the call relaying as it was.
+    pub async fn conference_seat_call(
+        &self,
+        engine_call_id: &str,
+        from_tag: &str,
+        conference_id: &str,
+        role: ConferenceRole,
+    ) -> Result<(), RtpEngineError> {
+        let Self::SiphonRtp(set) = self else {
+            return Err(self.no_mixer("conference_seat"));
+        };
+        set.conference_seat(engine_call_id, from_tag, conference_id, role)
+            .await?;
+        SEATED_CALLS.insert(engine_call_id.to_string(), conference_id.to_string());
+        Ok(())
+    }
+
+    /// The engine call `engine_call_id` is being deleted: its seat goes with
+    /// it, and a room this process then has no seat in forgets its instance.
+    pub(super) fn seated_call_deleted(&self, engine_call_id: &str) {
+        let Some((_, room)) = SEATED_CALLS.remove(engine_call_id) else {
+            return;
+        };
+        if let Self::SiphonRtp(set) = self {
+            if !Self::room_has_seats(&room) {
+                set.forget_room(&room);
+            }
+        }
     }
 
     /// The refusal for a backend that has no conference mixer.
@@ -109,10 +166,7 @@ impl MediaBackend {
         // later leave or delete must still find it.
         if outcome.is_ok() {
             SEATS.remove_if(call_id, |_, held| held == seat);
-            if !SEATS
-                .iter()
-                .any(|held| held.conference_id == seat.conference_id)
-            {
+            if !Self::room_has_seats(&seat.conference_id) {
                 set.forget_room(&seat.conference_id);
             }
         }

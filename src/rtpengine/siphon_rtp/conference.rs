@@ -475,5 +475,7 @@ impl SiphonRtpClientSet {
     }
 }
 
+mod seat;
+
 #[cfg(test)]
 mod tests;

@@ -1148,6 +1148,88 @@ class MockEnumAnswer:
 # B2BUA namespace
 # ---------------------------------------------------------------------------
 
+
+_STREAM_TRANSPORTS = ("tcp", "tls", "ws", "wss")
+
+
+def _uri_user(uri: Optional[str]) -> Optional[str]:
+    """The user part of a SIP URI, inside a name-addr or bare."""
+    if not uri:
+        return None
+    match = re.search(r"sips?:([^@;>]+)@", uri)
+    return match.group(1) if match else None
+
+
+class HeldLeg:
+    """One leg of a call the mock node holds (test helper for
+    :meth:`MockB2bua.adopt_replaced`): the dialog's identifiers as siphon holds
+    them, and the party on it as the ownership check reads it.
+
+    Args:
+        call_id: the dialog's SIP Call-ID.
+        local_tag: siphon's tag on the dialog (a ``Replaces`` ``to-tag``).
+        remote_tag: the party's tag (a ``Replaces`` ``from-tag``).
+        source: where the party's signalling comes from, ``"ip:port"``.
+        uri: the party's own URI on the dialog.
+        transport: ``"udp"``, ``"tcp"``, ``"tls"``, ``"ws"`` or ``"wss"``.
+        connection_id: the accepted connection, on a stream transport.
+        auth_user: the digest identity the party authenticated as (only a
+            party that placed the call can have one).
+    """
+
+    def __init__(self, call_id: str, local_tag: str, remote_tag: str,
+                 source: str, uri: str, transport: str = "udp",
+                 connection_id: int = 0,
+                 auth_user: Optional[str] = None) -> None:
+        self.call_id = call_id
+        self.local_tag = local_tag
+        self.remote_tag = remote_tag
+        self.source = source
+        self.uri = uri
+        self.transport = transport
+        self.connection_id = connection_id
+        self.auth_user = auth_user
+
+    def replaces(self) -> dict:
+        """The ``Replaces`` a client names this dialog by (RFC 3891), as
+        ``call.refer_replaces`` carries it."""
+        return {
+            "call_id": self.call_id,
+            "from_tag": self.remote_tag,
+            "to_tag": self.local_tag,
+            "early_only": False,
+        }
+
+
+class HeldCall:
+    """A call the mock node holds: a caller leg and a callee leg (test helper
+    for :meth:`MockB2bua.adopt_replaced`). After a merge, the leg that was
+    named is ``None`` and :attr:`adoption` says which room the other is in."""
+
+    def __init__(self, caller: HeldLeg, callee: HeldLeg,
+                 state: str = "answered") -> None:
+        self._call_id = caller.call_id
+        self.caller: Optional[HeldLeg] = caller
+        self.callee: Optional[HeldLeg] = callee
+        self.state = state
+        self.adoption: Optional[dict] = None
+
+    @property
+    def call_id(self) -> str:
+        """The SIP Call-ID the call is known by: its caller dialog's."""
+        return self._call_id
+
+    def _named(self, replaces: dict) -> Optional[str]:
+        for side in ("caller", "callee"):
+            leg = getattr(self, side)
+            if (leg is not None
+                    and leg.call_id == replaces.get("call_id")
+                    and leg.local_tag == replaces.get("to_tag")
+                    and leg.remote_tag == replaces.get("from_tag")):
+                return side
+        return None
+
+
 class MockB2bua:
     """Mock B2BUA namespace with decorator registration.
 
@@ -1198,6 +1280,10 @@ class MockB2bua:
         # and not reported yet, and the b2bua.complete_refer(...) reports.
         self.open_script_refers: set[str] = set()
         self.refer_reports: list[dict] = []
+        # The calls the mock node holds (b2bua.hold_call), and every merge
+        # b2bua.adopt_replaced carried out.
+        self.held_calls: list[HeldCall] = []
+        self.adoptions: list[dict] = []
         # Records b2bua.send_info(...) calls, and the status they resolve to.
         self.sent_infos: list[dict] = []
         self.info_status: Optional[int] = 200
@@ -1211,6 +1297,8 @@ class MockB2bua:
         """Reset recorded imperative calls (called by ``reset()``)."""
         self.open_script_refers.clear()
         self.refer_reports.clear()
+        self.held_calls.clear()
+        self.adoptions.clear()
         self.sent_infos.clear()
         self.info_status = 200
         self.reoffers.clear()
@@ -1627,6 +1715,214 @@ class MockB2bua:
             }
         )
         return True
+
+    def hold_call(self, caller: HeldLeg, callee: HeldLeg,
+                  state: str = "answered") -> HeldCall:
+        """Make the mock node hold a call between ``caller`` and ``callee``,
+        for :meth:`adopt_replaced` to find (test helper). ``state`` is
+        ``"answered"`` for a confirmed call; anything else is an early one."""
+        held = HeldCall(caller, callee, state)
+        self.held_calls.append(held)
+        return held
+
+    def _named_leg(self, replaces: Optional[dict]) -> Optional[tuple]:
+        if not replaces:
+            return None
+        for held in self.held_calls:
+            side = held._named(replaces)
+            if side is not None:
+                return held, side
+        return None
+
+    def replaces_call_facts(self, replaces: Optional[dict]) -> Optional[dict]:
+        """What ``call.refer_replaces_call`` reads: the facts of the leg the
+        ``Replaces`` names, or ``None`` when the node holds no such dialog."""
+        named = self._named_leg(replaces)
+        if named is None:
+            return None
+        held, side = named
+        leg = getattr(held, side)
+        return {
+            "call_id": leg.call_id,
+            "leg": side,
+            "source": leg.source,
+            "transport": leg.transport,
+            "from_uri": leg.uri,
+            "auth_user": leg.auth_user if side == "caller" else None,
+        }
+
+    @staticmethod
+    def _referrer_facts(call: Any) -> dict:
+        flow = getattr(call, "flow", None)
+        if flow is not None:
+            source, transport, connection = (
+                flow.remote_addr, flow.transport, flow.connection_id)
+        else:
+            source = f"{call.source_ip}:5060"
+            transport = getattr(call, "_transport", "udp")
+            connection = 0
+        return {
+            "source": source,
+            "transport": transport,
+            "connection_id": connection,
+            "from_uri": str(call.from_uri),
+            "auth_user": call.auth_user,
+        }
+
+    @staticmethod
+    def _same_party(referrer: dict, named: dict, connection_id: int) -> bool:
+        if referrer["auth_user"] and named["auth_user"]:
+            return referrer["auth_user"] == named["auth_user"]
+        if (referrer["transport"] in _STREAM_TRANSPORTS
+                and named["transport"] in _STREAM_TRANSPORTS):
+            return (referrer["transport"] == named["transport"]
+                    and referrer["connection_id"] == connection_id
+                    and connection_id != 0)
+        user = _uri_user(referrer["from_uri"])
+        return (referrer["source"] == named["source"]
+                and user is not None
+                and user == _uri_user(named["from_uri"]))
+
+    async def adopt_replaced(self, call: Any, conference_id: str,
+                             role: str = "talker",
+                             on_owner_leave: str = "end") -> int:
+        """Merge the call a REFER's ``Replaces`` names into a conference room
+        on this node (RFC 4579 section 5.5, a handset's "merge").
+
+        Called from ``@b2bua.on_refer`` on the conference dialog, after
+        ``call.accept_refer(mode="script")``. The named dialog is the
+        referrer's own leg of a call this node holds (its caller or callee
+        leg). The call's *other* leg, the far party, is seated in
+        ``conference_id`` in place (siphon-rtp ``conference_seat``): no SIP goes
+        to that party, its media keeps the same ports and the same session.
+        The named leg is then sent a BYE with ``Reason: SIP;cause=200;
+        text="Merged into conference"`` (RFC 3891).
+
+        The adopted call stays a call: its Ro session, maximum duration,
+        session timer and CDR carry on, with the far party as its one SIP leg.
+        A re-INVITE or UPDATE from the far party is answered against the
+        session in force (``@b2bua.on_reoffer`` sees it first); its BYE, a
+        credit or duration teardown, or the seat going silent ends it, which
+        takes the seat out of the room.
+
+        siphon first checks the dialog belongs to the referrer: the same
+        ``auth_user`` when both legs carry one, else the same connection on a
+        stream transport, else the same source address and the same user.
+        ``call.refer_replaces_call`` shows the facts compared, so a script can
+        refuse more; it cannot accept what siphon refuses.
+
+        Args:
+            call: the ``Call`` of the ``@b2bua.on_refer`` handler.
+            conference_id: the room to seat the far party in.
+            role: ``"talker"`` (default), ``"listener"`` or ``"muted"``.
+            on_owner_leave: ``"end"`` (default) tears the adopted call down
+                with a BYE (``Reason: Q.850;cause=16``) when the conference
+                dialog that adopted it ends; ``"keep"`` leaves it in the room.
+
+        Returns:
+            int: the status for ``b2bua.complete_refer``: ``200``; ``481`` no
+            confirmed dialog here matches (or no ``Replaces``); ``403`` the
+            dialog is not the referrer's; ``488`` the engine or the call's
+            state refused the seat; ``501`` the media backend is not
+            siphon-rtp or the engine lacks ``conference_seat``. A refusal
+            leaves the named call untouched.
+
+        Raises:
+            ValueError: outside ``@b2bua.on_refer``, an empty
+                ``conference_id``, or an unknown ``role`` / ``on_owner_leave``.
+
+        In the mock the comparison is applied for real to the calls
+        :meth:`hold_call` registered, and the far leg is seated in
+        ``rtpengine.conferences[conference_id]`` under its tag. The referrer's
+        source is ``call.flow.remote_addr`` (``"<source_ip>:5060"`` without a
+        flow). Prime the engine with
+        ``rtpengine.set_conference_seat_supported(False)`` (501) or
+        ``rtpengine.refuse_conference_seat(reason)`` (488). Each merge is
+        recorded on ``adoptions``; :meth:`conference_dialog_ended` plays the
+        conference dialog hanging up.
+
+        Usage::
+
+            @b2bua.on_refer
+            async def on_refer(call):
+                call.accept_refer(mode="script")
+                status = await b2bua.adopt_replaced(call, room_of(call))
+                b2bua.complete_refer(call.call_id, status)
+        """
+        if role not in ("talker", "listener", "muted"):
+            raise ValueError(
+                f'b2bua.adopt_replaced(role=…) is "talker", "listener" or "muted" (got {role!r})')
+        if on_owner_leave not in ("end", "keep"):
+            raise ValueError(
+                f'b2bua.adopt_replaced(on_owner_leave=…) is "end" or "keep" (got {on_owner_leave!r})')
+        if not conference_id:
+            raise ValueError("b2bua.adopt_replaced(conference_id=…) names a room; it is empty")
+        if getattr(call, "refer_to", None) is None:
+            raise ValueError(
+                "b2bua.adopt_replaced() works on the call of an @b2bua.on_refer handler")
+        named = self._named_leg(call.refer_replaces)
+        if named is None:
+            return 481
+        held, side = named
+        if held.state != "answered":
+            return 481
+        leg = getattr(held, side)
+        facts = self.replaces_call_facts(call.refer_replaces) or {}
+        if not self._same_party(self._referrer_facts(call), facts, leg.connection_id):
+            return 403
+        engine = get_rtpengine()
+        if not engine._conference_seat_supported:
+            return 501
+        if held.adoption is not None or engine._conference_seat_refusal is not None:
+            return 488
+        far_side = "callee" if side == "caller" else "caller"
+        far = getattr(held, far_side)
+        room = engine.conferences.setdefault(conference_id, {})
+        room[far.remote_tag] = {
+            "call_id": held.call_id,
+            "profile": None,
+            "adopted": True,
+            **engine._conference_role(role, None, None),
+        }
+        setattr(held, side, None)
+        held.adoption = {
+            "conference_id": conference_id,
+            "owner_call_id": call.call_id,
+            "on_owner_leave": on_owner_leave,
+        }
+        self.adoptions.append({
+            "call_id": held.call_id,
+            "conference_id": conference_id,
+            "owner_call_id": call.call_id,
+            "replaced_leg": side,
+            "seated_tag": far.remote_tag,
+            "role": role,
+            "on_owner_leave": on_owner_leave,
+            "bye": {"call_id": leg.call_id,
+                    "reason": 'SIP;cause=200;text="Merged into conference"'},
+        })
+        return 200
+
+    def conference_dialog_ended(self, owner_call_id: str) -> list[str]:
+        """Play the conference dialog ``owner_call_id`` hanging up (test
+        helper): every call it adopted with ``on_owner_leave="end"`` is ended
+        with ``Reason: Q.850;cause=16`` and its seat leaves the room. Returns
+        the Call-IDs of the calls ended; each is also on ``terminates``."""
+        ended = []
+        engine = get_rtpengine()
+        for held in list(self.held_calls):
+            adoption = held.adoption
+            if (adoption is None or adoption["owner_call_id"] != owner_call_id
+                    or adoption["on_owner_leave"] != "end"):
+                continue
+            far = held.caller or held.callee
+            if far is not None:
+                engine._leave_seat(adoption["conference_id"], far.remote_tag)
+            self.held_calls.remove(held)
+            self.terminates.append({"call_id": held.call_id,
+                                    "reason": "Q.850;cause=16"})
+            ended.append(held.call_id)
+        return ended
 
     def complete_refer(self, call_id: str, code: int,
                        reason: Optional[str] = None) -> bool:
@@ -2084,8 +2380,20 @@ class MockB2bua:
         Doing nothing relays the offer. ``offer.reject(code, reason)``
         refuses it; ``offer.answer(sdp=None)`` answers it here and relays
         nothing. A handler that raises decides nothing: the offer is relayed.
-        Not called for a 491 siphon answers to a crossing offer, nor on a call
-        siphon answered itself or a controller bridged.
+        Not called for a 491 siphon answers to a crossing offer, on a call
+        siphon answered itself whose media session the engine answers for, or
+        on a controller bridge. Called, with nobody to relay to, for a
+        conference seat and for a call merged into a room with
+        ``b2bua.adopt_replaced``.
+
+        Several handlers: every registered one runs, in registration order,
+        on the same ``offer``. Each ``answer()`` / ``reject()`` replaces the
+        decision before it, so the last handler to decide wins. A handler that
+        raises stops the rest and the offer is relayed as it arrived, an
+        earlier handler's decision dropped with it. A script with several
+        should have each return early for calls that are not its own (a
+        conference handler for the merged or seated calls it tracks, the hold
+        handler for the rest).
 
         Example::
 
@@ -4807,6 +5115,10 @@ class MockRtpEngine:
             "a=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\n"
         )
         self._conference_join_no_codec: bool = False
+        # b2bua.adopt_replaced: whether the engine serves conference_seat,
+        # and the reason it refuses the next seat with.
+        self._conference_seat_supported: bool = True
+        self._conference_seat_refusal: Optional[str] = None
         self._active_speaker_handlers: list[dict[str, Any]] = []
         self.media_scopes: list[tuple[str, Optional[str]]] = []
         """``(operation, scope)`` per media verb (offer, answer, delete, delete_call,
@@ -6491,6 +6803,19 @@ class MockRtpEngine:
         ``ValueError``."""
         self._conference_join_no_codec = no_codec
 
+    def set_conference_seat_supported(self, supported: bool = True) -> None:
+        """Model an engine that does (or, with ``False``, does not) list
+        ``conference_seat`` in its features, or a backend other than
+        siphon-rtp: :meth:`MockB2bua.adopt_replaced` then resolves ``501``
+        (test helper)."""
+        self._conference_seat_supported = supported
+
+    def refuse_conference_seat(self, reason: Optional[str] = "room full") -> None:
+        """Prime the engine to refuse ``conference_seat`` (a full room, a
+        codec it cannot mix, a draining node): :meth:`MockB2bua.adopt_replaced`
+        then resolves ``488``. ``None`` clears it (test helper)."""
+        self._conference_seat_refusal = reason
+
     def set_conference_join_sdp(self, sdp: str) -> None:
         """Set the answer SDP :meth:`conference_join` resolves to (test
         helper)."""
@@ -7691,6 +8016,8 @@ class MockRtpEngine:
         self.conference_offers.clear()
         self.conference_plays.clear()
         self._conference_join_no_codec = False
+        self._conference_seat_supported = True
+        self._conference_seat_refusal = None
 
 
 # ---------------------------------------------------------------------------

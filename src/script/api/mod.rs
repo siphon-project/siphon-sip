@@ -10,6 +10,7 @@ pub mod auth;
 pub mod b2bua;
 pub mod cache;
 pub mod call;
+mod call_adopt;
 mod call_contact;
 mod call_failure_response;
 mod call_media;

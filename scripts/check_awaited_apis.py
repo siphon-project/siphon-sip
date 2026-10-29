@@ -52,6 +52,7 @@ NAMESPACE_AWAITABLE = {
         "require_ims_digest", "verify_digest",
     },
     "presence": {"notify", "terminate"},
+    "b2bua": {"adopt_replaced"},
     "sbi": {
         "discover_pcf_binding", "create_session", "update_session",
         "delete_session",
