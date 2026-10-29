@@ -95,9 +95,12 @@ pub enum Due {
         attempt: u32,
     },
     /// Timer B or Timer F elapsed with no response. The entry has already
-    /// been removed; the caller only reports it.
+    /// been removed. `data` is the request that went unanswered, which a
+    /// transaction user ending it as a locally generated 408 builds the
+    /// response from (RFC 3261 §8.1.3.1).
     GaveUp {
         key: RetransmitKey,
+        data: Bytes,
         destination: SocketAddr,
         attempts: u32,
     },
@@ -218,7 +221,13 @@ impl B2buaRetransmits {
     /// Returns `false` without storing anything for an unreliable transport,
     /// whose INVITE [`arm`](Self::arm) already times, and for anything but an
     /// INVITE.
-    pub fn arm_timeout(&self, key: RetransmitKey, target: RetransmitTarget, now: Instant) -> bool {
+    pub fn arm_timeout(
+        &self,
+        key: RetransmitKey,
+        data: Bytes,
+        target: RetransmitTarget,
+        now: Instant,
+    ) -> bool {
         let reliable = !matches!(
             crate::transaction::state::Transport::from(target.transport),
             crate::transaction::state::Transport::Udp
@@ -229,8 +238,10 @@ impl B2buaRetransmits {
         let give_up_at = now + self.timers.timer_b();
         let replaced = self.entries.insert(
             key,
+            // Never retransmitted (`next_at` is the give-up deadline), kept
+            // for the request a timeout is answered from.
             RetransmitEntry {
-                data: Bytes::new(),
+                data,
                 target,
                 next_at: give_up_at,
                 interval: self.timers.timer_b(),
@@ -289,6 +300,7 @@ impl B2buaRetransmits {
             if now >= entry.give_up_at {
                 expired.push((
                     entry.key().clone(),
+                    entry.data.clone(),
                     entry.target.destination,
                     entry.attempts,
                 ));
@@ -317,10 +329,11 @@ impl B2buaRetransmits {
             });
         }
 
-        for (key, destination, attempts) in expired {
+        for (key, data, destination, attempts) in expired {
             if self.disarm(&key) {
                 due.push(Due::GaveUp {
                     key,
+                    data,
                     destination,
                     attempts,
                 });
@@ -344,6 +357,11 @@ impl B2buaRetransmits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bytes of a request a schedule is armed for.
+    fn request() -> Bytes {
+        Bytes::from_static(b"INVITE sip:bob@example.com SIP/2.0\r\n\r\n")
+    }
 
     fn target(transport: Transport) -> RetransmitTarget {
         RetransmitTarget {
@@ -546,7 +564,7 @@ mod tests {
             .enumerate()
         {
             let key = RetransmitKey::new(format!("z9hG4bK-stream-{index}"), Method::Invite);
-            assert!(store.arm_timeout(key.clone(), target(transport), start));
+            assert!(store.arm_timeout(key.clone(), request(), target(transport), start));
             assert!(store.is_armed());
             let timer_b = store.timers.timer_b();
             let mut now = start;
@@ -559,8 +577,12 @@ mod tests {
             }
             let events = store.due(start + timer_b);
             assert!(
-                matches!(events.as_slice(), [Due::GaveUp { key: gone, attempts: 0, .. }] if *gone == key),
-                "{transport}: {events:?}"
+                matches!(
+                    events.as_slice(),
+                    [Due::GaveUp { key: gone, attempts: 0, data, .. }]
+                        if *gone == key && *data == request()
+                ),
+                "{transport}: the request it gave up on comes back with it: {events:?}"
             );
             assert_eq!(store.len(), 0, "{transport}: the entry is gone");
             assert!(!store.is_armed());
@@ -568,14 +590,15 @@ mod tests {
 
         // A response disarms it like any schedule.
         let key = RetransmitKey::new("z9hG4bK-stream-answered", Method::Invite);
-        assert!(store.arm_timeout(key.clone(), target(Transport::Tcp), start));
+        assert!(store.arm_timeout(key.clone(), request(), target(Transport::Tcp), start));
         assert!(store.disarm(&key));
         assert!(store.due(start + store.timers.timer_b()).is_empty());
 
         // Not for UDP, which `arm` times, and not for a non-INVITE.
-        assert!(!store.arm_timeout(invite_key(), target(Transport::Udp), start));
+        assert!(!store.arm_timeout(invite_key(), request(), target(Transport::Udp), start));
         assert!(!store.arm_timeout(
             RetransmitKey::new("z9hG4bK-stream-bye", Method::Bye),
+            request(),
             target(Transport::Tcp),
             start
         ));

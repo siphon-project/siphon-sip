@@ -873,3 +873,101 @@ async fn script_reoffer_waiters_drain_after_answered_and_abandoned_reoffers() {
         .collect();
     assert!(left.is_empty(), "waiters never released: {left:?}");
 }
+
+/// Past Timer B with nothing answered: every armed request gives up.
+fn past_timer_b(call: &Established) {
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(64);
+    tokio::task::block_in_place(|| {
+        super::timers::sweep_b2bua_retransmits_at(&call.dispatcher.state, later)
+    });
+}
+
+/// A re-offer the caller never answers, not even with a provisional, ends at
+/// Timer B as the 408 it stands for (RFC 3261 §17.1.1.2, §8.1.3.1): the script
+/// waiting on it is told 408, nothing is ACKed to the silent caller, and the
+/// next re-INVITE toward the caller goes out instead of reading as one that
+/// crosses an INVITE still in progress.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reoffer_nobody_answers_ends_at_timer_b_as_408_and_frees_the_leg() {
+    let call = call_deciding(83200, "pass");
+    let caller = caller_of(&call);
+    acks(&call.dispatcher.state, &caller);
+    let state = &call.dispatcher.state;
+    let internal = call.call_id();
+    let reoffered =
+        tokio::task::block_in_place(|| super::b2bua::reoffer_leg(state, &internal, true, None))
+            .expect("sent");
+    let (branch, status) = match reoffered {
+        super::b2bua::Reoffered::Sent { branch, status } => (branch, status),
+        super::b2bua::Reoffered::Crossing => panic!("nothing was pending"),
+    };
+    assert!(
+        sent_with(&wire(&call.dispatcher), call.a.1, Method::Invite).is_some(),
+        "the caller is re-INVITEd"
+    );
+
+    past_timer_b(&call);
+
+    let code = tokio::time::timeout(std::time::Duration::from_secs(2), status)
+        .await
+        .expect("settled at Timer B")
+        .expect("a status");
+    assert_eq!(code, 408);
+    assert!(!super::b2bua::is_script_reoffer(&branch));
+    let sent = wire(&call.dispatcher);
+    assert!(
+        sent_with(&sent, call.a.1, Method::Ack).is_none(),
+        "a 408 nobody sent is not ACKed"
+    );
+    assert!(
+        matches!(
+            tokio::task::block_in_place(|| super::b2bua::reoffer_leg(state, &internal, true, None)),
+            Ok(super::b2bua::Reoffered::Sent { .. })
+        ),
+        "the INVITE toward the caller is no longer in progress"
+    );
+}
+
+/// A re-INVITE relayed to a callee that never answers ends at Timer B as a
+/// 408 the caller is answered with, rather than leaving the caller's INVITE
+/// unanswered (RFC 3261 §16.7 step 2 has a proxy do the same), and the callee's
+/// leg takes the caller's next re-INVITE instead of answering it 491.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relayed_reinvite_the_callee_never_answers_is_answered_408_at_timer_b() {
+    let call = call_deciding(83210, "pass");
+    let caller = caller_of(&call);
+    acks(&call.dispatcher.state, &caller);
+
+    let sent = offers(
+        &call,
+        &caller,
+        "INVITE",
+        2,
+        Some(&caller_sdp(&call, "a=sendonly\r\n")),
+    );
+    assert!(
+        sent_with(&sent, call.b.1, Method::Invite).is_some(),
+        "the hold is relayed"
+    );
+
+    past_timer_b(&call);
+
+    let sent = wire(&call.dispatcher);
+    let answered = final_to(&sent, call.a.1).expect("the caller is answered");
+    assert_eq!(answered.status_code(), Some(408));
+    assert!(
+        sent_with(&sent, call.b.1, Method::Ack).is_none(),
+        "nothing is ACKed to the silent callee"
+    );
+
+    let sent = offers(&call, &caller, "INVITE", 3, Some(&caller_sdp(&call, "")));
+    assert!(
+        sent_with(&sent, call.b.1, Method::Invite).is_some(),
+        "the next re-INVITE is relayed"
+    );
+    assert_ne!(
+        final_to(&sent, call.a.1).and_then(|response| response.status_code()),
+        Some(491),
+        "not refused as crossing"
+    );
+}
