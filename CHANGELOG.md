@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.15.8] — 2026-10-30
+
 ### Added
 
 - **`isc.evaluate` exposes `include_register_request` and `include_register_response`.** Each result dict carries both flags of the iFC's `ApplicationServer/Extension` (TS 29.228), so an S-CSCF script can put the user's REGISTER and its 200 OK in the third-party REGISTER to that AS (TS 24.229 §5.4.1.7). Mirrored in the SDK mock.
