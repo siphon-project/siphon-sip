@@ -438,14 +438,12 @@ pub fn parse_user_profile(xml: &str) -> Result<UserProfile, IfcError> {
                     }
                     "IncludeRegisterRequest" => {
                         if let Some(ref mut app) = current_app_server {
-                            app.include_register_request =
-                                text == "1" || text.eq_ignore_ascii_case("true");
+                            app.include_register_request = include_flag_value(&text);
                         }
                     }
                     "IncludeRegisterResponse" => {
                         if let Some(ref mut app) = current_app_server {
-                            app.include_register_response =
-                                text == "1" || text.eq_ignore_ascii_case("true");
+                            app.include_register_response = include_flag_value(&text);
                         }
                     }
                     "ServiceInfo" => {
@@ -480,6 +478,19 @@ pub fn parse_user_profile(xml: &str) -> Result<UserProfile, IfcError> {
                 }
                 current_text.clear();
             }
+            // TS 29.228 Annex E types `IncludeRegisterRequest` and
+            // `IncludeRegisterResponse` as empty complex types: the element
+            // being present is the flag, so the self-closing form is the
+            // normal one. An empty element never pushes onto `depth`.
+            Ok(Event::Empty(element)) => {
+                if let Some(ref mut app) = current_app_server {
+                    match local_name(&element, &reader).as_str() {
+                        "IncludeRegisterRequest" => app.include_register_request = true,
+                        "IncludeRegisterResponse" => app.include_register_response = true,
+                        _ => {}
+                    }
+                }
+            }
             Ok(Event::Text(element)) => {
                 current_text.push_str(
                     &element
@@ -511,6 +522,14 @@ pub fn parse_user_profile(xml: &str) -> Result<UserProfile, IfcError> {
         ifcs: results,
         shared_ifc_set_ids,
     })
+}
+
+/// Value of an `IncludeRegisterRequest` / `IncludeRegisterResponse` element
+/// that has a start and end tag. The schema type is empty, so an empty body
+/// means set; `1` and `true` are read for profiles written with a value, and
+/// `0` / `false` clear it.
+fn include_flag_value(text: &str) -> bool {
+    text.is_empty() || text == "1" || text.eq_ignore_ascii_case("true")
 }
 
 /// Extract the local name (without namespace prefix) from a tag.
@@ -2285,8 +2304,10 @@ mod tests {
             "      <ServerName>sip:info-as@example.com</ServerName>\n",
             "      <DefaultHandling>0</DefaultHandling>\n",
             "      <ServiceInfo>mmtel;conference</ServiceInfo>\n",
-            "      <IncludeRegisterRequest>1</IncludeRegisterRequest>\n",
-            "      <IncludeRegisterResponse>1</IncludeRegisterResponse>\n",
+            "      <Extension>\n",
+            "        <IncludeRegisterRequest/>\n",
+            "        <IncludeRegisterResponse/>\n",
+            "      </Extension>\n",
             "    </ApplicationServer>\n",
             "  </InitialFilterCriteria>\n",
             "</ServiceProfile>\n",
@@ -2496,7 +2517,9 @@ mod tests {
             "      <ServerName>sip:as@example.com</ServerName>\n",
             "      <DefaultHandling>1</DefaultHandling>\n",
             "      <ServiceInfo>mmtel</ServiceInfo>\n",
-            "      <IncludeRegisterRequest>1</IncludeRegisterRequest>\n",
+            "      <Extension>\n",
+            "        <IncludeRegisterRequest/>\n",
+            "      </Extension>\n",
             "    </ApplicationServer>\n",
             "  </InitialFilterCriteria>\n",
             "</ServiceProfile>\n",
@@ -2510,6 +2533,134 @@ mod tests {
         assert_eq!(matched.priority, 3);
         assert!(matched.include_register_request);
         assert!(!matched.include_register_response);
+    }
+
+    /// One ApplicationServer in the TS 29.228 Annex E shape: the include
+    /// flags live under `ApplicationServer/Extension`.
+    fn include_register_profile(extension_body: &str) -> String {
+        format!(
+            concat!(
+                "<ServiceProfile>\n",
+                "  <InitialFilterCriteria>\n",
+                "    <Priority>0</Priority>\n",
+                "    <ApplicationServer>\n",
+                "      <ServerName>sip:as@example.com</ServerName>\n",
+                "      <DefaultHandling>0</DefaultHandling>\n",
+                "{}",
+                "    </ApplicationServer>\n",
+                "  </InitialFilterCriteria>\n",
+                "</ServiceProfile>\n",
+            ),
+            extension_body
+        )
+    }
+
+    fn include_flags(extension_body: &str) -> (bool, bool) {
+        let ifcs = parse_service_profile(&include_register_profile(extension_body)).unwrap();
+        let app_server = &ifcs[0].application_server;
+        (
+            app_server.include_register_request,
+            app_server.include_register_response,
+        )
+    }
+
+    #[test]
+    fn include_register_request_empty_element_in_extension_is_true() {
+        let flags = include_flags(concat!(
+            "      <Extension>\n",
+            "        <IncludeRegisterRequest/>\n",
+            "      </Extension>\n",
+        ));
+        assert_eq!(flags, (true, false));
+    }
+
+    #[test]
+    fn include_register_response_empty_element_in_extension_is_true() {
+        let flags = include_flags(concat!(
+            "      <Extension>\n",
+            "        <IncludeRegisterResponse/>\n",
+            "      </Extension>\n",
+        ));
+        assert_eq!(flags, (false, true));
+    }
+
+    #[test]
+    fn include_register_both_empty_elements_are_true() {
+        let flags = include_flags(concat!(
+            "      <Extension>\n",
+            "        <IncludeRegisterRequest/>\n",
+            "        <IncludeRegisterResponse/>\n",
+            "      </Extension>\n",
+        ));
+        assert_eq!(flags, (true, true));
+    }
+
+    #[test]
+    fn include_register_absent_is_false() {
+        assert_eq!(include_flags(""), (false, false));
+        let flags = include_flags(concat!("      <Extension>\n", "      </Extension>\n"));
+        assert_eq!(flags, (false, false));
+    }
+
+    #[test]
+    fn include_register_start_end_empty_form_is_true() {
+        let flags = include_flags(concat!(
+            "      <Extension>\n",
+            "        <IncludeRegisterRequest></IncludeRegisterRequest>\n",
+            "        <IncludeRegisterResponse></IncludeRegisterResponse>\n",
+            "      </Extension>\n",
+        ));
+        assert_eq!(flags, (true, true));
+    }
+
+    #[test]
+    fn include_register_legacy_one_is_still_true() {
+        let flags = include_flags(concat!(
+            "      <IncludeRegisterRequest>1</IncludeRegisterRequest>\n",
+            "      <IncludeRegisterResponse>true</IncludeRegisterResponse>\n",
+        ));
+        assert_eq!(flags, (true, true));
+    }
+
+    #[test]
+    fn include_register_zero_and_false_are_false() {
+        let flags = include_flags(concat!(
+            "      <Extension>\n",
+            "        <IncludeRegisterRequest>0</IncludeRegisterRequest>\n",
+            "        <IncludeRegisterResponse>false</IncludeRegisterResponse>\n",
+            "      </Extension>\n",
+        ));
+        assert_eq!(flags, (false, false));
+    }
+
+    #[test]
+    fn include_register_empty_element_does_not_disturb_following_siblings() {
+        let ifcs = parse_service_profile(concat!(
+            "<ServiceProfile>\n",
+            "  <InitialFilterCriteria>\n",
+            "    <Priority>4</Priority>\n",
+            "    <ApplicationServer>\n",
+            "      <ServerName>sip:as@example.com</ServerName>\n",
+            "      <Extension><IncludeRegisterRequest/></Extension>\n",
+            "      <ServiceInfo>after</ServiceInfo>\n",
+            "    </ApplicationServer>\n",
+            "  </InitialFilterCriteria>\n",
+            "  <InitialFilterCriteria>\n",
+            "    <Priority>5</Priority>\n",
+            "    <ApplicationServer>\n",
+            "      <ServerName>sip:other@example.com</ServerName>\n",
+            "    </ApplicationServer>\n",
+            "  </InitialFilterCriteria>\n",
+            "</ServiceProfile>\n",
+        ))
+        .unwrap();
+        assert_eq!(ifcs.len(), 2);
+        assert!(ifcs[0].application_server.include_register_request);
+        assert_eq!(
+            ifcs[0].application_server.service_info.as_deref(),
+            Some("after")
+        );
+        assert!(!ifcs[1].application_server.include_register_request);
     }
 
     #[test]

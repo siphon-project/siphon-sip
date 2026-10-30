@@ -129,7 +129,13 @@ impl PyIsc {
     /// Returns:
     ///     List of dicts, each with keys: ``server_name`` (str),
     ///     ``default_handling`` (int: 0=SESSION_CONTINUED, 1=SESSION_TERMINATED),
-    ///     ``service_info`` (str or None), ``priority`` (int).
+    ///     ``service_info`` (str or None), ``priority`` (int),
+    ///     ``include_register_request`` (bool) and
+    ///     ``include_register_response`` (bool): the iFC's
+    ///     ``ApplicationServer/Extension`` flags of TS 29.228 Annex E, set by
+    ///     the element being present. When true, the S-CSCF puts the user's
+    ///     REGISTER, and the 200 OK it answered with, in the third-party
+    ///     REGISTER to that AS (TS 24.229 §5.4.1.7).
     ///     Ordered by priority ascending (lowest first).
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (aor, method, ruri, headers, session_case="originating", start_after_priority=None, body=None))]
@@ -174,6 +180,11 @@ impl PyIsc {
             dict.set_item("default_handling", matched.default_handling)?;
             dict.set_item("service_info", matched.service_info.as_deref())?;
             dict.set_item("priority", matched.priority)?;
+            dict.set_item("include_register_request", matched.include_register_request)?;
+            dict.set_item(
+                "include_register_response",
+                matched.include_register_response,
+            )?;
             results.push(dict);
         }
         Ok(results)
@@ -264,6 +275,71 @@ mod tests {
             let number = 5i64.into_pyobject(python).unwrap();
             assert!(sdp_text(number.as_any()).is_err());
         });
+    }
+
+    fn evaluate_register(extension_body: &str) -> (bool, bool) {
+        let xml = format!(
+            concat!(
+                "<ServiceProfile>\n",
+                "  <InitialFilterCriteria>\n",
+                "    <Priority>0</Priority>\n",
+                "    <TriggerPoint>\n",
+                "      <ConditionTypeCNF>0</ConditionTypeCNF>\n",
+                "      <SPT><Group>0</Group><Method>REGISTER</Method></SPT>\n",
+                "    </TriggerPoint>\n",
+                "    <ApplicationServer>\n",
+                "      <ServerName>sip:as@example.com</ServerName>\n",
+                "{}",
+                "    </ApplicationServer>\n",
+                "  </InitialFilterCriteria>\n",
+                "</ServiceProfile>\n",
+            ),
+            extension_body
+        );
+        let store = Arc::new(IfcStore::new(Vec::new()));
+        let isc = PyIsc::new(store);
+        isc.store_profile("sip:alice@example.com", &xml).unwrap();
+        Python::initialize();
+        Python::attach(|python| {
+            let results = isc
+                .evaluate(
+                    python,
+                    "sip:alice@example.com",
+                    "REGISTER",
+                    "sip:example.com",
+                    Vec::new(),
+                    "originating",
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            let get = |key: &str| -> bool {
+                results[0]
+                    .get_item(key)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("missing key {key}"))
+                    .extract()
+                    .unwrap()
+            };
+            (
+                get("include_register_request"),
+                get("include_register_response"),
+            )
+        })
+    }
+
+    #[test]
+    fn evaluate_dict_carries_include_register_flags() {
+        assert_eq!(
+            evaluate_register("      <Extension><IncludeRegisterRequest/></Extension>\n"),
+            (true, false)
+        );
+        assert_eq!(
+            evaluate_register("      <Extension><IncludeRegisterResponse/></Extension>\n"),
+            (false, true)
+        );
+        assert_eq!(evaluate_register(""), (false, false));
     }
 
     #[test]
