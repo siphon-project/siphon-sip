@@ -3216,8 +3216,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sigtran"
-version = "5.1.0"
-source = "git+https://github.com/siphon-project/siphon-sigtran?tag=v5.1.0#328169f970458ba07c468d151b281df4f2ea45c7"
+version = "5.1.1"
+source = "git+https://github.com/siphon-project/siphon-sigtran?tag=v5.1.1#905e6a7c6c51d1b27e6d2e78569292cb388f92dc"
 dependencies = [
  "async-sctp",
  "gsm_cap",
@@ -3242,8 +3242,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sip"
-version = "1.15.6"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#e41b6344cc9fde304a18daba9b25d18da1a9d965"
+version = "1.15.7"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#7b5ea8861df5b9bf17eb17d3d949eade531f35c0"
 dependencies = [
  "aes",
  "arc-swap",
