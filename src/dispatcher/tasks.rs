@@ -339,6 +339,7 @@ pub(super) async fn deliver_registrar_change(
     let super::registration_events::RegistrarChange {
         aor,
         event: event_type,
+        exchange,
     } = change;
 
     // A binding that went away ends the dialogs it vouched for at once, rather
@@ -405,7 +406,36 @@ pub(super) async fn deliver_registrar_change(
                 let arguments = (aor.as_str(), event_type, &py_contacts);
                 // `sequence=` only for a handler that takes it, so a 3-argument
                 // handler written before it existed keeps working.
-                let result = match sequence_keyword(python, callable, sequence) {
+                let sequence_keywords = sequence_keyword(python, callable, sequence);
+                // `exchange=` only for a handler whose signature names it
+                // (decided when it registered): `None` where no REGISTER of
+                // this node is behind the change.
+                let keywords = if handler.takes_exchange {
+                    let keywords =
+                        sequence_keywords.unwrap_or_else(|| pyo3::types::PyDict::new(python));
+                    let exchange = exchange.as_ref().and_then(|exchange| {
+                        Py::new(
+                            python,
+                            crate::script::api::register_exchange::PyRegisterExchange::new(
+                                Arc::clone(exchange),
+                            ),
+                        )
+                        .map_err(|error| {
+                            error!("PyRegisterExchange creation failed: {error}");
+                        })
+                        .ok()
+                    });
+                    match keywords.set_item("exchange", exchange) {
+                        Ok(()) => Some(keywords),
+                        Err(error) => {
+                            error!("registrar.on_change exchange argument failed: {error}");
+                            Some(keywords)
+                        }
+                    }
+                } else {
+                    sequence_keywords
+                };
+                let result = match keywords {
                     Some(keywords) => callable.call(arguments, Some(&keywords)),
                     None => callable.call1(arguments),
                 };

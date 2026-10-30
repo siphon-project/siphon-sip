@@ -615,6 +615,7 @@ pub(super) fn handle_response(
                 inbound.remote_addr,
                 inbound_local_addr,
                 connection_id,
+                Some(inbound.data.clone()),
             );
 
             // `reply.reject(code, reason)` from `@proxy.on_reply`: fail the
@@ -671,10 +672,12 @@ pub(super) fn handle_response(
                 );
                 let (cb_forward, cb_reject, cb_retarget): RelayCallbackOutcome =
                     Python::attach(|python| {
-                        let py_reply_obj = PyReply::new(Arc::clone(&msg_arc)).with_response_source(
-                            inbound.remote_addr.ip().to_string(),
-                            inbound.remote_addr.port(),
-                        );
+                        let py_reply_obj = PyReply::new(Arc::clone(&msg_arc))
+                            .with_response_source(
+                                inbound.remote_addr.ip().to_string(),
+                                inbound.remote_addr.port(),
+                            )
+                            .with_wire(inbound.data.clone());
                         let py_reply = match Py::new(python, py_reply_obj) {
                             Ok(obj) => obj,
                             Err(error) => {
@@ -1345,6 +1348,7 @@ pub(super) fn run_reply_handlers(
     response_source: SocketAddr,
     inbound_local_addr: SocketAddr,
     inbound_connection_id: ConnectionId,
+    response_wire: Option<Bytes>,
 ) -> (SipMessage, bool, Option<(u16, String)>) {
     // Automatic NAT Contact fixup on responses (nat.fix_contact: true).
     // Rewrites the Contact URI host:port with the observed source address
@@ -1368,8 +1372,11 @@ pub(super) fn run_reply_handlers(
     }
 
     let message_arc = Arc::new(std::sync::Mutex::new(message));
-    let reply = PyReply::new(Arc::clone(&message_arc))
+    let mut reply = PyReply::new(Arc::clone(&message_arc))
         .with_response_source(response_source.ip().to_string(), response_source.port());
+    if let Some(wire) = response_wire {
+        reply = reply.with_wire(wire);
+    }
 
     // Build a PyRequest from the original request so scripts get (request, reply)
     let request_arc = Arc::new(std::sync::Mutex::new(original_request));

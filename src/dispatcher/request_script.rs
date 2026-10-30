@@ -36,6 +36,10 @@ pub(super) struct ScriptDecision {
     reply_headers: Vec<(crate::script::api::request::ReplyHeaderOp, String, String)>,
     reply_body: Option<(Vec<u8>, String)>,
     auth_user: Option<String>,
+    /// The registrar events the handlers' `save()` calls held back. Published
+    /// once the reply is out; whatever path ends the request without that
+    /// (a relay, a drop, an early return) drops it, and the drop publishes.
+    registrar_events: Option<crate::registrar::RegisterEventHold>,
 }
 
 impl ScriptDecision {
@@ -51,6 +55,7 @@ impl ScriptDecision {
             reply_headers: vec![],
             reply_body: None,
             auth_user: None,
+            registrar_events: None,
         }
     }
 
@@ -80,6 +85,7 @@ impl ScriptDecision {
             // caller — or normalised the identity afterwards — is what reaches
             // the CDR. Reading it before would always be empty.
             auth_user: request.get_auth_user().map(String::from),
+            registrar_events: request.take_registrar_hold(),
         }
     }
 }
@@ -221,7 +227,11 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
         reply_headers,
         reply_body,
         auth_user,
+        registrar_events,
     } = decision;
+    // Dropped wherever this function returns, which publishes what is still
+    // held; the reply arm below publishes it sooner, once the reply is out.
+    let mut registrar_events = registrar_events;
 
     // Every handler has returned, so whatever the gate holds was sent while
     // the script was still deciding. Move it onto this thread's deferred queue,
@@ -286,20 +296,29 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
             code,
             reason,
             reliable,
-        } => send_scripted_reply(
-            &request_message,
-            ScriptedReply {
-                code: *code,
-                reason,
-                reliable: *reliable,
-                headers: &reply_headers,
-                body: reply_body.as_ref(),
-            },
-            &method,
-            &inbound,
-            server_key.as_ref(),
-            state,
-        ),
+        } => {
+            send_scripted_reply(
+                &request_message,
+                ScriptedReply {
+                    code: *code,
+                    reason,
+                    reliable: *reliable,
+                    headers: &reply_headers,
+                    body: reply_body.as_ref(),
+                    exchange: registrar_events
+                        .as_ref()
+                        .and_then(|held| held.exchange().cloned()),
+                },
+                &method,
+                &inbound,
+                server_key.as_ref(),
+                state,
+            );
+            // The reply is with the transport: `@registrar.on_change` may run.
+            if let Some(held) = registrar_events.as_mut() {
+                held.flush();
+            }
+        }
         RequestAction::Relay {
             next_hop,
             flow,
@@ -449,6 +468,9 @@ struct ScriptedReply<'a> {
     reliable: bool,
     headers: &'a [(crate::script::api::request::ReplyHeaderOp, String, String)],
     body: Option<&'a (Vec<u8>, String)>,
+    /// The REGISTER exchange this reply completes: it is given the reply's wire
+    /// form before the registrar events that carry it are published.
+    exchange: Option<Arc<crate::registrar::RegisterExchange>>,
 }
 
 /// Send the reply the script decided on through the server transaction, with
@@ -465,8 +487,11 @@ fn send_scripted_reply(
         code,
         reason,
         reliable,
+        ref exchange,
         ..
     } = reply;
+    // Only a final response answers the REGISTER.
+    let exchange = exchange.as_ref().filter(|_| code >= 200);
     let mut response = build_response(
         request_message,
         code,
@@ -611,6 +636,14 @@ fn send_scripted_reply(
                 Ok(actions) => {
                     sent_by_transaction =
                         actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
+                    // The reply as the transaction sends it, To-tag included.
+                    if let Some(exchange) = exchange {
+                        if let Some(Action::SendMessage(sent)) =
+                            actions.iter().find(|a| matches!(a, Action::SendMessage(_)))
+                        {
+                            exchange.set_response(Bytes::from(sent.to_bytes()));
+                        }
+                    }
                     process_timer_actions_with_followups(
                         &actions,
                         key,
@@ -633,8 +666,12 @@ fn send_scripted_reply(
         }
     }
     if !sent_by_transaction {
+        let frame = Bytes::from(response.to_bytes());
+        if let Some(exchange) = exchange {
+            exchange.set_response(frame.clone());
+        }
         send_frames_in_order_from(
-            Bytes::from(response.to_bytes()),
+            frame,
             std::mem::take(&mut reply_followups),
             inbound.transport,
             inbound.remote_addr,

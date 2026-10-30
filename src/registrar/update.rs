@@ -20,7 +20,8 @@ use dashmap::mapref::entry::Entry;
 
 use super::{
     backend, is_aor_key_safe, is_stream_transport, normalize_aor_cow, parse_contact_target,
-    push_binding, Contact, ContactKind, FlowCapture, Registrar, RegistrarError, RegistrationEvent,
+    push_binding, Contact, ContactKind, FlowCapture, RegisterEventHold, Registrar, RegistrarError,
+    RegistrationEvent,
 };
 use crate::sip::uri::SipUri;
 use crate::transport::Transport;
@@ -128,6 +129,19 @@ impl Registrar {
         updates: Vec<ContactUpdate>,
         force: bool,
     ) -> Result<(), RegistrarError> {
+        self.apply_register_in(aor, updates, force, None)
+    }
+
+    /// [`apply_register`](Self::apply_register) for the REGISTER `hold`
+    /// belongs to: its change events carry that REGISTER's exchange, and are
+    /// published when the hold says so rather than at once.
+    pub(crate) fn apply_register_in(
+        &self,
+        aor: &str,
+        updates: Vec<ContactUpdate>,
+        force: bool,
+        mut hold: Option<&mut RegisterEventHold>,
+    ) -> Result<(), RegistrarError> {
         if updates.is_empty() {
             if force {
                 self.clear_bindings(aor);
@@ -203,7 +217,7 @@ impl Registrar {
             self.release_cleared(&primary, cleared, cleared_at);
         }
         for effect in effects {
-            self.carry_out(&key, effect, sequence);
+            self.carry_out(&key, effect, sequence, hold.as_deref_mut());
         }
         Ok(())
     }
@@ -376,7 +390,13 @@ impl Registrar {
     /// Carry out what one committed Contact owes, in the order a lone save
     /// always did. `sequence` was taken under the entry the change was
     /// committed in.
-    fn carry_out(&self, aor: &str, effect: Effect, sequence: backend::WriteSequence) {
+    fn carry_out(
+        &self,
+        aor: &str,
+        effect: Effect,
+        sequence: backend::WriteSequence,
+        hold: Option<&mut RegisterEventHold>,
+    ) {
         match effect {
             Effect::Removed {
                 stale_tokens,
@@ -401,8 +421,9 @@ impl Registrar {
                         metrics.registrations_active.dec();
                     }
                 }
-                self.emit_event(RegistrationEvent::Deregistered {
+                self.announce(hold, |exchange| RegistrationEvent::Deregistered {
                     aor: aor.to_string(),
+                    exchange,
                 });
             }
             Effect::Stored {
@@ -432,15 +453,17 @@ impl Registrar {
                 self.index_connection(connection_id, is_stream, aor);
                 self.persist_aor(aor, stored, sequence);
                 if refreshed {
-                    self.emit_event(RegistrationEvent::Refreshed {
+                    self.announce(hold, |exchange| RegistrationEvent::Refreshed {
                         aor: aor.to_string(),
+                        exchange,
                     });
                 } else {
                     if let Some(metrics) = crate::metrics::try_metrics() {
                         metrics.registrations_active.inc();
                     }
-                    self.emit_event(RegistrationEvent::Registered {
+                    self.announce(hold, |exchange| RegistrationEvent::Registered {
                         aor: aor.to_string(),
+                        exchange,
                     });
                 }
             }
@@ -560,6 +583,7 @@ impl Registrar {
                 emptied,
             },
             sequence,
+            None,
         );
         true
     }
@@ -869,7 +893,7 @@ mod tests {
     ) -> Vec<String> {
         let mut seen = Vec::new();
         while let Ok(event) = receiver.try_recv() {
-            if let RegistrationEvent::Deregistered { aor } = event {
+            if let RegistrationEvent::Deregistered { aor, .. } = event {
                 seen.push(aor);
             }
         }

@@ -163,7 +163,9 @@ class Request:
         contact_expires: Optional[int] = None,
         event: Optional[str] = None,
         headers: Optional[dict[str, Union[str, list[str]]]] = None,
+        wire: Optional[bytes] = None,
     ) -> None:
+        self._wire = wire
         self._method = method
         self._ruri = _parse_uri(ruri) or SipUri()
         self._from_uri = _parse_uri(from_uri)
@@ -314,6 +316,29 @@ class Request:
         """
         effective = self._client_transport or self._transport
         return effective in ("tls", "wss")
+
+    @property
+    def wire(self) -> Optional[bytes]:
+        """The request exactly as it was received, or ``None``.
+
+        Every byte of the datagram or stream frame: compact header forms,
+        header order, folding and body untouched. Unlike serialising the parsed
+        request, this is what the peer sent, which is what a third-party
+        REGISTER carries as its ``message/sip`` body (3GPP TS 24.229
+        clause 5.4.1.7).
+
+        ``None`` where siphon did not receive the request itself: one a script
+        built, or the request handed to ``on_reply`` and ``on_failure``
+        callbacks, which is rebuilt from the parsed message. In a test it is
+        what ``Request(wire=...)`` was given, ``None`` by default.
+
+        Example::
+
+            @proxy.on_request("REGISTER")
+            def register(request):
+                raw = request.wire      # b"REGISTER sip:... SIP/2.0\\r\\n..."
+        """
+        return self._wire
 
     @property
     def source_ip(self) -> str:

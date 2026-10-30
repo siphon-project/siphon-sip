@@ -130,7 +130,10 @@ impl Registrar {
                     metrics.registrations_active.dec();
                 }
             }
-            self.emit_event(RegistrationEvent::Deregistered { aor: aor.clone() });
+            self.emit_event(RegistrationEvent::Deregistered {
+                aor: aor.clone(),
+                exchange: None,
+            });
             evicted.extend(taken.into_iter().map(|contact| EvictedBinding {
                 aor: aor.clone(),
                 owned_elsewhere: owned_elsewhere(&contact),
@@ -212,7 +215,7 @@ mod tests {
         );
         assert!(matches!(
             events.try_recv(),
-            Ok(RegistrationEvent::Deregistered { ref aor }) if aor == IMPU
+            Ok(RegistrationEvent::Deregistered { ref aor, .. }) if aor == IMPU
         ));
         assert!(registrar.contact_index_is_consistent());
     }

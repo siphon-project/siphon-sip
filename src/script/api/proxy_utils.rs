@@ -1877,6 +1877,120 @@ mod tests {
         SipUri::new("mmtel.ims.example.org".to_string())
     }
 
+    /// The third-party REGISTER bodies of TS 24.229 §5.4.1.7, built by the
+    /// script from a `RegisterExchange` the way its docstring shows: the user's
+    /// REGISTER as `message/sip`, and `multipart/mixed` with the REGISTER, the
+    /// 200 OK and the `application/3gpp-ims+xml` service information. Both go
+    /// through the real `send_request` builder. With
+    /// `SIPHON_THIRD_PARTY_DUMP_DIR` set, the serialised messages are written
+    /// there as hex dumps for an independent decoder (`text2pcap`, `tshark`).
+    #[test]
+    fn third_party_register_bodies_built_from_an_exchange_are_well_formed() {
+        const REQUEST: &[u8] = concat!(
+            "REGISTER sip:ims.mnc001.mcc001.3gppnetwork.org SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.20:5070;branch=z9hG4bK-3pr\r\n",
+            "Max-Forwards: 70\r\n",
+            "From: <sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>;tag=ue-3pr\r\n",
+            "To: <sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>\r\n",
+            "Call-ID: third-party-1\r\n",
+            "CSeq: 1 REGISTER\r\n",
+            "Contact: <sip:001010000000001@192.0.2.20:5070>;expires=600000\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        )
+        .as_bytes();
+        const RESPONSE: &[u8] = concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.20:5070;branch=z9hG4bK-3pr\r\n",
+            "From: <sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>;tag=ue-3pr\r\n",
+            "To: <sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>;tag=scscf-3pr\r\n",
+            "Call-ID: third-party-1\r\n",
+            "CSeq: 1 REGISTER\r\n",
+            "Contact: <sip:001010000000001@192.0.2.20:5070>;expires=600000\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        )
+        .as_bytes();
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let exchange = std::sync::Arc::new(crate::registrar::RegisterExchange::new(REQUEST));
+            exchange.set_response(bytes::Bytes::from_static(RESPONSE));
+            let object = Py::new(
+                py,
+                crate::script::api::register_exchange::PyRegisterExchange::new(exchange),
+            )
+            .expect("the exchange");
+            let globals = PyDict::new(py);
+            globals.set_item("exchange", object).unwrap();
+            let source = std::ffi::CString::new(concat!(
+                "boundary = 'ims-boundary'\n",
+                "service_info = b'<?xml version=\"1.0\"?><ims-3gpp version=\"1\"><service-info>info</service-info></ims-3gpp>'\n",
+                "single = exchange.request\n",
+                "parts = [\n",
+                "    (b'message/sip', exchange.request),\n",
+                "    (b'message/sip', exchange.response),\n",
+                "    (b'application/3gpp-ims+xml', service_info),\n",
+                "]\n",
+                "multi = b''.join(\n",
+                "    b'--' + boundary.encode() + b'\\r\\nContent-Type: ' + kind + b'\\r\\n\\r\\n' + data + b'\\r\\n'\n",
+                "    for kind, data in parts\n",
+                ") + b'--' + boundary.encode() + b'--\\r\\n'\n",
+            ))
+            .unwrap();
+            py.run(source.as_c_str(), Some(&globals), None).unwrap();
+
+            let cases = [
+                ("message_sip", "single", "message/sip"),
+                (
+                    "multipart_mixed",
+                    "multi",
+                    "multipart/mixed;boundary=ims-boundary",
+                ),
+            ];
+            for (name, body_name, content_type) in cases {
+                let body = globals.get_item(body_name).unwrap().unwrap();
+                let headers = PyDict::new(py);
+                headers.set_item("Content-Type", content_type).unwrap();
+                headers.set_item("Expires", "600000").unwrap();
+                let (message, _branch) = build_send_request_message(
+                    "REGISTER",
+                    SipUri::new("as.ims.mnc001.mcc001.3gppnetwork.org".to_string()),
+                    Transport::Udp,
+                    local_sent_by(),
+                    Some(&headers),
+                    Some(&body),
+                )
+                .expect("build_send_request_message");
+                let wire = message.to_bytes();
+                let text = String::from_utf8_lossy(&wire);
+                assert!(
+                    text.contains(&format!("Content-Type: {content_type}")),
+                    "{text}"
+                );
+                let body_bytes: Vec<u8> = body.extract().unwrap();
+                assert!(
+                    wire.ends_with(&body_bytes),
+                    "the body is last on the wire, byte for byte"
+                );
+                if name == "multipart_mixed" {
+                    assert!(text.contains("application/3gpp-ims+xml"));
+                    assert!(text.contains("SIP/2.0 200 OK"));
+                }
+                if let Ok(dir) = std::env::var("SIPHON_THIRD_PARTY_DUMP_DIR") {
+                    let mut dump = String::new();
+                    for (row, chunk) in wire.chunks(16).enumerate() {
+                        dump.push_str(&format!("{:06x}", row * 16));
+                        for byte in chunk {
+                            dump.push_str(&format!(" {byte:02x}"));
+                        }
+                        dump.push('\n');
+                    }
+                    std::fs::write(format!("{dir}/{name}.hex"), dump).unwrap();
+                }
+            }
+        });
+    }
+
     /// 3PR (TS 24.229 §5.4.1.7): S-CSCF sends a REGISTER body containing
     /// the original REGISTER as `message/sip` to the AS.  Both the body
     /// and the script-supplied `Content-Type` MUST appear on the wire.

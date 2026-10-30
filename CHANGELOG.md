@@ -16,10 +16,17 @@ entry, but a working config keeps working.
 ### Added
 
 - **`isc.evaluate` exposes `include_register_request` and `include_register_response`.** Each result dict carries both flags of the iFC's `ApplicationServer/Extension` (TS 29.228), so an S-CSCF script can put the user's REGISTER and its 200 OK in the third-party REGISTER to that AS (TS 24.229 §5.4.1.7). Mirrored in the SDK mock.
+- **`request.wire`: the request exactly as it was received.** Every byte of the datagram or frame, compact forms, header order, folding and body untouched (`bytes`). `None` for a request a script built and for the request handed to `on_reply` and `on_failure` callbacks, which is rebuilt from the parsed message. The SDK's `Request(wire=...)` mirrors it.
+- **`reply.wire`: the response exactly as siphon received it**, in `@proxy.on_reply` handlers and a relayed request's `on_reply` callback; `None` elsewhere. The SDK's `Reply(wire=...)` mirrors it.
+- **`@registrar.on_change` handlers may take an `exchange` parameter.** A `RegisterExchange` with `.request` (the REGISTER as received, one device's) and `.response` (the 200 OK siphon sent, To-tag included), or `None` where no REGISTER of this node's own is behind the change (an expiry, a network or admin removal, a snapshot, `registrar.save_proxy()`). It is what the third-party REGISTER body of TS 24.229 §5.4.1.7 is built from, as `message/sip` or `multipart/mixed` with the 200 OK and `application/3gpp-ims+xml` service information. A handler without the parameter is called as before. The SDK gains `RegisterExchange`.
 
 ### Fixed
 
 - **The iFC parser reads `IncludeRegisterRequest` and `IncludeRegisterResponse` in the TS 29.228 form.** The schema types both as empty elements, so `<IncludeRegisterRequest/>` (or an empty start/end pair) under `ApplicationServer/Extension` now sets the flag; it used to parse as false. `0` and `false` clear it, `1` and `true` still set it.
+
+### Changed
+
+- **`@registrar.on_change` runs after the REGISTER's reply is queued.** The change a `registrar.save()` makes was announced while the handler was still deciding the reply, so `on_change` could run before the 200 OK left (a reg-event NOTIFY or third-party REGISTER ahead of the answer, RFC 3680). It now runs once the reply is with the transport, and on every other end of the request (relay, silent drop, a handler that raised) when that end is reached, so no change is lost.
 
 ## [1.15.7] — 2026-10-29
 

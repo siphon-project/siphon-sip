@@ -89,6 +89,7 @@ fn stamped(script: &str, method: &str) -> (Vec<String>, bool) {
         UAS.parse().expect("a literal address"),
         dispatcher.state.local_addr,
         ConnectionId(0),
+        None,
     );
     let mut names: Vec<String> = [
         "X-Every",

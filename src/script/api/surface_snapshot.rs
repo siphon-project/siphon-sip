@@ -101,6 +101,7 @@ mod tests {
             super::super::proxy_utils::PyProxyUtils,
             super::super::qos::PyQosNamespace,
             super::super::registrant::PyRegistration,
+            super::super::register_exchange::PyRegisterExchange,
             super::super::registrar::PyContact,
             super::super::registrar::PyFlow,
             super::super::registrar::PyRegistrar,

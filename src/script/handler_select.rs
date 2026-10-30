@@ -412,6 +412,7 @@ mod tests {
             kind,
             callable: std::sync::Arc::new(python.None()),
             is_async: false,
+            takes_exchange: false,
             options: None,
             options_value: None,
         }

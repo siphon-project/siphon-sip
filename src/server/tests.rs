@@ -523,15 +523,24 @@ fn registration_events_carry_the_release_18_register_causes() {
     use crate::registrar::RegistrationEvent;
     let aor = || "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org".to_string();
     assert_eq!(
-        registration_cause_code(&RegistrationEvent::Registered { aor: aor() }),
+        registration_cause_code(&RegistrationEvent::Registered {
+            aor: aor(),
+            exchange: None
+        }),
         -1
     );
     assert_eq!(
-        registration_cause_code(&RegistrationEvent::Refreshed { aor: aor() }),
+        registration_cause_code(&RegistrationEvent::Refreshed {
+            aor: aor(),
+            exchange: None
+        }),
         -1
     );
     assert_eq!(
-        registration_cause_code(&RegistrationEvent::Deregistered { aor: aor() }),
+        registration_cause_code(&RegistrationEvent::Deregistered {
+            aor: aor(),
+            exchange: None
+        }),
         -3
     );
     assert_eq!(
