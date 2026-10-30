@@ -41,3 +41,18 @@ def test_evaluate_takes_orig_cdiv_and_a_body():
     assert isc.evaluations[0]["session_case"] == "orig_cdiv"
     with pytest.raises(ValueError):
         isc.evaluate("sip:alice@example.com", "INVITE", "sip:bob@example.com", [], "cdiv")
+
+
+def test_evaluate_results_carry_the_include_register_flags():
+    isc = MockIsc()
+    isc.set_eval_results("sip:alice@example.com", [
+        {"server_name": "sip:a@example.com", "default_handling": 0,
+         "service_info": None, "priority": 0, "include_register_request": True},
+        {"server_name": "sip:b@example.com", "default_handling": 0,
+         "service_info": None, "priority": 1, "include_register_response": True},
+        {"server_name": "sip:c@example.com", "default_handling": 0,
+         "service_info": None, "priority": 2},
+    ])
+    matches = isc.evaluate("sip:alice@example.com", "REGISTER", "sip:example.com", [])
+    flags = [(m["include_register_request"], m["include_register_response"]) for m in matches]
+    assert flags == [(True, False), (False, True), (False, False)]

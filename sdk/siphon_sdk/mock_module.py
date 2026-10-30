@@ -13591,7 +13591,23 @@ class MockIsc:
 
         Returns:
             List of dicts with keys: ``server_name``, ``default_handling``,
-            ``service_info``, ``priority``.
+            ``service_info``, ``priority``, ``include_register_request``
+            (bool) and ``include_register_response`` (bool).
+
+            The two flags are the iFC's ``ApplicationServer/Extension``
+            elements of TS 29.228 (empty elements: present means set). When
+            true, the S-CSCF includes the user's REGISTER, and the 200 OK it
+            answered with, in the third-party REGISTER to that AS
+            (TS 24.229 §5.4.1.7).
+
+            Example (S-CSCF)::
+
+                for match in isc.evaluate(aor, "REGISTER", aor, []):
+                    wants_request = match["include_register_request"]
+                    wants_response = match["include_register_response"]
+                    if wants_request or wants_response:
+                        log.info(f"{match['server_name']} wants the REGISTER "
+                                 f"(request={wants_request}, response={wants_response})")
 
         Raises:
             ValueError: ``session_case`` is not one of the above.
@@ -13610,7 +13626,8 @@ class MockIsc:
             "start_after_priority": start_after_priority, "body": body,
         })
         return [
-            match for match in self._eval_results.get(aor, [])
+            {"include_register_request": False, "include_register_response": False, **match}
+            for match in self._eval_results.get(aor, [])
             if start_after_priority is None or match.get("priority", 0) > start_after_priority
         ]
 
@@ -13626,7 +13643,9 @@ class MockIsc:
         Args:
             aor: Address of Record.
             results: List of dicts, each with keys ``server_name``,
-                ``default_handling``, ``service_info``, ``priority``.
+                ``default_handling``, ``service_info``, ``priority`` and
+                optionally ``include_register_request`` /
+                ``include_register_response`` (both default ``False``).
 
         Example::
 
