@@ -31,7 +31,7 @@ use tracing::{info, warn};
 
 use crate::metrics::event_lag::{record_lag, LaggedConsumer};
 use crate::registrant::{RegistrantEvent, RegistrantManager};
-use crate::registrar::{Registrar, RegistrationEvent};
+use crate::registrar::{RegisterExchange, Registrar, RegistrationEvent};
 
 /// The `event` a delivery carries when it re-reports held state after a lag
 /// instead of reporting a change.
@@ -43,17 +43,25 @@ pub(crate) const SNAPSHOT: &str = "snapshot";
 pub(crate) struct RegistrarChange {
     pub aor: String,
     pub event: &'static str,
+    /// The REGISTER behind the change and its 200 OK, when this node received
+    /// and answered one. `None` for an expiry, a network or admin removal and
+    /// a snapshot.
+    pub exchange: Option<Arc<RegisterExchange>>,
 }
 
 impl RegistrarChange {
     fn from_event(event: RegistrationEvent) -> Self {
-        let (aor, event) = match event {
-            RegistrationEvent::Registered { aor } => (aor, "registered"),
-            RegistrationEvent::Refreshed { aor } => (aor, "refreshed"),
-            RegistrationEvent::Deregistered { aor } => (aor, "deregistered"),
-            RegistrationEvent::Expired { aor } => (aor, "expired"),
+        let (aor, event, exchange) = match event {
+            RegistrationEvent::Registered { aor, exchange } => (aor, "registered", exchange),
+            RegistrationEvent::Refreshed { aor, exchange } => (aor, "refreshed", exchange),
+            RegistrationEvent::Deregistered { aor, exchange } => (aor, "deregistered", exchange),
+            RegistrationEvent::Expired { aor } => (aor, "expired", None),
         };
-        Self { aor, event }
+        Self {
+            aor,
+            event,
+            exchange,
+        }
     }
 
     /// Whether this re-reports held state rather than a change.
@@ -138,6 +146,7 @@ pub(crate) async fn drain_registrar_events<D, F>(
                     deliver(RegistrarChange {
                         aor,
                         event: SNAPSHOT,
+                        exchange: None,
                     })
                     .await;
                 }

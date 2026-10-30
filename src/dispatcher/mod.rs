@@ -317,6 +317,8 @@ mod recording_finished_event_tests;
 #[cfg(test)]
 mod refer_answer_tests;
 #[cfg(test)]
+mod register_exchange_tests;
+#[cfg(test)]
 mod relay_connection_hold_tests;
 #[cfg(test)]
 mod relay_strip_tests;
@@ -334,6 +336,8 @@ mod replacement_fork_tests;
 mod replacement_prack_tests;
 #[cfg(test)]
 mod reply_script_header_tests;
+#[cfg(test)]
+mod reply_wire_tests;
 #[cfg(test)]
 mod retransmit_capture_tests;
 #[cfg(test)]

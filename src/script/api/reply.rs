@@ -59,6 +59,9 @@ pub struct PyReply {
     /// decided the caller is sent of it. `None` on every other reply, where
     /// `relay(body=False)` and `withhold()` have nothing to decide and raise.
     provisional_relay: Option<ProvisionalRelay>,
+    /// The response as siphon received it, for `reply.wire`. A refcount on the
+    /// receive buffer, held only while the handler runs.
+    wire: Option<bytes::Bytes>,
 }
 
 impl PyReply {
@@ -81,7 +84,14 @@ impl PyReply {
             reject_action: None,
             script_shaped_headers: Vec::new(),
             provisional_relay: None,
+            wire: None,
         }
+    }
+
+    /// Record the bytes this response was received as, for `reply.wire`.
+    pub fn with_wire(mut self, wire: bytes::Bytes) -> Self {
+        self.wire = Some(wire);
+        self
     }
 
     /// Make this the reply of a callee's provisional the B2BUA is about to
@@ -189,6 +199,23 @@ impl PyReply {
 
 #[pymethods]
 impl PyReply {
+    /// The response exactly as siphon received it: compact forms, header
+    /// order, folding and body untouched (``bytes``), whatever the script has
+    /// changed on this object since. Set in ``@proxy.on_reply`` handlers and
+    /// in a relayed request's ``on_reply`` callback; ``None`` anywhere else.
+    ///
+    /// ```python
+    /// @proxy.on_reply
+    /// def on_reply(request, reply):
+    ///     raw = reply.wire            # b"SIP/2.0 200 OK\r\n..."
+    /// ```
+    #[getter]
+    fn wire<'py>(&self, python: Python<'py>) -> Option<Bound<'py, pyo3::types::PyBytes>> {
+        self.wire
+            .as_ref()
+            .map(|wire| pyo3::types::PyBytes::new(python, wire))
+    }
+
     /// Response status code (e.g. 200, 404, 503).
     #[getter]
     fn status_code(&self) -> PyResult<u16> {

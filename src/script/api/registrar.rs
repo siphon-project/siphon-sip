@@ -661,7 +661,8 @@ impl PyRegistrar {
                 if force {
                     self.inner.clear_bindings(&aor);
                 }
-                self.inner.remove_all(&aor);
+                self.inner
+                    .remove_all_in(&aor, Some(request.registrar_hold(&self.inner)));
                 message.headers.set("Expires", "0".to_string());
                 drop(message);
                 request.set_reply(200, "OK".to_string());
@@ -782,7 +783,12 @@ impl PyRegistrar {
         // Every Contact is stored or none is. A refusal leaves the AoR as it was
         // (with `force`, its existing bindings too) and is answered here: raised,
         // it would end the handler and the dispatcher would answer 500.
-        if let Err(refusal) = self.inner.apply_register(&aor, updates, force) {
+        if let Err(refusal) = self.inner.apply_register_in(
+            &aor,
+            updates,
+            force,
+            Some(request.registrar_hold(&self.inner)),
+        ) {
             drop(message);
             answer_refusal(request, &self.inner, &aor, &refusal);
             return Ok(false);
@@ -1532,6 +1538,14 @@ impl PyRegistrar {
     ///   - aor: str — Address of Record (e.g. "sip:alice@example.com")
     ///   - event_type: str — "registered", "refreshed", "deregistered", "expired", "snapshot"
     ///   - contacts: list[Contact] — current contact bindings
+    ///
+    /// A handler that also names an `exchange` parameter is passed a
+    /// `RegisterExchange` there (or `None`): the REGISTER behind this change,
+    /// byte for byte as received, and the 200 OK siphon sent for it. That is
+    /// what a third-party REGISTER carries in its body (TS 24.229 clause
+    /// 5.4.1.7). The handler runs after that 200 OK has been handed to the
+    /// transport. A handler without the parameter is called as it always was.
+    /// See `RegisterExchange` for an example that builds the body.
     #[staticmethod]
     fn on_change(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
         let asyncio = python.import("asyncio")?;

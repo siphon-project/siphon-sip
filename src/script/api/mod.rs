@@ -35,12 +35,14 @@ pub mod numbers;
 pub mod presence;
 pub mod proxy_utils;
 pub mod qos;
+pub mod register_exchange;
 pub mod registrant;
 pub mod registrar;
 pub mod reoffer;
 pub mod reply;
 pub mod request;
 mod request_bound;
+mod request_wire;
 pub mod ro_session;
 mod route_entries;
 pub mod rtpengine;
@@ -793,6 +795,11 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
     module
         .add_class::<registrar::PyFlow>()
         .map_err(|error| SiphonError::Script(format!("add_class Flow: {error}")))?;
+    // The REGISTER (and its 200 OK) behind a registration change, passed as
+    // `exchange=` to an `@registrar.on_change` handler that names it.
+    module
+        .add_class::<register_exchange::PyRegisterExchange>()
+        .map_err(|error| SiphonError::Script(format!("add_class RegisterExchange: {error}")))?;
     // LCR: `Route` / `LcrDecision` are returned by `await lcr.route(call)` and
     // consumed by `call.route(...)`. Registered so scripts can type-check /
     // repr them (`from siphon import Route` also resolves).

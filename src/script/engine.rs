@@ -307,6 +307,10 @@ pub struct HandlerEntry {
     pub callable: Arc<Py<PyAny>>,
     /// `true` when `asyncio.iscoroutinefunction(callable)` returned `True`.
     pub is_async: bool,
+    /// A `@registrar.on_change` handler that names an `exchange` parameter
+    /// (decided once, when it registered): it is passed the REGISTER exchange.
+    /// `false` for every other handler.
+    pub takes_exchange: bool,
     /// Optional per-handler metadata dict carried through from the
     /// Python registry. Populated for [`HandlerKind::Custom`] handlers
     /// so extensions can ship arbitrary options alongside the kind name
@@ -1298,10 +1302,23 @@ fn extract_handlers(python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<V
             .and_then(|dict| options_as_json(python, dict))
             .map(Arc::new);
 
+        // Decided once, when the script loads, by the handler's signature: a
+        // `@registrar.on_change` that names `exchange` is passed the REGISTER
+        // exchange, every other handler is called as it always was.
+        let takes_exchange = matches!(kind, HandlerKind::RegistrarOnChange)
+            && crate::script::handler_keyword::accepted_keyword(
+                python,
+                callable.bind(python),
+                3,
+                "exchange",
+                python.None(),
+            )
+            .is_some();
         handlers.push(HandlerEntry {
             kind,
             callable: Arc::new(callable),
             is_async,
+            takes_exchange,
             options: options.map(|dict| Arc::new(dict.unbind())),
             options_value,
         });

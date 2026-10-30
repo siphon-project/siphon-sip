@@ -198,6 +198,7 @@ async fn the_registrar_loop_ends_only_when_the_channel_closes() {
         vec![RegistrarChange {
             aor: "sip:gone@example.com".to_string(),
             event: "expired",
+            exchange: None,
         }]
     );
 }
@@ -322,6 +323,7 @@ async fn a_snapshot_reaches_the_script_and_the_control_plane_as_snapshot() {
         RegistrarChange {
             aor: aor.to_string(),
             event: SNAPSHOT,
+            exchange: None,
         },
     )
     .await;
@@ -365,6 +367,7 @@ async fn a_three_argument_handler_is_called_as_before_and_numbers_rise() {
             RegistrarChange {
                 aor: "sip:three-args@example.com".to_string(),
                 event,
+                exchange: None,
             },
         )
         .await;

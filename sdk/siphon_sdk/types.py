@@ -350,6 +350,64 @@ class Flow:
         return True
 
 
+class RegisterExchange:
+    """One REGISTER as received and the 200 OK siphon sent for it (3GPP
+    TS 24.229 clause 5.4.1.7).
+
+    Passed as ``exchange=`` to an ``@registrar.on_change`` handler that names
+    that parameter. One REGISTER is one device, so with several devices
+    registered to one AoR each device's change carries its own request, not the
+    AoR's whole registration. It is ``None`` where no REGISTER of this node's
+    own is behind the change: an expiry, a network or admin removal, a
+    ``"snapshot"``, a ``registrar.save_proxy()`` binding, and a ``save()`` of a
+    request built without ``wire=``.
+
+    Attributes:
+        request: The REGISTER byte for byte as received (``bytes``).
+        response: The 200 OK as siphon sent it, To-tag included (``bytes``),
+            or ``None``. The mock registrar does not build a response, so it is
+            ``None`` there unless a test sets it.
+
+    An S-CSCF builds the third-party REGISTER body from it::
+
+        @registrar.on_change
+        async def on_change(aor, event, contacts, exchange):
+            if exchange is None or event not in ("registered", "refreshed", "deregistered"):
+                return
+            # message/sip: the REGISTER as received.
+            body = exchange.request
+            content_type = "message/sip"
+            # multipart/mixed: the REGISTER, the 200 OK and the service info
+            # (TS 24.229 clause 5.4.1.7).
+            if exchange.response is not None:
+                boundary = "ims-boundary"
+                service_info = b'<?xml version="1.0"?><ims-3gpp version="1"><service-info>info</service-info></ims-3gpp>'
+                parts = [
+                    (b"message/sip", exchange.request),
+                    (b"message/sip", exchange.response),
+                    (b"application/3gpp-ims+xml", service_info),
+                ]
+                body = b"".join(
+                    b"--" + boundary.encode() + b"\r\nContent-Type: " + kind
+                    + b"\r\n\r\n" + data + b"\r\n"
+                    for kind, data in parts
+                ) + b"--" + boundary.encode() + b"--\r\n"
+                content_type = f"multipart/mixed;boundary={boundary}"
+            await proxy.send_request(
+                "REGISTER", "sip:as.ims.example.com", body=body,
+                headers={"Content-Type": content_type, "Expires": "600000"},
+            )
+    """
+
+    def __init__(self, request: bytes, response: Optional[bytes] = None) -> None:
+        self.request = request
+        self.response = response
+
+    def __repr__(self) -> str:
+        response = "None" if self.response is None else f"{len(self.response)} bytes"
+        return f"RegisterExchange(request={len(self.request)} bytes, response={response})"
+
+
 @dataclass
 class Contact:
     """A registered contact binding returned by ``registrar.lookup()``.

@@ -902,9 +902,9 @@ pub(super) fn spawn_rf_register_emitter(
             };
             let cause_code = registration_cause_code(&event);
             let aor = match &event {
-                RegistrationEvent::Registered { aor }
-                | RegistrationEvent::Refreshed { aor }
-                | RegistrationEvent::Deregistered { aor }
+                RegistrationEvent::Registered { aor, .. }
+                | RegistrationEvent::Refreshed { aor, .. }
+                | RegistrationEvent::Deregistered { aor, .. }
                 | RegistrationEvent::Expired { aor } => aor.clone(),
             };
             let ims_data = ImsChargingData {

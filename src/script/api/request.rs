@@ -254,6 +254,8 @@ pub struct PyRequest {
     /// Set by the dispatcher for SUBSCRIBE only; `subscribe_state.accept()` /
     /// `create()` hand it to the handle they return.
     reply_gate: Option<Arc<super::proxy_utils::ReplyGate>>,
+    /// The bytes it was received as, and the registrar events its saves hold.
+    wire_capture: super::request_wire::WireCapture,
 }
 
 impl PyRequest {
@@ -287,6 +289,7 @@ impl PyRequest {
             inbound_connection_id: None,
             consumed_routes: vec![],
             reply_gate: None,
+            wire_capture: Default::default(),
         }
     }
 
@@ -353,6 +356,7 @@ impl PyRequest {
             inbound_connection_id: None,
             consumed_routes: vec![],
             reply_gate: None,
+            wire_capture: Default::default(),
         }
     }
 
@@ -376,6 +380,31 @@ impl PyRequest {
     pub fn set_reply_gate(&mut self, gate: Arc<super::proxy_utils::ReplyGate>) {
         gate.register_dialog_of(&self.message);
         self.reply_gate = Some(gate);
+    }
+
+    /// Record the bytes this request was received as, for `request.wire`.
+    /// A refcount on the receive buffer, not a copy.
+    pub fn set_wire(&mut self, wire: bytes::Bytes) {
+        self.wire_capture.set_wire(wire);
+    }
+
+    /// Hold the events `registrar.save()` produces until the dispatcher has
+    /// handed the reply to the transport (main request dispatch only).
+    pub fn defer_registrar_events(&mut self) {
+        self.wire_capture.defer_registrar_events();
+    }
+
+    /// The hold this request's `registrar.save()` calls record into.
+    pub(crate) fn registrar_hold(
+        &mut self,
+        registrar: &Arc<crate::registrar::Registrar>,
+    ) -> &mut crate::registrar::RegisterEventHold {
+        self.wire_capture.hold(registrar)
+    }
+
+    /// Take the hold, once every handler has returned.
+    pub fn take_registrar_hold(&mut self) -> Option<crate::registrar::RegisterEventHold> {
+        self.wire_capture.take_hold()
     }
 
     /// The gate set by [`Self::set_reply_gate`], if any.
@@ -785,6 +814,29 @@ impl PyRequest {
             StartLine::Request(request_line) => Ok(request_line.method.as_str().to_string()),
             _ => Err(pyo3::exceptions::PyRuntimeError::new_err("not a request")),
         }
+    }
+
+    /// The request exactly as it was received: every byte of the datagram or
+    /// stream frame, compact header forms, header order, folding and body
+    /// untouched (``bytes``). ``None`` where siphon did not receive this
+    /// request itself: one built by a script, or the request object handed to
+    /// ``on_reply`` and ``on_failure`` callbacks, which are rebuilt from the
+    /// parsed message.
+    ///
+    /// Unlike serialising the parsed request, this is what the peer sent, which
+    /// is what a third-party REGISTER carries as its ``message/sip`` body
+    /// (3GPP TS 24.229 clause 5.4.1.7).
+    ///
+    /// ```python
+    /// @proxy.on_request("REGISTER")
+    /// def register(request):
+    ///     raw = request.wire          # b"REGISTER sip:... SIP/2.0\r\n..."
+    /// ```
+    #[getter]
+    fn wire<'py>(&self, python: Python<'py>) -> Option<Bound<'py, pyo3::types::PyBytes>> {
+        self.wire_capture
+            .wire()
+            .map(|wire| pyo3::types::PyBytes::new(python, wire))
     }
 
     /// Request-URI as a SipUri. Assigning to its `user`, `host` or `port`

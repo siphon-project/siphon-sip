@@ -90,6 +90,18 @@ def _takes_sequence(fn: Callable) -> bool:
     return True
 
 
+def _takes_exchange(fn: Callable) -> bool:
+    """Whether an ``on_change`` handler names an ``exchange`` parameter (or takes
+    ``**kwargs``), as the engine decides when the script loads."""
+    import inspect
+
+    try:
+        inspect.signature(fn).bind(None, None, None, exchange=None)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _run_async(coroutine: Any) -> Any:
     """Drive an awaitable to completion from sync code.
 
@@ -2941,9 +2953,9 @@ class MockRegistrar:
                     request.reply(400, "Bad Request")
                 return False
             self._drop_bindings(aor)
-            self._fire_on_change(aor, "deregistered")
             if hasattr(request, "reply"):
                 request.reply(200, "OK")
+            self._fire_on_change(aor, "deregistered", exchange=self._exchange_of(request))
             return True
 
         updates = self._contact_updates(request, contact_values)
@@ -2971,8 +2983,6 @@ class MockRegistrar:
                 self._store.pop(aor, None)
         if flow_token is not None and any(c.flow_token == flow_token for c in staged):
             self._tokens[flow_token] = aor
-        for event in events:
-            self._fire_on_change(aor, event)
         if aliases:
             self.set_associated_uris(aor, list(aliases))
         # Automatically reply 200 OK on behalf of the script — matches the
@@ -2980,6 +2990,10 @@ class MockRegistrar:
         # call request.reply()).
         if hasattr(request, "reply"):
             request.reply(200, "OK")
+        # `@registrar.on_change` runs once the reply is out, as in the engine.
+        exchange = self._exchange_of(request)
+        for event in events:
+            self._fire_on_change(aor, event, exchange=exchange)
         return True
 
     def restore(
@@ -3919,17 +3933,35 @@ class MockRegistrar:
         for aor in aors:
             self._fire_on_change(aor, "deregistered")
 
-    def _fire_on_change(self, aor: str, event_type: str) -> None:
+    @staticmethod
+    def _exchange_of(request: Any) -> Optional[Any]:
+        """The :class:`RegisterExchange` a ``save()`` of ``request`` hands the
+        ``on_change`` handlers: its ``wire`` as the request, and no response
+        (the mock does not build one). ``None`` for a request without ``wire``."""
+        from siphon_sdk.types import RegisterExchange
+
+        wire = getattr(request, "wire", None)
+        return RegisterExchange(wire) if wire is not None else None
+
+    def _fire_on_change(
+        self, aor: str, event_type: str, exchange: Optional[Any] = None
+    ) -> None:
         """Invoke all on_change handlers registered via decorator.
 
         Handles both sync and async handlers — async ones are driven on a
         per-call event loop so callers don't need to maintain one (matches
         how the harness drives ``@proxy.on_request`` async handlers).
+
+        A handler that names an ``exchange`` parameter is passed ``exchange``
+        (``None`` where no REGISTER is behind the change); every other handler
+        is called as it always was.
         """
         contacts = self._store.get(aor, [])
         self._sequence += 1
         for _, fn, is_async, _meta in _registry.handlers.get("registrar.on_change", []):
             keywords = {"sequence": self._sequence} if _takes_sequence(fn) else {}
+            if _takes_exchange(fn):
+                keywords["exchange"] = exchange
             if is_async:
                 _run_async(fn(aor, event_type, contacts, **keywords))
             else:
@@ -14923,6 +14955,9 @@ def install() -> ModuleType:
     # Path-token MT routing (RFC 3327 §5 / TS 24.229 §5.2.7.2).
     from siphon_sdk.types import Flow as _Flow
     mod.Flow = _Flow  # type: ignore[attr-defined]
+    # The REGISTER exchange an `@registrar.on_change(..., exchange)` handler gets.
+    from siphon_sdk.types import RegisterExchange as _RegisterExchange
+    mod.RegisterExchange = _RegisterExchange  # type: ignore[attr-defined]
 
     # Also install the _siphon_registry mock
     registry_mod = ModuleType("_siphon_registry")

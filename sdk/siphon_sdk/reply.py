@@ -46,7 +46,9 @@ class Reply:
         headers: Optional[dict[str, Union[str, list[str]]]] = None,
         source_ip: Optional[str] = None,
         source_port: Optional[int] = None,
+        wire: Optional[bytes] = None,
     ) -> None:
+        self._wire = wire
         self._status_code = status_code
         self._reason = reason
         self._from_uri = _parse_uri(from_uri)
@@ -69,6 +71,18 @@ class Reply:
     def status_code(self) -> int:
         """SIP status code (e.g. 200, 404, 503)."""
         return self._status_code
+
+    @property
+    def wire(self) -> Optional[bytes]:
+        """The response exactly as siphon received it, or ``None``.
+
+        Compact forms, header order, folding and body untouched, whatever the
+        script has changed on this object since. Set in ``@proxy.on_reply``
+        handlers and in a relayed request's ``on_reply`` callback; ``None``
+        anywhere else. In a test it is what ``Reply(wire=...)`` was given,
+        ``None`` by default.
+        """
+        return self._wire
 
     @property
     def reason(self) -> str:

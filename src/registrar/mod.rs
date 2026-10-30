@@ -8,6 +8,7 @@
 
 pub mod backend;
 pub(crate) mod contact_index;
+pub mod event_hold;
 pub(crate) mod proxy_grant;
 pub mod reginfo;
 pub mod restore_eviction;
@@ -22,18 +23,31 @@ use std::time::Instant;
 use dashmap::DashMap;
 use tokio::sync::broadcast;
 
+pub use event_hold::{RegisterEventHold, RegisterExchange};
+
 use crate::sip::uri::SipUri;
 use crate::transport::Transport;
 
 /// A registration change event emitted by the registrar.
 #[derive(Debug, Clone)]
 pub enum RegistrationEvent {
-    /// A new contact was registered.
-    Registered { aor: String },
-    /// An existing contact was refreshed.
-    Refreshed { aor: String },
-    /// All contacts for an AoR were removed.
-    Deregistered { aor: String },
+    /// A new contact was registered. `exchange` is the REGISTER that did it
+    /// and its 200 OK, when this node received and answered one.
+    Registered {
+        aor: String,
+        exchange: Option<Arc<RegisterExchange>>,
+    },
+    /// An existing contact was refreshed. `exchange` as for `Registered`.
+    Refreshed {
+        aor: String,
+        exchange: Option<Arc<RegisterExchange>>,
+    },
+    /// Contacts for an AoR were removed. `exchange` is the de-REGISTER that
+    /// did it; `None` for a network- or admin-initiated removal.
+    Deregistered {
+        aor: String,
+        exchange: Option<Arc<RegisterExchange>>,
+    },
     /// Contacts expired during cleanup.
     Expired { aor: String },
 }
@@ -956,6 +970,12 @@ impl Registrar {
 
     /// Remove all contacts for an AoR (wildcard deregister, Contact: *).
     pub fn remove_all(&self, aor: &str) {
+        self.remove_all_in(aor, None);
+    }
+
+    /// [`remove_all`](Self::remove_all) for the de-REGISTER `hold` belongs to:
+    /// its `Deregistered` carries that REGISTER's exchange.
+    pub(crate) fn remove_all_in(&self, aor: &str, hold: Option<&mut RegisterEventHold>) {
         let primary = self.resolve_alias(aor);
         let aor = primary.as_str();
         // Capture flow tokens before dropping the AoR so the reverse index
@@ -984,8 +1004,9 @@ impl Registrar {
                 metrics.registrations_active.dec();
             }
         }
-        self.emit_event(RegistrationEvent::Deregistered {
+        self.announce(hold, |exchange| RegistrationEvent::Deregistered {
             aor: aor.to_string(),
+            exchange,
         });
     }
 
@@ -1078,7 +1099,10 @@ impl Registrar {
             if let Some((stored, sequence)) = snapshot {
                 self.persist_aor(&aor, stored, sequence);
             }
-            self.emit_event(RegistrationEvent::Deregistered { aor });
+            self.emit_event(RegistrationEvent::Deregistered {
+                aor,
+                exchange: None,
+            });
         }
 
         for token in &tokens_to_remove {
@@ -1873,7 +1897,10 @@ impl Registrar {
             }
         }
         for aor in deregistered {
-            self.emit_event(RegistrationEvent::Deregistered { aor });
+            self.emit_event(RegistrationEvent::Deregistered {
+                aor,
+                exchange: None,
+            });
         }
 
         removed
@@ -2467,7 +2494,7 @@ mod tests {
         // Token pruned from the reverse index.
         assert!(registrar.lookup_by_token("tok-1").is_none());
         match events.try_recv() {
-            Ok(RegistrationEvent::Deregistered { aor }) => {
+            Ok(RegistrationEvent::Deregistered { aor, .. }) => {
                 assert_eq!(aor, "sip:alice@example.com")
             }
             other => panic!("expected Deregistered, got {other:?}"),
@@ -2635,7 +2662,7 @@ mod tests {
         let mut events = registrar.subscribe_events();
         assert_eq!(registrar.unregister_flow(42), 1);
         match events.try_recv() {
-            Ok(RegistrationEvent::Deregistered { aor }) => {
+            Ok(RegistrationEvent::Deregistered { aor, .. }) => {
                 assert_eq!(aor, "sip:a@example.com");
             }
             other => panic!("expected Deregistered, got {other:?}"),
@@ -4282,7 +4309,7 @@ mod tests {
 
         let event = receiver.try_recv().unwrap();
         assert!(
-            matches!(event, RegistrationEvent::Deregistered { ref aor } if aor == "sip:alice@example.com")
+            matches!(event, RegistrationEvent::Deregistered { ref aor, .. } if aor == "sip:alice@example.com")
         );
     }
 

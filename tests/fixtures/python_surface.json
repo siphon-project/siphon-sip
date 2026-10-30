@@ -5,6 +5,7 @@
     "Flow",
     "LcrDecision",
     "PendingSA",
+    "RegisterExchange",
     "RoSession",
     "Route",
     "SAHandle",
@@ -1670,6 +1671,16 @@
         "kind": "getset_descriptor"
       }
     },
+    "RegisterExchange": {
+      "request": {
+        "doc": "The REGISTER byte for byte as it was received (``bytes``): compact",
+        "kind": "getset_descriptor"
+      },
+      "response": {
+        "doc": "The 200 OK as siphon sent it, To-tag included (``bytes``); ``None`` when",
+        "kind": "getset_descriptor"
+      }
+    },
     "RegistrarNamespace": {
       "aor_count": {
         "doc": "Number of currently registered AoRs across the deployment.",
@@ -2024,6 +2035,10 @@
         "doc": "To URI parsed from the To header.",
         "kind": "getset_descriptor"
       },
+      "wire": {
+        "doc": "The response exactly as siphon received it: compact forms, header",
+        "kind": "getset_descriptor"
+      },
       "withhold": {
         "doc": "Relay nothing to the caller for this provisional of the callee.",
         "kind": "method_descriptor",
@@ -2366,6 +2381,10 @@
       },
       "user_agent": {
         "doc": "User-Agent header value.",
+        "kind": "getset_descriptor"
+      },
+      "wire": {
+        "doc": "The request exactly as it was received: every byte of the datagram or",
         "kind": "getset_descriptor"
       }
     },

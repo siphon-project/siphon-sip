@@ -676,8 +676,40 @@ fn bench_listener_identity(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// What `request.wire` and the REGISTER exchange cost per request: the refcount
+/// the request holds on its receive buffer (every request, no copy), and the
+/// right-sized copy a `registrar.save()` makes for the event it queues.
+fn bench_register_exchange(c: &mut Criterion) {
+    let register = concat!(
+        "REGISTER sip:ims.mnc001.mcc001.3gppnetwork.org SIP/2.0\r\n",
+        "Via: SIP/2.0/UDP 192.0.2.20:5070;branch=z9hG4bK-bench\r\n",
+        "Max-Forwards: 70\r\n",
+        "From: <sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>;tag=ue\r\n",
+        "To: <sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>\r\n",
+        "Call-ID: bench-register\r\n",
+        "CSeq: 1 REGISTER\r\n",
+        "Contact: <sip:001010000000001@192.0.2.20:5070>;expires=600000\r\n",
+        "Content-Length: 0\r\n",
+        "\r\n",
+    );
+    // A received frame is a slice of a larger receive buffer.
+    let mut buffer = bytes::BytesMut::with_capacity(8192);
+    buffer.extend_from_slice(register.as_bytes());
+    let wire = buffer.split_to(register.len()).freeze();
+
+    let mut group = c.benchmark_group("register_exchange");
+    group.bench_function("retain_received_bytes", |bencher| {
+        bencher.iter(|| black_box(black_box(&wire).clone()));
+    });
+    group.bench_function("exchange_right_sized_copy", |bencher| {
+        bencher.iter(|| black_box(siphon::registrar::RegisterExchange::new(black_box(&wire))));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_register_exchange,
     bench_listener_identity,
     bench_parse,
     bench_parse_bytes,

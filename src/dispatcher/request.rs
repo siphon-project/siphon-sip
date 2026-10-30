@@ -928,6 +928,10 @@ pub(super) fn handle_request_after_queue(
     // What the client spoke, when a front declared it. Parallel to
     // `transport_name` above, which stays the hop siphon accepted.
     request.set_client_transport(inbound.client_transport);
+    // The bytes as received, for `request.wire`, and `registrar.save()`'s
+    // events held back until this request's reply is out.
+    request.set_wire(inbound.data.clone());
+    request.defer_registrar_events();
     // In-dialog messages a SUBSCRIBE handler sends through the handle it
     // accepted wait here until the reply has been dispatched (RFC 6665
     // §4.1.2.3). Only SUBSCRIBE creates such a handle, so only it pays for one.
