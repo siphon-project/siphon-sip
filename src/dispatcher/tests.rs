@@ -6362,6 +6362,42 @@ async fn in_dialog_flow_resolves_fresh_for_divergent_next_hop() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn in_dialog_flow_divergent_hop_without_transport_is_udp() {
+    // RFC 3263 §4.1: a sip: URI with a numeric host and no transport parameter
+    // is UDP. The established branch (a TCP leg to the next proxy) says nothing
+    // about how the new hop is reached: inheriting its TCP sent an on-net ACK to
+    // a UE registered over UDP on a connection that UE never accepts.
+    let resolver = test_resolver();
+    let cached = "203.0.113.10:6060".parse::<SocketAddr>().unwrap();
+    let (destination, transport, _) = resolve_in_dialog_flow_uri(
+        Some("sip:198.51.100.7:5060"),
+        &resolver,
+        cached,
+        Transport::Tcp,
+        ConnectionId(7),
+    );
+    assert_eq!(
+        destination,
+        "198.51.100.7:5060".parse::<SocketAddr>().unwrap()
+    );
+    assert_eq!(transport, Transport::Udp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_dialog_flow_divergent_sips_hop_without_transport_is_tls() {
+    let resolver = test_resolver();
+    let cached = "203.0.113.10:6060".parse::<SocketAddr>().unwrap();
+    let (_, transport, _) = resolve_in_dialog_flow_uri(
+        Some("sips:198.51.100.7:5061"),
+        &resolver,
+        cached,
+        Transport::Tcp,
+        ConnectionId(7),
+    );
+    assert_eq!(transport, Transport::Tls);
+}
+
 // --- Mid-dialog self-next-hop rescue (RFC 3261 §12.2.1.1 / §16.5) ---
 //
 // The field case: a UAC keeps the proxy's address in the R-URI of its
