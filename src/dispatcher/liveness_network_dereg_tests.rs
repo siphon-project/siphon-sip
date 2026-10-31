@@ -28,6 +28,11 @@ const AOR: &str = "sip:001010000000001@ims.example.invalid";
 /// binding that `network_dereg` de-registers upstream).
 fn registrar_with_binding(ue: SocketAddr) -> Arc<crate::registrar::Registrar> {
     let registrar = Arc::new(crate::registrar::Registrar::default());
+    bind(&registrar, ue, "tok-liveness");
+    registrar
+}
+
+fn bind(registrar: &crate::registrar::Registrar, ue: SocketAddr, token: &str) {
     registrar
         .save_full(
             AOR,
@@ -48,14 +53,13 @@ fn registrar_with_binding(ue: SocketAddr) -> Arc<crate::registrar::Registrar> {
             vec![],
             crate::registrar::FlowCapture {
                 client_transport: None,
-                flow_token: Some("tok-liveness".into()),
+                flow_token: Some(token.into()),
                 inbound_local_addr: Some(addr("192.0.2.1:5060")),
                 inbound_connection_id: None,
             },
             Vec::new(),
         )
         .expect("the binding is saved");
-    registrar
 }
 
 /// Liveness gives up on the UE and de-registers it with `network_dereg`.
@@ -202,4 +206,57 @@ async fn the_ue_answering_its_notify_ends_the_grace() {
         gone_within(&manager, ue, Duration::from_secs(2)).await,
         "the pair goes once the UE answered its NOTIFY"
     );
+}
+
+/// A script ends one UE's registration on the network's word, e.g. when the
+/// PCF terminates the AF session of its signalling path (3GPP TS 29.514 clause
+/// 4.2.5.3): the binding registered from that source goes, the S-CSCF is told
+/// with a de-REGISTER over the Service-Route, and another device of the same
+/// identity keeps its registration.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_deregisters_one_source_and_tells_the_s_cscf() {
+    crate::metrics::init().expect("the metrics registry builds");
+    let (proxy, _manager) = p_cscf(ANSWER);
+    let ue = addr("198.51.100.140:6100");
+    let other = addr("198.51.100.141:6200");
+    let registrar = registrar_with_binding(ue);
+    bind(&registrar, other, "tok-other");
+    registrar.set_service_routes(AOR, vec!["<sip:192.0.2.9:6060;lr>".to_string()]);
+    let mut context = LivenessDeregCtx::from_state(&proxy.state, Arc::clone(&registrar));
+    context.dereg_mode = crate::config::LivenessDeregMode::NetworkDereg;
+    let _ = drain(&proxy.udp);
+
+    let removed = deregister_bindings(&context, AOR, Some(ue), "signalling path lost").await;
+
+    assert_eq!(removed, 1);
+    let left: Vec<_> = registrar
+        .lookup(AOR)
+        .into_iter()
+        .map(|contact| contact.source_addr)
+        .collect();
+    assert_eq!(left, vec![Some(other)]);
+    let sent = drain(&proxy.udp);
+    let dereg = sent
+        .iter()
+        .find(|sent| sent.message.method() == Some(&Method::Register))
+        .expect("a de-REGISTER is sent");
+    assert_eq!(dereg.destination, addr("192.0.2.9:6060"));
+    assert_eq!(
+        dereg.message.headers.get("Expires").map(String::as_str),
+        Some("0")
+    );
+}
+
+/// No source: every binding of the identity goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_deregisters_every_binding_without_a_source() {
+    crate::metrics::init().expect("the metrics registry builds");
+    let (proxy, _manager) = p_cscf(ANSWER);
+    let registrar = registrar_with_binding(addr("198.51.100.150:6100"));
+    bind(&registrar, addr("198.51.100.151:6200"), "tok-other");
+    let mut context = LivenessDeregCtx::from_state(&proxy.state, Arc::clone(&registrar));
+    context.dereg_mode = crate::config::LivenessDeregMode::NetworkDereg;
+
+    assert_eq!(deregister_bindings(&context, AOR, None, "network").await, 2);
+    assert!(!registrar.is_registered(AOR));
 }

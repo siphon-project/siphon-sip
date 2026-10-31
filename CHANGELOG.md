@@ -13,6 +13,10 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **`registrar.network_deregister(aor, source=None, reason=...)` ends a registration on the network's word.** For a P-CSCF that learns the UE's access is gone (TS 24.229 §5.2.8), e.g. when the PCF terminates the AF session of its signalling path (TS 29.514 §4.2.5.3). The bindings registered from `source` (`(ip, port)`), or all of them, go the way registrar liveness removes an idle one: a `save_proxy()` binding is de-registered at the S-CSCF with a REGISTER (`Expires: 0`) over its Service-Route, `@registrar.on_change` fires with `"deregistered"`, and the UE's SA pair is shortened for the NOTIFY or removed. Awaitable, returns how many bindings went. Unlike liveness it also covers a UE without IPsec. Mirrored in the SDK mock (`network_deregistrations`).
+
 ## [1.15.8] — 2026-10-30
 
 ### Added

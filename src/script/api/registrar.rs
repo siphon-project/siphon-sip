@@ -1358,6 +1358,59 @@ impl PyRegistrar {
             .remove_contact(&aor, &extract_uri_string(contact)?))
     }
 
+    /// End a registration on the network's word, as a P-CSCF does when it
+    /// learns the UE's access is gone (3GPP TS 24.229 clause 5.2.8): for
+    /// instance when the PCF terminates the AF session of the UE's signalling
+    /// path (TS 29.514 clause 4.2.5.3), or an Rx ASR ends it.
+    ///
+    /// Each UE binding of `aor` registered from `source`, or every one when
+    /// `source` is ``None``, goes the way registrar liveness removes an idle
+    /// one: a binding stored by `save_proxy()` is de-registered at the
+    /// S-CSCF with a REGISTER (``Expires: 0``) over its Service-Route,
+    /// `@registrar.on_change` fires with ``"deregistered"``, and the UE's
+    /// IPsec security associations are shortened for the NOTIFY reporting it
+    /// (TS 24.229 clause 5.2.5.2) or removed.
+    ///
+    /// Args:
+    ///     aor: The AoR (or one of its implicit-set aliases), str or SipUri.
+    ///     source: ``(ip, port)`` the binding was registered from, as
+    ///         ``request.source_ip`` and ``request.source_port`` gave it.
+    ///     reason: Logged with the de-registration.
+    ///
+    /// Returns:
+    ///     An awaitable of how many bindings were de-registered.
+    #[pyo3(signature = (aor, source=None, reason="network-initiated"))]
+    fn network_deregister<'py>(
+        &self,
+        py: Python<'py>,
+        aor: &Bound<'_, PyAny>,
+        source: Option<(String, u16)>,
+        reason: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let aor = normalize_aor(&extract_uri_string(aor)?);
+        let source = source
+            .map(|(ip, port)| {
+                ip.parse::<std::net::IpAddr>()
+                    .map(|ip| std::net::SocketAddr::new(ip, port))
+                    .map_err(|_| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "source address {ip:?} is not an IP address"
+                        ))
+                    })
+            })
+            .transpose()?;
+        let reason = reason.to_string();
+        crate::script::awaitable(py, async move {
+            crate::dispatcher::network_deregister(&aor, source, &reason)
+                .await
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "network_deregister: the registrar, UAC sender or resolver is not running",
+                    )
+                })
+        })
+    }
+
     /// Check if a URI has any registered contacts.
     /// Accepts either a string or a SipUri object.
     fn is_registered(&self, uri: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -2018,6 +2071,26 @@ mod tests {
 
     /// A proxy-cached binding (`save_proxy`) of a two-contact AoR loses only
     /// the contact named, whichever form the script names it in.
+    #[test]
+    fn network_deregister_refuses_a_source_that_is_not_an_ip_address() {
+        let py_reg = PyRegistrar::new(make_registrar());
+        Python::initialize();
+        Python::attach(|python| {
+            let aor = pyo3::types::PyString::new(python, "sip:alice@ims.example.com").into_any();
+            let refused = py_reg.network_deregister(
+                python,
+                &aor,
+                Some(("ue.example.com".to_string(), 5060)),
+                "network-initiated",
+            );
+            assert!(
+                refused.is_err_and(
+                    |error| error.is_instance_of::<pyo3::exceptions::PyValueError>(python)
+                )
+            );
+        });
+    }
+
     #[test]
     fn remove_contact_drops_one_proxy_cached_binding() {
         let registrar = make_registrar();

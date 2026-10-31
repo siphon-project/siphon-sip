@@ -465,6 +465,7 @@ pub(crate) use b2bua::{
 pub(crate) use charging::{ro_answer_ocs_request, ro_bind_call, RO_CONTROL};
 pub use charging::{ro_authorize_b2bua, RoAuthorizeOutcome};
 pub(crate) use liveness::liveness_on_flow_close;
+pub(crate) use liveness::network_deregister;
 pub use media_init::{init_rtpengine, spawn_rtpengine_health_check};
 pub(crate) use proxy_release::proxy_release_call;
 pub(crate) use state::ProxyRfState;
