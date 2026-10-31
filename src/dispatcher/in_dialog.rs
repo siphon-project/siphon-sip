@@ -284,11 +284,19 @@ pub(super) fn resolve_in_dialog_flow_uri(
                 (cached_addr, cached_transport, cached_connection_id)
             } else {
                 // Genuinely different next hop (IMS route-set divergence) —
-                // resolve fresh and open/pool a new connection.
+                // resolve fresh and open/pool a new connection. A hop whose
+                // URI and DNS name no transport is UDP for sip: and TLS for
+                // sips: (RFC 3263 §4.1); the established branch's transport
+                // belongs to another hop and says nothing about this one.
                 let target = &candidates[0];
+                let default_transport = if uri.trim_start_matches('<').starts_with("sips:") {
+                    Transport::Tls
+                } else {
+                    Transport::Udp
+                };
                 (
                     target.address,
-                    target.transport.unwrap_or(cached_transport),
+                    target.transport.unwrap_or(default_transport),
                     ConnectionId::default(),
                 )
             }
