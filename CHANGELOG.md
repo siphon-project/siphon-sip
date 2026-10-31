@@ -13,6 +13,10 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **`registrar.network_deregister(aor, source=None, reason=...)` ends a registration on the network's word.** For a P-CSCF that learns the UE's access is gone (TS 24.229 §5.2.8), e.g. when the PCF terminates the AF session of its signalling path (TS 29.514 §4.2.5.3). The bindings registered from `source` (`(ip, port)`), or all of them, go the way registrar liveness removes an idle one: a `save_proxy()` binding is de-registered at the S-CSCF with a REGISTER (`Expires: 0`) over its Service-Route, `@registrar.on_change` fires with `"deregistered"`, and the UE's SA pair is shortened for the NOTIFY or removed. Awaitable, returns how many bindings went. Unlike liveness it also covers a UE without IPsec. Mirrored in the SDK mock (`network_deregistrations`).
+
 ### Fixed
 
 - **An in-dialog request to a new next hop without a transport goes UDP (`sip:`) or TLS (`sips:`).** When the dialog route set led somewhere other than the branch the INVITE took, a URI and DNS naming no transport took that branch's transport (RFC 3263 §4.1 says otherwise). On a dialog whose two legs cross one proxy, the end-to-end 2xx ACK to a UE registered over UDP went out over TCP, which the UE never accepted: the UE kept retransmitting its 200 and the call ended at Timer H.

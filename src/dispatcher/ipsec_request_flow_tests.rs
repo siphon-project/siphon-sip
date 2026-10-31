@@ -32,10 +32,10 @@ pub(super) fn addr(text: &str) -> SocketAddr {
 /// One message as the transport would have been handed it.
 #[derive(Debug)]
 pub(super) struct Sent {
-    destination: SocketAddr,
+    pub(super) destination: SocketAddr,
     source_local_addr: Option<SocketAddr>,
     transport: Transport,
-    message: SipMessage,
+    pub(super) message: SipMessage,
 }
 
 pub(super) fn drain(receiver: &flume::Receiver<OutboundMessage>) -> Vec<Sent> {

@@ -1736,6 +1736,11 @@
         "kind": "method_descriptor",
         "sig": "($self, uri)"
       },
+      "network_deregister": {
+        "doc": "End a registration on the network's word, as a P-CSCF does when it",
+        "kind": "method_descriptor",
+        "sig": "($self, aor, source=None, reason=\"network-initiated\")"
+      },
       "on_change": {
         "doc": "Decorator to register a handler for registration state changes.",
         "kind": "builtin_function_or_method",

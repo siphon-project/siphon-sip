@@ -2763,6 +2763,8 @@ class MockRegistrar:
 
     def __init__(self) -> None:
         self._store: dict[str, list[Contact]] = {}
+        #: ``(aor, contact_uri, reason)`` per binding :meth:`network_deregister` ended.
+        self.network_deregistrations: list[tuple[str, str, str]] = []
         self._asserted_identities: dict[str, str] = {}
         self._service_routes: dict[str, list[str]] = {}
         self._associated_uris: dict[str, list[str]] = {}
@@ -3688,6 +3690,45 @@ class MockRegistrar:
             self._store[primary] = kept
         self._fire_on_change(primary, "deregistered")
         return True
+
+    async def network_deregister(
+        self,
+        aor: Union[str, SipUri],
+        source: Optional[tuple[str, int]] = None,
+        reason: str = "network-initiated",
+    ) -> int:
+        """End a registration on the network's word, as a P-CSCF does when it
+        learns the UE's access is gone (3GPP TS 24.229 clause 5.2.8), e.g. the
+        PCF terminating the AF session of the UE's signalling path.
+
+        Each UE binding of ``aor`` registered from ``source`` (``(ip, port)``),
+        or every one when ``source`` is ``None``, goes: siphon de-registers a
+        ``save_proxy()`` binding at the S-CSCF with a REGISTER (``Expires: 0``)
+        over its Service-Route, fires ``@registrar.on_change`` with
+        ``"deregistered"`` and shortens or removes the UE's security
+        associations. The mock removes the bindings and records each in
+        :attr:`network_deregistrations`::
+
+            gone = await registrar.network_deregister(aor, (ip, port), "access lost")
+
+        Returns:
+            How many bindings were de-registered.
+        """
+        wanted = None
+        if source is not None:
+            ipaddress.ip_address(source[0])
+            wanted = f"{source[0]}:{source[1]}"
+        primary = self._resolve_alias(self._normalize_aor(str(aor)))
+        doomed = [
+            c for c in self._store.get(primary, [])
+            if getattr(c, "kind", "ue") == "ue"
+            and (wanted is None
+                 or str(getattr(getattr(c, "flow", None), "remote_addr", "")) == wanted)
+        ]
+        for contact in doomed:
+            self.remove_contact(primary, contact)
+            self.network_deregistrations.append((primary, str(contact.uri), reason))
+        return len(doomed)
 
     def save_pending(self, request: Any) -> None:
         """Save contacts in pending state (IMS: awaiting SAR confirmation).

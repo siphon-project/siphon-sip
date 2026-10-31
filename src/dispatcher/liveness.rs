@@ -685,6 +685,47 @@ pub(super) async fn liveness_dereg_contact(
     }
 }
 
+/// End the registration of `aor` on the network's word: every UE binding of it
+/// registered from `source`, or every one when `source` is `None`, goes through
+/// [`liveness_dereg_contact`] as an idle binding does: a de-REGISTER to the
+/// S-CSCF for a P-CSCF cache binding under `network_dereg`, the local removal
+/// with its `on_change` cascade, and the UE's IPsec SA. Returns how many
+/// bindings went.
+///
+/// For a P-CSCF told that the UE's access is gone, e.g. the PCF terminating
+/// the AF session of its signalling path (3GPP TS 29.514 clause 4.2.5.3, TS
+/// 24.229 clause 5.2.8), where the binding may be one no liveness probe covers.
+pub(super) async fn deregister_bindings(
+    context: &LivenessDeregCtx,
+    aor: &str,
+    source: Option<SocketAddr>,
+    reason: &str,
+) -> usize {
+    let doomed: Vec<crate::registrar::Contact> = context
+        .registrar
+        .lookup(aor)
+        .into_iter()
+        .filter(|contact| source.is_none_or(|source| contact.source_addr == Some(source)))
+        .collect();
+    for contact in &doomed {
+        let ue_port_c = contact.source_addr.map(|address| address.port());
+        liveness_dereg_contact(context, aor, contact, ue_port_c, reason).await;
+    }
+    doomed.len()
+}
+
+/// [`deregister_bindings`] with a network de-REGISTER toward the S-CSCF, for
+/// the script API. `None` until the registrar, UAC sender and resolver are
+/// installed.
+pub(crate) async fn network_deregister(
+    aor: &str,
+    source: Option<SocketAddr>,
+    reason: &str,
+) -> Option<usize> {
+    let context = LivenessDeregCtx::from_globals(crate::config::LivenessDeregMode::NetworkDereg)?;
+    Some(deregister_bindings(&context, aor, source, reason).await)
+}
+
 /// Synthesize and fire-and-forget a de-REGISTER (`Expires: 0`) toward the
 /// S-CSCF via the binding's stored Service-Route, on the UE's behalf.
 pub(super) async fn send_liveness_network_dereg(
