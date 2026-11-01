@@ -65,6 +65,7 @@ fn context(
         connection_pool: pool(),
         ue_sockets,
         ipsec_manager: None,
+        mtu: None,
     }
 }
 
@@ -104,7 +105,7 @@ fn ip(text: &str) -> IpAddr {
 /// REGISTER pinned to its own address.
 #[tokio::test]
 async fn a_tick_opens_each_ues_sockets_and_registers_it_from_them() {
-    let manager = test_support::manager();
+    let manager = Arc::new(test_support::manager());
     let sockets = ue_sockets();
     let (outbound, _default) = router_with(Some(Arc::clone(&sockets)));
     let port = free_port();
@@ -174,7 +175,7 @@ async fn a_tick_opens_each_ues_sockets_and_registers_it_from_them() {
 /// from the process's address instead.
 #[tokio::test]
 async fn shutdown_keeps_the_ues_sockets_for_the_de_registers() {
-    let manager = test_support::manager();
+    let manager = Arc::new(test_support::manager());
     let sockets = ue_sockets();
     let (outbound, _default) = router_with(Some(Arc::clone(&sockets)));
     let port = free_port();
@@ -202,7 +203,7 @@ async fn shutdown_keeps_the_ues_sockets_for_the_de_registers() {
 /// pinned to that address; a process-address entry keeps the first listener.
 #[tokio::test]
 async fn each_register_leaves_pinned_to_its_entrys_address() {
-    let manager = test_support::manager();
+    let manager = Arc::new(test_support::manager());
     let (outbound, sent) = router();
     let context = context(outbound, None, 5070);
     install(&manager, &context);
@@ -235,7 +236,7 @@ async fn each_register_leaves_pinned_to_its_entrys_address() {
 
 #[tokio::test]
 async fn an_entry_whose_socket_cannot_bind_sits_the_tick_out() {
-    let manager = test_support::manager();
+    let manager = Arc::new(test_support::manager());
     let sockets = ue_sockets();
     let (outbound, _sent) = router_with(Some(Arc::clone(&sockets)));
     let port = free_port();
@@ -293,7 +294,7 @@ fn free_port_run() -> u16 {
 /// the entry registers.
 #[tokio::test]
 async fn a_process_ue_whose_rotation_port_is_taken_registers_anyway() {
-    let manager = test_support::manager();
+    let manager = Arc::new(test_support::manager());
     let sockets = ue_sockets();
     let (outbound, sent) = router_with(Some(Arc::clone(&sockets)));
     let context = context(outbound, Some(Arc::clone(&sockets)), free_port());
@@ -327,7 +328,7 @@ async fn a_process_ue_whose_rotation_port_is_taken_registers_anyway() {
 
 #[tokio::test]
 async fn a_removed_entry_is_de_registered_from_its_own_address() {
-    let manager = test_support::manager();
+    let manager = Arc::new(test_support::manager());
     let (outbound, sent) = router();
     let context = context(outbound, None, 5070);
     install(&manager, &context);
@@ -354,7 +355,7 @@ async fn a_removed_entry_is_de_registered_from_its_own_address() {
 
 #[tokio::test]
 async fn deregister_all_sends_each_binding_from_its_own_address() {
-    let manager = test_support::manager();
+    let manager = Arc::new(test_support::manager());
     let (outbound, sent) = router();
     let context = context(Arc::clone(&outbound), None, 5070);
     install(&manager, &context);
@@ -506,7 +507,7 @@ fn tcp_loop(plain_port: u16) -> TcpLoop {
     }
 }
 
-fn tick(manager: &RegistrantManager, context: &RegistrationLoopContext) {
+fn tick(manager: &Arc<RegistrantManager>, context: &RegistrationLoopContext) {
     run_tick(
         manager,
         context,
@@ -558,7 +559,7 @@ async fn tcp_ues_register_from_their_own_address_and_take_the_pcscf_connection()
         .await
         .expect("a P-CSCF");
     let pcscf_address = pcscf.local_addr().expect("its address");
-    let manager = test_support::manager();
+    let manager = Arc::new(test_support::manager());
     install(&manager, &harness.context);
     let addresses = [ip("127.0.0.71"), ip("127.0.0.72")];
     for (index, address) in (1u32..).zip(addresses) {
@@ -707,7 +708,7 @@ fn expires_by_aor(sent: &flume::Receiver<OutboundMessage>) -> Vec<(String, u32)>
 async fn shutdown_de_registers_each_entry_once_and_never_registers_again() {
     const ENTRIES: u32 = 8;
     const FAILED: &str = "sip:failed@carrier.example";
-    let manager = test_support::manager();
+    let manager = Arc::new(test_support::manager());
     let (outbound, sent) = router();
     let context = context(Arc::clone(&outbound), None, 5070);
     install(&manager, &context);
@@ -756,7 +757,7 @@ async fn shutdown_de_registers_each_entry_once_and_never_registers_again() {
 #[tokio::test]
 async fn a_removed_entry_de_registers_once_and_never_re_registers() {
     const AOR: &str = "sip:removed@carrier.example";
-    let manager = test_support::manager();
+    let manager = Arc::new(test_support::manager());
     let (outbound, sent) = router();
     let context = context(outbound, None, 5070);
     install(&manager, &context);
@@ -799,4 +800,224 @@ async fn a_reconcile_after_shutdown_reads_nothing_and_adds_nothing() {
 
     assert_eq!(report, Ok(ReconcileReport::default()));
     assert!(manager.is_empty());
+}
+
+// --- over the MTU on an SA set -------------------------------------------------
+//
+// A UDP IMS UE's REGISTER over its SA set that is over the MTU goes over TCP on
+// that set (RFC 3261 clause 18.1.1; TS 33.203 clause 7.1; TS 24.229 clause
+// 5.1.1.2.2 1 b). Driven through the loop's tick against a P-CSCF on loopback
+// that listens on the same port for UDP and TCP, with the UE on an address of
+// its own on 127.0.0.0/8.
+
+/// A P-CSCF's protected server port: UDP and TCP on one loopback port, the TCP
+/// half optional.
+async fn pcscf_ports(tcp: bool) -> (tokio::net::UdpSocket, Option<tokio::net::TcpListener>) {
+    // A port free for both, whichever protocol is asked first.
+    for _ in 0..100 {
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a P-CSCF UDP port");
+        let address = udp.local_addr().expect("its address");
+        if !tcp {
+            return (udp, None);
+        }
+        if let Ok(listener) = tokio::net::TcpListener::bind(address).await {
+            return (udp, Some(listener));
+        }
+    }
+    panic!("no loopback port free for both UDP and TCP");
+}
+
+/// A UDP IMS UE on `ue_ip` registered through `pcscf` over an established SA
+/// set, due now, with `body_len` bytes of REGISTER body.
+fn registered_over_a_set(
+    manager: &RegistrantManager,
+    index: u32,
+    ue_ip: IpAddr,
+    pcscf: SocketAddr,
+    body_len: usize,
+) -> String {
+    let mut entry = ue(index, Some(ue_ip));
+    entry.destination = pcscf;
+    if body_len > 0 {
+        entry = entry.with_register_extras(
+            crate::registrant::register_extras::RegisterExtras::new(
+                Some(("text/plain".to_string(), vec![b'x'; body_len])),
+                Vec::new(),
+            )
+            .expect("extras"),
+        );
+    }
+    manager.try_add(entry).expect("added");
+    let aor = impu(index);
+    crate::registrant::rotate_sa_set_against(
+        manager,
+        &aor,
+        &format!(
+            "ipsec-3gpp; alg=hmac-sha-1-96; ealg=null; spi-c=55555; spi-s=66666; \
+             port-c=5064; port-s={}",
+            pcscf.port()
+        ),
+    );
+    manager.handle_success(&aor, 600);
+    test_support::make_due(manager, &aor);
+    aor
+}
+
+async fn datagram(socket: &tokio::net::UdpSocket) -> Option<(String, SocketAddr)> {
+    let mut buffer = vec![0u8; 65535];
+    let (length, from) = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        socket.recv_from(&mut buffer),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    Some((
+        String::from_utf8_lossy(&buffer[..length]).into_owned(),
+        from,
+    ))
+}
+
+/// Over the threshold: the refresh leaves over TCP from the protected client
+/// port of the set to the P-CSCF's protected server port, its Via says TCP,
+/// and nothing goes over UDP. Before: it went UDP, fragmented.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_mtu_refresh_goes_over_tcp_from_the_protected_client_port() {
+    let (udp, listener) = pcscf_ports(true).await;
+    let listener = listener.expect("TCP");
+    let pcscf = listener.local_addr().expect("its address");
+    let mut harness = tcp_loop(free_port());
+    harness.context.mtu = Some(1280);
+    let manager = Arc::new(test_support::manager());
+    install(&manager, &harness.context);
+    let ue_ip = ip("127.0.0.78");
+    let aor = registered_over_a_set(&manager, 1, ue_ip, pcscf, 1500);
+    let held = manager.ue_egress(&aor, ue_ip).expect("a set").local;
+    assert_eq!(held.port(), 6100);
+
+    tick(&manager, &harness.context);
+
+    let (mut connection, peer) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+            .await
+            .expect("the UE connects")
+            .expect("accepted");
+    assert_eq!(peer, held, "from the set's protected client port");
+    let register = read_message(&mut connection).await;
+    assert!(register.starts_with("REGISTER "), "{register}");
+    assert!(
+        register.contains("Via: SIP/2.0/TCP 127.0.0.78:6101;branch=z9hG4bK-reg-"),
+        "{register}"
+    );
+    assert!(register.contains("Security-Verify:"), "{register}");
+    assert!(datagram(&udp).await.is_none(), "nothing over UDP as well");
+    assert_eq!(manager.state(&aor), Some(RegistrantState::Registering));
+    assert!(harness.pool.has_live_from(held, pcscf), "kept for the next");
+    harness.inbound.drain().for_each(drop);
+}
+
+/// Under the threshold, or with no MTU, it stays UDP, from the same port, and
+/// no connection is opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_under_threshold_refresh_stays_udp_from_the_protected_client_port() {
+    for (index, body_len, mtu) in [(1u32, 0usize, Some(1280u16)), (2, 1500, None)] {
+        let (udp, listener) = pcscf_ports(true).await;
+        let listener = listener.expect("TCP");
+        let pcscf = listener.local_addr().expect("its address");
+        let mut harness = tcp_loop(free_port());
+        harness.context.mtu = mtu;
+        let manager = Arc::new(test_support::manager());
+        install(&manager, &harness.context);
+        let ue_ip = ip(&format!("127.0.0.{}", 90 + index));
+        let aor = registered_over_a_set(&manager, index, ue_ip, pcscf, body_len);
+        let held = manager.ue_egress(&aor, ue_ip).expect("a set").local;
+
+        tick(&manager, &harness.context);
+
+        let (register, from) = datagram(&udp).await.expect("a datagram");
+        assert!(register.starts_with("REGISTER "), "{register}");
+        assert!(register.contains("Via: SIP/2.0/UDP "), "{register}");
+        assert_eq!(from, held, "from the protected client port");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept())
+                .await
+                .is_err(),
+            "body {body_len}, mtu {mtu:?}: no connection"
+        );
+        assert!(!harness.pool.has_live_from(held, pcscf));
+        harness.inbound.drain().for_each(drop);
+    }
+}
+
+/// A P-CSCF with nothing listening for TCP refuses the connection: the REGISTER
+/// goes over UDP instead (RFC 3261 clause 18.1.1), from the same port, and the
+/// entry is still registering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_connection_sends_the_over_mtu_refresh_over_udp() {
+    let (udp, _) = pcscf_ports(false).await;
+    let pcscf = udp.local_addr().expect("its address");
+    let mut harness = tcp_loop(free_port());
+    harness.context.mtu = Some(1280);
+    let manager = Arc::new(test_support::manager());
+    install(&manager, &harness.context);
+    let ue_ip = ip("127.0.0.79");
+    let aor = registered_over_a_set(&manager, 1, ue_ip, pcscf, 1500);
+    let held = manager.ue_egress(&aor, ue_ip).expect("a set").local;
+
+    tick(&manager, &harness.context);
+
+    let (register, from) = datagram(&udp).await.expect("the UDP retry");
+    assert!(register.starts_with("REGISTER "), "{register}");
+    assert!(register.contains("Via: SIP/2.0/UDP "), "{register}");
+    assert!(register.len() > 1500, "the whole request, not a fragment");
+    assert_eq!(from, held);
+    assert_eq!(manager.state(&aor), Some(RegistrantState::Registering));
+    assert!(!harness.pool.has_live_from(held, pcscf));
+    harness.inbound.drain().for_each(drop);
+}
+
+/// Leak gate: refresh over TCP and go away, over and over: no pooled
+/// connection from the UE's address, listener or accepted connection is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_mtu_register_cycles_leave_no_connection_behind() {
+    let (_udp, listener) = pcscf_ports(true).await;
+    let listener = listener.expect("TCP");
+    let pcscf = listener.local_addr().expect("its address");
+    let mut harness = tcp_loop(free_port());
+    harness.context.mtu = Some(1280);
+    let manager = Arc::new(test_support::manager());
+    install(&manager, &harness.context);
+    let ue_ip = ip("127.0.0.88");
+    let mut held = Vec::new();
+    for cycle in 0..10 {
+        let aor = registered_over_a_set(&manager, 1, ue_ip, pcscf, 1500);
+        tick(&manager, &harness.context);
+        let (connection, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap_or_else(|_| panic!("cycle {cycle}: the UE connects"))
+                .expect("accepted");
+        held.push(connection);
+        assert!(
+            eventually(|| harness.pool.connections_bound_on(ue_ip) == 1).await,
+            "cycle {cycle}: the UE's connection is pooled"
+        );
+
+        manager.remove(&aor);
+        // Past the wait for the de-REGISTER's answer, as a tick after it.
+        manager.expire_teardowns(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        tick(&manager, &harness.context);
+        assert!(
+            eventually(|| harness.pool.connections_bound_on(ue_ip) == 0
+                && harness.sockets.tcp_len() == (0, 0))
+            .await,
+            "cycle {cycle}: pool {}, listeners {:?}",
+            harness.pool.connections_bound_on(ue_ip),
+            harness.sockets.tcp_len()
+        );
+        harness.inbound.drain().for_each(drop);
+    }
+    assert!(eventually(|| harness.connection_map.is_empty()).await);
 }

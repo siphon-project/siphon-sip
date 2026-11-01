@@ -333,7 +333,25 @@ impl RegistrantManager {
     ///
     /// A removed entry's sets awaiting the answer to its de-REGISTER keep their
     /// connections: the answer comes back on them.
+    #[cfg(test)]
     pub(super) fn ue_stream_plan(&self, plain_port: u16) -> (UeTcpPlan, Vec<(String, SocketAddr)>) {
+        self.ue_stream_plan_with(plain_port, None, false)
+    }
+
+    /// [`ue_stream_plan`](Self::ue_stream_plan), and with `process_ue_ip` (the
+    /// UE address of an entry on the process's own) the TCP a UDP IPsec entry
+    /// takes on its protected ports: see [`super::protected_tcp`].
+    /// `own_connections` is whether the UE may open its own (an MTU is set):
+    /// its client ports are then bindable sources. Those add no
+    /// owner: a UDP entry registers over UDP, so a listener that will not bind
+    /// costs it only the over-MTU TCP path (the bind failure is logged), never
+    /// its registration.
+    pub(super) fn ue_stream_plan_with(
+        &self,
+        plain_port: u16,
+        process_ue_ip: Option<IpAddr>,
+        own_connections: bool,
+    ) -> (UeTcpPlan, Vec<(String, SocketAddr)>) {
         let mut plan = UeTcpPlan::default();
         let mut owners = Vec::new();
         for entry in self.entries.iter() {
@@ -341,6 +359,7 @@ impl RegistrantManager {
                 .local_addr
                 .filter(|_| entry.transport == Transport::Tcp)
             else {
+                Self::plan_protected_tcp(&entry, process_ue_ip, own_connections, &mut plan);
                 continue;
             };
             let plain = SocketAddr::new(ip, plain_port);

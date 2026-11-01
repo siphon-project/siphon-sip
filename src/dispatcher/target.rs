@@ -163,11 +163,9 @@ pub(super) fn resolve_target(uri_string: &str, resolver: &SipResolver) -> Option
 }
 
 /// RFC 3261 §18.1.1: a UDP request whose serialised length exceeds `mtu - 200`
-/// bytes must be sent over a congestion-controlled transport (TCP).  The 200
-/// bytes is headroom for the Via siphon adds plus additions by downstream hops.
-pub(super) fn over_mtu(len: usize, mtu: u16) -> bool {
-    len > mtu.saturating_sub(200) as usize
-}
+/// bytes must be sent over a congestion-controlled transport (TCP).  Shared
+/// with the registrant's over-MTU REGISTER, see [`crate::transport::mtu`].
+pub(super) use crate::transport::mtu::over_mtu;
 
 /// Time budget for the §18.1.1 TCP-reachability probe (below).  Kept short so a
 /// blackholed TCP port on the (rare) over-MTU path adds only bounded latency; a

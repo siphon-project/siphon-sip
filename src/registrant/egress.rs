@@ -117,6 +117,12 @@ pub(crate) fn established_ue(manager: &RegistrantManager, index: u32, ue_ip: IpA
 /// replaces its established SA set with a new one.
 #[cfg(test)]
 pub(crate) fn rotate_sa_set(manager: &RegistrantManager, aor: &str) {
+    rotate_sa_set_against(manager, aor, super::test_support::SECURITY_SERVER);
+}
+
+/// [`rotate_sa_set`] against a P-CSCF whose 401 carried `security_server`.
+#[cfg(test)]
+pub(crate) fn rotate_sa_set_against(manager: &RegistrantManager, aor: &str, security_server: &str) {
     // The REGISTER that starts it offers a client port no held set uses.
     let listen = std::collections::HashMap::from([(
         crate::transport::Transport::Udp,
@@ -127,9 +133,9 @@ pub(crate) fn rotate_sa_set(manager: &RegistrantManager, aor: &str) {
     manager
         .build_register(aor, defaults, 600000)
         .expect("a REGISTER");
-    let server = crate::ipsec::parse_security_client(super::test_support::SECURITY_SERVER)
+    let server = crate::ipsec::parse_security_client(security_server)
         .expect("the fixture's Security-Server parses");
-    manager.store_security_server(aor, &server, super::test_support::SECURITY_SERVER);
+    manager.store_security_server(aor, &server, security_server);
     manager
         .begin_authentication(aor, "Digest username=\"ue\"")
         .expect("an SA set to authenticate");

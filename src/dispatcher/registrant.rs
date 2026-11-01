@@ -325,7 +325,11 @@ pub(super) fn handle_registrant_ipsec_challenge(
         send_registrant_request(registrant, aor, &built, state);
         return;
     }
-    let (retry_message, destination, transport) =
+    // Over the MTU it goes over TCP on the temporary set, once the connection
+    // from the protected client port is up (RFC 3261 clause 18.1.1).
+    let over_mtu = built.over_mtu_tcp(state.mtu);
+    let pool = Arc::clone(&state.connection_pool);
+    let (mut retry_message, destination, mut transport) =
         (built.message, built.destination, built.transport);
 
     // The UE side of the SAs: the entry's own address when it has one, else the
@@ -371,7 +375,6 @@ pub(super) fn handle_registrant_ipsec_challenge(
         .unwrap_or_default();
     registrant.begin_authentication(aor, &authorization);
 
-    let data = bytes::Bytes::from(retry_message.to_bytes());
     let call_id = retry_message
         .headers
         .get("Call-ID")
@@ -408,6 +411,15 @@ pub(super) fn handle_registrant_ipsec_challenge(
             registrant_task.handle_failure(&aor_task, 0, None);
             return;
         }
+        // The set is installed, so a connection from its client port is carried
+        // by it. A failed connect leaves the REGISTER on UDP.
+        if let Some(path) = &over_mtu {
+            if path.connect(&pool, &aor_task).await {
+                path.apply(&mut retry_message);
+                transport = crate::transport::Transport::Tcp;
+            }
+        }
+        let data = bytes::Bytes::from(retry_message.to_bytes());
         let outbound_message = crate::transport::OutboundMessage {
             followups: None,
             connection_id: crate::transport::ConnectionId::default(),
@@ -627,3 +639,7 @@ mod mt_tests;
 #[cfg(test)]
 #[path = "registrant_transaction_tests.rs"]
 mod transaction_tests;
+
+#[cfg(test)]
+#[path = "registrant_over_mtu_tests.rs"]
+mod over_mtu_tests;

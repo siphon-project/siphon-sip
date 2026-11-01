@@ -120,7 +120,11 @@ impl PyRegistration {
     ///         so the address need not exist on the host yet. transport "udp"
     ///         or "tcp": over TCP siphon listens on ue_port_s (the plain port
     ///         without ipsec) for the P-CSCF's connection and connects from
-    ///         ue_port_c. None (default): the process's own address.
+    ///         ue_port_c. Over UDP with ipsec it also accepts TCP on ue_port_s
+    ///         while an SA set stands (the P-CSCF's over-MTU requests), and
+    ///         with ``listen.mtu`` set sends a REGISTER over the SA set that
+    ///         exceeds mtu - 200 over TCP from ue_port_c (UDP if the connect
+    ///         fails). None (default): the process's own address.
     ///     require_local_addr: Never register from the process's address:
     ///         without a local_addr the entry waits as "awaiting_address" until
     ///         set_local_addr() gives it one. Implied by local_addr.

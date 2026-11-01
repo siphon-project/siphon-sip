@@ -19,13 +19,14 @@ pub mod aka;
 mod contact;
 mod egress;
 #[cfg(test)]
-pub(crate) use egress::{established_ue, rotate_sa_set};
+pub(crate) use egress::{established_ue, rotate_sa_set, rotate_sa_set_against};
 pub mod entry_config;
 pub mod ipsec_offer;
 mod lifecycle;
 pub mod messages;
 pub mod pacing;
 pub mod protected;
+mod protected_tcp;
 mod refresh;
 pub mod register_extras;
 pub mod source;

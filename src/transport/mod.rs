@@ -8,6 +8,7 @@ mod listener_identity;
 pub use listener_identity::cached_routable_local_ip;
 #[cfg(test)]
 mod late_response_tests;
+pub mod mtu;
 pub mod mux;
 pub mod outbound_tls;
 pub mod pool;

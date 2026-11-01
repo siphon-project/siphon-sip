@@ -489,7 +489,12 @@ registrar:
 # exact address and port is used instead (static wins). The protected ports
 # may repeat across entries, two entries may not share (local_addr, ue_port_c).
 # UDP only: local_addr on a tcp/tls entry is refused at load. IPsec entries
-# need the top-level `ipsec:` block and CAP_NET_ADMIN.
+# need the top-level `ipsec:` block and CAP_NET_ADMIN. An IPsec entry over UDP
+# also listens for TCP on ue_port_s while it holds an SA set (the SAs carry TCP
+# and UDP, TS 33.203): a P-CSCF sends a request over the MTU that way. With
+# `listen.mtu` set, its own REGISTER over the SA set that exceeds mtu - 200 goes
+# over TCP from the set's protected client port (RFC 3261 18.1.1), over UDP if
+# the connection cannot be opened.
 #
 # registrant:
 #   refresh_window: [0.4, 0.6]        # refresh at a uniform draw between 40 %
