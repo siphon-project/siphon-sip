@@ -135,6 +135,20 @@ This is the check an S-CSCF needs for HSS based P-CSCF restoration (3GPP TS
   provisional, that provisional is sent the CANCEL and is not forwarded, and
   the final response that follows is ACKed and absorbed. A late 2xx is
   forwarded, as every 2xx is (§16.7 step 5).
+- **Telling it from a `408` the next hop sent.** Both are `408 Request Timeout`
+  to the script. `reply.generated_locally` is `True` for the one siphon made
+  (this bound, Timer B, Timer F, and the `503` of a transport failure) and
+  `False` for any response received, so a script that fails over only from a
+  silent hop checks it:
+
+  ```python
+  @proxy.on_failure
+  def failure_route(request, reply):
+      if reply.status_code == 408 and reply.generated_locally:
+          ...   # nothing came back at all
+  ```
+
+  After a fork it describes the response chosen as the best.
 - **The bound must be below the transaction timeout.** Below Timer B (32 s)
   for an INVITE, below Timer F (`transaction.timeout_secs`, else 32 s) for
   anything else. A value at or over it, zero, a negative one, or any value on

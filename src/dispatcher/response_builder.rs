@@ -236,6 +236,7 @@ pub(super) fn build_response(
                     version: Version::sip_2_0(),
                     status_code: 500,
                     reason_phrase: "Internal Server Error".to_string(),
+                    generated_locally: false,
                 }),
                 headers: SipHeaders::new(),
                 body: Vec::new(),

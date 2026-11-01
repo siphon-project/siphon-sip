@@ -34,6 +34,7 @@ impl SipMessageBuilder {
             version: Version::sip_2_0(),
             status_code,
             reason_phrase,
+            generated_locally: false,
         }));
         self
     }
@@ -169,6 +170,7 @@ pub fn build_response_skeleton(request: &SipMessage, status_code: u16, reason: &
             version: Version::sip_2_0(),
             status_code,
             reason_phrase: reason.to_string(),
+            generated_locally: false,
         }),
         headers: SipHeaders::new(),
         body: Vec::new(),

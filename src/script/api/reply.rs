@@ -239,6 +239,24 @@ impl PyReply {
         }
     }
 
+    /// ``True`` when siphon itself synthesized this response for a branch no
+    /// peer answered, ``False`` for every response received from the network.
+    ///
+    /// The locally generated ones are the `408 Request Timeout` of an expired
+    /// client transaction (Timer B for an INVITE, Timer F otherwise, RFC 3261
+    /// §16.7 step 2), the one `request.relay(no_response_ms=)` / `fork()`
+    /// produce when the next hop stays silent, and the `503` of a transport
+    /// failure (§16.9). Status and reason are those of the same response
+    /// received, so this is the only way to tell a silent next hop from a
+    /// `408` it sent. In a fork it describes the response chosen as the best.
+    #[getter]
+    fn generated_locally(&self) -> PyResult<bool> {
+        let message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        Ok(message.is_generated_locally())
+    }
+
     /// From URI parsed from the From header.
     #[getter]
     #[allow(clippy::wrong_self_convention)]
@@ -799,6 +817,7 @@ mod tests {
                 version: Version::sip_2_0(),
                 status_code,
                 reason_phrase: reason.to_string(),
+                generated_locally: false,
             }),
             headers,
             body: Vec::new(),

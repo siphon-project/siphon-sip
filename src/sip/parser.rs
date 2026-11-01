@@ -270,6 +270,7 @@ fn parse_status_line(input: &str) -> IResult<&str, StatusLine> {
             version,
             status_code,
             reason_phrase: reason_phrase.to_string(),
+            generated_locally: false,
         },
     ))
 }

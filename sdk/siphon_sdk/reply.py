@@ -47,8 +47,10 @@ class Reply:
         source_ip: Optional[str] = None,
         source_port: Optional[int] = None,
         wire: Optional[bytes] = None,
+        generated_locally: bool = False,
     ) -> None:
         self._wire = wire
+        self._generated_locally = generated_locally
         self._status_code = status_code
         self._reason = reason
         self._from_uri = _parse_uri(from_uri)
@@ -88,6 +90,19 @@ class Reply:
     def reason(self) -> str:
         """Reason phrase (e.g. ``"OK"``, ``"Not Found"``)."""
         return self._reason
+
+    @property
+    def generated_locally(self) -> bool:
+        """``True`` when siphon synthesized this response, not a peer.
+
+        A Timer B / Timer F expiry, a ``no_response_ms`` deadline and a
+        transport failure each produce a response whose status and reason
+        match one a next hop could send (``408``, ``503``); this tells them
+        apart. ``False`` for everything received. In a fork it describes the
+        response chosen as the best. Settable in a test through
+        ``Reply(generated_locally=True)``.
+        """
+        return self._generated_locally
 
     @property
     def from_uri(self) -> Optional[SipUri]:
