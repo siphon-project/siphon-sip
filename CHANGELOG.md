@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.15.9] — 2026-11-01
+
 ### Added
 
 - **`proxy.subscribe_state.send(body=, content_type=)` puts a body on the SUBSCRIBE and on every refresh of it.** A UE's refresh repeats the body of its initial SUBSCRIBE (TS 24.379 §9.2.1.4: the MCPTT client's `application/vnd.3gpp.mcptt-info+xml`), so the body is kept with the subscription and `handle.refresh()` sends it again, over the same flow and SA as the SUBSCRIBE; the unsubscribe carries none. `str` or `bytes`, sent exactly as given with a matching `Content-Length`. `body` without `content_type`, or the reverse, raises `ValueError`. `handle.refresh(body=, content_type=)` replaces the kept body for that refresh and the ones after. Mirrored in the SDK mock (`sends` and `refreshes` record `body` and `content_type`).
