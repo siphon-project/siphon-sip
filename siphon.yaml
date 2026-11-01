@@ -515,6 +515,13 @@ registrar:
 #       auth: aka
 #       aka: { k: "465b5ce8b199b49faa5f0a2ee238a6bc", opc: "cd63cb71954a9f4e48a5994e37a02baf" }
 #       ipsec: { ue_port_c: 6100, ue_port_s: 6101 }
+#       # Security-Client offer. Default: hmac-sha-1-96 and hmac-md5-96, ealg null
+#       # (two mechanisms). `alg` / `ealg` set the preferred pair of that default;
+#       # `offer` names the pairs outright, one mechanism each, in order, and
+#       # replaces them (not both). alg: hmac-sha-1-96 | hmac-md5-96 |
+#       # hmac-sha-256-128; ealg: null | aes-cbc | des-ede3-cbc.
+#       # ipsec: { ue_port_c: 6100, ue_port_s: 6101,
+#       #          offer: [{ alg: hmac-sha-1-96, ealg: aes-cbc }, { alg: hmac-md5-96 }] }
 #       ims: { imei: "01234567-000001-0", features: [mmtel, smsip] }   # also video, mcptt
 #       # register:                    # extra headers + a body on every REGISTER
 #       #   content_type: "application/vnd.3gpp.mcptt-info+xml"   # that registers (the

@@ -17,6 +17,10 @@
 
 use crate::ipsec::{EncryptionAlgorithm, IntegrityAlgorithm, SecurityClient};
 
+/// One offered transform: the `alg=` and `ealg=` of a single `ipsec-3gpp`
+/// mechanism (`Null` encryption for integrity-only).
+pub type UeTransform = (IntegrityAlgorithm, EncryptionAlgorithm);
+
 /// The transform + endpoints a UE offers in its Security-Client header.
 ///
 /// `spi_c`/`spi_s` are the UE's own SPIs (it allocates them) and
@@ -24,13 +28,11 @@ use crate::ipsec::{EncryptionAlgorithm, IntegrityAlgorithm, SecurityClient};
 /// answers with its own SPIs/ports in the Security-Server header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UeSecurityOffer {
-    /// Offered integrity algorithms, in preference order. The UE emits one
-    /// `ipsec-3gpp` mechanism per algorithm (all sharing the SPIs/ports); the
-    /// P-CSCF picks one in its Security-Server answer (handsets offer both
-    /// `hmac-sha-1-96` and `hmac-md5-96`).
-    pub aalgs: Vec<IntegrityAlgorithm>,
-    /// Offered encryption algorithm (`Null` for integrity-only).
-    pub ealg: EncryptionAlgorithm,
+    /// Offered `(integrity, encryption)` pairs, in preference order. The UE
+    /// emits one `ipsec-3gpp` mechanism per pair (all sharing the SPIs/ports);
+    /// the P-CSCF picks one in its Security-Server answer (handsets offer
+    /// `hmac-sha-1-96` and `hmac-md5-96`, each with `ealg=null`).
+    pub transforms: Vec<UeTransform>,
     /// UE client SPI (becomes `spi_uc` in the SA pair).
     pub spi_c: u32,
     /// UE server SPI (becomes `spi_us` in the SA pair).
@@ -42,18 +44,16 @@ pub struct UeSecurityOffer {
 }
 
 impl UeSecurityOffer {
-    /// Build an `ipsec-3gpp` offer for the given algorithms + endpoints.
+    /// Build an `ipsec-3gpp` offer for the given transforms + endpoints.
     pub fn new(
-        aalgs: Vec<IntegrityAlgorithm>,
-        ealg: EncryptionAlgorithm,
+        transforms: Vec<UeTransform>,
         spi_c: u32,
         spi_s: u32,
         port_c: u16,
         port_s: u16,
     ) -> Self {
         Self {
-            aalgs,
-            ealg,
+            transforms,
             spi_c,
             spi_s,
             port_c,
@@ -65,18 +65,17 @@ impl UeSecurityOffer {
 /// Build the `Security-Client` header value the UE puts on its REGISTER
 /// (3GPP TS 33.203 §7.2 / RFC 3329 §2.2).
 ///
-/// Emits one `ipsec-3gpp` mechanism per offered integrity algorithm, all
+/// Emits one `ipsec-3gpp` mechanism per offered `(alg, ealg)` pair, all
 /// sharing the same SPIs/ports, comma-separated — exactly the shape a real
 /// IMS handset sends. Each mechanism carries the mandatory `prot=esp` and
 /// `mod=trans` (ESP transport-mode SA) and uses the handset parameter order:
 /// `prot;mod;spi-c;spi-s;port-c;port-s;alg;ealg`. `ealg` is always emitted
 /// (incl. `ealg=null`) — an absent `ealg` is ambiguous to the P-CSCF.
 pub fn build_security_client(offer: &UeSecurityOffer) -> String {
-    let ealg = offer.ealg.sec_agree_name();
     offer
-        .aalgs
+        .transforms
         .iter()
-        .map(|aalg| {
+        .map(|(aalg, ealg)| {
             format!(
                 "ipsec-3gpp;prot=esp;mod=trans;spi-c={};spi-s={};port-c={};port-s={};alg={};ealg={}",
                 offer.spi_c,
@@ -84,7 +83,7 @@ pub fn build_security_client(offer: &UeSecurityOffer) -> String {
                 offer.port_c,
                 offer.port_s,
                 aalg.sec_agree_name(),
-                ealg,
+                ealg.sec_agree_name(),
             )
         })
         .collect::<Vec<_>>()
@@ -118,8 +117,7 @@ mod tests {
     #[test]
     fn build_security_client_single_mechanism_handset_shape() {
         let offer = UeSecurityOffer::new(
-            vec![IntegrityAlgorithm::HmacSha1],
-            EncryptionAlgorithm::Null,
+            vec![(IntegrityAlgorithm::HmacSha1, EncryptionAlgorithm::Null)],
             0x1111,
             0x2222,
             6100,
@@ -138,8 +136,10 @@ mod tests {
         // Offering both algorithms emits two ipsec-3gpp mechanisms sharing the
         // SPIs/ports, comma-separated, preference order preserved.
         let offer = UeSecurityOffer::new(
-            vec![IntegrityAlgorithm::HmacSha1, IntegrityAlgorithm::HmacMd5],
-            EncryptionAlgorithm::Null,
+            vec![
+                (IntegrityAlgorithm::HmacSha1, EncryptionAlgorithm::Null),
+                (IntegrityAlgorithm::HmacMd5, EncryptionAlgorithm::Null),
+            ],
             68054,
             68055,
             6100,
@@ -161,10 +161,32 @@ mod tests {
     }
 
     #[test]
+    fn build_security_client_mixed_pairs_one_mechanism_each() {
+        // Each pair is its own mechanism with its own ealg: the order and
+        // pairing are the caller's, not an alg list sharing one ealg.
+        let offer = UeSecurityOffer::new(
+            vec![
+                (IntegrityAlgorithm::HmacSha1, EncryptionAlgorithm::AesCbc128),
+                (IntegrityAlgorithm::HmacMd5, EncryptionAlgorithm::Null),
+            ],
+            1,
+            2,
+            6100,
+            6101,
+        );
+        assert_eq!(
+            build_security_client(&offer),
+            concat!(
+                "ipsec-3gpp;prot=esp;mod=trans;spi-c=1;spi-s=2;port-c=6100;port-s=6101;alg=hmac-sha-1-96;ealg=aes-cbc, ",
+                "ipsec-3gpp;prot=esp;mod=trans;spi-c=1;spi-s=2;port-c=6100;port-s=6101;alg=hmac-md5-96;ealg=null"
+            )
+        );
+    }
+
+    #[test]
     fn build_security_client_emits_aes_cbc() {
         let offer = UeSecurityOffer::new(
-            vec![IntegrityAlgorithm::HmacMd5],
-            EncryptionAlgorithm::AesCbc128,
+            vec![(IntegrityAlgorithm::HmacMd5, EncryptionAlgorithm::AesCbc128)],
             11111,
             22222,
             5060,
@@ -183,8 +205,7 @@ mod tests {
     #[test]
     fn build_security_client_round_trips_through_parser() {
         let offer = UeSecurityOffer::new(
-            vec![IntegrityAlgorithm::HmacSha1],
-            EncryptionAlgorithm::Null,
+            vec![(IntegrityAlgorithm::HmacSha1, EncryptionAlgorithm::Null)],
             33333,
             44444,
             6200,

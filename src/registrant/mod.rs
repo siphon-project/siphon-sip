@@ -21,6 +21,7 @@ mod egress;
 #[cfg(test)]
 pub(crate) use egress::{established_ue, rotate_sa_set};
 pub mod entry_config;
+pub mod ipsec_offer;
 mod lifecycle;
 pub mod messages;
 pub mod pacing;
@@ -60,7 +61,7 @@ use crate::auth::{self, DigestChallenge, NonceCounter};
 use std::net::IpAddr;
 
 use crate::hep::HepSender;
-use crate::ipsec::ue::{build_security_client, UeSecurityOffer};
+use crate::ipsec::ue::{build_security_client, UeSecurityOffer, UeTransform};
 use crate::ipsec::{
     EncryptionAlgorithm, IntegrityAlgorithm, IpsecManager, SaProtocol, SaRole,
     SecurityAssociationPair, SecurityClient,
@@ -209,10 +210,14 @@ pub struct UeIpsec {
     /// Chosen integrity algorithm for the SA (the preferred one until the
     /// P-CSCF picks one in Security-Server, see [`record_server_answer`]).
     pub aalg: IntegrityAlgorithm,
-    /// Integrity algorithms offered in Security-Client (one `ipsec-3gpp`
-    /// mechanism each), preference order — handsets offer SHA-1 + MD5.
-    pub offered_aalgs: Vec<IntegrityAlgorithm>,
-    /// Offered encryption algorithm (`Null` for integrity-only).
+    /// The `(alg, ealg)` pairs offered in Security-Client (one `ipsec-3gpp`
+    /// mechanism each), preference order. By default the preferred pair, then
+    /// SHA-1 and MD5 with the same ealg (what handsets offer); see
+    /// [`with_offer`](Self::with_offer) for an explicit set. Fixed for the
+    /// life of the entry: the P-CSCF's answer never changes what is offered.
+    pub offered: Vec<UeTransform>,
+    /// Encryption algorithm of the SA: the preferred one until the P-CSCF
+    /// picks one in Security-Server (see [`record_server_answer`]).
     pub ealg: EncryptionAlgorithm,
     /// UE client SPI for the current handshake (0 before the first offer).
     pub spi_uc: u32,
@@ -241,17 +246,19 @@ pub struct UeIpsec {
     pub ports_exhausted: bool,
 }
 
-/// The integrity algorithms a UE offers in Security-Client: the preferred one
-/// first, then the interoperable defaults (HMAC-SHA-1-96, HMAC-MD5-96), deduped.
-/// Real handsets offer both SHA-1 and MD5, letting the P-CSCF pick.
-fn offered_integrity_algs(preferred: IntegrityAlgorithm) -> Vec<IntegrityAlgorithm> {
-    let mut algs = vec![preferred];
+/// The transforms a UE offers in Security-Client when none are named: the
+/// preferred pair first, then the interoperable defaults (HMAC-SHA-1-96,
+/// HMAC-MD5-96) with the same ealg, deduped. Real handsets offer both SHA-1 and
+/// MD5, letting the P-CSCF pick. With the defaults (`hmac-sha-1-96`, `null`)
+/// that is exactly two mechanisms.
+fn default_offer(preferred: IntegrityAlgorithm, ealg: EncryptionAlgorithm) -> Vec<UeTransform> {
+    let mut offer = vec![(preferred, ealg)];
     for alg in [IntegrityAlgorithm::HmacSha1, IntegrityAlgorithm::HmacMd5] {
-        if !algs.contains(&alg) {
-            algs.push(alg);
+        if !offer.iter().any(|(offered, _)| *offered == alg) {
+            offer.push((alg, ealg));
         }
     }
-    algs
+    offer
 }
 
 impl UeIpsec {
@@ -268,7 +275,7 @@ impl UeIpsec {
             client_ports: protected::protected_client_ports(ue_port_c, ue_port_s),
             sa_sets: UeSaSets::default(),
             aalg,
-            offered_aalgs: offered_integrity_algs(aalg),
+            offered: default_offer(aalg, ealg),
             ealg,
             spi_uc: 0,
             spi_us: 0,
@@ -285,11 +292,10 @@ impl UeIpsec {
     }
 
     /// The Security-Client offer for the current SPIs/ports — one mechanism per
-    /// offered integrity algorithm.
+    /// offered `(alg, ealg)` pair.
     pub fn offer(&self) -> UeSecurityOffer {
         UeSecurityOffer::new(
-            self.offered_aalgs.clone(),
-            self.ealg,
+            self.offered.clone(),
             self.spi_uc,
             self.spi_us,
             self.ue_port_c,
@@ -324,8 +330,9 @@ impl UeIpsec {
     /// fresh one. For an entry that moved to another address; the caller
     /// queues the SA sets for deletion first.
     pub fn reset_handshake(&mut self) {
-        if let Some(preferred) = self.offered_aalgs.first().copied() {
-            self.aalg = preferred;
+        if let Some((aalg, ealg)) = self.offered.first().copied() {
+            self.aalg = aalg;
+            self.ealg = ealg;
         }
         self.ue_port_c = self.client_ports[0];
         self.sa_sets = UeSaSets::default();

@@ -81,8 +81,8 @@ pub use observability::{
 };
 pub use registrant::{
     RegistrantAkaConfig, RegistrantBackendType, RegistrantDatabaseConfig, RegistrantEntryConfig,
-    RegistrantHttpConfig, RegistrantImsConfig, RegistrantIpsecConfig, RegistrantRegisterConfig,
-    RegistrantYamlConfig,
+    RegistrantHttpConfig, RegistrantImsConfig, RegistrantIpsecConfig, RegistrantIpsecOffer,
+    RegistrantRegisterConfig, RegistrantYamlConfig,
 };
 pub use registrar::{
     LivenessDeregMode, PostgresBackendConfig, RedisBackendConfig, RegistrarBackendType,

@@ -9082,7 +9082,9 @@ class MockRegistration:
             amf: Optional[str] = None, sqn: Optional[str] = None,
             ipsec: bool = False, ue_port_c: Optional[int] = None,
             ue_port_s: Optional[int] = None, ipsec_alg: Optional[str] = None,
-            ipsec_ealg: Optional[str] = None, imei: Optional[str] = None,
+            ipsec_ealg: Optional[str] = None,
+            ipsec_offer: Optional[list[tuple[str, str]]] = None,
+            imei: Optional[str] = None,
             ims_features: Optional[list[str]] = None,
             register_body: Optional[tuple[str, Union[bytes, str]]] = None,
             register_headers: Optional[dict[str, str]] = None,
@@ -9118,10 +9120,25 @@ class MockRegistration:
                 (3GPP TS 33.203). Requires auth="aka", ue_port_c, ue_port_s.
             ue_port_c: UE protected client port (must also be a listen.udp port).
             ue_port_s: UE protected server port (must also be a listen.udp port).
-            ipsec_alg: Offered integrity algorithm — "hmac-sha-1-96" (default),
-                "hmac-md5-96", or "hmac-sha-256-128" (a siphon extension, not
-                a 3GPP Annex H transform).
-            ipsec_ealg: Offered encryption algorithm — "null" (default) or "aes-cbc".
+            ipsec_alg: Preferred integrity algorithm — "hmac-sha-1-96"
+                (default), "hmac-md5-96", or "hmac-sha-256-128" (a siphon
+                extension, not a 3GPP Annex H transform). Without
+                `ipsec_offer` the Security-Client offers it first, then
+                "hmac-sha-1-96" and "hmac-md5-96", each with `ipsec_ealg`, so
+                the defaults offer exactly two mechanisms (sha-1 and md5,
+                both ``ealg=null``).
+            ipsec_ealg: Encryption algorithm paired with those: "null"
+                (default), "aes-cbc" or "des-ede3-cbc".
+            ipsec_offer: The Security-Client offer, explicitly: a non-empty
+                list of ``(alg, ealg)`` pairs, one ``ipsec-3gpp`` mechanism
+                each, in the order given (3GPP TS 33.203 clause 6.1,
+                RFC 3329). ``[("hmac-sha-1-96", "aes-cbc")]`` offers one
+                mechanism; ``[("hmac-sha-1-96", "null"), ("hmac-md5-96",
+                "null")]`` is the default offer. alg is "hmac-sha-1-96",
+                "hmac-md5-96" or "hmac-sha-256-128"; ealg is "null",
+                "aes-cbc" or "des-ede3-cbc". A pair may be a tuple or a
+                two-item list. Needs ipsec=True and replaces `ipsec_alg` /
+                `ipsec_ealg` (naming both is an error).
             imei: IMEI for the Contact +sip.instance (urn:gsma:imei), e.g.
                 "01234567-000001-0". None: no instance tag.
             ims_features: Contact feature tags to advertise: any of "mmtel",
@@ -9166,7 +9183,10 @@ class MockRegistration:
                 registrant default (half the grant).
 
         Raises:
-            ValueError: when `ims_features` names an unknown tag; when
+            ValueError: when `ipsec_offer` is empty, names an unknown alg or
+                ealg or the same pair twice, is given without ipsec=True, or
+                comes with `ipsec_alg` / `ipsec_ealg`; when `ims_features`
+                names an unknown tag; when
                 `register_headers` names a header siphon owns on a REGISTER or
                 `register_body`'s content type is not a MIME type; when
                 `transport` is not udp/tcp/tls; when auth="aka"
@@ -9180,7 +9200,8 @@ class MockRegistration:
                 ``0 < low <= high < 1``; or once the process is shutting down
                 (it de-registered everything and registers nothing again) —
                 mirroring the Rust binding.
-            TypeError: when `refresh_window` is not a tuple of two numbers.
+            TypeError: when `refresh_window` is not a tuple of two numbers,
+                or `ipsec_offer` is not a list of ``(alg, ealg)`` str pairs.
 
         Example::
 
@@ -9260,6 +9281,7 @@ class MockRegistration:
         normalized_transport = (transport or "udp").lower()
         if address is not None and normalized_transport not in ("udp", "tcp"):
             raise ValueError(self._transport_error(aor, normalized_transport))
+        offer = self._check_ipsec_offer(ipsec, ipsec_offer, ipsec_alg, ipsec_ealg)
         port_c = ue_port_c if ipsec else None
         if address is not None:
             self._refuse_taken(aor, address, port_c)
@@ -9285,6 +9307,7 @@ class MockRegistration:
             "ue_port_s": ue_port_s,
             "ipsec_alg": ipsec_alg or "hmac-sha-1-96",
             "ipsec_ealg": ipsec_ealg or "null",
+            "ipsec_offer": offer,
             "imei": imei,
             "ims_features": features,
             "register_body": (register_body[0], body_bytes) if register_body else None,
@@ -9301,6 +9324,44 @@ class MockRegistration:
             "associated_uris": [],
         }
         self._fire_on_change(aor, "awaiting_address" if awaiting else "registered")
+
+    _IPSEC_ALGS = ("hmac-sha-1-96", "hmac-md5-96", "hmac-sha-256-128")
+    _IPSEC_EALGS = ("null", "aes-cbc", "des-ede3-cbc")
+
+    @classmethod
+    def _check_ipsec_offer(cls, ipsec, offer, alg, ealg):
+        """Validate `ipsec_offer` as the Rust binding does; return the pairs
+        (lower-cased) or None when no offer was given."""
+        if offer is None:
+            return None
+        if isinstance(offer, (str, bytes)):
+            raise TypeError("ipsec_offer is a list of (alg, ealg) pairs of str")
+        pairs = []
+        for item in offer:
+            if (isinstance(item, (str, bytes)) or len(item) != 2
+                    or not all(isinstance(token, str) for token in item)):
+                raise TypeError("ipsec_offer is a list of (alg, ealg) pairs of str")
+            pairs.append((item[0].strip().lower(), item[1].strip().lower()))
+        if alg is not None or ealg is not None:
+            raise ValueError(
+                "ipsec_offer names the algorithms offered; drop ipsec_alg / ipsec_ealg"
+            )
+        if not ipsec:
+            raise ValueError("ipsec_offer requires ipsec=True")
+        if not pairs:
+            raise ValueError("the ipsec offer needs at least one (alg, ealg) pair")
+        for pair_alg, pair_ealg in pairs:
+            if pair_alg not in cls._IPSEC_ALGS:
+                raise ValueError(
+                    f"unknown ipsec alg {pair_alg!r} (one of {', '.join(cls._IPSEC_ALGS)})"
+                )
+            if pair_ealg not in cls._IPSEC_EALGS:
+                raise ValueError(
+                    f"unknown ipsec ealg {pair_ealg!r} (one of {', '.join(cls._IPSEC_EALGS)})"
+                )
+        if len(set(pairs)) != len(pairs):
+            raise ValueError("the ipsec offer names the same (alg, ealg) pair twice")
+        return pairs
 
     def set_local_addr(self, aor: str, local_addr: Optional[str]) -> bool:
         """Move a registration to another address, or take its address away.

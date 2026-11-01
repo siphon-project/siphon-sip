@@ -101,16 +101,25 @@ pub fn entry_from_config(
         if entry.auth_mode != AuthMode::Aka {
             return Err("registrant ipsec requires auth: aka".to_string());
         }
-        let aalg = IntegrityAlgorithm::from_sec_agree_name(&ipsec_config.alg)
-            .ok_or_else(|| format!("unknown ipsec alg {}", ipsec_config.alg))?;
-        let ealg = EncryptionAlgorithm::from_sec_agree_name(&ipsec_config.ealg)
-            .ok_or_else(|| format!("unknown ipsec ealg {}", ipsec_config.ealg))?;
-        entry = entry.with_ipsec(UeIpsec::new(
-            ipsec_config.ue_port_c,
-            ipsec_config.ue_port_s,
-            aalg,
-            ealg,
-        ));
+        let aalg = IntegrityAlgorithm::from_sec_agree_name(ipsec_config.alg_token())
+            .ok_or_else(|| format!("unknown ipsec alg {}", ipsec_config.alg_token()))?;
+        let ealg = EncryptionAlgorithm::from_sec_agree_name(ipsec_config.ealg_token())
+            .ok_or_else(|| format!("unknown ipsec ealg {}", ipsec_config.ealg_token()))?;
+        let mut ue_ipsec = UeIpsec::new(ipsec_config.ue_port_c, ipsec_config.ue_port_s, aalg, ealg);
+        if let Some(offer) = &ipsec_config.offer {
+            if ipsec_config.alg.is_some() || ipsec_config.ealg.is_some() {
+                return Err(
+                    "registrant ipsec: `offer` names the algorithms offered; drop `alg` / `ealg`"
+                        .to_string(),
+                );
+            }
+            let pairs: Vec<(&str, &str)> = offer
+                .iter()
+                .map(|pair| (pair.alg.as_str(), pair.ealg.as_str()))
+                .collect();
+            ue_ipsec = ue_ipsec.with_offer(super::ipsec_offer::parse_ipsec_offer(&pairs)?);
+        }
+        entry = entry.with_ipsec(ue_ipsec);
     }
 
     // IMS Contact feature tags (instance ID + MMTel/video/SMS).
@@ -322,6 +331,88 @@ mod tests {
             "    refresh_window: [0.9, 0.2]\n",
         ));
         assert!(entry_from_config(&config.entries[0], &config).is_err());
+    }
+
+    fn ue_with_ipsec_block(block: &str) -> RegistrantYamlConfig {
+        registrant_config(&format!(
+            concat!(
+                "entries:\n",
+                "  - aor: \"sip:001010000000001@ims.mnc01.mcc001.3gppnetwork.org\"\n",
+                "    registrar: \"sip:198.51.100.10:5060\"\n",
+                "    user: \"001010000000001@ims.mnc01.mcc001.3gppnetwork.org\"\n",
+                "    auth: aka\n",
+                "    aka:\n",
+                "      k: \"465b5ce8b199b49faa5f0a2ee238a6bc\"\n",
+                "      opc: \"cd63cb71954a9f4e48a5994e37a02baf\"\n",
+                "    ipsec:\n",
+                "      ue_port_c: 6100\n",
+                "      ue_port_s: 6101\n",
+                "{}",
+            ),
+            block
+        ))
+    }
+
+    fn security_client_of(config: &RegistrantYamlConfig) -> Result<String, String> {
+        let entry = entry_from_config(&config.entries[0], config)?;
+        let ipsec = entry.ue_ipsec.expect("an ipsec entry");
+        Ok(crate::ipsec::ue::build_security_client(&ipsec.offer()))
+    }
+
+    #[test]
+    fn a_yaml_offer_is_the_security_client_it_names() {
+        let one = ue_with_ipsec_block(concat!(
+            "      offer:\n",
+            "        - { alg: hmac-sha-1-96, ealg: aes-cbc }\n",
+        ));
+        assert_eq!(
+            security_client_of(&one).expect("valid"),
+            "ipsec-3gpp;prot=esp;mod=trans;spi-c=0;spi-s=0;port-c=6100;port-s=6101;alg=hmac-sha-1-96;ealg=aes-cbc"
+        );
+        let two = ue_with_ipsec_block(concat!(
+            "      offer:\n",
+            "        - { alg: hmac-md5-96 }\n",
+            "        - { alg: hmac-sha-1-96, ealg: aes-cbc }\n",
+        ));
+        let header = security_client_of(&two).expect("valid");
+        let mechanisms: Vec<&str> = header.split(", ").collect();
+        assert_eq!(mechanisms.len(), 2);
+        assert!(mechanisms[0].ends_with("alg=hmac-md5-96;ealg=null"));
+        assert!(mechanisms[1].ends_with("alg=hmac-sha-1-96;ealg=aes-cbc"));
+    }
+
+    #[test]
+    fn without_an_offer_the_default_two_mechanisms_go_out() {
+        let header = security_client_of(&ue_with_ipsec_block("")).expect("valid");
+        assert_eq!(header.split(", ").count(), 2);
+        assert!(header.contains("alg=hmac-sha-1-96;ealg=null"));
+        assert!(header.contains("alg=hmac-md5-96;ealg=null"));
+    }
+
+    #[test]
+    fn a_bad_yaml_offer_is_refused() {
+        for (block, needle) in [
+            ("      offer: []\n", "at least one"),
+            (
+                "      offer:\n        - { alg: hmac-sha-9-9 }\n",
+                "hmac-sha-9-9",
+            ),
+            (
+                "      offer:\n        - { alg: hmac-sha-1-96, ealg: rot13 }\n",
+                "rot13",
+            ),
+            (
+                "      alg: hmac-md5-96\n      offer:\n        - { alg: hmac-sha-1-96 }\n",
+                "drop `alg`",
+            ),
+            (
+                "      ealg: aes-cbc\n      offer:\n        - { alg: hmac-sha-1-96 }\n",
+                "drop `alg`",
+            ),
+        ] {
+            let error = security_client_of(&ue_with_ipsec_block(block)).expect_err(block);
+            assert!(error.contains(needle), "{block}: {error}");
+        }
     }
 
     #[test]

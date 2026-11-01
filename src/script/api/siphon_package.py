@@ -1399,7 +1399,8 @@ class _RegistrationNamespace:
     def add(self, aor, registrar, *, user, password="", interval=None, realm=None,
             contact=None, transport=None, auth=None, k=None, op=None, opc=None,
             amf=None, sqn=None, ipsec=False, ue_port_c=None, ue_port_s=None,
-            ipsec_alg=None, ipsec_ealg=None, imei=None, ims_features=None,
+            ipsec_alg=None, ipsec_ealg=None, ipsec_offer=None, imei=None,
+            ims_features=None,
             local_addr=None, require_local_addr=False, refresh_window=None):
         raise NotImplementedError("registration.add() not available — no registrant in config")
 

@@ -1130,8 +1130,9 @@ registrant:
     let ipsec = ue.ipsec.as_ref().expect("ipsec block");
     assert_eq!(ipsec.ue_port_c, 6100);
     assert_eq!(ipsec.ue_port_s, 6101);
-    assert_eq!(ipsec.alg, "hmac-sha-1-96"); // default
-    assert_eq!(ipsec.ealg, "null"); // default
+    assert_eq!(ipsec.alg_token(), "hmac-sha-1-96"); // default
+    assert_eq!(ipsec.ealg_token(), "null"); // default
+    assert!(ipsec.offer.is_none(), "no explicit offer by default");
 }
 
 /// The shipped IMS UE B2BUA example config must actually parse (env vars
