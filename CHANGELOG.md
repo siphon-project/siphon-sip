@@ -20,6 +20,8 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A refresh or unsubscribe of a `subscribe_state.send()` subscription carries a Contact.** `handle.refresh()` and `handle.terminate()` built their SUBSCRIBE without one, though every SUBSCRIBE has exactly one (RFC 6665 §4.1.2.1). It is the Contact the first SUBSCRIBE carried, kept with the dialog.
+- **`subscribe_state.accept()` takes a refresh without a Contact.** A SUBSCRIBE inside a known dialog that leaves its Contact out is a target refresh not made (RFC 3261 §12.2.2): the dialog keeps its remote target instead of `accept()` raising `ValueError`. An initial SUBSCRIBE without a Contact still raises (`create()` too), and the script answers it 400.
 - **An in-dialog request to a new next hop without a transport goes UDP (`sip:`) or TLS (`sips:`).** When the dialog route set led somewhere other than the branch the INVITE took, a URI and DNS naming no transport took that branch's transport (RFC 3263 §4.1 says otherwise). On a dialog whose two legs cross one proxy, the end-to-end 2xx ACK to a UE registered over UDP went out over TCP, which the UE never accepted: the UE kept retransmitting its 200 and the call ended at Timer H.
 
 ## [1.15.8] — 2026-10-30

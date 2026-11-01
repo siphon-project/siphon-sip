@@ -42,3 +42,12 @@ def test_zero_expiry_can_be_terminated_and_does_not_leak():
         assert handle.expires == 0
         run(handle.terminate(reason="deactivated", body="Messages-Waiting: no\r\n"))
         assert state.local_count == 0
+
+
+def test_a_refresh_without_a_contact_is_accepted():
+    """RFC 3261 section 12.2.2: a target refresh is optional, siphon accepts it."""
+    state = MockSubscribeState()
+    initial = state.accept(subscription())
+    refresh = subscription(f";tag={initial.local_tag}")
+    assert refresh.get_header("Contact") is None
+    assert state.accept(refresh, expires=600).id == initial.id

@@ -285,6 +285,7 @@ async fn a_resolved_refresh_names_siphon_in_its_via() {
         is_outbound: true,
         registrant_flow: None,
         body: None,
+        local_contact: None,
     };
     send_in_dialog(
         &watcher.uac.sender,
@@ -460,6 +461,20 @@ async fn a_subscription_body_rides_the_initial_subscribe_and_every_refresh() {
     let sent = watcher.sent().await;
     let refreshed = assert_rides_the_sa(&sent, client);
     assert_carries_body(&sent, &refreshed, MCPTT_INFO);
+    // Exactly one Contact (RFC 6665 §4.1.2.1), the one the SUBSCRIBE carried.
+    assert_eq!(
+        refreshed.headers.get_all("Contact").map(Vec::len),
+        Some(1),
+        "one Contact on the refresh"
+    );
+    assert_eq!(
+        refreshed.headers.get("Contact"),
+        subscribe.headers.get("Contact")
+    );
+    assert_eq!(
+        dialog.local_contact,
+        subscribe.headers.get("Contact").cloned()
+    );
     assert_eq!(
         refreshed.headers.get("Expires").map(String::as_str),
         Some("600")
@@ -478,7 +493,57 @@ async fn a_subscription_body_rides_the_initial_subscribe_and_every_refresh() {
     )
     .await
     .expect("sent");
-    assert_bodyless(&assert_rides_the_sa(&watcher.sent().await, client));
+    let unsubscribe = assert_rides_the_sa(&watcher.sent().await, client);
+    assert_bodyless(&unsubscribe);
+    assert_eq!(
+        unsubscribe.headers.get("Contact"),
+        subscribe.headers.get("Contact")
+    );
+}
+
+/// A dialog cached before the Contact was kept still refreshes with one: the
+/// default `send()` derives, from siphon's own sent-by.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_of_a_dialog_without_a_kept_contact_derives_the_default() {
+    let watcher = Watcher::new();
+    let dialog = SubscribeDialog {
+        id: "legacy".to_string(),
+        call_id: "py-sub-legacy".to_string(),
+        local_tag: "local".to_string(),
+        remote_tag: "remote".to_string(),
+        local_uri: "sip:watcher@192.0.2.1".to_string(),
+        remote_uri: "sip:resource@198.51.100.70".to_string(),
+        remote_target: "sip:resource@198.51.100.70:5060".to_string(),
+        received_address: None,
+        received_transport: None,
+        received_connection_id: None,
+        route_set: vec!["<sip:198.51.100.71:5060;lr>".to_string()],
+        event: "reg".to_string(),
+        expires_secs: 600,
+        created_at_unix: 0,
+        cseq: 2,
+        event_version: 0,
+        terminated: false,
+        is_outbound: true,
+        registrant_flow: None,
+        body: None,
+        local_contact: None,
+    };
+    send_in_dialog(
+        &watcher.uac.sender,
+        watcher.resolver,
+        None,
+        &dialog,
+        600,
+        None,
+    )
+    .await
+    .expect("sent");
+    let message = parse_sip_message_bytes(&watcher.sent().await.data).unwrap();
+    assert_eq!(
+        message.headers.get_all("Contact").cloned(),
+        Some(vec!["<sip:127.0.0.1:5060>".to_string()])
+    );
 }
 
 /// Without a flow the body goes the same way, and a subscription made without
