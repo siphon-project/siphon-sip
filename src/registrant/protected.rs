@@ -26,6 +26,7 @@
 //! [`protected_client_ports`]): a P-CSCF refuses an offered client port that
 //! one of its sets still uses (TS 33.203 7.1, rule 3).
 
+use super::register_extras::RegisterExtras;
 use super::*;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicUsize;
@@ -616,7 +617,7 @@ impl RegistrantManager {
             entry.state = RegistrantState::Registering;
             entry.in_flight_branch = Some(branch.clone());
         }
-        match builder.build() {
+        match RegisterExtras::apply(entry.register_extras.as_ref(), builder, expires).build() {
             Ok(message) => Some(BuiltRegister {
                 message,
                 branch,

@@ -515,7 +515,12 @@ registrar:
 #       auth: aka
 #       aka: { k: "465b5ce8b199b49faa5f0a2ee238a6bc", opc: "cd63cb71954a9f4e48a5994e37a02baf" }
 #       ipsec: { ue_port_c: 6100, ue_port_s: 6101 }
-#       ims: { imei: "01234567-000001-0", features: [mmtel, smsip] }
+#       ims: { imei: "01234567-000001-0", features: [mmtel, smsip] }   # also video, mcptt
+#       # register:                    # extra headers + a body on every REGISTER
+#       #   content_type: "application/vnd.3gpp.mcptt-info+xml"   # that registers (the
+#       #   body: "<mcpttinfo>...</mcpttinfo>"                    # de-REGISTER has none)
+#       #   headers:                   # headers siphon builds itself (Via, Contact,
+#       #     P-Preferred-Service: "urn:urn-7:3gpp-service.ims.icsi.mcptt"  # ...) are refused
 #       local_addr: "203.0.113.11"     # IP only, no port
 #       refresh_window: [0.3, 0.5]     # optional per-entry override
 #     - aor: "sip:001010000000002@ims.mnc01.mcc001.3gppnetwork.org"

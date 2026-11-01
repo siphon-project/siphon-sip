@@ -82,7 +82,23 @@ impl PyRegistration {
     ///     imei: IMEI for the Contact +sip.instance (urn:gsma:imei). None → no
     ///         instance tag.
     ///     ims_features: Contact feature tags to advertise so the S-CSCF
-    ///         registers the implied services — any of "mmtel", "video", "smsip".
+    ///         registers the implied services — any of "mmtel", "video",
+    ///         "smsip", "mcptt". "mcptt" adds `+g.3gpp.mcptt` and the MCPTT
+    ///         ICSI to the Contact (TS 24.379 clause 7.2.1); with "mmtel" both
+    ///         ICSIs share one `+g.3gpp.icsi-ref` parameter. Anything else
+    ///         raises ``ValueError``.
+    ///     register_body: ``(content_type, body)`` carried by every REGISTER
+    ///         that registers: the initial one, each refresh, the answer to a
+    ///         401 (digest or AKA) and the protected re-REGISTER. ``body`` is
+    ///         ``bytes`` or ``str`` (UTF-8). The de-REGISTER carries none
+    ///         (TS 24.379 clause 7.2.1 asks for it only to authorise a
+    ///         binding). The MCPTT service authorisation goes here as
+    ///         ``("application/vnd.3gpp.mcptt-info+xml", xml)``.
+    ///     register_headers: ``{name: value}`` added to the same REGISTERs, in
+    ///         order. A header siphon builds on a REGISTER (Via, From, To,
+    ///         Call-ID, CSeq, Contact, Expires, Content-Type, Content-Length,
+    ///         Authorization, Security-*, Require, Supported, ...) raises
+    ///         ``ValueError``.
     ///     local_addr: The IP this entry registers from (Via/Contact host,
     ///         source, and with ipsec the UE side of its SAs, its protected
     ///         ports opened on this address). siphon opens the sockets itself,
@@ -105,7 +121,7 @@ impl PyRegistration {
     // Wide by necessity: outbound registration exposes the full carrier-trunk
     // + AKA + IPsec credential set as keyword arguments to scripts.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (aor, registrar, *, user, password="", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None, ipsec=false, ue_port_c=None, ue_port_s=None, ipsec_alg=None, ipsec_ealg=None, imei=None, ims_features=None, local_addr=None, require_local_addr=false, refresh_window=None))]
+    #[pyo3(signature = (aor, registrar, *, user, password="", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None, ipsec=false, ue_port_c=None, ue_port_s=None, ipsec_alg=None, ipsec_ealg=None, imei=None, ims_features=None, register_body=None, register_headers=None, local_addr=None, require_local_addr=false, refresh_window=None))]
     fn add(
         &self,
         aor: &str,
@@ -129,6 +145,8 @@ impl PyRegistration {
         ipsec_ealg: Option<&str>,
         imei: Option<String>,
         ims_features: Option<Vec<String>>,
+        register_body: Option<(String, Bound<'_, PyAny>)>,
+        register_headers: Option<Bound<'_, PyDict>>,
         local_addr: Option<&str>,
         require_local_addr: bool,
         refresh_window: Option<(f64, f64)>,
@@ -242,14 +260,50 @@ impl PyRegistration {
         // IMS Contact feature tags (instance ID + MMTel/video/SMS) so the
         // S-CSCF registers the implied services (TS 24.229 / GSMA IR.92).
         let entry = if imei.is_some() || ims_features.is_some() {
-            let features = ims_features.unwrap_or_default();
-            let has = |tag: &str| features.iter().any(|f| f.eq_ignore_ascii_case(tag));
-            entry.with_ims_contact(crate::registrant::ImsContactParams {
-                instance_id: imei,
-                mmtel: has("mmtel"),
-                video: has("video"),
-                smsip: has("smsip"),
-            })
+            let params = crate::registrant::ImsContactParams::from_features(
+                imei,
+                &ims_features.unwrap_or_default(),
+            )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            entry.with_ims_contact(params)
+        } else {
+            entry
+        };
+
+        // Headers and a body on every registering REGISTER (see
+        // `registrant::register_extras`).
+        let entry = if register_body.is_some() || register_headers.is_some() {
+            let body = register_body
+                .map(|(content_type, body)| {
+                    let bytes = if let Ok(text) = body.extract::<String>() {
+                        text.into_bytes()
+                    } else if let Ok(bytes) = body.extract::<Vec<u8>>() {
+                        bytes
+                    } else {
+                        return Err(pyo3::exceptions::PyTypeError::new_err(
+                            "register_body is (content_type, body) with body bytes or str",
+                        ));
+                    };
+                    Ok((content_type, bytes))
+                })
+                .transpose()?;
+            let mut headers = Vec::new();
+            if let Some(mapping) = register_headers {
+                for (name, value) in mapping.iter() {
+                    let (Ok(name), Ok(value)) =
+                        (name.extract::<String>(), value.extract::<String>())
+                    else {
+                        return Err(pyo3::exceptions::PyTypeError::new_err(
+                            "register_headers takes a mapping of str header names to str values",
+                        ));
+                    };
+                    headers.push((name, value));
+                }
+            }
+            entry.with_register_extras(
+                crate::registrant::register_extras::RegisterExtras::new(body, headers)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?,
+            )
         } else {
             entry
         };
@@ -568,6 +622,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             false,
             None,
         )
@@ -597,6 +653,8 @@ mod tests {
             true,
             ue_port_c,
             ue_port_s,
+            None,
+            None,
             None,
             None,
             None,
@@ -675,6 +733,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -804,6 +864,8 @@ assert 'registration.on_change' in kinds, kinds
             None,
             None,
             None,
+            None,
+            None,
             false,
             None,
         )
@@ -893,6 +955,8 @@ assert 'registration.on_change' in kinds, kinds
             None,
             Some("01234567-000001-0".to_string()),
             Some(vec!["mmtel".to_string()]),
+            None,
+            None,
             local_addr,
             require_local_addr,
             refresh_window,
@@ -1045,6 +1109,159 @@ assert 'registration.on_change' in kinds, kinds
                         .unwrap()
                         .unwrap()
                         .is_none());
+                });
+            },
+        );
+    }
+
+    /// A digest trunk added with the MCPTT-shaped keyword arguments.
+    fn add_with_register_options(
+        py_reg: &PyRegistration,
+        features: Option<Vec<String>>,
+        body: Option<(String, Bound<'_, PyAny>)>,
+        headers: Option<Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        py_reg.add(
+            "sip:trunk@carrier.example",
+            "sip:198.51.100.20:5060",
+            "trunk",
+            "secret",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            features,
+            body,
+            headers,
+            None,
+            false,
+            None,
+        )
+    }
+
+    /// The first REGISTER of the trunk `add_with_register_options` added: its
+    /// header block and body as sent.
+    fn built_register(manager: &RegistrantManager) -> (String, Vec<u8>) {
+        let listen = std::collections::HashMap::new();
+        let built = manager
+            .build_register(
+                "sip:trunk@carrier.example",
+                crate::registrant::messages::EgressDefaults::new(
+                    "192.0.2.1:5060".parse().unwrap(),
+                    &listen,
+                ),
+                3600,
+            )
+            .unwrap();
+        let bytes = built.message.to_bytes();
+        let split = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        (
+            String::from_utf8_lossy(&bytes[..split + 2]).into_owned(),
+            bytes[split + 4..].to_vec(),
+        )
+    }
+
+    #[test]
+    fn add_takes_register_body_register_headers_and_mcptt() {
+        crate::own_process::run(
+            concat!(
+                module_path!(),
+                "::add_takes_register_body_register_headers_and_mcptt"
+            ),
+            || {
+                pyo3::Python::initialize();
+                pyo3::Python::attach(|python| {
+                    let manager = make_manager();
+                    let py_reg = PyRegistration::new(
+                        Arc::clone(&manager),
+                        "127.0.0.1:5060".parse().unwrap(),
+                    );
+                    let headers = PyDict::new(python);
+                    headers.set_item("X-First", "1").unwrap();
+                    headers.set_item("X-Second", "2").unwrap();
+                    let body = pyo3::types::PyBytes::new(python, b"<a/>\r\n\xff").into_any();
+                    add_with_register_options(
+                        &py_reg,
+                        Some(vec!["MCPTT".to_string(), "mmtel".to_string()]),
+                        Some(("application/vnd.3gpp.mcptt-info+xml".to_string(), body)),
+                        Some(headers),
+                    )
+                    .unwrap();
+                    let (head, wire_body) = built_register(&manager);
+                    assert!(head.contains(
+                        ";+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel,urn%3Aurn-7%3A3gpp-service.ims.icsi.mcptt\";+g.3gpp.mcptt"
+                    ));
+                    assert!(head.contains("\r\nX-First: 1\r\nX-Second: 2\r\n"));
+                    assert!(
+                        head.contains("\r\nContent-Type: application/vnd.3gpp.mcptt-info+xml\r\n")
+                    );
+                    assert!(head.contains("\r\nContent-Length: 7\r\n"));
+                    assert_eq!(wire_body, b"<a/>\r\n\xff".to_vec());
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn add_takes_a_str_body_and_refuses_what_siphon_owns() {
+        crate::own_process::run(
+            concat!(
+                module_path!(),
+                "::add_takes_a_str_body_and_refuses_what_siphon_owns"
+            ),
+            || {
+                pyo3::Python::initialize();
+                pyo3::Python::attach(|python| {
+                    let manager = make_manager();
+                    let py_reg = PyRegistration::new(
+                        Arc::clone(&manager),
+                        "127.0.0.1:5060".parse().unwrap(),
+                    );
+                    let text = pyo3::types::PyString::new(python, "hello").into_any();
+                    add_with_register_options(
+                        &py_reg,
+                        None,
+                        Some(("text/plain".to_string(), text)),
+                        None,
+                    )
+                    .unwrap();
+                    let (_, wire_body) = built_register(&manager);
+                    assert_eq!(wire_body, b"hello".to_vec());
+                    drop(manager);
+
+                    for owned in ["Via", "contact", "Content-Type", "Authorization", "l"] {
+                        let manager = make_manager();
+                        let py_reg =
+                            PyRegistration::new(manager, "127.0.0.1:5060".parse().unwrap());
+                        let headers = PyDict::new(python);
+                        headers.set_item(owned, "x").unwrap();
+                        let refused = add_with_register_options(&py_reg, None, None, Some(headers))
+                            .expect_err(owned);
+                        assert!(refused.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+                    }
+
+                    let manager = make_manager();
+                    let py_reg = PyRegistration::new(manager, "127.0.0.1:5060".parse().unwrap());
+                    let refused = add_with_register_options(
+                        &py_reg,
+                        Some(vec!["mcptx".to_string()]),
+                        None,
+                        None,
+                    )
+                    .expect_err("unknown feature");
+                    assert!(refused.is_instance_of::<pyo3::exceptions::PyValueError>(python));
                 });
             },
         );
