@@ -1806,7 +1806,7 @@
       "add": {
         "doc": "Add a new outbound registration.",
         "kind": "method_descriptor",
-        "sig": "($self, aor, registrar, *, user, password=\"\", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None, ipsec=False, ue_port_c=None, ue_port_s=None, ipsec_alg=None, ipsec_ealg=None, imei=None, ims_features=None, register_body=None, register_headers=None, local_addr=None, require_local_addr=False, refresh_window=None)"
+        "sig": "($self, aor, registrar, *, user, password=\"\", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None, ipsec=False, ue_port_c=None, ue_port_s=None, ipsec_alg=None, ipsec_ealg=None, ipsec_offer=None, imei=None, ims_features=None, register_body=None, register_headers=None, local_addr=None, require_local_addr=False, refresh_window=None)"
       },
       "associated_uris": {
         "doc": "The P-Associated-URI list (implicit registration set) for this AoR.",

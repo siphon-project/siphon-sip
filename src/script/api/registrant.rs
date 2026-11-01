@@ -76,9 +76,24 @@ impl PyRegistration {
     ///         (3GPP TS 33.203). Requires auth="aka", ue_port_c, ue_port_s.
     ///     ue_port_c: UE protected client port (must also be a listen.udp port).
     ///     ue_port_s: UE protected server port (must also be a listen.udp port).
-    ///     ipsec_alg: Offered integrity algorithm — "hmac-sha-1-96" (default),
-    ///         "hmac-md5-96", or "hmac-sha-256-128".
-    ///     ipsec_ealg: Offered encryption algorithm — "null" (default) or "aes-cbc".
+    ///     ipsec_alg: Preferred integrity algorithm — "hmac-sha-1-96" (default),
+    ///         "hmac-md5-96", or "hmac-sha-256-128". The Security-Client
+    ///         offers it first, then "hmac-sha-1-96" and "hmac-md5-96", each
+    ///         with ``ipsec_ealg`` (so the defaults offer exactly two
+    ///         mechanisms: sha-1 and md5, both ``ealg=null``).
+    ///     ipsec_ealg: Encryption algorithm paired with those — "null"
+    ///         (default), "aes-cbc" or "des-ede3-cbc".
+    ///     ipsec_offer: The Security-Client offer, explicitly: a non-empty
+    ///         list of ``(alg, ealg)`` pairs, one ``ipsec-3gpp`` mechanism
+    ///         each, in the order given (TS 33.203 clause 6.1, RFC 3329).
+    ///         ``[("hmac-sha-1-96", "aes-cbc")]`` offers one mechanism;
+    ///         ``[("hmac-sha-1-96", "null"), ("hmac-md5-96", "null")]`` is
+    ///         the default offer. alg is "hmac-sha-1-96", "hmac-md5-96" or
+    ///         "hmac-sha-256-128"; ealg is "null", "aes-cbc" or
+    ///         "des-ede3-cbc". Raises ``ValueError`` for an empty list, an
+    ///         unknown token, a repeated pair, without ``ipsec=True``, or
+    ///         together with ``ipsec_alg`` / ``ipsec_ealg`` (name the
+    ///         algorithms in one place).
     ///     imei: IMEI for the Contact +sip.instance (urn:gsma:imei). None → no
     ///         instance tag.
     ///     ims_features: Contact feature tags to advertise so the S-CSCF
@@ -105,7 +120,11 @@ impl PyRegistration {
     ///         so the address need not exist on the host yet. transport "udp"
     ///         or "tcp": over TCP siphon listens on ue_port_s (the plain port
     ///         without ipsec) for the P-CSCF's connection and connects from
-    ///         ue_port_c. None (default): the process's own address.
+    ///         ue_port_c. Over UDP with ipsec it also accepts TCP on ue_port_s
+    ///         while an SA set stands (the P-CSCF's over-MTU requests), and
+    ///         with ``listen.mtu`` set sends a REGISTER over the SA set that
+    ///         exceeds mtu - 200 over TCP from ue_port_c (UDP if the connect
+    ///         fails). None (default): the process's own address.
     ///     require_local_addr: Never register from the process's address:
     ///         without a local_addr the entry waits as "awaiting_address" until
     ///         set_local_addr() gives it one. Implied by local_addr.
@@ -121,7 +140,7 @@ impl PyRegistration {
     // Wide by necessity: outbound registration exposes the full carrier-trunk
     // + AKA + IPsec credential set as keyword arguments to scripts.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (aor, registrar, *, user, password="", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None, ipsec=false, ue_port_c=None, ue_port_s=None, ipsec_alg=None, ipsec_ealg=None, imei=None, ims_features=None, register_body=None, register_headers=None, local_addr=None, require_local_addr=false, refresh_window=None))]
+    #[pyo3(signature = (aor, registrar, *, user, password="", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None, ipsec=false, ue_port_c=None, ue_port_s=None, ipsec_alg=None, ipsec_ealg=None, ipsec_offer=None, imei=None, ims_features=None, register_body=None, register_headers=None, local_addr=None, require_local_addr=false, refresh_window=None))]
     fn add(
         &self,
         aor: &str,
@@ -143,6 +162,7 @@ impl PyRegistration {
         ue_port_s: Option<u16>,
         ipsec_alg: Option<&str>,
         ipsec_ealg: Option<&str>,
+        ipsec_offer: Option<Bound<'_, PyAny>>,
         imei: Option<String>,
         ims_features: Option<Vec<String>>,
         register_body: Option<(String, Bound<'_, PyAny>)>,
@@ -227,6 +247,18 @@ impl PyRegistration {
             entry
         };
 
+        // The explicit Security-Client offer, read before anything is built so a
+        // bad one raises without a half-added entry.
+        let offer_pairs = ipsec_offer
+            .as_ref()
+            .map(offer_pairs_from_python)
+            .transpose()?;
+        if offer_pairs.is_some() && (ipsec_alg.is_some() || ipsec_ealg.is_some()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "ipsec_offer names the algorithms offered; drop ipsec_alg / ipsec_ealg",
+            ));
+        }
+
         // IPsec sec-agree (3GPP TS 33.203): the protected ports must also be
         // declared as listen.udp entries so the protected REGISTER can egress
         // from ue_port_c and MT requests arrive on ue_port_s.
@@ -252,8 +284,21 @@ impl PyRegistration {
                     "unknown ipsec_ealg '{ealg_token}'"
                 ))
             })?;
-            entry.with_ipsec(UeIpsec::new(port_c, port_s, aalg, ealg))
+            let ue_ipsec = UeIpsec::new(port_c, port_s, aalg, ealg);
+            let ue_ipsec = match &offer_pairs {
+                Some(pairs) => ue_ipsec.with_offer(
+                    crate::registrant::ipsec_offer::parse_ipsec_offer(pairs)
+                        .map_err(pyo3::exceptions::PyValueError::new_err)?,
+                ),
+                None => ue_ipsec,
+            };
+            entry.with_ipsec(ue_ipsec)
         } else {
+            if offer_pairs.is_some() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "ipsec_offer requires ipsec=True",
+                ));
+            }
             entry
         };
 
@@ -531,6 +576,27 @@ fn parse_ip(text: &str, argument: &str) -> PyResult<std::net::IpAddr> {
     })
 }
 
+/// The `(alg, ealg)` pairs of `ipsec_offer=`: a list (or tuple) of two-item
+/// tuples or lists of strings. A bad shape is a `TypeError`; the tokens are
+/// checked by `parse_ipsec_offer` (a `ValueError`).
+fn offer_pairs_from_python(offer: &Bound<'_, PyAny>) -> PyResult<Vec<(String, String)>> {
+    let shape = || {
+        pyo3::exceptions::PyTypeError::new_err(
+            "ipsec_offer is a list of (alg, ealg) pairs of str, e.g. [(\"hmac-sha-1-96\", \"null\")]",
+        )
+    };
+    let mut pairs = Vec::new();
+    for item in offer.try_iter().map_err(|_| shape())? {
+        let item = item?;
+        let tokens: Vec<String> = item.extract().map_err(|_| shape())?;
+        match tokens.as_slice() {
+            [alg, ealg] => pairs.push((alg.clone(), ealg.clone())),
+            _ => return Err(shape()),
+        }
+    }
+    Ok(pairs)
+}
+
 /// Parse an initial SQN_MS from a 12-hex-char string into 6 bytes.
 fn parse_sqn(hex: &str) -> PyResult<[u8; 6]> {
     let bytes = crate::ipsec::milenage::hex_to_bytes(hex)
@@ -624,6 +690,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             None,
         )
@@ -653,6 +720,7 @@ mod tests {
             true,
             ue_port_c,
             ue_port_s,
+            None,
             None,
             None,
             None,
@@ -733,6 +801,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -866,6 +935,7 @@ assert 'registration.on_change' in kinds, kinds
             None,
             None,
             None,
+            None,
             false,
             None,
         )
@@ -951,6 +1021,7 @@ assert 'registration.on_change' in kinds, kinds
             true,
             Some(6100),
             Some(6101),
+            None,
             None,
             None,
             Some("01234567-000001-0".to_string()),
@@ -1142,6 +1213,7 @@ assert 'registration.on_change' in kinds, kinds
             None,
             None,
             None,
+            None,
             features,
             body,
             headers,
@@ -1262,6 +1334,169 @@ assert 'registration.on_change' in kinds, kinds
                     )
                     .expect_err("unknown feature");
                     assert!(refused.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+                });
+            },
+        );
+    }
+
+    /// An IMS UE added with the algorithm keywords, the Security-Client of
+    /// its first REGISTER returned (or the refusal).
+    fn security_client_after_add(
+        python: Python<'_>,
+        ipsec: bool,
+        alg: Option<&str>,
+        ealg: Option<&str>,
+        offer: Option<&str>,
+    ) -> Result<String, PyErr> {
+        let manager = make_manager();
+        let py_reg = PyRegistration::new(Arc::clone(&manager), "127.0.0.1:5060".parse().unwrap());
+        let offer = offer.map(|source| {
+            python
+                .eval(&std::ffi::CString::new(source).expect("no nul"), None, None)
+                .expect("a python literal")
+        });
+        py_reg.add(
+            AKA_AOR,
+            "sip:198.51.100.10:5060",
+            "001010000000001@ims.mnc01.mcc001.3gppnetwork.org",
+            "",
+            None,
+            None,
+            None,
+            None,
+            Some("aka"),
+            Some(AKA_K),
+            None,
+            Some(AKA_OPC),
+            None,
+            None,
+            ipsec,
+            ipsec.then_some(6100),
+            ipsec.then_some(6101),
+            alg,
+            ealg,
+            offer,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )?;
+        let listen = std::collections::HashMap::new();
+        let built = manager
+            .build_register(
+                AKA_AOR,
+                crate::registrant::messages::EgressDefaults::new(
+                    "192.0.2.1:5060".parse().unwrap(),
+                    &listen,
+                ),
+                3600,
+            )
+            .expect("a REGISTER");
+        Ok(built
+            .message
+            .headers
+            .get("Security-Client")
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    #[test]
+    fn ipsec_offer_sets_the_security_client_pairs() {
+        crate::own_process::run(
+            concat!(
+                module_path!(),
+                "::ipsec_offer_sets_the_security_client_pairs"
+            ),
+            || {
+                pyo3::Python::initialize();
+                pyo3::Python::attach(|python| {
+                    // Default: the two mechanisms the registrant always sent.
+                    let default =
+                        security_client_after_add(python, true, None, None, None).expect("added");
+                    assert_eq!(default.split(", ").count(), 2, "{default}");
+                    assert!(default.contains("alg=hmac-sha-1-96;ealg=null"));
+                    assert!(default.contains("alg=hmac-md5-96;ealg=null"));
+
+                    // One pair, one mechanism.
+                    let one = security_client_after_add(
+                        python,
+                        true,
+                        None,
+                        None,
+                        Some("[('hmac-sha-1-96', 'aes-cbc')]"),
+                    )
+                    .expect("added");
+                    assert!(one.contains("port-c=6100;port-s=6101;alg=hmac-sha-1-96;ealg=aes-cbc"));
+                    assert!(!one.contains(','), "one mechanism: {one}");
+
+                    // Two pairs, in order, lists accepted as pairs too.
+                    let two = security_client_after_add(
+                        python,
+                        true,
+                        None,
+                        None,
+                        Some("[['hmac-md5-96', 'null'], ('hmac-sha-1-96', 'aes-cbc')]"),
+                    )
+                    .expect("added");
+                    let mechanisms: Vec<&str> = two.split(", ").collect();
+                    assert_eq!(mechanisms.len(), 2, "{two}");
+                    assert!(mechanisms[0].ends_with("alg=hmac-md5-96;ealg=null"));
+                    assert!(mechanisms[1].ends_with("alg=hmac-sha-1-96;ealg=aes-cbc"));
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn ipsec_offer_refuses_what_it_cannot_honour() {
+        crate::own_process::run(
+            concat!(
+                module_path!(),
+                "::ipsec_offer_refuses_what_it_cannot_honour"
+            ),
+            || {
+                pyo3::Python::initialize();
+                pyo3::Python::attach(|python| {
+                    let value_error = |ipsec, alg, ealg, offer: &str| {
+                        let error =
+                            security_client_after_add(python, ipsec, alg, ealg, Some(offer))
+                                .expect_err(offer);
+                        assert!(
+                            error.is_instance_of::<pyo3::exceptions::PyValueError>(python),
+                            "{offer}: {error}"
+                        );
+                    };
+                    value_error(true, None, None, "[]");
+                    value_error(true, None, None, "[('hmac-sha-9-9', 'null')]");
+                    value_error(true, None, None, "[('hmac-sha-1-96', 'rot13')]");
+                    value_error(
+                        true,
+                        None,
+                        None,
+                        "[('hmac-sha-1-96', 'null'), ('hmac-sha-1-96', 'null')]",
+                    );
+                    // Algorithms named twice, or an offer without IPsec.
+                    value_error(
+                        true,
+                        Some("hmac-md5-96"),
+                        None,
+                        "[('hmac-sha-1-96', 'null')]",
+                    );
+                    value_error(true, None, Some("aes-cbc"), "[('hmac-sha-1-96', 'null')]");
+                    value_error(false, None, None, "[('hmac-sha-1-96', 'null')]");
+                    // Wrong shapes are a TypeError.
+                    for shape in ["'hmac-sha-1-96'", "[('hmac-sha-1-96',)]", "[1]", "5"] {
+                        let error =
+                            security_client_after_add(python, true, None, None, Some(shape))
+                                .expect_err(shape);
+                        assert!(
+                            error.is_instance_of::<pyo3::exceptions::PyTypeError>(python),
+                            "{shape}: {error}"
+                        );
+                    }
                 });
             },
         );

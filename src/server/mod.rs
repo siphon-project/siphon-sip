@@ -2371,6 +2371,7 @@ impl SiphonServer {
                     connection_pool: Arc::clone(&connection_pool),
                     ue_sockets: ue_sockets.clone(),
                     ipsec_manager: ipsec_manager.clone(),
+                    mtu: config.listen.mtu,
                 },
             );
         }

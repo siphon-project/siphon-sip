@@ -268,13 +268,45 @@ pub struct RegistrantIpsecConfig {
     pub ue_port_c: u16,
     /// UE protected server port.
     pub ue_port_s: u16,
-    /// Offered integrity algorithm: "hmac-sha-1-96" (default), "hmac-md5-96",
-    /// or "hmac-sha-256-128".
-    #[serde(default = "default_ipsec_alg")]
+    /// Preferred integrity algorithm: "hmac-sha-1-96" (default),
+    /// "hmac-md5-96", or "hmac-sha-256-128". Without `offer` the UE offers this
+    /// one first, then "hmac-sha-1-96" and "hmac-md5-96" (each with `ealg`).
+    /// Not with `offer`.
+    #[serde(default)]
+    pub alg: Option<String>,
+    /// Encryption algorithm: "null" (default), "aes-cbc" or "des-ede3-cbc".
+    /// Not with `offer`.
+    #[serde(default)]
+    pub ealg: Option<String>,
+    /// The Security-Client offer, explicitly: one `ipsec-3gpp` mechanism per
+    /// entry, in order (3GPP TS 33.203 clause 6.1, RFC 3329). Replaces the
+    /// default two-mechanism offer. Refused with `alg` / `ealg`, when empty,
+    /// or with a token siphon does not implement.
+    #[serde(default)]
+    pub offer: Option<Vec<RegistrantIpsecOffer>>,
+}
+
+/// One `(alg, ealg)` pair of an explicit Security-Client offer.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RegistrantIpsecOffer {
+    /// Integrity algorithm: "hmac-sha-1-96", "hmac-md5-96" or
+    /// "hmac-sha-256-128".
     pub alg: String,
-    /// Offered encryption algorithm: "null" (default) or "aes-cbc".
+    /// Encryption algorithm: "null" (default), "aes-cbc" or "des-ede3-cbc".
     #[serde(default = "default_ipsec_ealg")]
     pub ealg: String,
+}
+
+impl RegistrantIpsecConfig {
+    /// The preferred integrity algorithm token (`hmac-sha-1-96` unless set).
+    pub fn alg_token(&self) -> &str {
+        self.alg.as_deref().unwrap_or("hmac-sha-1-96")
+    }
+
+    /// The encryption algorithm token (`null` unless set).
+    pub fn ealg_token(&self) -> &str {
+        self.ealg.as_deref().unwrap_or("null")
+    }
 }
 
 fn default_aka_amf() -> String {
@@ -283,10 +315,6 @@ fn default_aka_amf() -> String {
 
 fn default_aka_sqn() -> String {
     "000000000000".to_string()
-}
-
-fn default_ipsec_alg() -> String {
-    "hmac-sha-1-96".to_string()
 }
 
 fn default_ipsec_ealg() -> String {

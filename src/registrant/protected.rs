@@ -627,6 +627,7 @@ impl RegistrantManager {
                 sent_by,
                 own_address: egress.own_address,
                 protected: true,
+                over_sa_set: true,
                 challenge_rejected,
             }),
             Err(error) => {

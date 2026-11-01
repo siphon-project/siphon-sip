@@ -113,6 +113,10 @@ pub struct BuiltRegister {
     /// Whether it rides an established IPsec SA set (a protected re- or
     /// de-REGISTER, see [`super::protected`]).
     pub protected: bool,
+    /// Whether it leaves over an SA set (a protected re- or de-REGISTER, or
+    /// the authenticated one on the temporary set a 401 made), so that over
+    /// the MTU it may take TCP on that set: see [`super::protected_tcp`].
+    pub over_sa_set: bool,
     /// Whether it tells the network its AKA challenge was invalid (TS 24.229
     /// 5.1.1.5.3): it goes as built, and no temporary SA set is made for it.
     pub challenge_rejected: bool,
@@ -253,6 +257,7 @@ impl RegistrantManager {
                 sent_by: egress.sent_by,
                 own_address: egress.own_address,
                 protected: false,
+                over_sa_set: false,
                 challenge_rejected,
             }),
             Err(error) => {
@@ -371,6 +376,7 @@ impl RegistrantManager {
                 sent_by: egress.sent_by,
                 own_address: egress.own_address,
                 protected: false,
+                over_sa_set: false,
                 challenge_rejected: false,
             }),
             Err(error) => {
@@ -586,6 +592,9 @@ impl RegistrantManager {
                 sent_by: via_sent_by,
                 own_address: egress.own_address,
                 protected: false,
+                // The authenticated REGISTER of a handshake rides the
+                // temporary set the dispatcher installs for it.
+                over_sa_set: security_verify.is_some() && entry.ue_ipsec.is_some(),
                 challenge_rejected,
             }),
             Err(error) => {

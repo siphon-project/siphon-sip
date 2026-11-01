@@ -117,3 +117,62 @@ def test_add_accepts_the_dialable_transports_case_insensitively(transport):
                      user="trunk", password="secret", transport=transport)
     entry = registration._entries["sip:trunk@carrier.example"]
     assert entry["transport"] == (transport or "udp")
+
+
+# --- ipsec_offer= ---
+#
+# The Security-Client offer, named explicitly: (alg, ealg) pairs, one
+# ipsec-3gpp mechanism each. Mirrors the Rust binding's refusals.
+
+
+def _add_ue(registration, **extra):
+    registration.add(AKA_AOR, PCSCF, user=IMPI, auth="aka", k=AKA_K, opc=AKA_OPC,
+                     ipsec=True, ue_port_c=6100, ue_port_s=6101, **extra)
+
+
+def test_ipsec_offer_is_recorded_in_order_and_lowercased():
+    registration = _fresh_registration()
+    _add_ue(registration, ipsec_offer=[("hmac-md5-96", "null"),
+                                       ["HMAC-SHA-1-96", "aes-cbc"]])
+    assert registration._entries[AKA_AOR]["ipsec_offer"] == [
+        ("hmac-md5-96", "null"), ("hmac-sha-1-96", "aes-cbc")]
+
+
+def test_no_ipsec_offer_leaves_the_default():
+    registration = _fresh_registration()
+    _add_ue(registration)
+    assert registration._entries[AKA_AOR]["ipsec_offer"] is None
+
+
+@pytest.mark.parametrize("offer", [
+    [],
+    [("hmac-sha-9-9", "null")],
+    [("hmac-sha-1-96", "rot13")],
+    [("hmac-sha-1-96", "null"), ("hmac-sha-1-96", "null")],
+])
+def test_ipsec_offer_refuses_empty_unknown_and_repeated(offer):
+    registration = _fresh_registration()
+    with pytest.raises(ValueError):
+        _add_ue(registration, ipsec_offer=offer)
+    assert registration._entries == {}
+
+
+@pytest.mark.parametrize("extra", [{"ipsec_alg": "hmac-md5-96"}, {"ipsec_ealg": "aes-cbc"}])
+def test_ipsec_offer_replaces_alg_and_ealg(extra):
+    registration = _fresh_registration()
+    with pytest.raises(ValueError, match="drop ipsec_alg"):
+        _add_ue(registration, ipsec_offer=[("hmac-sha-1-96", "null")], **extra)
+
+
+def test_ipsec_offer_needs_ipsec():
+    registration = _fresh_registration()
+    with pytest.raises(ValueError, match="requires ipsec=True"):
+        registration.add(AKA_AOR, PCSCF, user=IMPI, auth="aka", k=AKA_K, opc=AKA_OPC,
+                         ipsec_offer=[("hmac-sha-1-96", "null")])
+
+
+@pytest.mark.parametrize("offer", ["hmac-sha-1-96", [("hmac-sha-1-96",)], [1], 5])
+def test_ipsec_offer_wrong_shape_is_a_type_error(offer):
+    registration = _fresh_registration()
+    with pytest.raises(TypeError):
+        _add_ue(registration, ipsec_offer=offer)

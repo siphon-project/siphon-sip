@@ -489,7 +489,12 @@ registrar:
 # exact address and port is used instead (static wins). The protected ports
 # may repeat across entries, two entries may not share (local_addr, ue_port_c).
 # UDP only: local_addr on a tcp/tls entry is refused at load. IPsec entries
-# need the top-level `ipsec:` block and CAP_NET_ADMIN.
+# need the top-level `ipsec:` block and CAP_NET_ADMIN. An IPsec entry over UDP
+# also listens for TCP on ue_port_s while it holds an SA set (the SAs carry TCP
+# and UDP, TS 33.203): a P-CSCF sends a request over the MTU that way. With
+# `listen.mtu` set, its own REGISTER over the SA set that exceeds mtu - 200 goes
+# over TCP from the set's protected client port (RFC 3261 18.1.1), over UDP if
+# the connection cannot be opened.
 #
 # registrant:
 #   refresh_window: [0.4, 0.6]        # refresh at a uniform draw between 40 %
@@ -515,6 +520,13 @@ registrar:
 #       auth: aka
 #       aka: { k: "465b5ce8b199b49faa5f0a2ee238a6bc", opc: "cd63cb71954a9f4e48a5994e37a02baf" }
 #       ipsec: { ue_port_c: 6100, ue_port_s: 6101 }
+#       # Security-Client offer. Default: hmac-sha-1-96 and hmac-md5-96, ealg null
+#       # (two mechanisms). `alg` / `ealg` set the preferred pair of that default;
+#       # `offer` names the pairs outright, one mechanism each, in order, and
+#       # replaces them (not both). alg: hmac-sha-1-96 | hmac-md5-96 |
+#       # hmac-sha-256-128; ealg: null | aes-cbc | des-ede3-cbc.
+#       # ipsec: { ue_port_c: 6100, ue_port_s: 6101,
+#       #          offer: [{ alg: hmac-sha-1-96, ealg: aes-cbc }, { alg: hmac-md5-96 }] }
 #       ims: { imei: "01234567-000001-0", features: [mmtel, smsip] }   # also video, mcptt
 #       # register:                    # extra headers + a body on every REGISTER
 #       #   content_type: "application/vnd.3gpp.mcptt-info+xml"   # that registers (the

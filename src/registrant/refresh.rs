@@ -39,6 +39,10 @@ pub struct RegistrationLoopContext {
     pub ue_sockets: Option<Arc<UeSockets>>,
     /// Tears down the SAs of an entry that moved off its address.
     pub ipsec_manager: Option<Arc<IpsecManager>>,
+    /// `listen.mtu`: with it set, a REGISTER over an IMS UE's SA set that is
+    /// over the RFC 3261 clause 18.1.1 threshold goes over TCP on that set
+    /// (see [`super::protected_tcp`]). `None`: every REGISTER stays UDP.
+    pub mtu: Option<u16>,
 }
 
 /// The tick when no start-rate cap is configured.
@@ -94,7 +98,7 @@ pub async fn registration_loop(manager: Arc<RegistrantManager>, context: Registr
 
 /// One pass of [`registration_loop`].
 fn run_tick(
-    manager: &RegistrantManager,
+    manager: &Arc<RegistrantManager>,
     context: &RegistrationLoopContext,
     egress: &RegistrantEgress,
     mut limiter: Option<&mut RegisterRateLimiter>,
@@ -156,6 +160,16 @@ fn run_tick(
             continue;
         };
         debug!(aor = %aor, branch = %built.branch, "sending REGISTER");
+        // Over the MTU on an SA set it goes over TCP on that set, once the
+        // connection is up: a connect can take a while, so it waits in a task.
+        if let Some(path) = built.over_mtu_tcp(context.mtu) {
+            if spawn_over_mtu_register(manager, context, aor.clone(), built, path) {
+                continue;
+            }
+            // No runtime to spawn on: nothing was sent; it comes due again.
+            manager.handle_failure(&aor, 0, None);
+            continue;
+        }
         if let Err(error) = send_register(manager, &context.outbound, egress, &built) {
             warn!(aor = %aor, %error, "failed to send REGISTER");
             manager.handle_failure(&aor, 0, None);
@@ -236,7 +250,11 @@ fn reconcile_ue_streams(
     egress: &RegistrantEgress,
 ) -> HashSet<String> {
     let plain_port = egress.defaults().plain_port();
-    let (plan, owners) = manager.ue_stream_plan(plain_port);
+    let (plan, owners) = manager.ue_stream_plan_with(
+        plain_port,
+        Some(process_ue_ip(egress)),
+        context.mtu.is_some(),
+    );
     let Some(sockets) = context.ue_sockets.as_ref() else {
         if !owners.is_empty() {
             debug!(
@@ -403,6 +421,53 @@ fn send_register(
     let message = outbound_message(egress, built);
     manager.open_transaction(&built.message, &message)?;
     outbound.send(message).map_err(|error| error.to_string())
+}
+
+/// Send `built`, which is over the MTU on an SA set, over TCP on `path` from a
+/// task: connect first, then put the TCP form on the wire under its client
+/// transaction, or the UDP one when the connection cannot be opened (RFC 3261
+/// clause 18.1.1, see [`OverMtuTcp::connect`]). `false` when there is no runtime
+/// to run the task on.
+fn spawn_over_mtu_register(
+    manager: &Arc<RegistrantManager>,
+    context: &RegistrationLoopContext,
+    aor: String,
+    built: BuiltRegister,
+    path: super::protected_tcp::OverMtuTcp,
+) -> bool {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        warn!(aor = %aor, "over-MTU REGISTER with no runtime to open its TCP connection on");
+        return false;
+    };
+    let call_id = built
+        .message
+        .headers
+        .get("Call-ID")
+        .cloned()
+        .unwrap_or_default();
+    let manager = Arc::clone(manager);
+    let outbound = Arc::clone(&context.outbound);
+    let pool = Arc::clone(&context.connection_pool);
+    runtime.spawn(async move {
+        let built = if path.connect(&pool, &aor).await {
+            built.over_tcp(&path)
+        } else {
+            built
+        };
+        // Shutdown or the entry's removal may have come while connecting.
+        if !manager.registration_live(&aor, &call_id) {
+            debug!(aor = %aor, "registration ended while its TCP connection opened; not sent");
+            return;
+        }
+        let Some(egress) = manager.egress.get() else {
+            return;
+        };
+        if let Err(error) = send_register(&manager, &outbound, egress, &built) {
+            warn!(aor = %aor, %error, "failed to send REGISTER");
+            manager.handle_failure(&aor, 0, None);
+        }
+    });
+    true
 }
 
 /// Put one built de-registration on the wire.
