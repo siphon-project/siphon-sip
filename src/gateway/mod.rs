@@ -2902,6 +2902,7 @@ pub(crate) mod tests {
                 version: Version::sip_2_0(),
                 status_code: status,
                 reason_phrase: "Test".to_string(),
+                generated_locally: false,
             }),
             headers,
             body: Vec::new(),

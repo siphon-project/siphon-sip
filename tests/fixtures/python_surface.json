@@ -1965,6 +1965,10 @@
         "doc": "From URI parsed from the From header.",
         "kind": "getset_descriptor"
       },
+      "generated_locally": {
+        "doc": "``True`` when siphon itself synthesized this response for a branch no",
+        "kind": "getset_descriptor"
+      },
       "get_header": {
         "doc": "Get the first value of a header, or None.",
         "kind": "method_descriptor",

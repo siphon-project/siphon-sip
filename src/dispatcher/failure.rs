@@ -527,6 +527,8 @@ pub(super) fn fail_branch_locally(
         state.identity.load().server.as_deref(),
         &[],
     );
+    // Lets `reply.generated_locally` tell this from the same status received.
+    response.mark_generated_locally();
 
     // `build_response` copies the request's Via stack, whose top is the UAC's.
     // The response path keys the branch off the *topmost* Via and strips it, so

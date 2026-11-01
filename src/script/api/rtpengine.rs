@@ -3896,6 +3896,7 @@ mod tests {
                         version: Version::sip_2_0(),
                         status_code: 200,
                         reason_phrase: "OK".to_string(),
+                        generated_locally: false,
                     });
                     format!("<sip:bob@example.com>;tag={tag}")
                 }

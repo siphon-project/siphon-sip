@@ -295,6 +295,8 @@ mod proxy_failure_reply_tests;
 #[cfg(test)]
 mod proxy_flow_ack_tests;
 #[cfg(test)]
+mod proxy_generated_locally_tests;
+#[cfg(test)]
 mod proxy_late_answer_tests;
 #[cfg(test)]
 mod proxy_no_response_tests;

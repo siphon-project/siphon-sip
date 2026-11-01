@@ -88,6 +88,7 @@ pub fn forward_update_response(
                 version: Version::sip_2_0(),
                 status_code: status,
                 reason_phrase: "Server Internal Error".to_string(),
+                generated_locally: false,
             });
             remove_body(message);
             if retry_after {

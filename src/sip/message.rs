@@ -109,6 +109,11 @@ pub struct StatusLine {
     pub version: Version,
     pub status_code: u16,
     pub reason_phrase: String,
+    /// Set on a response siphon synthesized for a branch no peer answered (a
+    /// Timer B / Timer F expiry, a `no_response_ms` deadline, a transport
+    /// failure), never on one received. Not part of the wire form. Lives here
+    /// because the padding after `status_code` holds it for free.
+    pub generated_locally: bool,
 }
 
 /// Start line (either RequestLine or StatusLine)
@@ -135,6 +140,19 @@ impl SipMessage {
     /// Check if this is a response
     pub fn is_response(&self) -> bool {
         matches!(self.start_line, StartLine::Response(_))
+    }
+
+    /// Whether this is a response siphon synthesized itself (see
+    /// [`StatusLine::generated_locally`]); `false` for a request.
+    pub fn is_generated_locally(&self) -> bool {
+        matches!(&self.start_line, StartLine::Response(line) if line.generated_locally)
+    }
+
+    /// Mark this response as one siphon synthesized. No-op on a request.
+    pub fn mark_generated_locally(&mut self) {
+        if let StartLine::Response(line) = &mut self.start_line {
+            line.generated_locally = true;
+        }
     }
 
     /// Get method if this is a request
