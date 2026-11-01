@@ -1448,7 +1448,7 @@ impl PySubscribeState {
         });
 
         let mut receiver = match &flow_egress {
-            Some(egress) => egress.send(uac_sender, message),
+            Some(egress) => egress.send(uac_sender, message).await,
             None => uac_sender.send_request_with_response(message, destination, transport),
         };
 

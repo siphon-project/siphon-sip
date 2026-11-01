@@ -375,6 +375,14 @@ pub(super) fn relay_request(
     // port (see `over_mtu_upgrade`), and the protected source and Via follow
     // it.  The `state.mtu.is_some()` guard keeps the serialise off the default
     // hot path.
+    //
+    // Over siphon's own UE flow (the registrant's SA) the switch is the same
+    // rule on the flow's own connection (`flow_over_mtu_upgrade`); the Via
+    // sent-by stays the flow's socket, only its transport token changes.
+    let flow_transport = outbound_transport;
+    if flow_over_mtu_upgrade(state, flow, &relayed) {
+        outbound_transport = Transport::Tcp;
+    }
     if state.mtu.is_some() && flow.is_none() {
         if let Some((tcp_transport, tcp_addr)) = over_mtu_upgrade(
             state,
@@ -445,7 +453,7 @@ pub(super) fn relay_request(
         // (3GPP TS 33.203 §7.4).  A datagram flow names its socket, a
         // stream flow the public identity of the listener that accepted
         // it — see `flow_sent_by`.
-        let (host, port) = flow_sent_by(local, state, &outbound_transport);
+        let (host, port) = flow_sent_by(local, state, &flow_transport);
         (host, Some(port))
     } else if let Some(protected) = protected {
         // IPsec auto-source: the request leaves from the pair's port, but the
@@ -959,6 +967,7 @@ pub(super) fn relay_fork_request(
 /// next hop (RFC 3327 §5.3 + RFC 3261 §16.6 step 6).  The Request-URI stays the
 /// branch target either way.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // shares its body with relay_request, which carries the same allowance
 pub(super) fn relay_fork_branch(
     message: &SipMessage,
     target: &str,
@@ -1065,6 +1074,12 @@ pub(super) fn relay_fork_branch(
 
     // RFC 3261 §18.1.1 — bias an over-MTU UDP fork branch to TCP.  Skipped for a
     // flow-pinned branch (its transport is fixed by connection reuse).
+    // Over siphon's own UE flow: the same rule on the flow's own connection,
+    // with the flow's socket in the Via (see `relay_request`).
+    let flow_transport = outbound_transport;
+    if flow_over_mtu_upgrade(state, flow, &relayed) {
+        outbound_transport = Transport::Tcp;
+    }
     if state.mtu.is_some() && flow.is_none() {
         if let Some((tcp_transport, tcp_addr)) = over_mtu_upgrade(
             state,
@@ -1120,7 +1135,7 @@ pub(super) fn relay_fork_branch(
     // A branch to a UE's protected port names the pair's protected server
     // port, as `relay_request` does (TS 24.229 clause 5.2.6.4.3 step 6).
     let (via_host, via_port) = match (flow, send_socket) {
-        (Some(flow), _) => flow_sent_by(flow.local_addr, state, &outbound_transport),
+        (Some(flow), _) => flow_sent_by(flow.local_addr, state, &flow_transport),
         (None, Some(pin)) => state.pin_sent_by(pin),
         (None, None) => unpinned_request_sent_by(destination, outbound_transport, state),
     };

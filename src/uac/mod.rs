@@ -165,6 +165,10 @@ pub struct UacSender {
     /// ([`crate::ipsec::pcscf_udp_egress`]). `None` without a P-CSCF `ipsec:`
     /// block.
     ipsec_egress: Option<(Arc<crate::ipsec::IpsecManager>, u16)>,
+    /// The connection pool and `listen.mtu` a request over a UE's SA flow that
+    /// is over the MTU moves to TCP with (RFC 3261 clause 18.1.1, see
+    /// [`crate::registrant::OverMtuTcp`]). `None` without an MTU.
+    over_mtu: Option<(Arc<crate::transport::pool::ConnectionPool>, u16)>,
 }
 
 impl UacSender {
@@ -191,6 +195,7 @@ impl UacSender {
             pending: Arc::new(DashMap::new()),
             cseq_counter: std::sync::atomic::AtomicU32::new(1),
             ipsec_egress: None,
+            over_mtu: None,
         }
     }
 
@@ -207,6 +212,27 @@ impl UacSender {
     ) -> Self {
         self.ipsec_egress = manager.zip(pcscf_port_s);
         self
+    }
+
+    /// Let a request over a registrant UE's SA flow that is over `mtu` move to
+    /// TCP on the pooled connection from the UE's protected client port (RFC
+    /// 3261 clause 18.1.1). `mtu` of `None` leaves every send on its flow's
+    /// transport.
+    pub fn with_over_mtu(
+        mut self,
+        pool: Arc<crate::transport::pool::ConnectionPool>,
+        mtu: Option<u16>,
+    ) -> Self {
+        self.over_mtu = mtu.map(|mtu| (pool, mtu));
+        self
+    }
+
+    /// The pool and `listen.mtu` an over-MTU request over a UE's SA flow moves
+    /// to TCP with, when an MTU is set.
+    pub fn over_mtu(&self) -> Option<(&crate::transport::pool::ConnectionPool, u16)> {
+        self.over_mtu
+            .as_ref()
+            .map(|(pool, mtu)| (pool.as_ref(), *mtu))
     }
 
     /// `(destination, source_local_addr)` a send really uses.

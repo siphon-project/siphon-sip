@@ -324,8 +324,14 @@ class MockProxy:
             timeout_ms: Response timeout (not meaningfully enforced in the mock).
             flow: Send over a flow. A ``registration.flow(impu)`` is the UE's
                 own SA: the request leaves over it with ``route`` as its Route
-                headers (TS 24.229 5.1.2A.1.1). A callee's flow is used with
-                no route set and yields to one, as in ``call.dial``.
+                headers (TS 24.229 5.1.2A.1.1). With ``listen.mtu`` set, a
+                request over that SA that is over the threshold (RFC 3261
+                18.1.1) leaves over TCP from the UE's protected client port to
+                the P-CSCF's protected server port, each request by its own
+                size, and goes over UDP when the connection cannot be opened.
+                A callee's flow is used with no route set and yields to one,
+                as in ``call.dial``; it keeps its transport, as does a flow
+                already on a stream transport.
             route: The route set, one Route header per entry, in order. Not
                 with a ``Route`` in ``headers``.
 
@@ -768,7 +774,11 @@ class MockSubscribeState:
         ``route`` (the P-CSCF's protected URI, then the Service-Route) as the
         SUBSCRIBE's Route headers; siphon sends the refreshes and the
         unsubscribe over the SA set the registration holds at the time, and
-        refuses a callee's flow with ``ValueError``. ``route`` cannot be
+        refuses a callee's flow with ``ValueError``. With ``listen.mtu`` set,
+        each of those requests that is over the threshold (RFC 3261 18.1.1)
+        goes over TCP from the UE's protected client port to the P-CSCF's
+        protected server port, each by its own size, and over UDP when the
+        connection cannot be opened. ``route`` cannot be
         combined with ``target_uri`` or a ``Route`` in ``headers``.
 
         ``body`` (``str`` or ``bytes``) and ``content_type`` put a body on the

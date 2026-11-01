@@ -276,6 +276,18 @@ pub fn b2bua_dial_b_leg(
     // Contact.  Handing it the Contact instead would let resolve_tcp_path's
     // A/AAAA lookup replace the destination with the Contact's own address, so
     // an over-MTU B-leg would bypass the very Path the resolve above followed.
+    //
+    // A leg dialled over siphon's own UE flow (the registrant's SA) takes the
+    // same rule on the flow's connection: over the MTU it goes TCP from the
+    // protected client port to the P-CSCF's protected server port, the INVITE's
+    // Via says TCP, and the leg is a TCP leg from here on (the CANCEL, the ACK
+    // of a non-2xx and the in-dialog requests follow the INVITE's transport,
+    // RFC 3261 sections 9.1 and 17.1.1.3). The Via sent-by, the Contact and the
+    // identity host stay the flow's: `flow_transport`.
+    let flow_transport = outbound_transport;
+    if flow_over_mtu_upgrade(state, flow, original_request) {
+        outbound_transport = Transport::Tcp;
+    }
     if state.mtu.is_some() && flow.is_none() {
         if let Some((tcp_transport, tcp_addr)) = over_mtu_upgrade(
             state,
@@ -334,7 +346,7 @@ pub fn b2bua_dial_b_leg(
     // far end answers to the Via, sends every in-dialog request to the
     // Contact, and a peer that admits only one name refuses any other.
     let (via_host, via_port) = if flow_local_addr.is_some() {
-        b_leg_sent_by(flow_local_addr, destination, state, &outbound_transport)
+        b_leg_sent_by(flow_local_addr, destination, state, &flow_transport)
     } else {
         egress_sent_by(
             None,
@@ -354,7 +366,7 @@ pub fn b2bua_dial_b_leg(
     // protected port, say) rather than a name to present; that keeps the
     // transport's advertised host it has always had.
     let identity_host = match flow_local_addr {
-        Some(_) => state.via_host(&outbound_transport),
+        Some(_) => state.via_host(&flow_transport),
         None => via_host.clone(),
     };
 
@@ -528,7 +540,7 @@ pub fn b2bua_dial_b_leg(
     let b_contact_value = build_b_leg_contact(
         branch_contact_host.as_deref().unwrap_or(&b_contact_host),
         b_contact_port,
-        outbound_transport,
+        flow_transport,
         presented_contact_user(
             branch_contact_user.as_deref(),
             contact_user_override.as_deref(),

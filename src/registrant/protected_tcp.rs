@@ -32,8 +32,9 @@
 //! and reused by every request in between. When it cannot be opened the REGISTER
 //! goes over UDP as it would have, with a warning (RFC 3261 clause 18.1.1:
 //! "SHOULD retry the request, using UDP"). Not switched: the de-REGISTER (small,
-//! and sent as the process stops) and requests a script sends over
-//! `registration.flow()`, which keep the flow's transport.
+//! and sent as the process stops). The requests a script sends over
+//! `registration.flow()` take the same path ([`OverMtuTcp::decide`]), each by its
+//! own size.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -89,13 +90,19 @@ impl RegistrantManager {
     }
 }
 
-/// The TCP path of a REGISTER over an SA set that is over the MTU: the
+/// The TCP path of a request over an SA set that is over the MTU: the
 /// connection from the UE's protected client port to the P-CSCF's protected
 /// server port, which the SA set carries like UDP (TS 33.203 clause 7.1, "the
 /// transport protocol selector shall allow UDP and TCP"; TS 24.229 clause
 /// 5.1.1.2.2 1 b, the connection "established by the UE, i.e. from the UE's
 /// protected client port and the UE's IP address to the P-CSCF's protected
 /// server port").
+///
+/// One path for everything the UE originates over its SA set: its own REGISTER
+/// ([`BuiltRegister::over_mtu_tcp`]) and the requests a script sends over
+/// `registration.flow()` (a dial, `proxy.send_request(flow=)`,
+/// `proxy.subscribe_state.send(flow=)` and its refreshes), which decide through
+/// [`OverMtuTcp::decide`].
 ///
 /// The same connection serves every later request until the SA set changes:
 /// the registration loop keeps the pooled connection from a held set's client
@@ -106,12 +113,34 @@ pub struct OverMtuTcp {
     pub source: SocketAddr,
     /// The P-CSCF's protected server port: the connection's destination.
     pub destination: SocketAddr,
-    /// The Via the request carries once it moves to TCP (RFC 3261 clause
-    /// 18.1.1: "the value in the top Via MUST be changed").
-    via: String,
 }
 
 impl OverMtuTcp {
+    /// The TCP path of a request of `serialized_len` bytes that would leave
+    /// over UDP from `source` to `destination` (an SA set), when it is over the
+    /// threshold the relay uses ([`crate::transport::mtu::over_mtu`], RFC 3261
+    /// clause 18.1.1). `None` with no MTU configured (`listen.mtu`) and for a
+    /// request already over a stream transport, which keeps it.
+    ///
+    /// The size is read through `serialized_len` only when an MTU is set, so a
+    /// deployment without one pays nothing.
+    pub fn decide(
+        source: SocketAddr,
+        destination: SocketAddr,
+        transport: Transport,
+        mtu: Option<u16>,
+        serialized_len: impl FnOnce() -> usize,
+    ) -> Option<Self> {
+        let mtu = mtu?;
+        if transport != Transport::Udp || !crate::transport::mtu::over_mtu(serialized_len(), mtu) {
+            return None;
+        }
+        Some(Self {
+            source,
+            destination,
+        })
+    }
+
     /// Open, or find open, the connection. `true` when it is up and the request
     /// may go over it.
     ///
@@ -121,38 +150,60 @@ impl OverMtuTcp {
     /// Not Supported, or a TCP reset). siphon retries over UDP on any failure
     /// to connect, a timeout included: the request is not lost, it goes as it
     /// would have without the switch. The pool backs off a destination that
-    /// failed, so a P-CSCF without TCP costs one attempt, not one per REGISTER.
-    pub async fn connect(&self, pool: &crate::transport::pool::ConnectionPool, aor: &str) -> bool {
+    /// failed, so a P-CSCF without TCP costs one attempt, not one per request.
+    /// `what` names the request in the log (the AoR of a REGISTER, a method).
+    pub async fn connect(&self, pool: &crate::transport::pool::ConnectionPool, what: &str) -> bool {
         match pool.connect_tcp_from(self.source, self.destination).await {
             Ok(connection_id) => {
                 tracing::debug!(
-                    aor = %aor,
+                    request = %what,
                     source = %self.source,
                     destination = %self.destination,
                     ?connection_id,
-                    "over-MTU REGISTER over its SA set goes over TCP from the protected client \
+                    "over-MTU request over its SA set goes over TCP from the protected client \
                      port to the P-CSCF's protected server port"
                 );
                 true
             }
             Err(error) => {
                 tracing::warn!(
-                    aor = %aor,
+                    request = %what,
                     source = %self.source,
                     destination = %self.destination,
                     %error,
-                    "over-MTU REGISTER: the TCP connection over the SA set could not be opened; \
-                     retrying the REGISTER over UDP (RFC 3261 clause 18.1.1)"
+                    "over-MTU request: the TCP connection over the SA set could not be opened; \
+                     retrying the request over UDP (RFC 3261 clause 18.1.1)"
                 );
                 false
             }
         }
     }
 
-    /// Put the TCP Via on `message`.
+    /// Put the TCP transport on the top Via of `message` (RFC 3261 clause
+    /// 18.1.1: "the value in the top Via MUST be changed"). The sent-by and
+    /// the branch are the request's own: the UE's protected server port, where
+    /// the P-CSCF sends what it originates (TS 24.229 clause 5.1.1.2.2), and
+    /// the response to this request comes back over the connection (clause
+    /// 18.2.2).
     pub fn apply(&self, message: &mut crate::sip::message::SipMessage) {
-        message.headers.set("Via", self.via.clone());
+        if let Some(via) = message.headers.get("Via") {
+            let via = tcp_via(via);
+            message.headers.set("Via", via);
+        }
     }
+}
+
+/// `via` with its transport token `UDP` replaced by `TCP`; anything else is
+/// returned unchanged.
+fn tcp_via(via: &str) -> String {
+    let (protocol, rest) = via.split_once(char::is_whitespace).unwrap_or((via, ""));
+    let Some((version, transport)) = protocol.rsplit_once('/') else {
+        return via.to_string();
+    };
+    if !transport.eq_ignore_ascii_case("UDP") {
+        return via.to_string();
+    }
+    format!("{version}/TCP {rest}")
 }
 
 impl super::BuiltRegister {
@@ -163,18 +214,12 @@ impl super::BuiltRegister {
     /// (`listen.mtu`), for a REGISTER that is not over an SA set, and for one
     /// already over a stream transport.
     pub fn over_mtu_tcp(&self, mtu: Option<u16>) -> Option<OverMtuTcp> {
-        let mtu = mtu?;
-        if !self.over_sa_set || self.transport != Transport::Udp {
+        if !self.over_sa_set {
             return None;
         }
         let source = self.source_local_addr?;
-        if !crate::transport::mtu::over_mtu(self.message.to_bytes().len(), mtu) {
-            return None;
-        }
-        Some(OverMtuTcp {
-            source,
-            destination: self.destination,
-            via: format!("SIP/2.0/TCP {};branch={};rport", self.sent_by, self.branch),
+        OverMtuTcp::decide(source, self.destination, self.transport, mtu, || {
+            self.message.to_bytes().len()
         })
     }
 
