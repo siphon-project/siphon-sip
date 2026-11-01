@@ -116,6 +116,12 @@ pub struct SubscribeDialog {
     /// `None` for a bodyless subscription, and for payloads cached before it.
     #[serde(default)]
     pub body: Option<DialogBody>,
+    /// The Contact an outbound SUBSCRIBE carried (RFC 6665 §4.1.2.1: every
+    /// SUBSCRIBE has exactly one), which the refreshes and the unsubscribe
+    /// repeat. `None` for notifier-side dialogs, and for payloads cached
+    /// before it: a refresh then derives the default one.
+    #[serde(default)]
+    pub local_contact: Option<String>,
 }
 
 /// A SUBSCRIBE body with its Content-Type, kept with the dialog.
@@ -477,6 +483,7 @@ mod tests {
             is_outbound: false,
             registrant_flow: None,
             body: None,
+            local_contact: None,
         }
     }
 

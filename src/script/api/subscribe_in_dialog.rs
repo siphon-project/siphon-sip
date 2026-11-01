@@ -266,6 +266,7 @@ fn build_in_dialog_subscribe(
         .max_forwards(70)
         .from(from_header)
         .to(to_header)
+        .header("Contact", in_dialog_contact(dialog, transport, sent_by))
         .header("Event", dialog.event.clone())
         .header("Expires", expires_secs.to_string());
 
@@ -279,6 +280,22 @@ fn build_in_dialog_subscribe(
     builder.build().map_err(|error| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build SUBSCRIBE: {error}"))
     })
+}
+
+/// The Contact of an in-dialog SUBSCRIBE (RFC 6665 §4.1.2.1: every SUBSCRIBE
+/// has exactly one): the one the dialog's SUBSCRIBE carried, else, for a dialog
+/// cached before it was kept, the default `send()` derives from the sent-by.
+fn in_dialog_contact(dialog: &SubscribeDialog, transport: Transport, sent_by: &str) -> String {
+    if let Some(contact) = &dialog.local_contact {
+        return contact.clone();
+    }
+    match sent_by
+        .rsplit_once(':')
+        .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)))
+    {
+        Some((host, port)) => super::format_default_contact(host, port, transport),
+        None => format!("<sip:{sent_by}>"),
+    }
 }
 
 /// The body and Content-Type a script gave, checked: both or neither.
@@ -313,5 +330,24 @@ pub(super) fn with_body(
             .content_type(body.content_type.clone())
             .body(body.bytes.clone()),
         None => builder.content_length(0),
+    }
+}
+
+/// The Contact of an incoming SUBSCRIBE. A refresh inside a dialog may leave it
+/// out when `optional`: the remote target is then unchanged (RFC 3261 §12.2.2,
+/// a target refresh is optional), which `accept()` keeps by reading the empty
+/// string as "not given". An initial SUBSCRIBE without one has no target at
+/// all (RFC 6665 §4.1.2.1).
+pub(super) fn incoming_contact(
+    headers: &crate::sip::headers::SipHeaders,
+    to: &str,
+    optional: bool,
+) -> PyResult<String> {
+    match headers.get("Contact").or_else(|| headers.get("m")) {
+        Some(contact) => Ok(contact.clone()),
+        None if optional && super::extract_tag(to).is_some() => Ok(String::new()),
+        None => Err(pyo3::exceptions::PyValueError::new_err(
+            "SUBSCRIBE missing Contact",
+        )),
     }
 }

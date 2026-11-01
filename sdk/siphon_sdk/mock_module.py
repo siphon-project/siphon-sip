@@ -710,6 +710,13 @@ class MockSubscribeState:
             handle = proxy.subscribe_state.accept(request, expires=3600)
             if handle is not None:
                 await handle.notify(body=summary, content_type=MWI_TYPE)
+
+        A refresh inside a known dialog may leave out its Contact: the remote
+        target stays as it was (RFC 3261 section 12.2.2). An initial SUBSCRIBE
+        without a Contact has no remote target (RFC 6665 section 4.1.2.1):
+        siphon's ``accept()`` raises ``ValueError("SUBSCRIBE missing Contact")``
+        and stores nothing, so check the header first and answer
+        ``request.reply(400, "Bad Request")``. The mock does not enforce that.
         """
         import uuid
         to_value = request.get_header("To") or ""

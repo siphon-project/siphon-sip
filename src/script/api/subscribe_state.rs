@@ -78,7 +78,7 @@ impl PySubscribeState {
         request: &Bound<'_, PyRequest>,
         expires: Option<u64>,
     ) -> PyResult<Option<PySubscribeHandle>> {
-        let candidate = capture_incoming(request, expires)?;
+        let candidate = capture_incoming(request, expires, true)?;
         let mut borrowed = request.borrow_mut();
         let message_arc = borrowed.message();
         let message = message_arc
@@ -117,7 +117,10 @@ impl PySubscribeState {
         };
         drop(message);
         let mut dialog = dialog;
-        dialog.remote_target = candidate.remote_target;
+        // No Contact on a refresh: the target the dialog has stands.
+        if !candidate.remote_target.is_empty() {
+            dialog.remote_target = candidate.remote_target;
+        }
         // A notifier's route set is the request's order, unlike a UAC's reversed
         // response route set (RFC 3261 section 12.1.1).
         if !tagged {
@@ -185,7 +188,7 @@ impl PySubscribeState {
         request: &Bound<'_, PyRequest>,
         expires: Option<u64>,
     ) -> PyResult<PySubscribeHandle> {
-        let dialog = capture_incoming(request, expires)?;
+        let dialog = capture_incoming(request, expires, false)?;
         let id = dialog.id.clone();
         self.store.put(dialog);
         debug!(id, "subscribe_state: dialog created");
@@ -759,6 +762,7 @@ impl PySubscribeHandle {
 fn capture_incoming(
     request: &Bound<'_, PyRequest>,
     expires: Option<u64>,
+    contact_optional: bool,
 ) -> PyResult<SubscribeDialog> {
     let borrowed = request.borrow();
     let message_arc = borrowed.message();
@@ -786,12 +790,7 @@ fn capture_incoming(
         .cloned()
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing To"))?;
 
-    let contact_raw = message
-        .headers
-        .get("Contact")
-        .or_else(|| message.headers.get("m"))
-        .cloned()
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("SUBSCRIBE missing Contact"))?;
+    let contact_raw = in_dialog::incoming_contact(&message.headers, &to_raw, contact_optional)?;
 
     let event = message
         .headers
@@ -851,6 +850,7 @@ fn capture_incoming(
         is_outbound: false,
         registrant_flow: None,
         body: None,
+        local_contact: None,
     };
 
     drop(message);
@@ -1443,6 +1443,7 @@ impl PySubscribeState {
                         ue_ip: flow.local_addr.ip(),
                     })
             }),
+            local_contact: message.headers.get("Contact").cloned(),
             body,
         });
 
@@ -1730,6 +1731,7 @@ mod tests {
             is_outbound: false,
             registrant_flow: None,
             body: None,
+            local_contact: None,
         };
         dialog.event_version = 2;
         let json = serde_json::to_string(&dialog).expect("serialize dialog");
@@ -2363,6 +2365,80 @@ else:
                     bytes: b"two".to_vec(),
                 })
             );
+        });
+    }
+
+    /// A SUBSCRIBE of `incoming()` without its Contact.
+    fn without_contact<'py>(request: Bound<'py, PyRequest>) -> Bound<'py, PyRequest> {
+        {
+            let borrowed = request.borrow();
+            let message = borrowed.message();
+            message.lock().unwrap().headers.remove("Contact");
+        }
+        request
+    }
+
+    /// RFC 3261 §12.2.2: a target refresh is optional, so a refresh inside a
+    /// dialog without a Contact keeps the remote target the dialog has.
+    #[test]
+    fn accept_refresh_without_contact_keeps_the_remote_target() {
+        Python::initialize();
+        Python::attach(|python| {
+            let store = Arc::new(SubscribeStore::new());
+            let namespace = PySubscribeState::new(Arc::clone(&store));
+            let handle = namespace
+                .accept(&incoming(python, "", 300), Some(300))
+                .unwrap()
+                .unwrap();
+            let initial = handle.load_local().unwrap();
+            assert!(initial.remote_target.contains("192.0.2.20"));
+
+            let refresh = without_contact(incoming(
+                python,
+                &format!(";tag={}", initial.local_tag),
+                600,
+            ));
+            let refreshed = namespace
+                .accept(&refresh, Some(600))
+                .expect("a refresh needs no Contact")
+                .expect("the dialog is known");
+            assert_eq!(refreshed.id, handle.id);
+            let updated = refreshed.load_local().unwrap();
+            assert_eq!(updated.remote_target, initial.remote_target);
+            assert_eq!(updated.expires_secs, 600);
+        });
+    }
+
+    /// An initial SUBSCRIBE has no remote target but its Contact: `accept()` and
+    /// `create()` raise `ValueError`, the script answers 400, and nothing is
+    /// stored. A tagged request for a dialog siphon does not know is 481 as
+    /// ever, whatever it carries.
+    #[test]
+    fn an_initial_subscribe_without_contact_is_refused() {
+        Python::initialize();
+        Python::attach(|python| {
+            let store = Arc::new(SubscribeStore::new());
+            let namespace = PySubscribeState::new(Arc::clone(&store));
+            let error = namespace
+                .accept(&without_contact(incoming(python, "", 300)), Some(300))
+                .map(|_| ())
+                .expect_err("no Contact on an initial SUBSCRIBE");
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+            assert!(error.to_string().contains("missing Contact"), "{error}");
+            assert!(
+                namespace
+                    .create(&without_contact(incoming(python, "", 300)), Some(300))
+                    .is_err(),
+                "create() holds the same line"
+            );
+            assert_eq!(store.local_count(), 0);
+
+            let unknown = without_contact(incoming(python, ";tag=nobody", 300));
+            assert!(namespace.accept(&unknown, Some(300)).unwrap().is_none());
+            assert!(matches!(
+                unknown.borrow().action(),
+                super::super::request::RequestAction::Reply { code: 481, .. }
+            ));
         });
     }
 }

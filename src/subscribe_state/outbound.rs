@@ -841,6 +841,7 @@ mod tests {
             is_outbound: true,
             registrant_flow: None,
             body: None,
+            local_contact: None,
         }
     }
 
