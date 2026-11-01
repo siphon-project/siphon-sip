@@ -41,6 +41,7 @@ pub use lifecycle::{Deregistration, RegisterTransactions};
 pub use messages::{BuiltRegister, EgressDefaults};
 pub use pacing::RefreshWindow;
 pub use protected::{PortDegradation, SaDeletion, UeExchange, UeSaKey, UeSaSets};
+pub use protected_tcp::OverMtuTcp;
 pub use refresh::{
     await_deregistrations, deregister_all, registration_loop, retire_ue_security_associations,
     RegistrationLoopContext, SHUTDOWN_ANSWER_WAIT,

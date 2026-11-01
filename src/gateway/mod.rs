@@ -2000,10 +2000,19 @@ pub(crate) mod tests {
     pub(crate) struct TestUac {
         pub(crate) sender: Arc<UacSender>,
         pub(crate) udp: flume::Receiver<crate::transport::OutboundMessage>,
+        pub(crate) tcp: flume::Receiver<crate::transport::OutboundMessage>,
         _other: Vec<flume::Receiver<crate::transport::OutboundMessage>>,
     }
 
     pub(crate) fn test_uac() -> TestUac {
+        test_uac_over_mtu(None)
+    }
+
+    /// [`test_uac`] whose requests over a UE's SA flow that are over the MTU
+    /// (the second element, `listen.mtu`) move to TCP on the given pool.
+    pub(crate) fn test_uac_over_mtu(
+        over_mtu: Option<(Arc<crate::transport::pool::ConnectionPool>, u16)>,
+    ) -> TestUac {
         let (udp_tx, udp_rx) = flume::unbounded();
         let (tcp_tx, tcp_rx) = flume::unbounded();
         let (tls_tx, tls_rx) = flume::unbounded();
@@ -2022,18 +2031,24 @@ pub(crate) mod tests {
             sctp: Some(sctp_tx),
         });
 
+        let sender = UacSender::new(
+            router,
+            "127.0.0.1:5060".parse().unwrap(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            None,
+            None,
+            crate::config::IdentityHeaders::default().shared(),
+        );
+        let sender = match over_mtu {
+            Some((pool, mtu)) => sender.with_over_mtu(pool, Some(mtu)),
+            None => sender,
+        };
         TestUac {
-            sender: Arc::new(UacSender::new(
-                router,
-                "127.0.0.1:5060".parse().unwrap(),
-                std::collections::HashMap::new(),
-                std::collections::HashMap::new(),
-                None,
-                None,
-                crate::config::IdentityHeaders::default().shared(),
-            )),
+            sender: Arc::new(sender),
             udp: udp_rx,
-            _other: vec![tcp_rx, tls_rx, ws_rx, wss_rx, sctp_rx],
+            tcp: tcp_rx,
+            _other: vec![tls_rx, ws_rx, wss_rx, sctp_rx],
         }
     }
 

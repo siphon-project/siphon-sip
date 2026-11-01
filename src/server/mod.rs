@@ -2187,7 +2187,8 @@ impl SiphonServer {
             .with_ipsec_egress(
                 ipsec_manager.clone(),
                 config.ipsec.as_ref().map(|ipsec| ipsec.pcscf_port_s),
-            ),
+            )
+            .with_over_mtu(Arc::clone(&connection_pool), config.listen.mtu),
         );
 
         // Wire UAC sender into proxy.send_request() Python API

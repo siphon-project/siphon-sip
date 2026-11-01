@@ -262,6 +262,10 @@ harness = false
 name = "proxy_branch_cancel" # RFC 3261 §9.1: the INVITE client transaction's step per response, and a request to cancel
 harness = false
 
+[[bench]]
+name = "flow_over_mtu"      # RFC 3261 §18.1.1 over a UE's SA flow: the per-request switch decision
+harness = false
+
 [features]
 default = ["redis-backend", "postgres-backend"]
 redis-backend = ["dep:redis"]

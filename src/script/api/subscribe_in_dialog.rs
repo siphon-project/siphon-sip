@@ -106,7 +106,7 @@ pub(super) async fn send_in_dialog(
     let message = build_in_dialog_subscribe(dialog, expires_secs, transport, sent_by)?;
     let Some(wait) = wait else {
         match &egress {
-            InDialogEgress::Flow(flow) => flow.send_and_forget(uac, message),
+            InDialogEgress::Flow(flow) => flow.send_and_forget(uac, message).await,
             InDialogEgress::Resolved {
                 address, transport, ..
             } => uac.send_request(message, *address, *transport),
@@ -114,7 +114,7 @@ pub(super) async fn send_in_dialog(
         return Ok(());
     };
     let receiver = match &egress {
-        InDialogEgress::Flow(flow) => flow.send(uac, message),
+        InDialogEgress::Flow(flow) => flow.send(uac, message).await,
         InDialogEgress::Resolved {
             address, transport, ..
         } => uac.send_request_with_response(message, *address, *transport),

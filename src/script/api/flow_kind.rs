@@ -40,6 +40,36 @@ impl FlowKind {
     }
 }
 
+impl PyFlow {
+    /// The TCP path a request of `serialized_len` bytes takes over this flow
+    /// instead of UDP: only for siphon's own UDP flow to its first hop as a UE
+    /// (the registrant's SA, `registration.flow()`), from the UE's protected
+    /// client port to the P-CSCF's protected server port, once it is over the
+    /// MTU (RFC 3261 clause 18.1.1, [`OverMtuTcp::decide`]). Every other flow
+    /// keeps its transport: a callee's flow (the proxy and registrar side), a
+    /// stream flow, a WebSocket flow.
+    ///
+    /// `None` is one comparison when the flow is not a registrant's, and the
+    /// size is read only for a UE flow with an MTU set.
+    pub fn over_mtu_tcp(
+        &self,
+        mtu: Option<u16>,
+        serialized_len: impl FnOnce() -> usize,
+    ) -> Option<crate::registrant::OverMtuTcp> {
+        self.kind.registrant()?;
+        if self.transport != "udp" {
+            return None;
+        }
+        crate::registrant::OverMtuTcp::decide(
+            self.local_addr,
+            self.source_addr,
+            crate::transport::Transport::Udp,
+            mtu,
+            serialized_len,
+        )
+    }
+}
+
 /// The flow a request goes over, once its route set has had its say.
 ///
 /// A callee's flow yields to a route set, which for it is a Path (RFC 3327

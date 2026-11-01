@@ -579,3 +579,160 @@ async fn a_subscription_body_goes_on_a_resolved_subscribe_too() {
         assert!(attempt.await.unwrap().is_err(), "unanswered");
     }
 }
+
+use crate::script::api::uac_flow_lab::{filler, UeLab};
+use crate::transport::pool::ConnectionPool;
+use crate::transport::Transport;
+
+impl Watcher {
+    /// A watcher whose UAC moves a request over a UE's SA flow that is over
+    /// 1280 bytes to TCP on `pool`.
+    fn over_mtu(pool: Arc<ConnectionPool>) -> Self {
+        Watcher {
+            uac: Box::leak(Box::new(crate::gateway::tests::test_uac_over_mtu(Some((
+                pool, 1280,
+            ))))),
+            resolver: Box::leak(Box::new(SipResolver::from_system().unwrap())),
+            registrants: Arc::new(crate::registrant::test_support::manager()),
+            store: Arc::new(SubscribeStore::new()),
+        }
+    }
+
+    /// What went out next, and whether over TCP.
+    async fn sent_either(&self) -> (bool, OutboundMessage) {
+        tokio::select! {
+            sent = self.uac.tcp.recv_async() => (true, sent.expect("open")),
+            sent = self.uac.udp.recv_async() => (false, sent.expect("open")),
+            _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("nothing was sent"),
+        }
+    }
+}
+
+fn pool() -> Arc<ConnectionPool> {
+    let (inbound_tx, inbound) = flume::unbounded();
+    std::mem::forget(inbound);
+    Arc::new(ConnectionPool::for_tests(
+        Arc::new(dashmap::DashMap::new()),
+        inbound_tx,
+    ))
+}
+
+fn route_set_of(entries: usize) -> Vec<String> {
+    (0..entries)
+        .map(|index| {
+            format!(
+                "<sip:hop{index}.{}.ims.mnc001.mcc001.3gppnetwork.org:5066;lr>",
+                "x".repeat(60)
+            )
+        })
+        .collect()
+}
+
+/// A subscription over the SA with a request over the MTU goes over TCP from
+/// the set's client port, its refresh and its unsubscribe each by their own
+/// size (RFC 3261 clause 18.1.1), the response matched as for UDP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_subscription_and_its_refreshes_pick_tcp_or_udp_by_their_own_size() {
+    let pool = pool();
+    let watcher = Arc::new(Watcher::over_mtu(Arc::clone(&pool)));
+    let lab = UeLab::new(144, true).await;
+    let aor = lab.established(&watcher.registrants, 1);
+    let flow = registrant_flow(&watcher.registrants, &aor, lab.ue_ip).expect("a flow");
+    assert_eq!(flow.local_addr, lab.source);
+    lab.pin(&pool);
+
+    let send = watcher.send(Some(flow), ue_route_set());
+    let subscriber = aor.clone();
+    let handle = tokio::spawn(async move {
+        PySubscribeState::send_inner(
+            send,
+            &subscriber,
+            "reg",
+            600000,
+            Some("application/reginfo+xml"),
+            None,
+            vec![
+                ("From".to_string(), format!("<{subscriber}>")),
+                (
+                    "X-Filler".to_string(),
+                    String::from_utf8(filler(1500)).unwrap(),
+                ),
+            ],
+            5000,
+            None,
+        )
+        .await
+    });
+    let (over_tcp, sent) = watcher.sent_either().await;
+    assert!(over_tcp, "the SUBSCRIBE over the MTU goes over TCP");
+    assert_eq!(sent.transport, Transport::Tcp);
+    assert_eq!(sent.destination, lab.pcscf);
+    assert_eq!(sent.source_local_addr, Some(lab.source));
+    let subscribe = parse_sip_message_bytes(&sent.data).unwrap();
+    let via = subscribe.headers.get("Via").cloned().unwrap();
+    assert!(
+        via.starts_with(&format!("SIP/2.0/TCP {};branch=", lab.server)),
+        "{via}"
+    );
+    let (_connection, peer) = lab.accept().await;
+    assert_eq!(peer, lab.source);
+    watcher.accept(&subscribe);
+    let id = handle.await.unwrap().expect("subscribed").id;
+    let dialog: SubscribeDialog = watcher.store.get_local(&id).expect("the dialog");
+
+    send_in_dialog(
+        &watcher.uac.sender,
+        watcher.resolver,
+        Some(&watcher.registrants),
+        &dialog,
+        600000,
+        None,
+    )
+    .await
+    .expect("sent");
+    let (over_tcp, sent) = watcher.sent_either().await;
+    assert!(!over_tcp, "a small refresh stays UDP");
+    assert_eq!(sent.source_local_addr, Some(lab.source));
+
+    let mut grown = dialog.clone();
+    grown.route_set = route_set_of(12);
+    let refresh = {
+        let (watcher, grown) = (Arc::clone(&watcher), grown.clone());
+        tokio::spawn(async move {
+            send_in_dialog(
+                &watcher.uac.sender,
+                watcher.resolver,
+                Some(&watcher.registrants),
+                &grown,
+                600000,
+                Some(Duration::from_secs(5)),
+            )
+            .await
+        })
+    };
+    let (over_tcp, sent) = watcher.sent_either().await;
+    assert!(over_tcp, "a refresh over the MTU goes over TCP");
+    assert_eq!(sent.source_local_addr, Some(lab.source));
+    let refreshed = parse_sip_message_bytes(&sent.data).unwrap();
+    assert!(refreshed
+        .headers
+        .get("Via")
+        .is_some_and(|via| via.starts_with("SIP/2.0/TCP ")));
+    watcher.accept(&refreshed);
+    refresh.await.unwrap().expect("the 2xx over the connection");
+
+    send_in_dialog(
+        &watcher.uac.sender,
+        watcher.resolver,
+        Some(&watcher.registrants),
+        &grown,
+        0,
+        None,
+    )
+    .await
+    .expect("sent");
+    let (over_tcp, _) = watcher.sent_either().await;
+    assert!(over_tcp, "the unsubscribe over the MTU goes over TCP");
+    assert_eq!(pool.connections_bound_on(lab.ue_ip), 1, "one connection");
+    pool.reconcile_pinned_sources(Default::default(), &Default::default());
+}

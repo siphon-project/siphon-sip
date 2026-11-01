@@ -1044,7 +1044,13 @@ class Call:
                 Path (RFC 3327 §5.3).  A ``registration.flow(impu)`` is the
                 UE's own SA to the P-CSCF instead: the INVITE always leaves
                 over it, and ``route=`` goes on the wire as Route headers
-                (TS 24.229 §5.1.2A.1.1).
+                (TS 24.229 §5.1.2A.1.1).  With ``listen.mtu`` set, an INVITE
+                over that SA that is over the threshold (RFC 3261 §18.1.1)
+                leaves over TCP from the UE's protected client port to the
+                P-CSCF's protected server port, with a TCP Via, and falls back
+                to UDP when the connection cannot be opened.  The leg stays on
+                TCP for its CANCEL and in-dialog requests.  A callee's flow
+                and a flow already on a stream transport keep their transport.
             header_policy: Qualified policy name selecting which header
                 policy the framework applies when building the B-leg
                 INVITE and forwarding responses back to the A-leg.

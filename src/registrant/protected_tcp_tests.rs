@@ -450,3 +450,57 @@ async fn register_and_de_register_cycles_return_every_store_to_baseline() {
     }
     assert!(wait_until(|| fixture.connection_map.is_empty()).await);
 }
+#[test]
+fn only_the_udp_token_of_the_top_via_becomes_tcp() {
+    let cases = [
+        (
+            "SIP/2.0/UDP 192.0.2.77:6101;branch=z9hG4bK-a;rport",
+            "SIP/2.0/TCP 192.0.2.77:6101;branch=z9hG4bK-a;rport",
+        ),
+        (
+            "SIP/2.0/udp 192.0.2.77:6101;branch=z9hG4bK-a",
+            "SIP/2.0/TCP 192.0.2.77:6101;branch=z9hG4bK-a",
+        ),
+        (
+            "SIP/2.0/TCP 192.0.2.77:6101;branch=z9hG4bK-a",
+            "SIP/2.0/TCP 192.0.2.77:6101;branch=z9hG4bK-a",
+        ),
+        (
+            "SIP/2.0/TLS 192.0.2.77:6101;branch=z9hG4bK-a",
+            "SIP/2.0/TLS 192.0.2.77:6101;branch=z9hG4bK-a",
+        ),
+        ("garbage", "garbage"),
+    ];
+    for (via, expected) in cases {
+        assert_eq!(tcp_via(via), expected, "{via}");
+    }
+}
+
+#[test]
+fn the_decision_reads_the_size_only_with_an_mtu_and_a_udp_request() {
+    let source: SocketAddr = "192.0.2.77:6100".parse().expect("addr");
+    let destination: SocketAddr = "198.51.100.10:5066".parse().expect("addr");
+    let unread = || -> usize { panic!("the size is not read") };
+    assert_eq!(
+        OverMtuTcp::decide(source, destination, Transport::Udp, None, unread),
+        None,
+        "no MTU: no size read"
+    );
+    assert_eq!(
+        OverMtuTcp::decide(source, destination, Transport::Tcp, Some(1280), unread),
+        None,
+        "already a stream: no size read"
+    );
+    assert_eq!(
+        OverMtuTcp::decide(source, destination, Transport::Udp, Some(1280), || 1080),
+        None,
+        "at mtu - 200 is not over"
+    );
+    assert_eq!(
+        OverMtuTcp::decide(source, destination, Transport::Udp, Some(1280), || 1081),
+        Some(OverMtuTcp {
+            source,
+            destination
+        })
+    );
+}

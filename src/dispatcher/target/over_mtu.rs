@@ -51,6 +51,32 @@ pub(in crate::dispatcher) fn over_mtu_upgrade(
     }
 }
 
+/// The over-MTU switch (RFC 3261 §18.1.1) of a request siphon sends as a UE
+/// over its own SA flow (`call.dial(flow=registration.flow())`,
+/// `request.relay(flow=...)` with one): `true` once the connection from the
+/// UE's protected client port to the P-CSCF's protected server port is open and
+/// the request is to go over it as TCP, `false` to keep it on the flow's UDP.
+///
+/// The same path as the registrant's REGISTER and a script's
+/// `proxy.send_request(flow=)` ([`crate::registrant::OverMtuTcp`]); the decision
+/// is [`PyFlow::over_mtu_tcp`](crate::script::api::registrar::PyFlow). Any other
+/// flow (a callee's, a stream's) is `false` without a size read. The connect
+/// runs released from the interpreter, like the generic switch's probe (never
+/// blocking while attached), and the pool backs off a destination that failed.
+pub(in crate::dispatcher) fn flow_over_mtu_upgrade(
+    state: &DispatcherState,
+    flow: Option<&crate::script::api::registrar::PyFlow>,
+    message: &SipMessage,
+) -> bool {
+    let Some(path) =
+        flow.and_then(|flow| flow.over_mtu_tcp(state.mtu, || message.to_bytes().len()))
+    else {
+        return false;
+    };
+    let method = message.method().map_or("", Method::as_str);
+    crate::script::blocking::block_on_released(path.connect(&state.connection_pool, method))
+}
+
 /// What the switch does toward a destination with a security association.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProtectedOverMtu {

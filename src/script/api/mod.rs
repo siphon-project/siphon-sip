@@ -58,6 +58,11 @@ pub mod subscribe_state;
 mod surface_snapshot;
 pub mod timer;
 mod uac_flow;
+#[cfg(test)]
+pub(crate) mod uac_flow_lab;
+#[cfg(test)]
+#[path = "uac_flow_over_mtu_tests.rs"]
+mod uac_flow_over_mtu_tests;
 
 use std::ffi::CString;
 use std::sync::{Arc, Mutex, OnceLock};

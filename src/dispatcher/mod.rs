@@ -57,6 +57,8 @@ mod charging;
 mod completed_invite;
 mod engine_channel_events;
 mod failure;
+#[cfg(test)]
+mod flow_over_mtu_tests;
 mod identity;
 mod in_dialog;
 mod inbound;

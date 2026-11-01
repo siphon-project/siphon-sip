@@ -251,3 +251,118 @@ async fn a_publish_waiting_for_its_response_rides_the_sa_like_a_message() {
     );
     assert_eq!(message.body, vec![0x01, 0x02]);
 }
+
+// --- over the MTU on a UE's SA flow ---------------------------------------------
+
+use crate::script::api::uac_flow_lab::{filler, UeLab};
+
+/// Send `method` from Python over `flow` with a `body_len` body; the request
+/// comes back from whichever channel it left on: `(over_tcp, message)`.
+fn send_sized(
+    fixture: &SendFixture,
+    method: &str,
+    flow: PyFlow,
+    body_len: usize,
+) -> (bool, OutboundMessage) {
+    Python::attach(|python| {
+        let proxy = Py::new(
+            python,
+            super::PyProxyUtils::new(std::sync::Arc::clone(&fixture.resolver)),
+        )
+        .unwrap();
+        let kwargs = PyDict::new(python);
+        let headers = PyDict::new(python);
+        headers
+            .set_item("To", "<sip:+15550100@ims.mnc01.mcc001.3gppnetwork.org>")
+            .unwrap();
+        headers.set_item("Content-Type", "text/plain").unwrap();
+        headers.set_item("Event", "presence").unwrap();
+        kwargs.set_item("headers", &headers).unwrap();
+        kwargs
+            .set_item("body", pyo3::types::PyBytes::new(python, &filler(body_len)))
+            .unwrap();
+        kwargs
+            .set_item("flow", Py::new(python, flow).unwrap())
+            .unwrap();
+        kwargs.set_item("wait_for_response", false).unwrap();
+        run_send_request(
+            python,
+            proxy.bind(python).as_any(),
+            method,
+            "sip:+15550100@ims.mnc01.mcc001.3gppnetwork.org",
+            &kwargs,
+        )
+        .expect("sent over the flow");
+    });
+    let wait = std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if let Ok(sent) = fixture.tcp.try_recv() {
+            return (true, sent);
+        }
+        if let Ok(sent) = fixture.udp.try_recv() {
+            return (false, sent);
+        }
+        assert!(std::time::Instant::now() < deadline, "{method} went out");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+// The turn on the shared sender is held across the awaits on purpose: it keeps
+// the other tests off it while this one reads its wire.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_threshold_message_or_publish_over_a_ue_flow_goes_tcp_and_a_small_one_udp() {
+    let (_turn, fixture) = SendFixture::turn();
+    let lab = UeLab::new(141, true).await;
+    lab.pin(&fixture.pool);
+    for method in ["MESSAGE", "PUBLISH"] {
+        let (over_tcp, sent) = send_sized(fixture, method, lab.flow(), 1500);
+        assert!(over_tcp, "{method} over the MTU goes over TCP");
+        assert_eq!(sent.transport, crate::transport::Transport::Tcp);
+        assert_eq!(sent.destination, lab.pcscf, "to the P-CSCF's port_ps");
+        assert_eq!(sent.source_local_addr, Some(lab.source), "from port_uc");
+        assert!(
+            via(&sent).starts_with(&format!("SIP/2.0/TCP {};branch=", lab.server)),
+            "{}",
+            via(&sent)
+        );
+        let (_connection, peer) = lab.accept().await;
+        assert_eq!(peer, lab.source);
+
+        let (over_tcp, sent) = send_sized(fixture, method, lab.flow(), 20);
+        assert!(!over_tcp, "{method} under the MTU stays UDP");
+        assert!(via(&sent).starts_with("SIP/2.0/UDP "), "{}", via(&sent));
+        assert_eq!(sent.source_local_addr, Some(lab.source));
+    }
+    // One pooled connection served both methods.
+    assert_eq!(fixture.pool.connections_bound_on(lab.ue_ip), 1);
+    fixture
+        .pool
+        .reconcile_pinned_sources(Default::default(), &Default::default());
+}
+
+// The turn on the shared sender is held across the awaits on purpose: it keeps
+// the other tests off it while this one reads its wire.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_threshold_send_request_refused_by_the_p_cscf_goes_udp_and_a_callee_flow_is_unchanged(
+) {
+    let (_turn, fixture) = SendFixture::turn();
+    let refused = UeLab::new(142, false).await;
+    refused.pin(&fixture.pool);
+    let (over_tcp, sent) = send_sized(fixture, "MESSAGE", refused.flow(), 1500);
+    assert!(!over_tcp, "connect refused: the UDP retry");
+    assert!(via(&sent).starts_with("SIP/2.0/UDP "), "{}", via(&sent));
+    assert!(sent.data.len() > 1500);
+
+    let callee = UeLab::new(143, true).await;
+    callee.pin(&fixture.pool);
+    let (over_tcp, sent) = send_sized(fixture, "MESSAGE", callee.inbound_flow(), 1500);
+    assert!(!over_tcp, "a callee's flow keeps its transport");
+    assert!(via(&sent).starts_with("SIP/2.0/UDP "), "{}", via(&sent));
+    assert!(!callee.sees_connection().await);
+    fixture
+        .pool
+        .reconcile_pinned_sources(Default::default(), &Default::default());
+}

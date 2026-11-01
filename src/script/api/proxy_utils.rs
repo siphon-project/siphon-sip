@@ -919,7 +919,7 @@ impl PyProxyUtils {
                 .build(uri, egress.transport, &egress.sent_by)
                 .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
             return crate::script::awaitable(python, async move {
-                let receiver = egress.send(&uac, message);
+                let receiver = egress.send(&uac, message).await;
                 await_send_request_reply(uac, receiver, branch, wait_for_response, timeout).await
             });
         }
@@ -2506,8 +2506,13 @@ mod tests {
     /// and takes turns on it ([`SendFixture::turn`]).
     pub(super) struct SendFixture {
         pub(super) udp: flume::Receiver<crate::transport::OutboundMessage>,
+        pub(super) tcp: flume::Receiver<crate::transport::OutboundMessage>,
+        /// The pool a request over a UE's SA flow moves to TCP with (the
+        /// sender's `listen.mtu` is 1280).
+        pub(super) pool: Arc<crate::transport::pool::ConnectionPool>,
         pub(super) resolver: Arc<SipResolver>,
         _other: Vec<flume::Receiver<crate::transport::OutboundMessage>>,
+        _inbound: flume::Receiver<crate::transport::InboundMessage>,
     }
 
     static SEND_FIXTURE: std::sync::OnceLock<SendFixture> = std::sync::OnceLock::new();
@@ -2541,15 +2546,23 @@ mod tests {
                     wss: wss_tx,
                     sctp: Some(sctp_tx),
                 });
-                let sender = Arc::new(UacSender::new(
-                    router,
-                    "127.0.0.1:5060".parse().unwrap(),
-                    HashMap::new(),
-                    HashMap::new(),
-                    None,
-                    None,
-                    crate::config::IdentityHeaders::default().shared(),
+                let (inbound_tx, inbound_rx) = flume::unbounded();
+                let pool = Arc::new(crate::transport::pool::ConnectionPool::for_tests(
+                    Arc::new(dashmap::DashMap::new()),
+                    inbound_tx,
                 ));
+                let sender = Arc::new(
+                    UacSender::new(
+                        router,
+                        "127.0.0.1:5060".parse().unwrap(),
+                        HashMap::new(),
+                        HashMap::new(),
+                        None,
+                        None,
+                        crate::config::IdentityHeaders::default().shared(),
+                    )
+                    .with_over_mtu(Arc::clone(&pool), Some(1280)),
+                );
                 let resolver = Arc::new(SipResolver::from_system().unwrap());
                 assert!(
                     UAC_SENDER.set(sender).is_ok(),
@@ -2558,11 +2571,15 @@ mod tests {
                 let _ = SEND_RESOLVER.set(Arc::clone(&resolver));
                 SendFixture {
                     udp: udp_rx,
+                    tcp: tcp_rx,
+                    pool,
                     resolver,
-                    _other: vec![tcp_rx, tls_rx, ws_rx, wss_rx, sctp_rx],
+                    _other: vec![tls_rx, ws_rx, wss_rx, sctp_rx],
+                    _inbound: inbound_rx,
                 }
             });
             while fixture.udp.try_recv().is_ok() {}
+            while fixture.tcp.try_recv().is_ok() {}
             (turn, fixture)
         }
     }
