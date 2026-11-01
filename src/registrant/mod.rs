@@ -16,6 +16,7 @@
 
 pub mod address;
 pub mod aka;
+mod contact;
 mod egress;
 #[cfg(test)]
 pub(crate) use egress::{established_ue, rotate_sa_set};
@@ -25,11 +26,14 @@ pub mod messages;
 pub mod pacing;
 pub mod protected;
 mod refresh;
+pub mod register_extras;
 pub mod source;
 mod status;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+use contact::build_contact_header;
+pub use contact::ImsContactParams;
 pub use egress::UeEgress;
 pub use lifecycle::{Deregistration, RegisterTransactions};
 pub use messages::{BuiltRegister, EgressDefaults};
@@ -174,23 +178,6 @@ impl fmt::Display for AuthMode {
             Self::Aka => write!(formatter, "aka"),
         }
     }
-}
-
-/// IMS Contact-header feature tags (3GPP TS 24.229 §5.1.1.2 / GSMA IR.92,
-/// NG.114). These let the S-CSCF match iFCs and register the UE's MMTel /
-/// voice / video / SMS services, and carry the instance ID for GRUU/outbound
-/// (RFC 5626). Emitted after the `<sip:…>` of the Contact when present.
-#[derive(Debug, Clone, Default)]
-pub struct ImsContactParams {
-    /// IMEI for `+sip.instance="<urn:gsma:imei:…>"` (RFC 5626 instance ID).
-    /// `None` → no instance tag.
-    pub instance_id: Option<String>,
-    /// Emit the MMTel ICSI tag (`+g.3gpp.icsi-ref` mmtel).
-    pub mmtel: bool,
-    /// Emit `;video`.
-    pub video: bool,
-    /// Emit `+g.3gpp.smsip` (SMS-over-IP).
-    pub smsip: bool,
 }
 
 /// UE-side IPsec sec-agree parameters for an AKA registration (3GPP TS 33.203).
@@ -550,6 +537,10 @@ pub struct RegistrantEntry {
     /// appended to the Contact so the S-CSCF registers the implied services.
     pub ims_contact: Option<ImsContactParams>,
 
+    /// Headers and a body for every registering REGISTER of this entry
+    /// ([`register_extras`]).
+    pub register_extras: Option<register_extras::RegisterExtras>,
+
     // --- Per-entry address (see `address`) ---
     /// The address this entry registers from: its Via/Contact host, the UDP
     /// source of every REGISTER, and with IPsec the UE side of its SAs.
@@ -605,6 +596,7 @@ impl RegistrantEntry {
             path: Vec::new(),
             ue_ipsec: None,
             ims_contact: None,
+            register_extras: None,
             local_addr: None,
             require_local_addr: false,
             refresh_window: None,
@@ -671,6 +663,12 @@ impl RegistrantEntry {
     /// S-CSCF registers the implied services (TS 24.229 / GSMA IR.92).
     pub fn with_ims_contact(mut self, ims: ImsContactParams) -> Self {
         self.ims_contact = Some(ims);
+        self
+    }
+
+    /// Add `extras` to every registering REGISTER of this entry.
+    pub fn with_register_extras(mut self, extras: register_extras::RegisterExtras) -> Self {
+        self.register_extras = Some(extras);
         self
     }
 
@@ -1386,30 +1384,6 @@ impl fmt::Debug for RegistrantManager {
 /// — what a real VoLTE handset offers, so the S-CSCF/AS see the supported set.
 const IMS_ALLOW_METHODS: &str =
     "INVITE, ACK, OPTIONS, CANCEL, BYE, UPDATE, INFO, REFER, NOTIFY, MESSAGE, PRACK";
-
-/// Build the Contact header value: `<contact_uri>` plus any IMS feature tags
-/// (3GPP TS 24.229 §5.1.1.2 / GSMA IR.92). The instance ID, `q=1.0`, MMTel
-/// ICSI, `video` and SMS-over-IP tags are emitted in handset order so the
-/// S-CSCF registers the implied services. Without `ims`, just `<contact_uri>`.
-fn build_contact_header(contact_uri: &str, ims: Option<&ImsContactParams>) -> String {
-    let mut header = format!("<{}>", contact_uri);
-    if let Some(ims) = ims {
-        if let Some(ref imei) = ims.instance_id {
-            header.push_str(&format!(";+sip.instance=\"<urn:gsma:imei:{imei}>\""));
-        }
-        header.push_str(";q=1.0");
-        if ims.mmtel {
-            header.push_str(";+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"");
-        }
-        if ims.video {
-            header.push_str(";video");
-        }
-        if ims.smsip {
-            header.push_str(";+g.3gpp.smsip");
-        }
-    }
-    header
-}
 
 /// Build a default Contact URI from the entry's username, effective address, and transport.
 ///
@@ -2768,6 +2742,7 @@ mod tests {
             instance_id: Some("35436012-861541-0".to_string()),
             mmtel: true,
             video: true,
+            mcptt: false,
             smsip: true,
         };
         let header = build_contact_header("sip:208909990000002@100.65.0.4:5060", Some(&ims));

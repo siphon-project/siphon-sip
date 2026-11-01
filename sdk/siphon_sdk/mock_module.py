@@ -9057,6 +9057,16 @@ class MockRegistration:
         "awaiting_address",
     )
 
+    # Headers siphon builds itself on a REGISTER (lower case; compact forms
+    # are folded to these). Mirrors the Rust binding's refused set.
+    _REGISTER_OWNED_HEADERS = frozenset({
+        "via", "from", "to", "call-id", "cseq", "contact", "expires",
+        "max-forwards", "route", "record-route", "content-length",
+        "content-type", "authorization", "proxy-authorization",
+        "security-client", "security-verify", "security-server", "require",
+        "proxy-require", "supported", "allow", "user-agent",
+    })
+
     def __init__(self) -> None:
         self._entries: dict[str, dict] = {}
         self._sequence: int = 0
@@ -9074,6 +9084,8 @@ class MockRegistration:
             ue_port_s: Optional[int] = None, ipsec_alg: Optional[str] = None,
             ipsec_ealg: Optional[str] = None, imei: Optional[str] = None,
             ims_features: Optional[list[str]] = None,
+            register_body: Optional[tuple[str, Union[bytes, str]]] = None,
+            register_headers: Optional[dict[str, str]] = None,
             local_addr: Optional[str] = None,
             require_local_addr: bool = False,
             refresh_window: Optional[tuple[float, float]] = None) -> None:
@@ -9113,7 +9125,30 @@ class MockRegistration:
             imei: IMEI for the Contact +sip.instance (urn:gsma:imei), e.g.
                 "01234567-000001-0". None: no instance tag.
             ims_features: Contact feature tags to advertise: any of "mmtel",
-                "video", "smsip".
+                "video", "smsip", "mcptt" (case-insensitive; anything else
+                raises ValueError). "mcptt" adds ``+g.3gpp.mcptt`` and the
+                MCPTT ICSI to the Contact (3GPP TS 24.379 clause 7.2.1); with
+                "mmtel" both ICSIs share one ``+g.3gpp.icsi-ref`` parameter
+                (``"...icsi.mmtel,...icsi.mcptt"``, TS 24.229 clause 7.9.2).
+                siphon adds no P-Preferred-Service to a REGISTER (TS 24.379
+                7.2.1 asks for none); pass one in `register_headers` if the
+                core wants it.
+            register_body: ``(content_type, body)`` carried by every REGISTER
+                that registers: the initial one, each refresh, the answer to
+                a 401 (digest or AKA, protected or not) and the protected
+                re-REGISTER. `body` is ``bytes`` or ``str`` (UTF-8);
+                Content-Type and Content-Length are set from it. The
+                de-REGISTER (Expires 0) carries none: TS 24.379 7.2.1 asks
+                for it to authorise a binding, not to remove one. The MCPTT
+                service authorisation goes here as
+                ``("application/vnd.3gpp.mcptt-info+xml", xml)``.
+            register_headers: ``{name: value}`` added, in order, to the same
+                REGISTERs as `register_body`. A header siphon builds on a
+                REGISTER (Via, From, To, Call-ID, CSeq, Contact, Expires,
+                Max-Forwards, Route, Content-Type, Content-Length,
+                Authorization, Security-Client/Verify, Require, Supported,
+                Allow, User-Agent, ...) raises ValueError, as does a name that
+                is not a header field name or a value with a line break.
             local_addr: The IP this entry registers from (an address, no
                 port): the Via/Contact host, the UDP source, and with ipsec
                 the UE side of its SAs. siphon opens the sockets itself, so
@@ -9131,7 +9166,10 @@ class MockRegistration:
                 registrant default (half the grant).
 
         Raises:
-            ValueError: when `transport` is not udp/tcp/tls; when auth="aka"
+            ValueError: when `ims_features` names an unknown tag; when
+                `register_headers` names a header siphon owns on a REGISTER or
+                `register_body`'s content type is not a MIME type; when
+                `transport` is not udp/tcp/tls; when auth="aka"
                 but `k` or an operator key (`op`/`opc`) is missing; when
                 ipsec=True without auth="aka" / ue_port_c / ue_port_s; when
                 `local_addr` is not an IP address, or is given with
@@ -9154,7 +9192,51 @@ class MockRegistration:
                              require_local_addr=True)
             assert registration.status(impu) == "awaiting_address"
             registration.set_local_addr(impu, "192.0.2.77")
+
+            # An MCPTT client: feature tags in the Contact and the service
+            # authorisation in the body of every REGISTER.
+            registration.add(impu, "sip:198.51.100.10:5060", user=impi,
+                             auth="aka", k=k, opc=opc,
+                             ims_features=["mmtel", "mcptt"],
+                             register_body=("application/vnd.3gpp.mcptt-info+xml",
+                                            mcptt_info_xml),
+                             register_headers={"P-Preferred-Service":
+                                 "urn:urn-7:3gpp-service.ims.icsi.mcptt"})
         """
+        features = [feature.lower() for feature in (ims_features or [])]
+        for feature in features:
+            if feature not in ("mmtel", "video", "smsip", "mcptt"):
+                raise ValueError(
+                    f"unknown ims feature {feature!r} (mmtel, video, smsip, mcptt)"
+                )
+        body_bytes: Optional[bytes] = None
+        if register_body is not None:
+            content_type, body = register_body
+            if ("/" not in content_type or content_type.strip() != content_type
+                    or any(c in content_type for c in "\r\n\0")):
+                raise ValueError(
+                    f"register_body content type {content_type!r} is not a MIME type"
+                )
+            if isinstance(body, str):
+                body_bytes = body.encode("utf-8")
+            elif isinstance(body, (bytes, bytearray)):
+                body_bytes = bytes(body)
+            else:
+                raise TypeError("register_body is (content_type, body) with body bytes or str")
+        compact_forms = {"v": "via", "f": "from", "t": "to", "i": "call-id",
+                         "m": "contact", "l": "content-length",
+                         "c": "content-type", "k": "supported"}
+        extra_headers: list[tuple[str, str]] = []
+        for name, value in (register_headers or {}).items():
+            if (not name or any(c in name for c in " \t:\r\n\0")
+                    or any(c in value for c in "\r\n\0")):
+                raise ValueError(f"register_headers: {name!r} is not a usable header")
+            canonical = compact_forms.get(name.lower(), name.lower())
+            if canonical in self._REGISTER_OWNED_HEADERS:
+                raise ValueError(
+                    f"{name} cannot be set by register_headers: siphon owns it on a REGISTER"
+                )
+            extra_headers.append((name, value))
         if transport is not None and transport.lower() not in ("udp", "tcp", "tls"):
             raise ValueError(
                 f"registration.add(transport=): {transport!r} is not one siphon can "
@@ -9204,7 +9286,9 @@ class MockRegistration:
             "ipsec_alg": ipsec_alg or "hmac-sha-1-96",
             "ipsec_ealg": ipsec_ealg or "null",
             "imei": imei,
-            "ims_features": list(ims_features) if ims_features else [],
+            "ims_features": features,
+            "register_body": (register_body[0], body_bytes) if register_body else None,
+            "register_headers": extra_headers,
             "local_addr": address,
             "require_local_addr": requires_address,
             "refresh_window": window,

@@ -8,6 +8,7 @@
 //! An `impl RegistrantManager` block in a child module, so it keeps full access
 //! to the manager's private state and every call site is unchanged.
 
+use super::register_extras::RegisterExtras;
 use super::*;
 
 /// The process-wide addressing a REGISTER falls back to: what every entry
@@ -231,7 +232,8 @@ impl RegistrantManager {
             }
         }
 
-        let message = builder.build();
+        let message =
+            RegisterExtras::apply(entry.register_extras.as_ref(), builder, expires).build();
 
         let destination = entry.destination;
         let transport = entry.transport;
@@ -353,7 +355,8 @@ impl RegistrantManager {
             builder = builder.header("User-Agent", user_agent.clone());
         }
 
-        let message = builder.build();
+        let message =
+            RegisterExtras::apply(entry.register_extras.as_ref(), builder, expires).build();
 
         let destination = entry.destination;
         let transport = entry.transport;
@@ -549,7 +552,8 @@ impl RegistrantManager {
             }
         }
 
-        let message = builder.build();
+        let message =
+            RegisterExtras::apply(entry.register_extras.as_ref(), builder, expires).build();
         let transport = entry.transport;
 
         // The protected REGISTER goes to the P-CSCF's protected server port

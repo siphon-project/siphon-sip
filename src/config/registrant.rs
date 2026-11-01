@@ -196,6 +196,11 @@ pub struct RegistrantEntryConfig {
     /// IMS Contact feature tags (instance ID + MMTel/video/SMS) so the S-CSCF
     /// registers the implied services.
     pub ims: Option<RegistrantImsConfig>,
+    /// Extra headers and a MIME body on every registering REGISTER (the
+    /// de-REGISTER carries neither). The MCPTT client puts its
+    /// `application/vnd.3gpp.mcptt-info+xml` service authorisation here (TS
+    /// 24.379 clause 7.2.1).
+    pub register: Option<RegistrantRegisterConfig>,
     /// The address this entry registers from: Via and Contact host, the UDP
     /// source of every REGISTER, and with `ipsec` the UE side of its SAs (its
     /// protected ports opened on this address, so they may repeat across
@@ -213,12 +218,26 @@ pub struct RegistrantEntryConfig {
     pub refresh_window: Option<[f64; 2]>,
 }
 
+/// What a registrant entry adds to its REGISTERs.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RegistrantRegisterConfig {
+    /// Content-Type of `body`, e.g. `application/vnd.3gpp.mcptt-info+xml`.
+    /// Required with `body`.
+    pub content_type: Option<String>,
+    /// The body, as text.
+    pub body: Option<String>,
+    /// Extra headers, in order. Headers siphon builds on a REGISTER (Via,
+    /// Contact, Authorization, ...) are refused.
+    #[serde(default)]
+    pub headers: indexmap::IndexMap<String, String>,
+}
+
 /// IMS Contact feature tags for a registrant entry (TS 24.229 / GSMA IR.92).
 #[derive(Debug, Deserialize, Clone)]
 pub struct RegistrantImsConfig {
     /// IMEI for `+sip.instance="<urn:gsma:imei:…>"` (RFC 5626 instance ID).
     pub imei: Option<String>,
-    /// Feature tags to advertise: any of "mmtel", "video", "smsip".
+    /// Feature tags to advertise: any of "mmtel", "video", "smsip", "mcptt".
     #[serde(default)]
     pub features: Vec<String>,
 }

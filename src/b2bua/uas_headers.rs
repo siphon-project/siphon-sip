@@ -92,19 +92,27 @@ fn is_token(name: &str) -> bool {
 /// folding only as whitespace, and siphon serializes values verbatim).
 pub fn validate(headers: &[(String, String)]) -> Result<(), String> {
     for (name, value) in headers {
-        if !is_token(name) {
-            return Err(format!("'{name}' is not a SIP header name"));
-        }
+        check_syntax(name, value)?;
         if let Some(reason) = framework_owned_reason(name) {
             return Err(format!(
                 "{name} cannot be set by a script on a response siphon sends: it {reason}"
             ));
         }
-        if value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
-            return Err(format!(
-                "the value of {name} contains a line break or NUL, which would end the header early"
-            ));
-        }
+    }
+    Ok(())
+}
+
+/// The part of [`validate`] every script-supplied header shares, whatever
+/// message it goes on: `name` is a header field name, and `value` carries no
+/// line break or NUL.
+pub fn check_syntax(name: &str, value: &str) -> Result<(), String> {
+    if !is_token(name) {
+        return Err(format!("'{name}' is not a SIP header name"));
+    }
+    if value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
+        return Err(format!(
+            "the value of {name} contains a line break or NUL, which would end the header early"
+        ));
     }
     Ok(())
 }

@@ -10,6 +10,7 @@ use crate::config::{RegistrantEntryConfig, RegistrantYamlConfig};
 use crate::ipsec::{EncryptionAlgorithm, IntegrityAlgorithm};
 use crate::transport::Transport;
 
+use super::register_extras::RegisterExtras;
 use super::{
     aka, AuthMode, ImsContactParams, RefreshWindow, RegistrantCredentials, RegistrantEntry, UeIpsec,
 };
@@ -114,21 +115,28 @@ pub fn entry_from_config(
 
     // IMS Contact feature tags (instance ID + MMTel/video/SMS).
     if let Some(ims_config) = &entry_config.ims {
-        let has = |tag: &str| {
-            ims_config
-                .features
-                .iter()
-                .any(|feature| feature.eq_ignore_ascii_case(tag))
-        };
-        entry = entry.with_ims_contact(ImsContactParams {
-            instance_id: ims_config.imei.clone(),
-            mmtel: has("mmtel"),
-            video: has("video"),
-            smsip: has("smsip"),
-        });
+        entry = entry.with_ims_contact(ImsContactParams::from_features(
+            ims_config.imei.clone(),
+            &ims_config.features,
+        )?);
     }
 
-    // Its own address, or a promise of one (see `registrant::address`).
+    if let Some(register) = &entry_config.register {
+        let body = match (&register.content_type, &register.body) {
+            (Some(content_type), Some(body)) => {
+                Some((content_type.clone(), body.clone().into_bytes()))
+            }
+            (None, None) => None,
+            _ => return Err("register needs content_type and body together".to_string()),
+        };
+        let headers = register
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        entry = entry.with_register_extras(RegisterExtras::new(body, headers)?);
+    }
+
     if let Some(local_addr) = entry_config.local_addr {
         if !matches!(transport_type, Transport::Udp | Transport::Tcp) {
             return Err(format!(
@@ -245,6 +253,63 @@ mod tests {
         let entry = entry_on("tcp").expect("a TCP entry on its own address");
         assert_eq!(entry.transport, Transport::Tcp);
         assert_eq!(entry.local_addr, Some("192.0.2.77".parse().unwrap()));
+    }
+
+    fn trunk_yaml(extra: &str) -> String {
+        format!(
+            concat!(
+                "entries:\n",
+                "  - aor: \"sip:trunk@carrier.example\"\n",
+                "    registrar: \"sip:198.51.100.20:5060\"\n",
+                "    user: \"trunk\"\n",
+                "{}",
+            ),
+            extra
+        )
+    }
+
+    #[test]
+    fn an_mcptt_entry_carries_its_register_body_and_headers() {
+        let config = registrant_config(&trunk_yaml(concat!(
+            "    ims:\n",
+            "      features: [mcptt]\n",
+            "    register:\n",
+            "      content_type: \"application/vnd.3gpp.mcptt-info+xml\"\n",
+            "      body: \"<mcpttinfo/>\"\n",
+            "      headers:\n",
+            "        P-Preferred-Service: \"urn:urn-7:3gpp-service.ims.icsi.mcptt\"\n",
+        )));
+        let entry = entry_from_config(&config.entries[0], &config).expect("a valid entry");
+        assert!(entry.ims_contact.as_ref().is_some_and(|ims| ims.mcptt));
+        let extras = entry.register_extras.expect("register extras");
+        assert_eq!(
+            extras.body,
+            Some((
+                "application/vnd.3gpp.mcptt-info+xml".to_string(),
+                b"<mcpttinfo/>".to_vec()
+            ))
+        );
+        assert_eq!(extras.headers.len(), 1);
+    }
+
+    #[test]
+    fn a_register_block_naming_an_owned_header_or_half_a_body_is_refused() {
+        let owned = registrant_config(&trunk_yaml(concat!(
+            "    register:\n",
+            "      headers:\n",
+            "        Contact: \"<sip:x@192.0.2.1>\"\n",
+        )));
+        assert!(entry_from_config(&owned.entries[0], &owned).is_err());
+        let half = registrant_config(&trunk_yaml(concat!(
+            "    register:\n",
+            "      body: \"x\"\n",
+        )));
+        assert!(entry_from_config(&half.entries[0], &half).is_err());
+        let unknown = registrant_config(&trunk_yaml(concat!(
+            "    ims:\n",
+            "      features: [mcptx]\n",
+        )));
+        assert!(entry_from_config(&unknown.entries[0], &unknown).is_err());
     }
 
     #[test]
