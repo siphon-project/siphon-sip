@@ -3218,7 +3218,7 @@
       "refresh": {
         "doc": "Re-SUBSCRIBE to refresh the dialog. Only valid on dialogs",
         "kind": "method_descriptor",
-        "sig": "($self, expires=None, timeout_ms=2000)"
+        "sig": "($self, expires=None, timeout_ms=2000, body=None, content_type=None)"
       },
       "reload": {
         "doc": "Re-read the dialog through the configured L2 cache, refreshing this",
@@ -3259,7 +3259,7 @@
       "send": {
         "doc": "Originate an outbound SUBSCRIBE and capture the resulting dialog.",
         "kind": "method_descriptor",
-        "sig": "($self, ruri, event, expires, accept=None, target_uri=None, headers=None, timeout_ms=2000, flow=None, route=...)"
+        "sig": "($self, ruri, event, expires, accept=None, target_uri=None, headers=None, timeout_ms=2000, flow=None, route=..., body=None, content_type=None)"
       }
     },
     "TimerHandle": {

@@ -111,6 +111,20 @@ pub struct SubscribeDialog {
     /// `None` for every other dialog, and for payloads cached before it.
     #[serde(default)]
     pub registrant_flow: Option<DialogRegistrantFlow>,
+    /// The body an outbound SUBSCRIBE carries, and its Content-Type. Every
+    /// refresh of the subscription carries it again (TS 24.379 §9.2.1.4).
+    /// `None` for a bodyless subscription, and for payloads cached before it.
+    #[serde(default)]
+    pub body: Option<DialogBody>,
+}
+
+/// A SUBSCRIBE body with its Content-Type, kept with the dialog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialogBody {
+    /// The Content-Type header value.
+    pub content_type: String,
+    /// The body bytes, exactly as sent.
+    pub bytes: Vec<u8>,
 }
 
 /// The registration an outbound subscription rides, kept with the dialog.
@@ -462,6 +476,7 @@ mod tests {
             terminated: false,
             is_outbound: false,
             registrant_flow: None,
+            body: None,
         }
     }
 

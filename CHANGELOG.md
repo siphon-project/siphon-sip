@@ -15,6 +15,7 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`proxy.subscribe_state.send(body=, content_type=)` puts a body on the SUBSCRIBE and on every refresh of it.** A UE's refresh repeats the body of its initial SUBSCRIBE (TS 24.379 §9.2.1.4: the MCPTT client's `application/vnd.3gpp.mcptt-info+xml`), so the body is kept with the subscription and `handle.refresh()` sends it again, over the same flow and SA as the SUBSCRIBE; the unsubscribe carries none. `str` or `bytes`, sent exactly as given with a matching `Content-Length`. `body` without `content_type`, or the reverse, raises `ValueError`. `handle.refresh(body=, content_type=)` replaces the kept body for that refresh and the ones after. Mirrored in the SDK mock (`sends` and `refreshes` record `body` and `content_type`).
 - **`registrar.network_deregister(aor, source=None, reason=...)` ends a registration on the network's word.** For a P-CSCF that learns the UE's access is gone (TS 24.229 §5.2.8), e.g. when the PCF terminates the AF session of its signalling path (TS 29.514 §4.2.5.3). The bindings registered from `source` (`(ip, port)`), or all of them, go the way registrar liveness removes an idle one: a `save_proxy()` binding is de-registered at the S-CSCF with a REGISTER (`Expires: 0`) over its Service-Route, `@registrar.on_change` fires with `"deregistered"`, and the UE's SA pair is shortened for the NOTIFY or removed. Awaitable, returns how many bindings went. Unlike liveness it also covers a UE without IPsec. Mirrored in the SDK mock (`network_deregistrations`).
 
 ### Fixed
