@@ -59,6 +59,18 @@ fn send_message(
     route: &[String],
     extra: impl FnOnce(&Bound<'_, PyDict>),
 ) -> PyResult<OutboundMessage> {
+    send_method(fixture, "MESSAGE", flow, route, extra)
+}
+
+/// `send_message` for any method: `send_request` takes the one send path
+/// whatever the method, which is what the PUBLISH test below pins.
+fn send_method(
+    fixture: &SendFixture,
+    method: &str,
+    flow: Option<PyFlow>,
+    route: &[String],
+    extra: impl FnOnce(&Bound<'_, PyDict>),
+) -> PyResult<OutboundMessage> {
     Python::attach(|python| {
         let proxy = Py::new(
             python,
@@ -78,7 +90,7 @@ fn send_message(
         run_send_request(
             python,
             proxy.bind(python).as_any(),
-            "MESSAGE",
+            method,
             "sip:+15550100@ims.mnc01.mcc001.3gppnetwork.org",
             &kwargs,
         )
@@ -86,7 +98,7 @@ fn send_message(
     Ok(fixture
         .udp
         .recv_timeout(std::time::Duration::from_secs(5))
-        .expect("the MESSAGE went out"))
+        .expect("the request went out"))
 }
 
 fn routes(sent: &OutboundMessage) -> Vec<String> {
@@ -193,4 +205,49 @@ async fn a_flow_with_a_next_hop_or_two_route_sets_is_refused() {
     .expect_err("route= and a Route header together");
     assert!(error.to_string().contains("not both"), "{error}");
     assert!(fixture.udp.try_recv().is_err(), "nothing went out");
+}
+
+/// A PUBLISH takes the send path a MESSAGE takes: over the registration's SA,
+/// from the protected client port to the P-CSCF's protected server port, with
+/// the route set as Route headers, and with `wait_for_response=True` it is
+/// still sent that way before the wait. Were PUBLISH resolved instead, it
+/// would try to resolve the unresolvable route host and nothing would leave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_publish_waiting_for_its_response_rides_the_sa_like_a_message() {
+    let (_turn, fixture) = SendFixture::turn();
+    let sent = send_method(
+        fixture,
+        "PUBLISH",
+        Some(registrant_flow()),
+        &ue_route_set(),
+        |kwargs| {
+            kwargs.set_item("wait_for_response", true).unwrap();
+            kwargs.set_item("timeout_ms", 100).unwrap();
+            let headers = kwargs
+                .get_item("headers")
+                .unwrap()
+                .unwrap()
+                .cast_into::<PyDict>()
+                .unwrap();
+            headers.set_item("Event", "presence").unwrap();
+        },
+    )
+    .expect("sent over the flow");
+    let message = parse_sip_message_bytes(&sent.data).unwrap();
+    assert_eq!(
+        message.method().map(|method| method.as_str()),
+        Some("PUBLISH")
+    );
+    assert_eq!(
+        sent.destination,
+        PCSCF_SERVER.parse::<SocketAddr>().unwrap()
+    );
+    assert_eq!(sent.source_local_addr, Some(UE_CLIENT.parse().unwrap()));
+    assert_eq!(routes(&sent), ue_route_set());
+    assert!(
+        via(&sent).contains(&format!(" {UE_SERVER};")),
+        "the Via names the UE's protected server port: {}",
+        via(&sent)
+    );
+    assert_eq!(message.body, vec![0x01, 0x02]);
 }

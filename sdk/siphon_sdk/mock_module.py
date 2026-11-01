@@ -398,6 +398,23 @@ class MockProxy:
 # proxy.subscribe_state (managed SUBSCRIBE dialog API)
 # ---------------------------------------------------------------------------
 
+def _subscribe_body(caller: str, body: Any, content_type: Optional[str]) -> Optional[dict]:
+    """Check ``body=`` / ``content_type=``: both or neither, like siphon.
+
+    Returns ``{"body": bytes, "content_type": str}`` or ``None``. A ``str``
+    body is kept as its UTF-8 bytes. Raises ``ValueError`` for one without
+    the other.
+    """
+    if body is None and content_type is None:
+        return None
+    if body is None:
+        raise ValueError(f"{caller}: content_type= needs body=")
+    if content_type is None:
+        raise ValueError(f"{caller}: body= needs content_type=")
+    data = body.encode("utf-8") if isinstance(body, str) else bytes(body)
+    return {"body": data, "content_type": content_type}
+
+
 class MockSubscribeHandle:
     """Mock of the Rust ``SubscribeHandle``.
 
@@ -538,13 +555,26 @@ class MockSubscribeHandle:
         return _run()
 
     def refresh(self, expires: Optional[int] = None,
-                timeout_ms: int = 2000) -> bool:
+                timeout_ms: int = 2000, body=None,
+                content_type: Optional[str] = None) -> bool:
         """Mock refresh — records the call and updates the dialog's expiry.
 
         Tests can assert on the parent's ``refreshes`` list. Raises if
         the dialog wasn't created via ``send()`` (consistent with the
         Rust contract that refresh is only valid on outbound dialogs).
+
+        The refresh carries the body the subscription was sent with
+        (``send(body=, content_type=)``); each entry of ``refreshes`` records
+        it as ``body`` and ``content_type``. ``body=`` and ``content_type=``,
+        given together, replace it for this refresh and the ones after it;
+        one without the other raises ``ValueError``::
+
+            await handle.refresh(
+                body=info_xml, content_type="application/vnd.3gpp.mcptt-info+xml"
+            )
         """
+        replacement = _subscribe_body("refresh", body, content_type)
+
         async def _run():
             if not self._live().get("is_outbound"):
                 raise RuntimeError(
@@ -554,10 +584,15 @@ class MockSubscribeHandle:
                 self._parent.refreshes = []
             new_expires = expires if expires is not None else self.expires
             self._dialog["expires_secs"] = new_expires
+            if replacement is not None:
+                self._dialog["body"] = replacement["body"]
+                self._dialog["content_type"] = replacement["content_type"]
             self._parent.refreshes.append({
                 "id": self._id,
                 "expires": new_expires,
                 "timeout_ms": timeout_ms,
+                "body": self._dialog.get("body"),
+                "content_type": self._dialog.get("content_type"),
             })
             return True
 
@@ -717,6 +752,8 @@ class MockSubscribeState:
         timeout_ms: int = 2000,
         flow: Optional[Any] = None,
         route: Optional[list[str]] = None,
+        body: Optional[Any] = None,
+        content_type: Optional[str] = None,
     ) -> MockSubscribeHandle:
         """Mock outbound SUBSCRIBE — records the call and synthesises a dialog.
 
@@ -726,6 +763,20 @@ class MockSubscribeState:
         unsubscribe over the SA set the registration holds at the time, and
         refuses a callee's flow with ``ValueError``. ``route`` cannot be
         combined with ``target_uri`` or a ``Route`` in ``headers``.
+
+        ``body`` (``str`` or ``bytes``) and ``content_type`` put a body on the
+        SUBSCRIBE, with a matching ``Content-Length``, and on every refresh of
+        the subscription (TS 24.379 section 9.2.1.4); the unsubscribe carries
+        none. Give both or neither: one without the other raises
+        ``ValueError``. The recorded ``sends`` entry holds them as ``body``
+        (bytes) and ``content_type``::
+
+            handle = await proxy.subscribe_state.send(
+                ruri, event="conference", expires=600,
+                body=mcptt_info_xml,
+                content_type="application/vnd.3gpp.mcptt-info+xml",
+                flow=flow, route=route,
+            )
 
         Tests can assert on the recorded ``self.sends`` list to verify a
         script originated a SUBSCRIBE with the expected parameters.
@@ -788,6 +839,7 @@ class MockSubscribeState:
                 "subscribe_state.send: pass the route set as route= or as "
                 "target_uri= / a Route in headers=, not both"
             )
+        kept_body = _subscribe_body("subscribe_state.send", body, content_type)
 
         async def _run():
             import uuid
@@ -806,6 +858,8 @@ class MockSubscribeState:
                 "event_version": 0,
                 "is_outbound": True,
             }
+            if kept_body is not None:
+                dialog.update(kept_body)
             self._dialogs[handle_id] = dialog
             self.sends.append({
                 "ruri": ruri,
@@ -817,6 +871,8 @@ class MockSubscribeState:
                 "timeout_ms": timeout_ms,
                 "flow": flow,
                 "route": list(route or []),
+                "body": dialog.get("body"),
+                "content_type": dialog.get("content_type"),
             })
             return MockSubscribeHandle(self, handle_id, dialog)
 

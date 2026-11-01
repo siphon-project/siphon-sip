@@ -840,6 +840,7 @@ mod tests {
             terminated: false,
             is_outbound: true,
             registrant_flow: None,
+            body: None,
         }
     }
 

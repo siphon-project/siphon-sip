@@ -158,3 +158,67 @@ def test_a_notifier_side_dialog_is_still_removed_at_once_on_terminate():
     ))
     asyncio.run(handle.terminate())
     assert namespace.local_count == 0
+
+
+MCPTT_TYPE = "application/vnd.3gpp.mcptt-info+xml"
+MCPTT_INFO = "<mcpttinfo><mcpttURI>sip:mcptt-id@example.com</mcpttURI></mcpttinfo>"
+
+
+def test_a_subscription_body_is_recorded_and_kept_for_the_refreshes():
+    import asyncio
+
+    from siphon_sdk.mock_module import MockSubscribeState
+
+    namespace = MockSubscribeState()
+
+    async def scenario():
+        handle = await namespace.send(
+            "sip:resource@example.com", event="reg", expires=600,
+            body=MCPTT_INFO, content_type=MCPTT_TYPE,
+        )
+        await handle.refresh()
+        await handle.refresh(body=b"<replaced/>", content_type="application/xml")
+        await handle.refresh()
+
+    asyncio.run(scenario())
+
+    assert namespace.sends[0]["body"] == MCPTT_INFO.encode()
+    assert namespace.sends[0]["content_type"] == MCPTT_TYPE
+    assert [(entry["body"], entry["content_type"]) for entry in namespace.refreshes] == [
+        (MCPTT_INFO.encode(), MCPTT_TYPE),
+        (b"<replaced/>", "application/xml"),
+        (b"<replaced/>", "application/xml"),
+    ]
+
+
+def test_a_subscription_without_a_body_records_none():
+    import asyncio
+
+    from siphon_sdk.mock_module import MockSubscribeState
+
+    namespace = MockSubscribeState()
+    asyncio.run(namespace.send("sip:resource@example.com", event="reg", expires=600))
+
+    assert namespace.sends[0]["body"] is None
+    assert namespace.sends[0]["content_type"] is None
+
+
+def test_a_body_and_its_content_type_come_together_or_not_at_all():
+    import asyncio
+
+    from siphon_sdk.mock_module import MockSubscribeState
+
+    namespace = MockSubscribeState()
+    with pytest.raises(ValueError, match="needs content_type"):
+        namespace.send("sip:resource@example.com", event="reg", expires=600, body="<x/>")
+    with pytest.raises(ValueError, match="needs body"):
+        namespace.send("sip:resource@example.com", event="reg", expires=600,
+                       content_type="text/plain")
+    assert not hasattr(namespace, "sends")
+
+    handle = asyncio.run(
+        namespace.send("sip:resource@example.com", event="reg", expires=600))
+    with pytest.raises(ValueError):
+        handle.refresh(body="<x/>")
+    with pytest.raises(ValueError):
+        handle.refresh(content_type="text/plain")

@@ -10,7 +10,7 @@ use crate::dns::SipResolver;
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::message::Method;
 use crate::sip::parser::parse_uri_standalone;
-use crate::subscribe_state::SubscribeDialog;
+use crate::subscribe_state::{DialogBody, SubscribeDialog};
 use crate::transport::Transport;
 use crate::uac::UacSender;
 use pyo3::prelude::*;
@@ -272,9 +272,46 @@ fn build_in_dialog_subscribe(
     for route in &dialog.route_set {
         builder = builder.header("Route", route.clone());
     }
-    builder = builder.content_length(0);
+    // The unsubscribe carries no body; a refresh carries the one the
+    // subscription was made with (TS 24.379 §9.2.1.4).
+    builder = with_body(builder, dialog.body.as_ref().filter(|_| expires_secs > 0));
 
     builder.build().map_err(|error| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build SUBSCRIBE: {error}"))
     })
+}
+
+/// The body and Content-Type a script gave, checked: both or neither.
+pub(super) fn dialog_body(
+    caller: &str,
+    body: Option<&Bound<'_, PyAny>>,
+    content_type: Option<&str>,
+) -> PyResult<Option<DialogBody>> {
+    match (body, content_type) {
+        (None, None) => Ok(None),
+        (Some(body), Some(content_type)) => Ok(Some(DialogBody {
+            content_type: content_type.to_string(),
+            bytes: super::super::request::extract_body_bytes(body)?,
+        })),
+        (Some(_), None) => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{caller}: body= needs content_type="
+        ))),
+        (None, Some(_)) => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{caller}: content_type= needs body="
+        ))),
+    }
+}
+
+/// Put `body` and its Content-Type on a SUBSCRIBE, with the Content-Length of
+/// the bytes; without one, Content-Length 0.
+pub(super) fn with_body(
+    builder: SipMessageBuilder,
+    body: Option<&DialogBody>,
+) -> SipMessageBuilder {
+    match body {
+        Some(body) => builder
+            .content_type(body.content_type.clone())
+            .body(body.bytes.clone()),
+        None => builder.content_length(0),
+    }
 }

@@ -135,6 +135,7 @@ async fn a_subscription_over_a_registrant_flow_keeps_to_its_sa() {
             None,
             vec![("From".to_string(), format!("<{subscriber}>"))],
             5000,
+            None,
         )
         .await
     });
@@ -247,6 +248,7 @@ async fn a_route_set_without_a_flow_goes_to_its_topmost_entry() {
             None,
             Vec::new(),
             50,
+            None,
         )
         .await
     });
@@ -282,6 +284,7 @@ async fn a_resolved_refresh_names_siphon_in_its_via() {
         terminated: false,
         is_outbound: true,
         registrant_flow: None,
+        body: None,
     };
     send_in_dialog(
         &watcher.uac.sender,
@@ -327,9 +330,187 @@ fn a_callee_flow_cannot_carry_a_subscription() {
                 2000,
                 Some(flow),
                 Vec::new(),
+                None,
+                None,
             )
             .map(|_| ())
             .expect_err("an inbound flow is refused")
     });
     assert!(error.to_string().contains("registration.flow()"), "{error}");
+}
+
+const MCPTT_INFO: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n<mcpttinfo xmlns=\"urn:3gpp:ns:mcpttInfo:1.0\"><mcpttURI>sip:mcptt-id@example.com</mcpttURI></mcpttinfo>";
+const MCPTT_TYPE: &str = "application/vnd.3gpp.mcptt-info+xml";
+
+fn mcptt_body() -> crate::subscribe_state::DialogBody {
+    crate::subscribe_state::DialogBody {
+        content_type: MCPTT_TYPE.to_string(),
+        bytes: MCPTT_INFO.to_vec(),
+    }
+}
+
+/// The body on the wire: its Content-Type, a Content-Length of exactly its
+/// bytes, and those bytes as the tail of what was sent.
+fn assert_carries_body(sent: &OutboundMessage, message: &SipMessage, body: &[u8]) {
+    assert_eq!(
+        message.headers.get("Content-Type").map(String::as_str),
+        Some(MCPTT_TYPE)
+    );
+    assert_eq!(
+        message.headers.get("Content-Length").cloned(),
+        Some(body.len().to_string())
+    );
+    assert_eq!(message.body, body);
+    assert!(sent.data.ends_with(body), "the body ends the datagram");
+}
+
+fn assert_bodyless(message: &SipMessage) {
+    assert_eq!(
+        message.headers.get("Content-Length").map(String::as_str),
+        Some("0")
+    );
+    assert!(message.headers.get("Content-Type").is_none());
+    assert!(message.body.is_empty());
+}
+
+/// The body goes on the SUBSCRIBE over the SA, on every refresh of it, and not
+/// on the unsubscribe; a NOTIFY with a body of its own is then matched to the
+/// subscription and found by its tags.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_subscription_body_rides_the_initial_subscribe_and_every_refresh() {
+    let watcher = Arc::new(Watcher::new());
+    let ue_ip: IpAddr = UE_IP.parse().unwrap();
+    let aor = established_ue(&watcher.registrants, 1, ue_ip);
+    let flow = registrant_flow(&watcher.registrants, &aor, ue_ip).expect("a flow");
+    let client = flow.local_addr;
+
+    let send = watcher.send(Some(flow), ue_route_set());
+    let subscriber = aor.clone();
+    let attempt = tokio::spawn(async move {
+        PySubscribeState::send_inner(
+            send,
+            &subscriber,
+            "reg",
+            600,
+            None,
+            None,
+            vec![("From".to_string(), format!("<{subscriber}>"))],
+            5000,
+            Some(mcptt_body()),
+        )
+        .await
+    });
+    let initial = watcher.sent().await;
+    let subscribe = assert_rides_the_sa(&initial, client);
+    assert_carries_body(&initial, &subscribe, MCPTT_INFO);
+    watcher.accept(&subscribe);
+    let id = attempt.await.unwrap().expect("subscribed").id;
+    let dialog: SubscribeDialog = watcher.store.get_local(&id).expect("the dialog");
+    assert_eq!(dialog.body, Some(mcptt_body()), "kept for the refreshes");
+
+    // It survives the L2 cache's serialisation, and a payload cached before
+    // the field existed reads as bodyless.
+    let cached: SubscribeDialog =
+        serde_json::from_str(&serde_json::to_string(&dialog).unwrap()).unwrap();
+    assert_eq!(cached.body, dialog.body);
+    let mut legacy = serde_json::to_value(&dialog).unwrap();
+    legacy.as_object_mut().unwrap().remove("body");
+    let legacy: SubscribeDialog = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.body, None);
+
+    // The notifier's NOTIFY, with a body of its own, is this subscription's.
+    let notify = parse_sip_message_bytes(
+        format!(
+            "NOTIFY sip:watcher@192.0.2.77:6101 SIP/2.0\r\nVia: SIP/2.0/UDP 198.51.100.10:5066;branch=z9hG4bKn1\r\n\
+             From: <{aor}>;tag=notifier-1\r\nTo: {}\r\nCall-ID: {}\r\nCSeq: 1 NOTIFY\r\nEvent: reg\r\n\
+             Subscription-State: active;expires=600\r\nContact: <sip:scscf.invalid:6060>\r\n\
+             Content-Type: application/reginfo+xml\r\nContent-Length: 6\r\n\r\n<x/>\r\n",
+            subscribe.headers.get("From").unwrap(),
+            dialog.call_id,
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    assert!(matches!(
+        watcher.store.notify_received(&notify),
+        crate::subscribe_state::NotifyDisposition::Deliver
+    ));
+    let namespace = PySubscribeState::new(Arc::clone(&watcher.store));
+    let found = namespace
+        .find(&dialog.call_id, &dialog.local_tag, "notifier-1")
+        .expect("the NOTIFY's dialog is the subscription");
+    assert_eq!(found.id, id);
+
+    // A refresh carries the body again, over the SA as it stands.
+    let dialog = watcher.store.get_local(&id).unwrap();
+    let refresh = {
+        let (watcher, dialog) = (Arc::clone(&watcher), dialog.clone());
+        tokio::spawn(async move {
+            send_in_dialog(
+                &watcher.uac.sender,
+                watcher.resolver,
+                Some(&watcher.registrants),
+                &dialog,
+                600,
+                Some(Duration::from_secs(5)),
+            )
+            .await
+        })
+    };
+    let sent = watcher.sent().await;
+    let refreshed = assert_rides_the_sa(&sent, client);
+    assert_carries_body(&sent, &refreshed, MCPTT_INFO);
+    assert_eq!(
+        refreshed.headers.get("Expires").map(String::as_str),
+        Some("600")
+    );
+    watcher.accept(&refreshed);
+    refresh.await.unwrap().expect("the 2xx");
+
+    // The unsubscribe is not a refresh: no body.
+    send_in_dialog(
+        &watcher.uac.sender,
+        watcher.resolver,
+        Some(&watcher.registrants),
+        &dialog,
+        0,
+        None,
+    )
+    .await
+    .expect("sent");
+    assert_bodyless(&assert_rides_the_sa(&watcher.sent().await, client));
+}
+
+/// Without a flow the body goes the same way, and a subscription made without
+/// one sends no Content-Type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_subscription_body_goes_on_a_resolved_subscribe_too() {
+    let watcher = Watcher::new();
+    for (body, expected) in [
+        (Some(mcptt_body()), Some(MCPTT_INFO)),
+        (None, None::<&[u8]>),
+    ] {
+        let send = watcher.send(None, vec!["<sip:198.51.100.50:5070;lr>".to_string()]);
+        let attempt = tokio::spawn(async move {
+            PySubscribeState::send_inner(
+                send,
+                "sip:001010000000001@ims.mnc01.mcc001.3gppnetwork.org",
+                "reg",
+                600,
+                None,
+                None,
+                Vec::new(),
+                50,
+                body,
+            )
+            .await
+        });
+        let sent = watcher.sent().await;
+        let message = parse_sip_message_bytes(&sent.data).unwrap();
+        match expected {
+            Some(bytes) => assert_carries_body(&sent, &message, bytes),
+            None => assert_bodyless(&message),
+        }
+        assert!(attempt.await.unwrap().is_err(), "unanswered");
+    }
 }

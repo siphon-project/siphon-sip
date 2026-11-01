@@ -16,7 +16,7 @@ use crate::sip::message::Method;
 use crate::sip::parser::parse_uri_standalone;
 pub(crate) use crate::subscribe_state::strip_nameaddr;
 use crate::subscribe_state::{
-    extract_tag, DialogRegistrantFlow, RemoteParty, SubscribeDialog, SubscribeStore,
+    extract_tag, DialogBody, DialogRegistrantFlow, RemoteParty, SubscribeDialog, SubscribeStore,
 };
 use crate::transport::Transport;
 use crate::uac::UacSender;
@@ -290,6 +290,15 @@ impl PySubscribeState {
     ///            Without ``flow`` the SUBSCRIBE goes to its first entry.
     ///            Cannot be combined with ``target_uri`` or a Route in
     ///            ``headers``.
+    ///     body: Optional body (``str`` or ``bytes``) of the SUBSCRIBE, sent
+    ///           exactly as given with a matching ``Content-Length``. Every
+    ///           refresh of the subscription carries it again (TS 24.379
+    ///           §9.2.1.4), the unsubscribe does not.
+    ///     content_type: The body's ``Content-Type``. Required with ``body``
+    ///                   and refused without it.
+    ///
+    /// Raises ``ValueError`` for ``body`` without ``content_type`` and for
+    /// ``content_type`` without ``body``.
     ///
     /// Raises ``RuntimeError`` on a non-2xx response (§4.1.2.1: no
     /// subscription was created, even if a NOTIFY came first), on a timeout
@@ -306,6 +315,8 @@ impl PySubscribeState {
         timeout_ms=2000,
         flow=None,
         route=Vec::new(),
+        body=None,
+        content_type=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn send<'py>(
@@ -320,7 +331,10 @@ impl PySubscribeState {
         timeout_ms: u64,
         flow: Option<super::registrar::PyFlow>,
         route: Vec<String>,
+        body: Option<&Bound<'_, PyAny>>,
+        content_type: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let body = in_dialog::dialog_body("subscribe_state.send", body, content_type)?;
         // Read the header dict here: a `Bound` cannot cross into the future.
         let extra_headers: Vec<(String, String)> = match headers {
             Some(dict) => dict
@@ -374,6 +388,7 @@ impl PySubscribeState {
                 target_uri.as_deref(),
                 extra_headers,
                 timeout_ms,
+                body,
             )
             .await
         })
@@ -644,13 +659,20 @@ impl PySubscribeHandle {
     /// anchor on success, and persists to L2 if configured. Raises on
     /// non-2xx, timeout, or transport failure (existing dialog is
     /// kept; the script can decide to retry or terminate).
-    #[pyo3(signature = (expires=None, timeout_ms=2000))]
+    ///
+    /// The refresh carries the body the subscription was sent with. ``body``
+    /// and ``content_type`` (given together, as for ``send``) replace it, for
+    /// this refresh and the ones after it.
+    #[pyo3(signature = (expires=None, timeout_ms=2000, body=None, content_type=None))]
     fn refresh<'py>(
         &self,
         python: Python<'py>,
         expires: Option<u64>,
         timeout_ms: u64,
+        body: Option<&Bound<'_, PyAny>>,
+        content_type: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let replacement = in_dialog::dialog_body("refresh", body, content_type)?;
         let dialog = self.load_local()?;
         if !dialog.is_outbound {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -665,6 +687,9 @@ impl PySubscribeHandle {
             .store
             .update(&self.id, |dialog| {
                 dialog.next_cseq();
+                if replacement.is_some() {
+                    dialog.body = replacement;
+                }
             })
             .ok_or_else(|| {
                 pyo3::exceptions::PyLookupError::new_err(format!(
@@ -825,6 +850,7 @@ fn capture_incoming(
         terminated: false,
         is_outbound: false,
         registrant_flow: None,
+        body: None,
     };
 
     drop(message);
@@ -1076,6 +1102,7 @@ fn host_of(ip: std::net::IpAddr) -> String {
 /// sender / DNS resolver — the bug that motivated the extraction was the
 /// missing default Contact (RFC 6665 §4.1.2.1) which left notifiers
 /// without a dialog remote target and silently dropped every NOTIFY.
+#[allow(clippy::too_many_arguments)]
 fn build_outbound_subscribe(
     ruri: &str,
     ruri_parsed: crate::sip::uri::SipUri,
@@ -1089,6 +1116,7 @@ fn build_outbound_subscribe(
     call_id: &str,
     local_tag: &str,
     extra_headers: &[(String, String)],
+    body: Option<&DialogBody>,
 ) -> PyResult<(crate::sip::message::SipMessage, u32, Option<String>)> {
     let branch = format!("z9hG4bK-uac-py-{}", Uuid::new_v4());
     // Via sent-by is *our* advertised host:port so the notifier routes the
@@ -1159,7 +1187,7 @@ fn build_outbound_subscribe(
         // we already wrote rather than appending alongside it.
         builder = builder.set_header("From", ensure_tag(custom_from, local_tag));
     }
-    builder = builder.content_length(0);
+    builder = in_dialog::with_body(builder, body);
 
     let message = builder.build().map_err(|error| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build SUBSCRIBE: {error}"))
@@ -1269,6 +1297,7 @@ impl PySubscribeState {
         target_uri: Option<&str>,
         extra_headers: Vec<(String, String)>,
         timeout_ms: u64,
+        body: Option<DialogBody>,
     ) -> PyResult<PySubscribeHandle> {
         let SubscribeSend {
             store,
@@ -1375,6 +1404,7 @@ impl PySubscribeState {
             &call_id,
             &local_tag,
             &extra_headers,
+            body.as_ref(),
         )?;
 
         // The subscription exists from here, before the SUBSCRIBE leaves: the
@@ -1413,6 +1443,7 @@ impl PySubscribeState {
                         ue_ip: flow.local_addr.ip(),
                     })
             }),
+            body,
         });
 
         let mut receiver = match &flow_egress {
@@ -1649,11 +1680,11 @@ mod tests {
 
             // Live: the outbound check passes and it gets as far as needing a
             // loop, which is the awaitable contract every 1.10 API has.
-            let error = handle.refresh(python, None, 2000).unwrap_err();
+            let error = handle.refresh(python, None, 2000, None, None).unwrap_err();
             assert!(error.to_string().contains("await"), "got {error}");
 
             store.remove(&handle.id);
-            let error = handle.refresh(python, None, 2000).unwrap_err();
+            let error = handle.refresh(python, None, 2000, None, None).unwrap_err();
             assert!(error.is_instance_of::<pyo3::exceptions::PyLookupError>(python));
         });
     }
@@ -1698,6 +1729,7 @@ mod tests {
             terminated: false,
             is_outbound: false,
             registrant_flow: None,
+            body: None,
         };
         dialog.event_version = 2;
         let json = serde_json::to_string(&dialog).expect("serialize dialog");
@@ -1912,6 +1944,7 @@ else:
             "py-sub-test",
             "local-tag-1",
             &[],
+            None,
         )
         .expect("build SUBSCRIBE");
 
@@ -1953,6 +1986,7 @@ else:
             "py-sub-tcp",
             "local-tag-tcp",
             &[],
+            None,
         )
         .expect("build SUBSCRIBE");
 
@@ -1984,6 +2018,7 @@ else:
             "py-sub-override",
             "local-tag-2",
             &extra,
+            None,
         )
         .expect("build SUBSCRIBE");
 
@@ -2032,6 +2067,7 @@ else:
             "py-sub-event",
             "local-tag-3",
             &extra,
+            None,
         )
         .expect("build SUBSCRIBE");
 
@@ -2081,6 +2117,7 @@ else:
             "py-sub-multi",
             "local-tag-4",
             &extra,
+            None,
         )
         .expect("build SUBSCRIBE");
 
@@ -2117,6 +2154,7 @@ else:
             "py-sub-from",
             "local-tag-5",
             &extra,
+            None,
         )
         .expect("build SUBSCRIBE");
 
@@ -2182,6 +2220,7 @@ else:
             "py-sub-fqdn",
             "local-tag-fqdn",
             &[],
+            None,
         )
         .expect("build SUBSCRIBE");
 
@@ -2195,5 +2234,135 @@ else:
         let contacts = collect_header(&message, "Contact");
         assert_eq!(contacts.len(), 1, "one Contact expected, got {contacts:?}");
         assert_eq!(contacts[0], "<sip:sbc.example.org:5060>");
+    }
+
+    /// The body of an outbound SUBSCRIBE: its Content-Type, a Content-Length of
+    /// exactly its bytes, and a script's own Content-Type header yields to
+    /// `content_type=`.
+    #[test]
+    fn outbound_subscribe_carries_body_and_content_type() {
+        let ruri = "sip:alice@ims.example.org";
+        let body = DialogBody {
+            content_type: "application/vnd.3gpp.mcptt-info+xml".to_string(),
+            bytes: "<mcpttinfo>\u{e9}</mcpttinfo>".as_bytes().to_vec(),
+        };
+        let (message, _, _) = build_outbound_subscribe(
+            ruri,
+            parse_ruri(ruri),
+            "reg",
+            600,
+            None,
+            &[],
+            Transport::Udp,
+            local_host(),
+            local_port(),
+            "py-sub-body",
+            "local-tag-body",
+            &[("Content-Type".to_string(), "text/plain".to_string())],
+            Some(&body),
+        )
+        .expect("build SUBSCRIBE");
+        assert_eq!(
+            collect_header(&message, "Content-Type"),
+            vec!["application/vnd.3gpp.mcptt-info+xml"]
+        );
+        assert_eq!(
+            collect_header(&message, "Content-Length"),
+            vec![body.bytes.len().to_string().as_str()]
+        );
+        let wire = message.to_bytes();
+        assert!(wire.ends_with(&body.bytes));
+    }
+
+    /// `body=` and `content_type=` come together or not at all, on `send` and
+    /// on `refresh`, and nothing is sent or changed when they do not.
+    #[test]
+    fn body_without_content_type_or_the_reverse_is_a_value_error() {
+        Python::initialize();
+        Python::attach(|python| {
+            let store = Arc::new(SubscribeStore::new());
+            let namespace = PySubscribeState::new(Arc::clone(&store));
+            let body = pyo3::types::PyString::new(python, "<x/>").into_any();
+            let send = |body: Option<&Bound<'_, PyAny>>, content_type: Option<&str>| {
+                namespace
+                    .send(
+                        python,
+                        "sip:resource@198.51.100.70",
+                        "reg",
+                        600,
+                        None,
+                        None,
+                        None,
+                        2000,
+                        None,
+                        Vec::new(),
+                        body,
+                        content_type,
+                    )
+                    .map(|_| ())
+                    .expect_err("refused")
+            };
+            for error in [send(Some(&body), None), send(None, Some("text/plain"))] {
+                assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+                assert!(
+                    error.to_string().contains("subscribe_state.send"),
+                    "{error}"
+                );
+            }
+
+            let handle = namespace
+                .create(&incoming(python, "", 300), Some(300))
+                .unwrap();
+            store.update(&handle.id, |dialog| dialog.is_outbound = true);
+            for (body, content_type) in [(Some(&body), None), (None, Some("text/plain"))] {
+                let error = handle
+                    .refresh(python, None, 2000, body, content_type)
+                    .unwrap_err();
+                assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+            }
+            let dialog = store.get_local(&handle.id).unwrap();
+            assert_eq!(dialog.body, None);
+            assert_eq!(dialog.cseq, 0, "a refused refresh does not spend a CSeq");
+        });
+    }
+
+    /// A refresh with a replacement body keeps it for this refresh and the
+    /// ones after; one without leaves the body the subscription has.
+    #[test]
+    fn refresh_replaces_the_kept_body_only_when_given_one() {
+        Python::initialize();
+        Python::attach(|python| {
+            let store = Arc::new(SubscribeStore::new());
+            let namespace = PySubscribeState::new(Arc::clone(&store));
+            let handle = namespace
+                .create(&incoming(python, "", 300), Some(300))
+                .unwrap();
+            let original = DialogBody {
+                content_type: "text/plain".to_string(),
+                bytes: b"one".to_vec(),
+            };
+            store.update(&handle.id, |dialog| {
+                dialog.is_outbound = true;
+                dialog.body = Some(original.clone());
+            });
+
+            // Each reaches the point of needing a loop, after the store took it.
+            let error = handle.refresh(python, None, 2000, None, None).unwrap_err();
+            assert!(error.to_string().contains("await"), "got {error}");
+            assert_eq!(store.get_local(&handle.id).unwrap().body, Some(original));
+
+            let replacement = pyo3::types::PyBytes::new(python, b"two");
+            let error = handle
+                .refresh(python, None, 2000, Some(&replacement), Some("text/xml"))
+                .unwrap_err();
+            assert!(error.to_string().contains("await"), "got {error}");
+            assert_eq!(
+                store.get_local(&handle.id).unwrap().body,
+                Some(DialogBody {
+                    content_type: "text/xml".to_string(),
+                    bytes: b"two".to_vec(),
+                })
+            );
+        });
     }
 }
