@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.15.11] — 2026-11-02
+
 ### Added
 
 - **A conference seat can forward its digits to the other seats.** `rtpengine.conference_join(..., dtmf="forward")`, `rtpengine.conference_offer(..., dtmf="forward")` and `b2bua.adopt_replaced(..., dtmf="forward")` have siphon-rtp regenerate the seat's RFC 4733 telephone-events toward every other seat, in each seat's own payload type and clock; the default, `"events"`, keeps them as `@rtpengine.on_dtmf` events. `rtpengine.conference_route(..., dtmf=...)` switches it live and `None` keeps the setting. Any other value raises `ValueError`. Needs an engine that lists `conference_dtmf` (siphon-rtp 0.19): on one that does not, `"forward"` and an explicit route `dtmf` are refused with nothing sent (`RuntimeError`, `501` for a merge) instead of the digits being dropped silently. The roster dicts (`b2bua.conference_roster`, `on_conference_change`) carry the seat's `dtmf`. Mirrored in the SDK mock (`set_conference_dtmf_supported(False)` models the older engine).
