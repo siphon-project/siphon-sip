@@ -87,12 +87,29 @@ pub(crate) fn start_accepting(listener: socket2::Socket) -> Arc<AtomicUsize> {
     accepted
 }
 
-/// A port nothing listens on, so a connect to it is refused.
-fn refusing_peer() -> SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("a free port")
+/// A port that refuses connects: bound but not listening, so the kernel answers
+/// a SYN with a reset. The returned socket holds the port for as long as it is
+/// kept, so no other test can take it (a port bound and released would be free
+/// for anyone to listen on, and a connect meant to be refused would succeed),
+/// and [`recover`] brings the peer back on that same socket.
+fn refusing_peer() -> (SocketAddr, socket2::Socket) {
+    let socket =
+        socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).expect("a socket");
+    let address: SocketAddr = "127.0.0.1:0".parse().expect("an address");
+    socket.bind(&address.into()).expect("a free port");
+    let peer = socket
         .local_addr()
         .expect("bound")
+        .as_socket()
+        .expect("an inet address");
+    (peer, socket)
+}
+
+/// Bring a [`refusing_peer`] back: it listens on the port it held, so connects
+/// to it complete from now on, with no moment where the port was free.
+fn recover(socket: socket2::Socket) -> std::net::TcpListener {
+    socket.listen(128).expect("listen on the held port");
+    socket.into()
 }
 
 fn ping() -> Bytes {
@@ -206,12 +223,12 @@ async fn concurrent_tls_sends_make_one_connect() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_peer_fails_fast_then_recovers_after_the_window() {
     let _watchdog = watchdog("a_refused_peer_fails_fast_then_recovers_after_the_window");
-    let peer = refusing_peer();
+    let (peer, held) = refusing_peer();
     let pool = pool();
     assert!(pool.send_tcp(peer, ping()).await.is_err(), "refused");
 
     // The peer comes back inside the window.
-    let listener = std::net::TcpListener::bind(peer).expect("rebind the refused port");
+    let listener = recover(held);
     let accepted = Arc::new(AtomicUsize::new(0));
     {
         let counter = Arc::clone(&accepted);
@@ -256,9 +273,9 @@ async fn connect_state_drains_to_empty_once_destinations_recover() {
     let _watchdog = watchdog("connect_state_drains_to_empty_once_destinations_recover");
     let pool = Arc::new(pool());
     for batch in 0..2 {
-        // A set: a port freed by one probe can be handed out again.
-        let peers: std::collections::BTreeSet<SocketAddr> =
-            (0..50).map(|_| refusing_peer()).collect();
+        // Each holds its port, so the 50 are distinct.
+        let (peers, held): (Vec<SocketAddr>, Vec<socket2::Socket>) =
+            (0..50).map(|_| refusing_peer()).unzip();
         for peer in &peers {
             assert!(pool.send_tcp(*peer, ping()).await.is_err());
         }
@@ -267,10 +284,7 @@ async fn connect_state_drains_to_empty_once_destinations_recover() {
             (peers.len(), 0),
             "batch {batch}: one record per failing destination, no lock left behind"
         );
-        let _listeners: Vec<std::net::TcpListener> = peers
-            .iter()
-            .map(|peer| std::net::TcpListener::bind(peer).expect("rebind"))
-            .collect();
+        let _listeners: Vec<std::net::TcpListener> = held.into_iter().map(recover).collect();
         tokio::time::sleep(Duration::from_millis(1_200)).await;
         for peer in &peers {
             pool.send_tcp(*peer, ping())
