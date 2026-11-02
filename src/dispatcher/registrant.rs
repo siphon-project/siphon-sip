@@ -411,6 +411,11 @@ pub(super) fn handle_registrant_ipsec_challenge(
             registrant_task.handle_failure(&aor_task, 0, None);
             return;
         }
+        // The set is installed, so the P-CSCF may connect to the protected
+        // server port from now on, for an over-MTU request after the REGISTER
+        // (RFC 3261 18.1.1): the listener is there before the REGISTER leaves,
+        // not at the next registration tick.
+        registrant_task.reconcile_streams_now();
         // The set is installed, so a connection from its client port is carried
         // by it. A failed connect leaves the REGISTER on UDP.
         if let Some(path) = &over_mtu {

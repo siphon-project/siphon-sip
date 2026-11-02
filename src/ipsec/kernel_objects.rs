@@ -477,6 +477,7 @@ impl IpsecManager {
             spi_us = sa.spi_us,
             "IPsec: SA pair taken into use"
         );
+        self.lift_restart_bars(&sa);
         for (old, _) in siblings.iter().filter(|(pair, _)| {
             kernel_objects(&sa)
                 .iter()
@@ -723,6 +724,7 @@ impl IpsecManager {
                         ue_port_c = next.ue_port_c,
                         "IPsec: SA pair taken into use, the set in use went"
                     );
+                    self.lift_restart_bars(next);
                 }
             }
             let Some(theirs) = kernel_objects(next)

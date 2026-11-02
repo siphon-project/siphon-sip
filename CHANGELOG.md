@@ -17,6 +17,12 @@ entry, but a working config keeps working.
 
 - **A conference focus can read its room and be told when it changes.** `b2bua.conference_roster(conference_id)` lists the seats siphon holds in a room (`call_id`, `from_tag`, `party_uri`, `role`, `joined_at`, `kind` `"joined"` or `"adopted"`, `owner_call_id`), so a script that keeps no state of its own, as one must when a reload empties module state and a conference outlives a deploy, can build an RFC 4575 `application/conference-info+xml` body at any time. `call.conference` is `(conference_id, owner_call_id)` for a call in a room, readable in `@b2bua.on_bye`. `@b2bua.on_conference_change(conference_id, owner_call_id, change, call_id, roster)` runs once per seat that comes in or goes out of a room (`conference_join` / `conference_answer`, a successful `adopt_replaced`, and every way a seat leaves: delete, `conference_leave`, the adopted call's BYE, credit or duration teardown, `media_timeout`, the conference dialog ending the calls it adopted), with the room after the change, off the SIP message path. `proxy.subscribe_state.for_resource(uri, event)` lists the live subscriptions to a resource and event package to NOTIFY; it reads the in-process store, since the Redis cache is keyed by dialog id. Mirrored in the SDK mock.
 - **`b2bua.adopt_replaced(on_last_leave="end_owner")` ends a conference of one.** When the last call adopted under a conference dialog has left and no seat but the dialog's own remains in the room, siphon BYEs the dialog with `Reason: Q.850;cause=16` through the normal teardown, so its CDR and charging close, and frees its seat. Held by siphon, so it survives a script reload. The default, `"keep"`, is the behaviour before; any other value raises `ValueError`.
+## [1.15.10] — 2026-11-02
+
+### Fixed
+
+- registrant: an IMS UE over UDP opens the TCP listener on its protected server port when its SA set is installed, ahead of the protected REGISTER, not at the next registration tick. A P-CSCF's TCP connection for an over-MTU request right after the REGISTER (RFC 3261 18.1.1, TS 24.229 5.2.2.2) is no longer refused.
+- **After a restart, a P-CSCF no longer refuses terminating requests to a UE that has re-registered with new SAs.** The egress bars on the endpoints of a binding whose SAs were lost (a Contact port or old server port the new pair does not cover) lifted only when the old binding would have expired. They now lift when a new SA pair for that UE address is taken into use (TS 24.229 §5.1.1.4.1); a pair still pending lifts nothing.
 
 ## [1.15.9] — 2026-11-01
 

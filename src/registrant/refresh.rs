@@ -77,6 +77,10 @@ pub async fn registration_loop(manager: Arc<RegistrantManager>, context: Registr
         advertised_address: context.advertised_address.clone(),
         hep_sender: context.hep_sender.clone(),
     });
+    let _ = manager.stream_reconcile.set(StreamReconcile {
+        ue_sockets: context.ue_sockets.clone(),
+        mtu: context.mtu,
+    });
     let Some(egress) = manager.egress.get() else {
         error!("registrant egress could not be installed — outbound registration is not running");
         return;
@@ -128,7 +132,12 @@ fn run_tick(
     // Sockets for every entry that registers from an address of its own. An
     // entry whose socket cannot bind sits this tick out.
     let mut unbindable = reconcile_ue_sockets(manager, context, egress);
-    unbindable.extend(reconcile_ue_streams(manager, context, egress));
+    unbindable.extend(reconcile_ue_streams(
+        manager,
+        context.ue_sockets.as_ref(),
+        context.mtu,
+        egress,
+    ));
 
     // Stated before the liveness check below reads those connections, and
     // before the first REGISTER of a trunk added since the last tick opens one.
@@ -246,16 +255,14 @@ fn reconcile_ue_sockets(
 /// the P-CSCF could not reach it.
 fn reconcile_ue_streams(
     manager: &RegistrantManager,
-    context: &RegistrationLoopContext,
+    ue_sockets: Option<&Arc<UeSockets>>,
+    mtu: Option<u16>,
     egress: &RegistrantEgress,
 ) -> HashSet<String> {
     let plain_port = egress.defaults().plain_port();
-    let (plan, owners) = manager.ue_stream_plan_with(
-        plain_port,
-        Some(process_ue_ip(egress)),
-        context.mtu.is_some(),
-    );
-    let Some(sockets) = context.ue_sockets.as_ref() else {
+    let (plan, owners) =
+        manager.ue_stream_plan_with(plain_port, Some(process_ue_ip(egress)), mtu.is_some());
+    let Some(sockets) = ue_sockets else {
         if !owners.is_empty() {
             debug!(
                 entries = owners.len(),
@@ -275,6 +282,41 @@ fn reconcile_ue_streams(
                 .then_some(aor)
         })
         .collect()
+}
+
+impl RegistrantManager {
+    /// Converge the per-UE TCP listeners on the plan now, rather than at the
+    /// next tick: the same reconcile the tick runs ([`reconcile_ue_streams`]),
+    /// for the moments a listener must exist before the tick would open it.
+    /// Called as an SA set is installed, ahead of the protected REGISTER, so
+    /// the P-CSCF's connection to the protected server port for an over-MTU
+    /// request that follows it (RFC 3261 clause 18.1.1; TS 24.229 5.2.2.2) is
+    /// accepted instead of refused.
+    ///
+    /// A listener that does not bind is handled as in the tick (logged once,
+    /// retried by the next tick); the REGISTER is not held for it. It blocks on
+    /// nothing: it binds sockets and spawns their workers. A no-op before the
+    /// registration loop has started.
+    pub fn reconcile_streams_now(&self) {
+        let (Some(egress), Some(streams)) = (self.egress.get(), self.stream_reconcile.get()) else {
+            return;
+        };
+        reconcile_ue_streams(self, streams.ue_sockets.as_ref(), streams.mtu, egress);
+    }
+
+    /// Whether the registration loop has started and recorded what
+    /// [`reconcile_streams_now`](Self::reconcile_streams_now) needs.
+    #[cfg(test)]
+    pub(crate) fn has_stream_reconcile(&self) -> bool {
+        self.egress.get().is_some() && self.stream_reconcile.get().is_some()
+    }
+}
+
+/// What [`RegistrantManager::reconcile_streams_now`] needs besides the
+/// manager, recorded by [`registration_loop`].
+pub(super) struct StreamReconcile {
+    ue_sockets: Option<Arc<UeSockets>>,
+    mtu: Option<u16>,
 }
 
 /// Delete the SA pairs the manager queued.

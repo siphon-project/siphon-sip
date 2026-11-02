@@ -282,3 +282,106 @@ async fn the_digest_retry_leaves_from_the_socket_the_register_did() {
         assert!(String::from_utf8_lossy(&retry.data).contains("Authorization: Digest"));
     }
 }
+
+/// The P-CSCF dials the UE's protected server port over TCP as soon as the
+/// protected REGISTER is answered, for a request over the MTU (RFC 3261 clause
+/// 18.1.1; TS 24.229 5.2.2.2). The listener on that port must already be open
+/// when the REGISTER leaves, not wait for the next registration tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_protected_server_port_accepts_tcp_when_the_protected_register_leaves() {
+    use crate::transport::acl::TransportAcl;
+    use crate::transport::pool::ConnectionPool;
+    use crate::transport::ue_sockets::UeSockets;
+    use crate::transport::ue_streams::UeTcpContext;
+    use std::collections::HashSet;
+
+    let ue_ip = ip("127.0.0.5");
+    let registrant = Arc::new(test_support::manager());
+    registrant.try_add(ue(1, Some(ue_ip))).expect("added");
+    let (dispatcher, _ipsec) = dispatcher(&registrant);
+
+    // The registration loop as the server wires it, its tick far off.
+    let (inbound_tx, _inbound) = flume::unbounded();
+    let connection_map = Arc::new(dashmap::DashMap::new());
+    let pool = Arc::new(ConnectionPool::for_tests(
+        Arc::clone(&connection_map),
+        inbound_tx.clone(),
+    ));
+    let sockets = Arc::new(UeSockets::new(
+        inbound_tx,
+        Arc::new(TransportAcl::new(Vec::new(), Vec::new())),
+        None,
+        0,
+        Vec::new(),
+    ));
+    sockets.attach_tcp(UeTcpContext {
+        connection_map,
+        stream_connections: crate::transport::StreamConnections::new(),
+        pool: Arc::clone(&pool),
+        crlf_pong_tracker: None,
+        static_addrs: HashSet::new(),
+    });
+    let (udp, _udp_rx) = flume::unbounded();
+    let outbound = Arc::new(crate::transport::OutboundRouter {
+        udp: udp.into(),
+        udp_by_local: HashMap::new(),
+        udp_dynamic: Some(Arc::clone(&sockets)),
+        tcp: flume::unbounded().0,
+        tls: flume::unbounded().0,
+        ws: flume::unbounded().0,
+        wss: flume::unbounded().0,
+        sctp: None,
+    });
+    let loop_task = tokio::spawn(crate::registrant::registration_loop(
+        Arc::clone(&registrant),
+        crate::registrant::RegistrationLoopContext {
+            outbound,
+            local_addr: "192.0.2.1:5060".parse().expect("addr"),
+            listen_addrs: HashMap::from([(
+                Transport::Udp,
+                "192.0.2.1:5060".parse().expect("addr"),
+            )]),
+            advertised_addrs: HashMap::new(),
+            advertised_address: None,
+            hep_sender: None,
+            connection_pool: pool,
+            ue_sockets: Some(Arc::clone(&sockets)),
+            ipsec_manager: None,
+            mtu: Some(1300),
+        },
+    ));
+    let server = SocketAddr::new(ue_ip, 6101);
+    wait_for(|| registrant.has_stream_reconcile().then_some(())).await;
+    assert!(!sockets.contains_tcp(&server), "no set, no listener");
+
+    let call_id = initial_register(&registrant, &impu(1));
+    let challenge = response(
+        "401 Unauthorized",
+        &call_id,
+        &format!(
+            "WWW-Authenticate: {}\r\nSecurity-Server: {}\r\n",
+            test_support::aka_challenge_value("ff9bb4d0b607"),
+            test_support::SECURITY_SERVER
+        ),
+    );
+    handle_registrant_response(
+        &registrant,
+        &challenge,
+        401,
+        "z9hG4bK-reg-test",
+        &dispatcher.state,
+    );
+    let protected = tokio::time::timeout(Duration::from_secs(2), dispatcher.udp.recv_async())
+        .await
+        .expect("the protected REGISTER in time")
+        .expect("channel open");
+    assert_eq!(protected.destination, "198.51.100.10:5066".parse().unwrap());
+
+    // The P-CSCF's connection, the instant it has the REGISTER.
+    let connected = tokio::net::TcpStream::connect(server).await;
+    assert!(
+        connected.is_ok(),
+        "TCP to the protected server port at the REGISTER: {connected:?}"
+    );
+    loop_task.abort();
+}
