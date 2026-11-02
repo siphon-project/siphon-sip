@@ -98,7 +98,7 @@
       "adopt_replaced": {
         "doc": "Merge the call a REFER's `Replaces` names into a conference room on this",
         "kind": "method_descriptor",
-        "sig": "($self, call, conference_id, role=\"talker\", on_owner_leave=\"end\", on_last_leave=\"keep\")"
+        "sig": "($self, call, conference_id, role=\"talker\", on_owner_leave=\"end\", on_last_leave=\"keep\", dtmf=None)"
       },
       "bridge": {
         "doc": "Join two answered calls this process owns, so the two parties hear each",
@@ -2603,7 +2603,7 @@
       "conference_join": {
         "doc": "Seat a call in a conference room and resolve to the answer SDP for the",
         "kind": "method_descriptor",
-        "sig": "($self, conference_id, call, role=\"talker\", target=None, whisper_target=None, profile=None)"
+        "sig": "($self, conference_id, call, role=\"talker\", target=None, whisper_target=None, profile=None, dtmf=None)"
       },
       "conference_leave": {
         "doc": "Free a call's seat; the room ends with its last seat. ``call`` is a",
@@ -2613,7 +2613,7 @@
       "conference_offer": {
         "doc": "Offer a seat for a participant the focus calls out (``siphon-rtp``",
         "kind": "method_descriptor",
-        "sig": "($self, conference_id, seat_tag, role=\"talker\", target=None, whisper_target=None, profile=None)"
+        "sig": "($self, conference_id, seat_tag, role=\"talker\", target=None, whisper_target=None, profile=None, dtmf=None)"
       },
       "conference_play": {
         "doc": "Play a ``file``, ``blob`` or ``tone`` into a room, heard by every seat,",
@@ -2623,7 +2623,7 @@
       "conference_route": {
         "doc": "Change who a seat hears and who hears it, live: ``role``, ``target``",
         "kind": "method_descriptor",
-        "sig": "($self, conference_id, call, role, target=None, whisper_target=None)"
+        "sig": "($self, conference_id, call, role, target=None, whisper_target=None, dtmf=None)"
       },
       "conference_set_play_gain": {
         "doc": "Retune a running room playback's gain (\u221260..=+12 dB).",

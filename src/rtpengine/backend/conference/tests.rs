@@ -192,7 +192,7 @@ async fn a_backend_without_a_mixer_refuses_every_conference_verb() {
     );
     unsupported(
         backend
-            .conference_route(&seat("room-n", "alice"), ConferenceRole::Muted)
+            .conference_route(&seat("room-n", "alice"), ConferenceRole::Muted, None)
             .await,
         "conference_route",
     );

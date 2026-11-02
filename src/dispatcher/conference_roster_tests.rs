@@ -20,7 +20,7 @@ use super::dialog_state_events_tests::header;
 use super::originate_test_harness::{drain, socket, Sent};
 use super::test_dispatcher::TestDispatcher;
 use super::*;
-use crate::rtpengine::backend::{ConferenceRole, ConferenceSeat};
+use crate::rtpengine::backend::{ConferenceDtmf, ConferenceRole, ConferenceSeat};
 use crate::rtpengine::conference_roster::{self, SeatKind};
 use crate::rtpengine::profile::NgFlags;
 use crate::rtpengine::test_native_engine::NativeTestEngine;
@@ -117,6 +117,7 @@ async fn owner(
             ConferenceRole::Talker,
             &NgFlags::default(),
             Some("sip:15550100001@example.com".to_string()),
+            ConferenceDtmf::Events,
         )
         .await
         .expect("the conference dialog is seated");
@@ -319,6 +320,7 @@ async fn a_seat_besides_the_owners_keeps_the_conference_dialog() {
             ConferenceRole::Listener,
             &NgFlags::default(),
             Some("sip:15550100077@example.com".to_string()),
+            ConferenceDtmf::Events,
         )
         .await
         .expect("seated");
@@ -591,6 +593,17 @@ async fn the_roster_and_the_owner_link_drain_to_baseline() {
                 caller_sends(state, &conference, "BYE", "3 BYE");
             }
         }
+        if round % 3 != 0 && round % 2 == 0 {
+            // The last call leaving ends the owner, on a task of its own: its
+            // BYE is on the wire before this round's frames are read.
+            assert!(
+                eventually(|| state
+                    .call_actors
+                    .get_call(&conference.internal_call_id)
+                    .is_none())
+                .await
+            );
+        }
         drain(&dispatcher.udp);
         rooms.push(room);
     }
@@ -612,4 +625,116 @@ async fn the_roster_and_the_owner_link_drain_to_baseline() {
             told(list, room)
         );
     }
+}
+
+/// An engine that serves digit forwarding as well as `conference_seat`.
+async fn forwarding_engine() -> NativeTestEngine {
+    NativeTestEngine::start_with_features(&["relay", "scope", "conference_seat", "conference_dtmf"])
+        .await
+}
+
+/// The conference dialog's seat forwards its digits and an adopted seat stays on
+/// events unless asked: the engine is sent the field, and the roster says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_adopted_seat_carries_its_dtmf_to_the_engine_and_the_roster() {
+    let engine = forwarding_engine().await;
+    let room = "roster-dtmf";
+    let dispatcher = running(&engine, &script("ROSTER_DTMF", false));
+    let conference = conference_dialog(&dispatcher, "roster-dtmf@192.0.2.10", SUBSCRIBER);
+    engine
+        .backend()
+        .conference_join_party(
+            &conference.call_id,
+            ConferenceSeat {
+                conference_id: room.to_string(),
+                from_tag: "caller-tag".to_string(),
+            },
+            "v=0\r\n",
+            ConferenceRole::Talker,
+            &NgFlags::default(),
+            None,
+            ConferenceDtmf::Forward,
+        )
+        .await
+        .expect("the owner's seat forwards");
+    let plain = subscriber_called_out(&dispatcher, &engine, "dtmf-plain", SUBSCRIBER);
+    let forwarded = subscriber_called_out(&dispatcher, &engine, "dtmf-forward", SUBSCRIBER);
+    adopt(&dispatcher, &conference, room, &plain, false).await;
+    let mut request = request_in(room, &conference, forwarded.replaces_caller(), true);
+    request.dtmf = ConferenceDtmf::Forward;
+    let (status, _) = merge(&dispatcher, &conference, request).await;
+    assert_eq!(status, 200);
+
+    let seats = conference_roster::roster(room);
+    let dtmf: Vec<(&str, &str)> = seats
+        .iter()
+        .map(|seat| (seat.call_id.as_str(), seat.dtmf.as_str()))
+        .collect();
+    assert_eq!(
+        dtmf,
+        vec![
+            (conference.call_id.as_str(), "forward"),
+            (plain.b_call_id.as_str(), "events"),
+            (forwarded.b_call_id.as_str(), "forward"),
+        ]
+    );
+    let sent: Vec<Option<String>> = engine
+        .commands("conference_seat")
+        .into_iter()
+        .map(|command| command.dtmf)
+        .collect();
+    assert_eq!(
+        sent,
+        vec![Some("events".to_string()), Some("forward".to_string())]
+    );
+
+    // The script reads it off the roster.
+    pyo3::Python::attach(|python| {
+        let control = crate::script::api::b2bua::PyB2buaControl::new();
+        let list = control.conference_roster(python, room).expect("the roster");
+        let list = list.bind(python);
+        let last = list.get_item(2).expect("the forwarding seat");
+        assert_eq!(last.get_item("dtmf").expect("dtmf").to_string(), "forward");
+    });
+    // A route that changes the role only keeps the setting; one that names it moves it.
+    let seat = ConferenceSeat {
+        conference_id: room.to_string(),
+        from_tag: "caller-tag".to_string(),
+    };
+    engine
+        .backend()
+        .conference_route(&seat, ConferenceRole::Muted, None)
+        .await
+        .expect("routed");
+    assert_eq!(conference_roster::roster(room)[0].dtmf, "forward");
+    engine
+        .backend()
+        .conference_route(&seat, ConferenceRole::Talker, Some(ConferenceDtmf::Events))
+        .await
+        .expect("routed");
+    assert_eq!(conference_roster::roster(room)[0].dtmf, "events");
+
+    caller_sends(&dispatcher.state, &conference, "BYE", "3 BYE");
+    assert!(eventually(|| conference_roster::roster(room).is_empty()).await);
+}
+
+/// An engine that cannot forward digits refuses the seat: 501, the call is left
+/// as it was, and the engine is sent no `conference_seat`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_adopted_seat_that_asks_for_forwarding_is_refused_by_an_engine_without_it() {
+    let engine = NativeTestEngine::start().await;
+    let room = "roster-dtmf-refused";
+    let dispatcher = running(&engine, &script("ROSTER_DTMF_REFUSED", false));
+    let conference = owner(&dispatcher, &engine, room, "roster-dtmf-refused@192.0.2.10").await;
+    let held = subscriber_called_out(&dispatcher, &engine, "dtmf-refused", SUBSCRIBER);
+    let mut request = request_in(room, &conference, held.replaces_caller(), true);
+    request.dtmf = ConferenceDtmf::Forward;
+    let (status, _) = merge(&dispatcher, &conference, request).await;
+    assert_eq!(status, 501);
+    assert!(engine.commands("conference_seat").is_empty());
+    assert!(engine.holds(&held.a_call_id));
+    assert_eq!(dispatcher.state.call_actors.adoptions_len(), (0, 0));
+    assert_eq!(conference_roster::roster(room).len(), 1, "the owner only");
+    caller_sends(&dispatcher.state, &conference, "BYE", "3 BYE");
+    assert!(eventually(|| conference_roster::roster(room).is_empty()).await);
 }

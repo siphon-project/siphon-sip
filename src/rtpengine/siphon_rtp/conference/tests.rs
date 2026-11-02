@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use siphon_rtp_proto::{BridgeDirection, ConferenceRole, PlayRepeat};
+use siphon_rtp_proto::{BridgeDirection, ConferenceDtmf, ConferenceRole, PlayRepeat};
 use tokio::sync::mpsc;
 
 use super::super::{SiphonRtpClient, SiphonRtpClientSet};
@@ -46,6 +46,7 @@ async fn a_join_is_the_documented_frame_and_resolves_to_the_answer() {
             OFFER,
             ConferenceRole::Talker,
             &NgFlags::default(),
+            ConferenceDtmf::Events,
         )
         .await
         .expect("seated");
@@ -61,6 +62,7 @@ async fn a_join_is_the_documented_frame_and_resolves_to_the_answer() {
             "from_tag": "alice",
             "role": { "role": "talker" },
             "sdp": OFFER,
+            "dtmf": "events",
         })
     );
 }
@@ -77,7 +79,14 @@ async fn a_join_carries_the_profile_the_engine_reads_for_a_seat() {
     };
 
     client
-        .conference_join("room-1", "alice", OFFER, ConferenceRole::Listener, &flags)
+        .conference_join(
+            "room-1",
+            "alice",
+            OFFER,
+            ConferenceRole::Listener,
+            &flags,
+            ConferenceDtmf::Events,
+        )
         .await
         .expect("seated");
 
@@ -104,7 +113,7 @@ async fn leave_route_and_bridge_are_the_documented_frames() {
         .await
         .expect("left");
     client
-        .conference_route("room-1", "bob", ConferenceRole::Muted)
+        .conference_route("room-1", "bob", ConferenceRole::Muted, None)
         .await
         .expect("muted");
     client
@@ -114,6 +123,7 @@ async fn leave_route_and_bridge_are_the_documented_frames() {
             ConferenceRole::Whisper {
                 target: "agent-a".into(),
             },
+            None,
         )
         .await
         .expect("whispering");
@@ -125,6 +135,7 @@ async fn leave_route_and_bridge_are_the_documented_frames() {
                 target: "agent-a".into(),
                 whisper_target: Some("agent-a".into()),
             },
+            None,
         )
         .await
         .expect("monitoring");
@@ -326,6 +337,7 @@ async fn a_refusal_comes_back_as_the_engines_reason() {
             OFFER,
             ConferenceRole::Talker,
             &NgFlags::default(),
+            ConferenceDtmf::Events,
         )
         .await;
     let left = client.conference_leave("room-1", "alice").await;
@@ -445,11 +457,12 @@ async fn every_verb_of_a_room_reaches_the_instance_its_first_seat_went_to() {
             OFFER,
             ConferenceRole::Talker,
             &NgFlags::default(),
+            ConferenceDtmf::Events,
         )
         .await
         .expect("seated");
     }
-    set.conference_route("room-1", "bob", ConferenceRole::Muted)
+    set.conference_route("room-1", "bob", ConferenceRole::Muted, None)
         .await
         .expect("muted");
     set.conference_play(
@@ -543,6 +556,7 @@ async fn a_seat_behind_nat_is_refused_by_an_engine_that_ignores_received_from() 
             OFFER,
             ConferenceRole::Talker,
             &behind_nat(),
+            ConferenceDtmf::Events,
         )
         .await
         .expect_err("refused");
@@ -603,6 +617,7 @@ async fn a_seat_behind_nat_carries_received_from_to_an_engine_that_honours_it() 
             OFFER,
             ConferenceRole::Talker,
             &behind_nat(),
+            ConferenceDtmf::Events,
         )
         .await
         .expect("seated");
@@ -625,9 +640,189 @@ async fn a_seat_without_received_from_needs_no_feature_check() {
             OFFER,
             ConferenceRole::Talker,
             &NgFlags::default(),
+            ConferenceDtmf::Events,
         )
         .await
         .expect("seated");
     assert!(engine.frames("node_info").is_empty());
     assert_eq!(engine.frames("conference_join").len(), 1);
+}
+
+fn lists_conference_dtmf(request: &Value) -> Value {
+    listing(request, &["conference_seat", "conference_dtmf"])
+}
+
+fn lacks_conference_dtmf(request: &Value) -> Value {
+    listing(request, &["conference_seat"])
+}
+
+/// `dtmf` rides every seating verb, `events` by default and `forward` when
+/// asked, and a route carries it only when given.
+#[tokio::test]
+async fn every_seating_verb_carries_the_dtmf_field() {
+    let engine = FakeEngine::start(lists_conference_dtmf, Vec::new()).await;
+    let (client, _events) = client(&engine);
+    client
+        .conference_join(
+            "room-1",
+            "owner",
+            OFFER,
+            ConferenceRole::Talker,
+            &NgFlags::default(),
+            ConferenceDtmf::Forward,
+        )
+        .await
+        .expect("seated");
+    client
+        .conference_offer(
+            "room-1",
+            "callee",
+            ConferenceRole::Talker,
+            &NgFlags::default(),
+            ConferenceDtmf::Forward,
+        )
+        .await
+        .expect("offered");
+    client
+        .conference_seat(
+            "call-1",
+            "far",
+            "room-1",
+            ConferenceRole::Talker,
+            ConferenceDtmf::Forward,
+        )
+        .await
+        .expect("seated in place");
+    client
+        .conference_seat(
+            "call-2",
+            "far",
+            "room-1",
+            ConferenceRole::Talker,
+            ConferenceDtmf::Events,
+        )
+        .await
+        .expect("seated in place");
+    client
+        .conference_route(
+            "room-1",
+            "owner",
+            ConferenceRole::Talker,
+            Some(ConferenceDtmf::Events),
+        )
+        .await
+        .expect("routed");
+    client
+        .conference_route("room-1", "owner", ConferenceRole::Muted, None)
+        .await
+        .expect("routed");
+
+    assert_eq!(
+        engine.frames("conference_join")[0]["dtmf"],
+        json!("forward")
+    );
+    assert_eq!(
+        engine.frames("conference_offer")[0]["dtmf"],
+        json!("forward")
+    );
+    let seats = engine.frames("conference_seat");
+    assert_eq!(seats[0]["dtmf"], json!("forward"));
+    assert_eq!(seats[1]["dtmf"], json!("events"));
+    let routes = engine.frames("conference_route");
+    assert_eq!(routes[0]["dtmf"], json!("events"));
+    assert!(
+        routes[1]
+            .as_object()
+            .is_some_and(|fields| !fields.contains_key("dtmf")),
+        "a route that names no dtmf leaves the field out, so the engine keeps the seat's: {}",
+        routes[1]
+    );
+}
+
+/// An engine that does not list `conference_dtmf` would drop the digits
+/// without a word, so every ask for forwarding is refused and nothing is sent
+/// but the `node_info` check. `events` is what every engine does.
+#[tokio::test]
+async fn forwarding_is_refused_on_an_engine_without_the_feature() {
+    let engine = FakeEngine::start(lacks_conference_dtmf, Vec::new()).await;
+    let (client, _events) = client(&engine);
+    let refused = |outcome: Result<(), RtpEngineError>| {
+        assert!(
+            matches!(outcome, Err(RtpEngineError::Unsupported { .. })),
+            "{outcome:?}"
+        );
+    };
+    refused(
+        client
+            .conference_join(
+                "room-1",
+                "owner",
+                OFFER,
+                ConferenceRole::Talker,
+                &NgFlags::default(),
+                ConferenceDtmf::Forward,
+            )
+            .await
+            .map(|_| ()),
+    );
+    refused(
+        client
+            .conference_offer(
+                "room-1",
+                "callee",
+                ConferenceRole::Talker,
+                &NgFlags::default(),
+                ConferenceDtmf::Forward,
+            )
+            .await
+            .map(|_| ()),
+    );
+    refused(
+        client
+            .conference_seat(
+                "call-1",
+                "far",
+                "room-1",
+                ConferenceRole::Talker,
+                ConferenceDtmf::Forward,
+            )
+            .await,
+    );
+    refused(
+        client
+            .conference_route(
+                "room-1",
+                "owner",
+                ConferenceRole::Talker,
+                Some(ConferenceDtmf::Events),
+            )
+            .await,
+    );
+    for verb in [
+        "conference_join",
+        "conference_offer",
+        "conference_seat",
+        "conference_route",
+    ] {
+        assert!(engine.frames(verb).is_empty(), "{verb} was sent");
+    }
+
+    // Nothing asked for, nothing to gate: the same engine takes these.
+    client
+        .conference_join(
+            "room-2",
+            "plain",
+            OFFER,
+            ConferenceRole::Talker,
+            &NgFlags::default(),
+            ConferenceDtmf::Events,
+        )
+        .await
+        .expect("seated");
+    client
+        .conference_route("room-2", "plain", ConferenceRole::Muted, None)
+        .await
+        .expect("routed");
+    assert_eq!(engine.frames("conference_join").len(), 1);
+    assert_eq!(engine.frames("conference_route").len(), 1);
 }

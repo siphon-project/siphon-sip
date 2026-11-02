@@ -7,8 +7,8 @@ use pyo3::types::{PyDict, PyList};
 
 use crate::rtpengine::conference_roster::RosterSeat;
 
-/// One seat as a dict: `call_id`, `from_tag`, `party_uri`, `role`,
-/// `joined_at` (unix seconds), `kind` (`"joined"` or `"adopted"`) and
+/// One seat as a dict: `call_id`, `from_tag`, `party_uri`, `role`, `dtmf`
+/// (`"events"` or `"forward"`), `joined_at` (unix seconds), `kind` (`"joined"` or `"adopted"`) and
 /// `owner_call_id` (`None` for a joined seat).
 pub(crate) fn seat_dict<'py>(
     python: Python<'py>,
@@ -19,6 +19,7 @@ pub(crate) fn seat_dict<'py>(
     dict.set_item("from_tag", &seat.from_tag)?;
     dict.set_item("party_uri", seat.party_uri.as_deref())?;
     dict.set_item("role", &seat.role)?;
+    dict.set_item("dtmf", &seat.dtmf)?;
     dict.set_item("joined_at", seat.joined_at)?;
     dict.set_item("kind", seat.kind.label())?;
     dict.set_item("owner_call_id", seat.owner_call_id.as_deref())?;
@@ -46,6 +47,7 @@ mod tests {
             from_tag: "far-tag".into(),
             party_uri: Some("sip:15550100042@example.com".into()),
             role: "talker".into(),
+            dtmf: "events".into(),
             joined_at: 1_700_000_000.5,
             kind,
             owner_call_id: owner.map(str::to_string),
@@ -81,6 +83,7 @@ mod tests {
                 keys,
                 [
                     "call_id",
+                    "dtmf",
                     "from_tag",
                     "joined_at",
                     "kind",

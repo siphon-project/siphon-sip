@@ -340,6 +340,7 @@ pub(super) fn request_in(
         role: crate::rtpengine::backend::ConferenceRole::Talker,
         ends_with_owner,
         ends_owner_on_last: false,
+        dtmf: crate::rtpengine::backend::ConferenceDtmf::Events,
     }
 }
 
