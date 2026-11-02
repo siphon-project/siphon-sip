@@ -15,6 +15,7 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- registrant: an IMS UE over UDP opens the TCP listener on its protected server port when its SA set is installed, ahead of the protected REGISTER, not at the next registration tick. A P-CSCF's TCP connection for an over-MTU request right after the REGISTER (RFC 3261 18.1.1, TS 24.229 5.2.2.2) is no longer refused.
 - **After a restart, a P-CSCF no longer refuses terminating requests to a UE that has re-registered with new SAs.** The egress bars on the endpoints of a binding whose SAs were lost (a Contact port or old server port the new pair does not cover) lifted only when the old binding would have expired. They now lift when a new SA pair for that UE address is taken into use (TS 24.229 §5.1.1.4.1); a pair still pending lifts nothing.
 
 ## [1.15.9] — 2026-11-01
