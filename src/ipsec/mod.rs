@@ -960,9 +960,13 @@ impl IpsecManager {
         let (new_states, new_spis) = (sa.state_keys(), sa.local_inbound_spis());
         self.lifecycle
             .set_pending(&key, retire::pair_spis(&sa), pending);
+        let in_use_from_creation = pending.is_none().then(|| sa.clone());
         if let Some(replaced) = self.associations.insert(key, sa) {
             self.retire_replaced_pair(replaced, new_states, new_spis)
                 .await;
+        }
+        if let Some(pair) = in_use_from_creation {
+            self.lift_restart_bars(&pair);
         }
         Ok(())
     }

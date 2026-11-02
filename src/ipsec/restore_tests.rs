@@ -59,13 +59,22 @@ fn pair(manager: &IpsecManager, ue_addr: IpAddr) -> SecurityAssociationPair {
 /// `ue_addr`, accepted on local port `local_port` (a protected port when it is
 /// `PORT_PS`).
 async fn previous_process_backend(ue_addr: IpAddr, local_port: u16) -> MemoryBackend {
+    previous_process_backend_with_contact(ue_addr, local_port, UE_PORT_S).await
+}
+
+/// As [`previous_process_backend`], with the Contact URI on `contact_port`.
+async fn previous_process_backend_with_contact(
+    ue_addr: IpAddr,
+    local_port: u16,
+    contact_port: u16,
+) -> MemoryBackend {
     let previous = Registrar::default();
     previous
         .save_full(
             IMPU,
             SipUri::new(ue_addr.to_string())
                 .with_user("001010000000001".to_string())
-                .with_port(UE_PORT_S),
+                .with_port(contact_port),
             3600,
             1.0,
             "call-1".into(),
@@ -335,9 +344,108 @@ async fn a_new_sa_pair_lifts_the_bar() {
     assert!(wire.try_recv().is_ok());
     assert_eq!(
         manager.orphaned_flow_count(),
-        1,
-        "the other port is still held"
+        0,
+        "the UE registered afresh: no endpoint of the old binding is held"
     );
+}
+
+/// The UE address's other restart bars, on endpoints the new pair does not
+/// cover (a Contact on 5060, pair on 6100/6101), lift once the pair is taken
+/// into use, not when the old binding would have expired.
+#[tokio::test]
+async fn a_new_sa_pair_lifts_the_bar_on_a_contact_port_it_does_not_cover() {
+    let ue_addr = ue(17);
+    let store = previous_process_backend_with_contact(ue_addr, PORT_PS, 5060).await;
+    let (registrar, _writes) = restored(&store).await;
+    let manager = manager();
+    manager.drop_restored_bindings_without_sa(&registrar, &[PORT_PC], PORT_PS);
+    let contact = SocketAddr::new(ue_addr, 5060);
+    let (router, wire) = router();
+    assert!(
+        router
+            .send_guarded(options_to(contact), Some(&manager))
+            .is_err(),
+        "refused before the UE registers again"
+    );
+    assert_eq!(manager.orphaned_flow_count(), 2);
+
+    manager
+        .create_sa_pair(pair(&manager, ue_addr))
+        .await
+        .expect("installed");
+
+    assert!(manager.find_sa_by_ue(&ue_addr, 5060).is_none());
+    assert!(!manager.is_barred_flow(contact));
+    router
+        .send_guarded(options_to(contact), Some(&manager))
+        .expect("sent");
+    assert!(wire.try_recv().is_ok());
+    assert_eq!(manager.orphaned_flow_count(), 0);
+}
+
+/// A pair pending beside a set in use (an authentication in progress) is not
+/// held by the UE yet: the bar stays until it is taken into use.
+#[tokio::test]
+async fn a_pending_sa_pair_does_not_lift_the_bar() {
+    let ue_addr = ue(18);
+    let manager = manager();
+    manager
+        .create_sa_pair(pair(&manager, ue_addr))
+        .await
+        .expect("in use");
+    let contact = SocketAddr::new(ue_addr, 5060);
+    manager
+        .orphaned_flows
+        .endpoints
+        .insert(contact, Instant::now() + Duration::from_secs(600));
+    let mut next = pair(&manager, ue_addr);
+    next.ue_port_c = UE_PORT_C + 2;
+    next.spi_uc = 80_001;
+    next.spi_us = 90_001;
+    manager.create_sa_pair(next).await.expect("pending");
+    assert!(manager.is_pending(&ue_addr, UE_PORT_C + 2));
+    assert!(
+        manager.is_barred_flow(contact),
+        "still barred while pending"
+    );
+    let (router, _wire) = router();
+    assert!(router
+        .send_guarded(options_to(contact), Some(&manager))
+        .is_err());
+
+    let manager = Arc::new(manager);
+    assert!(manager
+        .take_into_use(&ue_addr, UE_PORT_C + 2)
+        .await
+        .expect("taken into use"));
+
+    assert!(!manager.is_barred_flow(contact));
+    assert_eq!(manager.orphaned_flow_count(), 0);
+}
+
+/// Another UE address keeps its bars.
+#[tokio::test]
+async fn a_new_sa_pair_leaves_another_ue_address_barred() {
+    let (ue_addr, other) = (ue(19), ue(20));
+    let manager = manager();
+    let until = Instant::now() + Duration::from_secs(600);
+    let other_contact = SocketAddr::new(other, 5060);
+    manager
+        .orphaned_flows
+        .endpoints
+        .insert(other_contact, until);
+    manager
+        .orphaned_flows
+        .endpoints
+        .insert(SocketAddr::new(ue_addr, 5060), until);
+
+    manager
+        .create_sa_pair(pair(&manager, ue_addr))
+        .await
+        .expect("installed");
+
+    assert_eq!(manager.orphaned_flow_count(), 1);
+    assert!(manager.is_barred_flow(other_contact));
 }
 
 /// The bar lasts as long as the binding would have, and the sweep drains it.
