@@ -26,11 +26,11 @@ use crate::rtpengine::test_native_engine::NativeTestEngine;
 use crate::sip::headers::refer::Replaces;
 
 /// The subscriber's handset: where its conference dialog and its own calls come from.
-const SUBSCRIBER: &str = "192.0.2.10:5060";
+pub(super) const SUBSCRIBER: &str = "192.0.2.10:5060";
 /// Another subscriber's handset.
 const STRANGER: &str = "192.0.2.66:5060";
 /// The carrier on the far side of a merged call.
-const CARRIER: &str = "198.51.100.77:5060";
+pub(super) const CARRIER: &str = "198.51.100.77:5060";
 const ROOM: &str = "room-1";
 
 const SCRIPT: &str = concat!(
@@ -46,11 +46,11 @@ const SCRIPT: &str = concat!(
 );
 
 /// A focus whose media is on `engine`.
-fn focus(engine: &NativeTestEngine) -> TestDispatcher {
+pub(super) fn focus(engine: &NativeTestEngine) -> TestDispatcher {
     focus_running(engine, SCRIPT)
 }
 
-fn focus_running(engine: &NativeTestEngine, script: &str) -> TestDispatcher {
+pub(super) fn focus_running(engine: &NativeTestEngine, script: &str) -> TestDispatcher {
     let mut dispatcher = test_dispatcher_with_script(script);
     dispatcher.state.rtpengine_set = Some(engine.backend());
     dispatcher.state.rtpengine_profiles = Some(Arc::new(crate::rtpengine::ProfileRegistry::new()));
@@ -61,35 +61,35 @@ fn focus_running(engine: &NativeTestEngine, script: &str) -> TestDispatcher {
 
 /// The conference dialog: the subscriber's call to the conference factory,
 /// answered and anchored by the focus.
-fn conference_dialog(dispatcher: &TestDispatcher, call_id: &str, from: &str) -> Caller {
+pub(super) fn conference_dialog(dispatcher: &TestDispatcher, call_id: &str, from: &str) -> Caller {
     answered_caller_from(dispatcher, call_id, from, "rtp_passthrough")
 }
 
 /// One end of a bridged call as a test builds it.
-struct End {
-    address: &'static str,
-    uri: &'static str,
-    tag: &'static str,
+pub(super) struct End {
+    pub(super) address: &'static str,
+    pub(super) uri: &'static str,
+    pub(super) tag: &'static str,
 }
 
 /// A bridged, answered, anchored call: what `merge` asks to take into a room.
-struct Held {
-    internal_call_id: String,
+pub(super) struct Held {
+    pub(super) internal_call_id: String,
     /// The A-leg's SIP Call-ID, the engine call's id.
-    a_call_id: String,
-    b_call_id: String,
+    pub(super) a_call_id: String,
+    pub(super) b_call_id: String,
     /// siphon's tag on each dialog.
-    a_local_tag: String,
-    b_local_tag: String,
-    caller: End,
-    callee: End,
+    pub(super) a_local_tag: String,
+    pub(super) b_local_tag: String,
+    pub(super) caller: End,
+    pub(super) callee: End,
     /// What siphon sent the callee: the session in force on that dialog.
-    sent_to_callee: Vec<u8>,
+    pub(super) sent_to_callee: Vec<u8>,
 }
 
 impl Held {
     /// The `Replaces` naming the caller's leg (the subscriber placed the call).
-    fn replaces_caller(&self) -> Replaces {
+    pub(super) fn replaces_caller(&self) -> Replaces {
         Replaces {
             call_id: self.a_call_id.clone(),
             to_tag: self.a_local_tag.clone(),
@@ -99,7 +99,7 @@ impl Held {
     }
 
     /// The `Replaces` naming the callee's leg (the subscriber was called).
-    fn replaces_callee(&self) -> Replaces {
+    pub(super) fn replaces_callee(&self) -> Replaces {
         Replaces {
             call_id: self.b_call_id.clone(),
             to_tag: self.b_local_tag.clone(),
@@ -131,7 +131,7 @@ fn host_of(address: &str) -> &str {
 
 /// Build a call from `caller` to `callee`, answered, ACKed and anchored on
 /// `engine` as one engine call keyed by the caller's Call-ID.
-fn held_call(
+pub(super) fn held_call(
     dispatcher: &TestDispatcher,
     engine: &NativeTestEngine,
     name: &str,
@@ -213,7 +213,7 @@ fn held_call(
 }
 
 /// The subscriber at `address` placed a call to a carrier.
-fn subscriber_called_out(
+pub(super) fn subscriber_called_out(
     dispatcher: &TestDispatcher,
     engine: &NativeTestEngine,
     name: &str,
@@ -237,7 +237,7 @@ fn subscriber_called_out(
 }
 
 /// A carrier called the subscriber at `address` (an inbound DID call).
-fn subscriber_was_called(
+pub(super) fn subscriber_was_called(
     dispatcher: &TestDispatcher,
     engine: &NativeTestEngine,
     name: &str,
@@ -263,7 +263,11 @@ fn subscriber_was_called(
 /// The REFER in the conference dialog, held for its handler as the handler
 /// path holds it, and accepted in mode `script`: a 202 and a `100 Trying`
 /// NOTIFY, both to the subscriber.
-fn refer_accepted(dispatcher: &TestDispatcher, conference: &Caller, replaces: &Replaces) {
+pub(super) fn refer_accepted(
+    dispatcher: &TestDispatcher,
+    conference: &Caller,
+    replaces: &Replaces,
+) {
     let state = &dispatcher.state;
     let raw = format!(
         concat!(
@@ -313,20 +317,35 @@ fn refer_accepted(dispatcher: &TestDispatcher, conference: &Caller, replaces: &R
     );
 }
 
-fn request(conference: &Caller, replaces: Replaces, ends_with_owner: bool) -> AdoptRequest {
+pub(super) fn request(
+    conference: &Caller,
+    replaces: Replaces,
+    ends_with_owner: bool,
+) -> AdoptRequest {
+    request_in(ROOM, conference, replaces, ends_with_owner)
+}
+
+/// [`request`] for the room `room`.
+pub(super) fn request_in(
+    room: &str,
+    conference: &Caller,
+    replaces: Replaces,
+    ends_with_owner: bool,
+) -> AdoptRequest {
     AdoptRequest {
         owner_call_id: conference.internal_call_id.clone(),
         referrer_on_a_leg: true,
         replaces,
-        conference_id: ROOM.to_string(),
+        conference_id: room.to_string(),
         role: crate::rtpengine::backend::ConferenceRole::Talker,
         ends_with_owner,
+        ends_owner_on_last: false,
     }
 }
 
 /// Merge with the REFER accepted, then report the outcome: returns the status
 /// and what went on the wire from the merge on, the NOTIFY last.
-async fn merge(
+pub(super) async fn merge(
     dispatcher: &TestDispatcher,
     conference: &Caller,
     request: AdoptRequest,
@@ -373,7 +392,7 @@ fn untouched(dispatcher: &TestDispatcher, engine: &NativeTestEngine, held: &Held
 }
 
 /// A request from the far party in its dialog with siphon.
-fn far_request(
+pub(super) fn far_request(
     method: &str,
     cseq: u32,
     far: &End,

@@ -421,6 +421,16 @@ def _subscribe_body(caller: str, body: Any, content_type: Optional[str]) -> Opti
     return {"body": data, "content_type": content_type}
 
 
+def _resource_uri(value: Any) -> str:
+    """A URI as ``proxy.subscribe_state`` keeps a subscription's resource: the
+    URI alone, without name-addr brackets, display name or header parameters."""
+    text = str(value or "").strip()
+    left, right = text.find("<"), text.rfind(">")
+    if 0 <= left < right:
+        return text[left + 1:right]
+    return text.split(";")[0].strip()
+
+
 class MockSubscribeHandle:
     """Mock of the Rust ``SubscribeHandle``.
 
@@ -700,6 +710,7 @@ class MockSubscribeState:
             "expires_secs": expires_secs,
             "call_id": getattr(request, "call_id", ""),
             "remote_tag": getattr(request, "from_tag", ""),
+            "local_uri": _resource_uri(getattr(request, "to_uri", None)),
             "event_version": 0,
         }
         self._dialogs[handle_id] = dialog
@@ -924,6 +935,39 @@ class MockSubscribeState:
             ):
                 return MockSubscribeHandle(self, dialog_id, dialog)
         return None
+
+    def for_resource(self, uri: str, event: str) -> list[MockSubscribeHandle]:
+        """The live subscriptions this node is the notifier of for one
+        resource and event package, oldest first.
+
+        ``uri`` is compared exactly after the normalisation a stored resource
+        has (name-addr brackets and display name stripped); ``event`` is the
+        package token, case-insensitive, any ``;id=`` parameter aside.
+        Terminated and expired subscriptions are left out, and so are
+        subscriptions the script originated with :meth:`send`.
+
+        siphon reads its in-process store, as :meth:`find` does: the Redis
+        cache is keyed by dialog id and cannot be searched by resource, so a
+        subscription held only there is listed once ``await
+        proxy.subscribe_state.get(id)`` has loaded it. The mock has one tier.
+
+        Example::
+
+            for handle in proxy.subscribe_state.for_resource(
+                    "sip:room-1@conf.example.com", "conference"):
+                await handle.notify(body=xml, content_type="application/conference-info+xml")
+        """
+        resource = _resource_uri(uri)
+        package = event.split(";")[0].strip().lower()
+        return [
+            MockSubscribeHandle(self, dialog_id, dialog)
+            for dialog_id, dialog in self._dialogs.items()
+            if not dialog.get("terminated")
+            and not dialog.get("is_outbound")
+            and int(dialog.get("expires_secs", 0)) > 0
+            and dialog.get("local_uri") == resource
+            and dialog.get("event", "").split(";")[0].strip().lower() == package
+        ]
 
     @property
     def local_count(self) -> int:
@@ -1245,6 +1289,47 @@ def _uri_user(uri: Optional[str]) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def _party_uri(target: Any, answered: bool = False) -> Optional[str]:
+    """The URI of the party a seat's object faces: its ``From`` (the
+    participant dialled in), or for a seat answered by the participant the
+    ``To`` of the focus's own INVITE. ``None`` for a ``(call_id, tag)`` pair."""
+    header = getattr(target, "header", None)
+    if header is None:
+        return None
+    try:
+        return _bare_uri(header("To" if answered else "From"))
+    except Exception:
+        return None
+
+
+def _run_to_completion(awaitable: Any) -> None:
+    """Run a coroutine to completion from sync code, whether or not an event
+    loop is already running here: on a thread of its own, so a handler that
+    awaits is finished before the call that raised the change returns."""
+    import threading
+
+    failure: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            asyncio.run(awaitable)
+        except BaseException as error:  # noqa: BLE001 — reported to the caller
+            failure.append(error)
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    thread.join()
+    if failure:
+        raise failure[0]
+
+
+def _bare_uri(uri: Optional[str]) -> Optional[str]:
+    """A party's URI without name-addr brackets, display name or parameters."""
+    if not uri:
+        return None
+    return _resource_uri(uri) or None
+
+
 class HeldLeg:
     """One leg of a call the mock node holds (test helper for
     :meth:`MockB2bua.adopt_replaced`): the dialog's identifiers as siphon holds
@@ -1369,6 +1454,10 @@ class MockB2bua:
         # b2bua.adopt_replaced carried out.
         self.held_calls: list[HeldCall] = []
         self.adoptions: list[dict] = []
+        # Conference dialogs conference_dialog_ended played hanging up.
+        self._ended_owners: set[str] = set()
+        # Handler raises from @b2bua.on_conference_change, for assertions.
+        self.conference_change_errors: list[BaseException] = []
         # Records b2bua.send_info(...) calls, and the status they resolve to.
         self.sent_infos: list[dict] = []
         self.info_status: Optional[int] = 200
@@ -1384,6 +1473,8 @@ class MockB2bua:
         self.refer_reports.clear()
         self.held_calls.clear()
         self.adoptions.clear()
+        self._ended_owners.clear()
+        self.conference_change_errors.clear()
         self.sent_infos.clear()
         self.info_status = 200
         self.reoffers.clear()
@@ -1870,7 +1961,8 @@ class MockB2bua:
 
     async def adopt_replaced(self, call: Any, conference_id: str,
                              role: str = "talker",
-                             on_owner_leave: str = "end") -> int:
+                             on_owner_leave: str = "end",
+                             on_last_leave: str = "keep") -> int:
         """Merge the call a REFER's ``Replaces`` names into a conference room
         on this node (RFC 4579 section 5.5, a handset's "merge").
 
@@ -1903,6 +1995,11 @@ class MockB2bua:
             on_owner_leave: ``"end"`` (default) tears the adopted call down
                 with a BYE (``Reason: Q.850;cause=16``) when the conference
                 dialog that adopted it ends; ``"keep"`` leaves it in the room.
+            on_last_leave: ``"keep"`` (default) leaves the conference dialog
+                alone. ``"end_owner"`` ends it, with a BYE carrying
+                ``Reason: Q.850;cause=16``, when the last call adopted under it
+                has left the room and no seat but the dialog's own remains: a
+                conference of one is over. Held by siphon, not the script.
 
         Returns:
             int: the status for ``b2bua.complete_refer``: ``200``; ``481`` no
@@ -1914,7 +2011,8 @@ class MockB2bua:
 
         Raises:
             ValueError: outside ``@b2bua.on_refer``, an empty
-                ``conference_id``, or an unknown ``role`` / ``on_owner_leave``.
+                ``conference_id``, or an unknown ``role`` / ``on_owner_leave``
+                / ``on_last_leave``.
 
         In the mock the comparison is applied for real to the calls
         :meth:`hold_call` registered, and the far leg is seated in
@@ -1940,6 +2038,9 @@ class MockB2bua:
         if on_owner_leave not in ("end", "keep"):
             raise ValueError(
                 f'b2bua.adopt_replaced(on_owner_leave=…) is "end" or "keep" (got {on_owner_leave!r})')
+        if on_last_leave not in ("keep", "end_owner"):
+            raise ValueError(
+                f'b2bua.adopt_replaced(on_last_leave=…) is "keep" or "end_owner" (got {on_last_leave!r})')
         if not conference_id:
             raise ValueError("b2bua.adopt_replaced(conference_id=…) names a room; it is empty")
         if getattr(call, "refer_to", None) is None:
@@ -1962,19 +2063,24 @@ class MockB2bua:
             return 488
         far_side = "callee" if side == "caller" else "caller"
         far = getattr(held, far_side)
-        room = engine.conferences.setdefault(conference_id, {})
-        room[far.remote_tag] = {
-            "call_id": held.call_id,
-            "profile": None,
-            "adopted": True,
-            **engine._conference_role(role, None, None),
-        }
         setattr(held, side, None)
         held.adoption = {
             "conference_id": conference_id,
             "owner_call_id": call.call_id,
             "on_owner_leave": on_owner_leave,
+            "on_last_leave": on_last_leave,
         }
+        engine._seat_in(conference_id, far.remote_tag, {
+            "call_id": held.call_id,
+            "sip_call_id": far.call_id,
+            "profile": None,
+            "adopted": True,
+            "kind": "adopted",
+            "party_uri": _bare_uri(far.uri),
+            "owner_call_id": call.call_id,
+            "on_last_leave": on_last_leave,
+            **engine._conference_role(role, None, None),
+        })
         self.adoptions.append({
             "call_id": held.call_id,
             "conference_id": conference_id,
@@ -1983,6 +2089,7 @@ class MockB2bua:
             "seated_tag": far.remote_tag,
             "role": role,
             "on_owner_leave": on_owner_leave,
+            "on_last_leave": on_last_leave,
             "bye": {"call_id": leg.call_id,
                     "reason": 'SIP;cause=200;text="Merged into conference"'},
         })
@@ -1991,23 +2098,71 @@ class MockB2bua:
     def conference_dialog_ended(self, owner_call_id: str) -> list[str]:
         """Play the conference dialog ``owner_call_id`` hanging up (test
         helper): every call it adopted with ``on_owner_leave="end"`` is ended
-        with ``Reason: Q.850;cause=16`` and its seat leaves the room. Returns
-        the Call-IDs of the calls ended; each is also on ``terminates``."""
+        with ``Reason: Q.850;cause=16`` and its seat leaves the room, each
+        reported to ``@b2bua.on_conference_change`` as a ``"left"``. Returns
+        the Call-IDs of the calls ended; each is also on ``terminates``. The
+        dialog's own seat is the script's to free, as in siphon
+        (``rtpengine.delete(call)`` in ``@b2bua.on_bye``)."""
         ended = []
         engine = get_rtpengine()
+        self._ended_owners.add(owner_call_id)
         for held in list(self.held_calls):
             adoption = held.adoption
             if (adoption is None or adoption["owner_call_id"] != owner_call_id
                     or adoption["on_owner_leave"] != "end"):
                 continue
             far = held.caller or held.callee
-            if far is not None:
-                engine._leave_seat(adoption["conference_id"], far.remote_tag)
             self.held_calls.remove(held)
             self.terminates.append({"call_id": held.call_id,
                                     "reason": "Q.850;cause=16"})
             ended.append(held.call_id)
+            if far is not None:
+                engine._leave_seat(adoption["conference_id"], far.remote_tag)
         return ended
+
+    def adopted_call_ended(self, call_id: str) -> bool:
+        """Play the far party of an adopted call hanging up, or the call
+        ending any other way (test helper): the call goes and its seat leaves
+        the room, reported to ``@b2bua.on_conference_change``. With
+        ``on_last_leave="end_owner"`` the last such call going also ends the
+        conference dialog. ``True`` when ``call_id`` was an adopted call
+        (``@b2bua.on_bye`` is not run: dispatch it with
+        ``harness.send_bye``, which calls this)."""
+        engine = get_rtpengine()
+        for held in list(self.held_calls):
+            if held.adoption is None or call_id not in (held.call_id, getattr(
+                    held.caller or held.callee, "call_id", None)):
+                continue
+            far = held.caller or held.callee
+            self.held_calls.remove(held)
+            if far is not None:
+                engine._leave_seat(held.adoption["conference_id"], far.remote_tag)
+            return True
+        return False
+
+    def conference_roster(self, conference_id: str) -> list[dict]:
+        """The seats currently in a conference room, from siphon's own state.
+
+        A list of dicts, in the order the seats were taken, one per seat:
+        ``call_id`` (the SIP Call-ID of the dialog with the seated party),
+        ``from_tag``, ``party_uri`` (the seated party's own URI, or ``None``),
+        ``role`` (``"talker"``, ``"listener"``, ``"muted"``, ``"whisper"`` or
+        ``"monitor"``), ``joined_at`` (unix seconds, a float), ``kind``
+        (``"joined"`` for a seat taken with ``rtpengine.conference_join`` /
+        ``conference_answer``, ``"adopted"`` for one :meth:`adopt_replaced`
+        made) and ``owner_call_id`` (the SIP Call-ID of the conference dialog
+        that adopted the call, ``None`` for a joined seat). An empty list for
+        a room nobody is seated in.
+
+        Nothing here is the script's: it reads the same after a reload, so a
+        stateless script can build a conference-info body (RFC 4575) from it
+        at any time.
+
+        Example::
+
+            users = [seat["party_uri"] for seat in b2bua.conference_roster(room)]
+        """
+        return get_rtpengine()._roster(conference_id)
 
     def complete_refer(self, call_id: str, code: int,
                        reason: Optional[str] = None) -> bool:
@@ -2489,6 +2644,43 @@ class MockB2bua:
         """
         is_async = asyncio.iscoroutinefunction(fn)
         _registry.register("b2bua.on_reoffer", None, fn, is_async)
+        return fn
+
+    @staticmethod
+    def on_conference_change(fn: Callable) -> Callable:
+        """Register handler for a change of who is seated in a conference room.
+
+        Handler signature: ``(conference_id, owner_call_id, change, call_id,
+        roster) -> None``, sync or ``async``.
+
+        Called once for each seat that comes in (``rtpengine.conference_join``
+        / ``conference_answer``, a successful ``b2bua.adopt_replaced``) and
+        once for each seat that goes out, whatever the reason (a delete,
+        ``rtpengine.conference_leave``, the adopted call's BYE, the conference
+        dialog ending the calls it adopted: one ``"left"`` per seat).
+
+        * ``change`` is ``"joined"`` or ``"left"``.
+        * ``call_id`` is the SIP Call-ID of the seat that changed.
+        * ``owner_call_id`` is the SIP Call-ID of the conference dialog that
+          adopted that seat; for a joined seat, the dialog the adopted seats
+          in the room agree on, else ``None``.
+        * ``roster`` is the room after the change, the dicts of
+          ``b2bua.conference_roster(conference_id)``.
+
+        A raise is swallowed (siphon logs it) and changes nothing. In the
+        mock the handler runs to completion before the call that caused the
+        change returns; siphon runs it off the SIP message path.
+
+        Example::
+
+            @b2bua.on_conference_change
+            async def changed(conference_id, owner_call_id, change, call_id, roster):
+                for handle in proxy.subscribe_state.for_resource(focus_uri(conference_id), "conference"):
+                    await handle.notify(body=conference_info(roster),
+                                        content_type="application/conference-info+xml")
+        """
+        is_async = asyncio.iscoroutinefunction(fn)
+        _registry.register("b2bua.on_conference_change", None, fn, is_async)
         return fn
 
     @staticmethod
@@ -6413,9 +6605,71 @@ class MockRtpEngine:
                     return conference_id, from_tag
         return None
 
+    def _roster(self, conference_id: str) -> list[dict]:
+        """The room as ``b2bua.conference_roster`` reads it."""
+        room = self.conferences.get(conference_id, {})
+        return [
+            {
+                "call_id": seat.get("sip_call_id", seat["call_id"]),
+                "from_tag": from_tag,
+                "party_uri": seat.get("party_uri"),
+                "role": seat.get("role", "talker"),
+                "joined_at": seat.get("joined_at", 0.0),
+                "kind": seat.get("kind", "joined"),
+                "owner_call_id": seat.get("owner_call_id"),
+            }
+            for from_tag, seat in room.items()
+        ]
+
+    def _seat_in(self, conference_id: str, from_tag: str, seat: dict[str, Any]) -> None:
+        """Seat a participant and report it to ``@b2bua.on_conference_change``."""
+        seat.setdefault("kind", "joined")
+        seat.setdefault("joined_at", time.time())
+        seat.setdefault("owner_call_id", None)
+        self.conferences.setdefault(conference_id, {})[from_tag] = seat
+        self._conference_changed(conference_id, "joined", seat)
+
+    def _conference_changed(self, conference_id: str, change: str, seat: dict[str, Any]) -> None:
+        """Tell ``@b2bua.on_conference_change`` handlers of a seat that came
+        in or went out, with the room as it is now, and carry out
+        ``on_last_leave="end_owner"``."""
+        roster = self._roster(conference_id)
+        owner = seat.get("owner_call_id")
+        if owner is None:
+            owners = {other["owner_call_id"] for other in roster if other["owner_call_id"]}
+            owner = owners.pop() if len(owners) == 1 else None
+        call_id = seat.get("sip_call_id", seat["call_id"])
+        errors = get_b2bua().conference_change_errors
+        for fn, is_async in _registry.get("b2bua.on_conference_change"):
+            try:
+                if is_async:
+                    _run_to_completion(fn(conference_id, owner, change, call_id, roster))
+                else:
+                    fn(conference_id, owner, change, call_id, roster)
+            except Exception as error:
+                errors.append(error)
+        if (change == "left" and seat.get("kind") == "adopted"
+                and seat.get("on_last_leave") == "end_owner"):
+            self._end_owner_when_alone(conference_id, seat, roster)
+
+    def _end_owner_when_alone(self, conference_id: str, seat: dict[str, Any],
+                              roster: list[dict]) -> None:
+        owner_call_id = seat["owner_call_id"]
+        b2bua = get_b2bua()
+        if owner_call_id in b2bua._ended_owners:
+            return
+        if any(other["call_id"] != owner_call_id for other in roster):
+            return
+        b2bua._ended_owners.add(owner_call_id)
+        b2bua.terminates.append({"call_id": owner_call_id, "reason": "Q.850;cause=16"})
+        owner_seat = self.conference_seat(owner_call_id)
+        if owner_seat is not None:
+            self._leave_seat(*owner_seat)
+            self.operations.append(("conference_leave", owner_seat[0]))
+
     def _leave_seat(self, conference_id: str, from_tag: str) -> None:
         room = self.conferences.get(conference_id, {})
-        room.pop(from_tag, None)
+        seat = room.pop(from_tag, None)
         if not room:
             # The room dies with its last seat, and its bridges and playbacks
             # with it.
@@ -6428,6 +6682,8 @@ class MockRtpEngine:
                 play_id: play for play_id, play in self.conference_plays.items()
                 if play["conference_id"] != conference_id
             }
+        if seat is not None:
+            self._conference_changed(conference_id, "left", seat)
 
     async def conference_join(
         self,
@@ -6514,8 +6770,6 @@ class MockRtpEngine:
             )
         if self._conference_join_no_codec:
             raise ValueError("no encodable codec in offer")
-        room = self.conferences.setdefault(conference_id, {})
-        room[from_tag] = {"call_id": call_id, "profile": profile, **seat_role}
         self.operations.append(("conference_join", conference_id))
         self.media_calls.append({
             "op": "conference_join",
@@ -6524,6 +6778,10 @@ class MockRtpEngine:
             "from_tag": from_tag,
             "profile": profile,
             **seat_role,
+        })
+        self._seat_in(conference_id, from_tag, {
+            "call_id": call_id, "profile": profile,
+            "party_uri": _party_uri(call), **seat_role,
         })
         return self._conference_join_sdp
 
@@ -6775,14 +7033,16 @@ class MockRtpEngine:
             raise ValueError(
                 "rtpengine.conference_answer refused: no offer is pending for this seat"
             )
-        room = self.conferences.setdefault(conference_id, {})
-        room[seat_tag] = {"call_id": call_id, **offered, "received_from": received_from}
         self.operations.append(("conference_answer", conference_id))
         self.media_calls.append({
             "op": "conference_answer",
             "conference_id": conference_id,
             "call_id": call_id,
             "from_tag": seat_tag,
+        })
+        self._seat_in(conference_id, seat_tag, {
+            "call_id": call_id, **offered, "received_from": received_from,
+            "party_uri": _party_uri(call, answered=True),
         })
         return True
 

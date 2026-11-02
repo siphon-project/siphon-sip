@@ -663,3 +663,46 @@ Returned by `call.media` — controls RTP anchoring for the call.
 Identifies which side ended an answered call (surfaced on `@b2bua.on_bye`).
 
 ::: siphon_sdk.types.ByeInitiator
+
+
+## Conference roster
+
+Siphon keeps who is seated in each conference room (RFC 4575 needs it for its
+NOTIFY bodies) and a script reads it; nothing of it is the script's, so it is
+the same after a reload.
+
+`call.conference` is `(conference_id, owner_call_id)` for a call seated in a
+room, else `None`. `owner_call_id` is the SIP Call-ID of the conference dialog
+that adopted the call with `b2bua.adopt_replaced`, `None` for a call seated with
+`rtpengine.conference_join` / `conference_answer`. It reads in `@b2bua.on_bye`
+and every other handler for as long as the seat is.
+
+`b2bua.conference_roster(conference_id)` returns a list of dicts in the order
+the seats were taken:
+
+| Key | Value |
+|---|---|
+| `call_id` | the SIP Call-ID of the dialog with the seated party |
+| `from_tag` | the seat's From-tag |
+| `party_uri` | the seated party's own URI, or `None` |
+| `role` | `talker`, `listener`, `muted`, `whisper` or `monitor` |
+| `joined_at` | unix seconds, a float |
+| `kind` | `"joined"` (`conference_join` / `conference_answer`) or `"adopted"` (`adopt_replaced`) |
+| `owner_call_id` | the conference dialog that adopted the call; `None` for a joined seat |
+
+An unknown room is an empty list.
+
+`@b2bua.on_conference_change` is called as
+`fn(conference_id, owner_call_id, change, call_id, roster)`, sync or `async`,
+once for each seat that comes in (`change == "joined"`) and once for each that
+goes out (`"left"`): a delete, `conference_leave`, the adopted call's BYE, a
+credit or duration teardown, a silent seat (`media_timeout`), or the conference
+dialog ending the calls it adopted. `call_id` is the seat that changed and
+`roster` the room after the change. It runs off the SIP message path from
+siphon's state; a raise is logged and counted, and the next change is still
+delivered.
+
+`b2bua.adopt_replaced(call, conference_id, role="talker", on_owner_leave="end",
+on_last_leave="keep")`: `on_last_leave="end_owner"` BYEs the conference dialog
+(`Reason: Q.850;cause=16`) once the last call adopted under it has left and no
+seat but its own remains in the room; any other value raises `ValueError`.

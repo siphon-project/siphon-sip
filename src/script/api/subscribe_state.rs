@@ -29,7 +29,8 @@ use super::request::PyRequest;
 #[cfg(test)]
 use in_dialog::send_in_dialog;
 use in_dialog::{
-    resolved_transport, send_in_dialog_subscribe, send_in_dialog_subscribe_with_timeout,
+    is_single_value_header, resolved_transport, send_in_dialog_subscribe,
+    send_in_dialog_subscribe_with_timeout,
 };
 
 static UAC_SENDER: OnceLock<Arc<UacSender>> = OnceLock::new();
@@ -214,6 +215,31 @@ impl PySubscribeState {
                 reply_gate: None,
             }))
         })
+    }
+
+    /// The live subscriptions this node is the notifier of for one resource
+    /// and event package: ``for_resource("sip:room@example.com",
+    /// "conference")`` lists a ``SubscribeHandle`` for each subscriber of that
+    /// conference focus URI. The URI is compared exactly after the
+    /// normalisation a stored resource has (name-addr brackets and display
+    /// name stripped); the event is the package token, case-insensitive, any
+    /// ``;id=`` parameter aside. Terminated and expired subscriptions are
+    /// left out, and so are subscriptions this node originated.
+    ///
+    /// Reads the in-process store, as :meth:`find` does: the Redis cache is
+    /// keyed by dialog id and holds nothing to search by resource, so a
+    /// subscription held only there is listed after :meth:`get` has loaded it.
+    #[pyo3(signature = (uri, event))]
+    fn for_resource(&self, uri: &str, event: &str) -> Vec<PySubscribeHandle> {
+        self.store
+            .for_resource(uri, event)
+            .into_iter()
+            .map(|dialog| PySubscribeHandle {
+                store: Arc::clone(&self.store),
+                id: dialog.id,
+                reply_gate: None,
+            })
+            .collect()
     }
 
     /// Number of subscribe dialogs currently held in the in-process
@@ -1213,38 +1239,6 @@ fn format_default_contact(host: &str, port: u16, transport: Transport) -> String
         Transport::Sctp => ";transport=sctp",
     };
     format!("<sip:{}:{}{}>", host, port, transport_param)
-}
-
-/// Return true for SIP headers that must appear at most once per RFC 3261
-/// §7.3.1 — script-supplied values for these headers should *replace* the
-/// builder's default rather than appending alongside it.  Multi-value
-/// headers (Via, Route, Record-Route, P-Associated-URI, P-Asserted-Identity,
-/// etc.) deliberately stay out of this list so callers can append.
-fn is_single_value_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "contact"
-            | "m"
-            | "event"
-            | "o"
-            | "expires"
-            | "accept"
-            | "call-id"
-            | "i"
-            | "cseq"
-            | "max-forwards"
-            | "content-type"
-            | "c"
-            | "content-length"
-            | "l"
-            | "to"
-            | "t"
-            | "subject"
-            | "s"
-            | "user-agent"
-            | "server"
-            | "subscription-state"
-    )
 }
 
 /// Strip parameters (`;param=val`) from a SIP URI string, returning

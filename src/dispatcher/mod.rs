@@ -55,6 +55,7 @@ mod cancel_ack;
 mod cdr;
 mod charging;
 mod completed_invite;
+mod conference_events;
 mod engine_channel_events;
 mod failure;
 #[cfg(test)]
@@ -142,6 +143,8 @@ mod cancel_awaits_provisional_tests;
 mod carrier_attribution_tests;
 #[cfg(test)]
 mod charging_role_of_node_tests;
+#[cfg(test)]
+mod conference_roster_tests;
 #[cfg(test)]
 mod config_reload_security_tests;
 #[cfg(test)]
@@ -480,6 +483,7 @@ use cancel_ack::*;
 use cdr::*;
 use charging::*;
 use completed_invite::*;
+use conference_events::*;
 use engine_channel_events::*;
 use failure::*;
 use identity::*;
@@ -881,6 +885,8 @@ pub async fn run(
     spawn_diameter_incoming(&state, diameter_incoming_rx);
 
     spawn_rtpengine_events(&state, rtpengine_events_rx);
+
+    spawn_conference_change_events(Arc::new(RunningDispatcher));
 
     info!("dispatcher started");
 

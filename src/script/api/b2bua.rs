@@ -341,7 +341,13 @@ impl PyB2buaControl {
     /// refused the seat) or `501` (the backend cannot seat a call's leg). A
     /// refusal leaves the named call untouched. Raises `ValueError` outside
     /// `@b2bua.on_refer`, or for a `role` / `on_owner_leave` it does not know.
-    #[pyo3(signature = (call, conference_id, role="talker", on_owner_leave="end"))]
+    ///
+    /// `on_last_leave="end_owner"` ends the conference dialog that adopted the
+    /// call, with a BYE carrying `Reason: Q.850;cause=16`, once the last call
+    /// adopted under it has left and no seat but the dialog's own remains in
+    /// the room; `"keep"` (default) leaves it. Both are held by siphon, not
+    /// the script. `ValueError` for any other value.
+    #[pyo3(signature = (call, conference_id, role="talker", on_owner_leave="end", on_last_leave="keep"))]
     fn adopt_replaced<'py>(
         &self,
         python: Python<'py>,
@@ -349,14 +355,30 @@ impl PyB2buaControl {
         conference_id: String,
         role: &str,
         on_owner_leave: &str,
+        on_last_leave: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let request = adopt_request(call, conference_id, role, on_owner_leave)?;
+        let request = adopt_request(call, conference_id, role, on_owner_leave, on_last_leave)?;
         crate::script::awaitable(python, async move {
             Ok(match request {
                 Some(request) => crate::dispatcher::b2bua_adopt_replaced(request).await,
                 None => 481,
             })
         })
+    }
+
+    /// The seats currently in a conference room, from siphon's own state: a
+    /// list of dicts `{call_id, from_tag, party_uri, role, joined_at, kind,
+    /// owner_call_id}`, in the order they were seated; empty for a room nobody
+    /// is seated in. See `siphon.b2bua.conference_roster`.
+    pub(crate) fn conference_roster(
+        &self,
+        python: Python<'_>,
+        conference_id: &str,
+    ) -> PyResult<Py<PyAny>> {
+        super::conference_roster::roster_list(
+            python,
+            &crate::rtpengine::conference_roster::roster(conference_id),
+        )
     }
 
     /// Report the outcome of a REFER accepted with
@@ -703,6 +725,7 @@ fn adopt_request(
     conference_id: String,
     role: &str,
     on_owner_leave: &str,
+    on_last_leave: &str,
 ) -> PyResult<Option<crate::dispatcher::AdoptRequest>> {
     use crate::rtpengine::backend::ConferenceRole;
     use pyo3::exceptions::PyValueError;
@@ -722,6 +745,11 @@ fn adopt_request(
         "end" => true,
         "keep" => false,
         other => return Err(refused("on_owner_leave", "\"end\" or \"keep\"", other)),
+    };
+    let ends_owner_on_last = match on_last_leave {
+        "end_owner" => true,
+        "keep" => false,
+        other => return Err(refused("on_last_leave", "\"keep\" or \"end_owner\"", other)),
     };
     if conference_id.is_empty() {
         return Err(PyValueError::new_err(
@@ -748,6 +776,7 @@ fn adopt_request(
                 conference_id,
                 role,
                 ends_with_owner,
+                ends_owner_on_last,
             },
         ))
 }
@@ -935,7 +964,7 @@ mod tests {
         Python::attach(|python| {
             let bound = |call: PyCall| Bound::new(python, call).expect("a call").into_any();
             let refused = |call: PyCall, room: &str, role: &str, leave: &str| {
-                adopt_request(&bound(call), room.to_string(), role, leave)
+                adopt_request(&bound(call), room.to_string(), role, leave, "keep")
                     .expect_err("refused")
                     .to_string()
             };
@@ -950,6 +979,16 @@ mod tests {
                 "linger"
             )
             .contains("on_owner_leave"));
+            let bad_last = adopt_request(
+                &bound(call(Some(replaces.clone()), true)),
+                "room".into(),
+                "talker",
+                "end",
+                "linger",
+            )
+            .expect_err("an unknown on_last_leave")
+            .to_string();
+            assert!(bad_last.contains("on_last_leave"), "{bad_last}");
             assert!(
                 refused(call(Some(replaces.clone()), true), "", "talker", "end")
                     .contains("conference_id")
@@ -959,10 +998,16 @@ mod tests {
                     .contains("on_refer")
             );
             let not_a_call = pyo3::types::PyString::new(python, "call").into_any();
-            assert!(adopt_request(&not_a_call, "room".into(), "talker", "end").is_err());
+            assert!(adopt_request(&not_a_call, "room".into(), "talker", "end", "keep").is_err());
 
-            let blind = adopt_request(&bound(call(None, true)), "room".into(), "talker", "end")
-                .expect("read");
+            let blind = adopt_request(
+                &bound(call(None, true)),
+                "room".into(),
+                "talker",
+                "end",
+                "keep",
+            )
+            .expect("read");
             assert!(blind.is_none(), "no Replaces: nothing to merge, 481");
 
             let request = adopt_request(
@@ -970,6 +1015,7 @@ mod tests {
                 "room".into(),
                 "muted",
                 "keep",
+                "end_owner",
             )
             .expect("read")
             .expect("a request");
@@ -982,6 +1028,7 @@ mod tests {
                 crate::rtpengine::backend::ConferenceRole::Muted
             );
             assert!(!request.ends_with_owner);
+            assert!(request.ends_owner_on_last);
         });
     }
 }

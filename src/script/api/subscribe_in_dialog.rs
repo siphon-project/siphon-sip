@@ -351,3 +351,35 @@ pub(super) fn incoming_contact(
         )),
     }
 }
+
+/// Return true for SIP headers that must appear at most once per RFC 3261
+/// §7.3.1 — script-supplied values for these headers should *replace* the
+/// builder's default rather than appending alongside it.  Multi-value
+/// headers (Via, Route, Record-Route, P-Associated-URI, P-Asserted-Identity,
+/// etc.) deliberately stay out of this list so callers can append.
+pub(super) fn is_single_value_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "contact"
+            | "m"
+            | "event"
+            | "o"
+            | "expires"
+            | "accept"
+            | "call-id"
+            | "i"
+            | "cseq"
+            | "max-forwards"
+            | "content-type"
+            | "c"
+            | "content-length"
+            | "l"
+            | "to"
+            | "t"
+            | "subject"
+            | "s"
+            | "user-agent"
+            | "server"
+            | "subscription-state"
+    )
+}

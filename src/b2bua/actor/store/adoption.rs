@@ -73,6 +73,18 @@ impl CallActorStore {
         Some(DialogParty::on_leg(&call, leg, on_a_leg))
     }
 
+    /// The party on the leg of `call_id` that stays when the leg `named_on_a_leg`
+    /// names is merged away: the far party the room seats.
+    pub fn far_party(&self, call_id: &str, named_on_a_leg: bool) -> Option<DialogParty> {
+        let call = self.calls.get(call_id)?;
+        if named_on_a_leg {
+            let leg = call.b_legs.get(call.winner?)?;
+            Some(DialogParty::on_leg(&call, leg, false))
+        } else {
+            Some(DialogParty::on_leg(&call, &call.a_leg, true))
+        }
+    }
+
     /// Mark `call_id` as being merged into `conference_id` for the conference
     /// dialog `owner_call_id`, if it can be: answered, the named leg confirmed,
     /// and nothing else in progress that a merge would cut across. Returns the

@@ -13,6 +13,11 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **A conference focus can read its room and be told when it changes.** `b2bua.conference_roster(conference_id)` lists the seats siphon holds in a room (`call_id`, `from_tag`, `party_uri`, `role`, `joined_at`, `kind` `"joined"` or `"adopted"`, `owner_call_id`), so a script that keeps no state of its own, as one must when a reload empties module state and a conference outlives a deploy, can build an RFC 4575 `application/conference-info+xml` body at any time. `call.conference` is `(conference_id, owner_call_id)` for a call in a room, readable in `@b2bua.on_bye`. `@b2bua.on_conference_change(conference_id, owner_call_id, change, call_id, roster)` runs once per seat that comes in or goes out of a room (`conference_join` / `conference_answer`, a successful `adopt_replaced`, and every way a seat leaves: delete, `conference_leave`, the adopted call's BYE, credit or duration teardown, `media_timeout`, the conference dialog ending the calls it adopted), with the room after the change, off the SIP message path. `proxy.subscribe_state.for_resource(uri, event)` lists the live subscriptions to a resource and event package to NOTIFY; it reads the in-process store, since the Redis cache is keyed by dialog id. Mirrored in the SDK mock.
+- **`b2bua.adopt_replaced(on_last_leave="end_owner")` ends a conference of one.** When the last call adopted under a conference dialog has left and no seat but the dialog's own remains in the room, siphon BYEs the dialog with `Reason: Q.850;cause=16` through the normal teardown, so its CDR and charging close, and frees its seat. Held by siphon, so it survives a script reload. The default, `"keep"`, is the behaviour before; any other value raises `ValueError`.
+
 ## [1.15.9] — 2026-11-01
 
 ### Added

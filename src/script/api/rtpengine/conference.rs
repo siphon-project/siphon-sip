@@ -83,6 +83,23 @@ pub(super) fn parse_direction(direction: &str) -> PyResult<BridgeDirection> {
     }
 }
 
+/// The URI of the party a seat's SIP object faces, for the roster: the `From`
+/// of a request or call (the participant dialled in), the `To` of a reply (the
+/// participant answered the focus's INVITE). `None` for a bare
+/// `(call_id, from_tag)` pair, which carries no URI.
+fn party_uri_of(target: &Bound<'_, PyAny>) -> Option<String> {
+    let is_reply = target.cast::<super::super::reply::PyReply>().is_ok();
+    let message = extract_message(target).ok()?;
+    let message = message.lock().ok()?;
+    let (long, short) = if is_reply { ("To", "t") } else { ("From", "f") };
+    let value = message
+        .headers
+        .get(long)
+        .or_else(|| message.headers.get(short))?;
+    let uri = crate::subscribe_state::strip_nameaddr(value);
+    (!uri.is_empty()).then_some(uri)
+}
+
 /// Refuse an empty room id before it reaches the engine.
 fn room_id(conference_id: String, argument: &str) -> PyResult<String> {
     if conference_id.is_empty() {
@@ -204,6 +221,7 @@ pub(super) fn join<'py>(
     let role = parse_role(role, target, whisper_target)?;
     let message = extract_message(call)?;
     let (call_id, from_tag, offer_sdp) = extract_offer_params(&message)?;
+    let party_uri = party_uri_of(call);
     if offer_sdp.is_empty() {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "rtpengine.conference_join needs the participant's offer: the message carries no SDP",
@@ -255,7 +273,7 @@ pub(super) fn join<'py>(
             from_tag,
         };
         let answer_sdp = client
-            .conference_join(&call_id, seat.clone(), &offer_sdp, role, &flags)
+            .conference_join_party(&call_id, seat.clone(), &offer_sdp, role, &flags, party_uri)
             .await
             .map_err(join_failure)?;
         debug!(
@@ -442,6 +460,7 @@ pub(super) fn answer<'py>(
         })
         .transpose()?;
     let (call_id, seat) = seat_of(conference_id, call)?;
+    let party_uri = party_uri_of(call);
     let answer_sdp = super::super::request::extract_body_bytes(answer_sdp)?;
     if answer_sdp.is_empty() {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -452,7 +471,13 @@ pub(super) fn answer<'py>(
     let client = Arc::clone(&engine.client);
     crate::script::awaitable(python, async move {
         client
-            .conference_answer(&call_id, seat.clone(), &answer_sdp, received_from)
+            .conference_answer_party(
+                &call_id,
+                seat.clone(),
+                &answer_sdp,
+                received_from,
+                party_uri,
+            )
             .await
             .map_err(|error| match &error {
                 RtpEngineError::EngineError(_) => pyo3::exceptions::PyValueError::new_err(format!(

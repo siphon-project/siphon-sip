@@ -916,6 +916,9 @@ class SipTestHarness:
             else:
                 fn(call, initiator)
 
+        # The call ending takes an adopted call's seat out of its room, as the
+        # media delete of the teardown does.
+        mock_module.get_b2bua().adopted_call_ended(call.call_id)
         self._release_inbound(call)
         return CallResult(call=call, actions=list(call.actions))
 

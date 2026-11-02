@@ -161,6 +161,19 @@ uses that exact live stream, never another phone sharing the same proxy address;
 a closed stream fails visibly. The Contact remains the NOTIFY Request-URI.
 Subscriptions with Record-Route follow their established route set.
 
+`proxy.subscribe_state.for_resource(uri, event)` lists the live subscriptions this
+node is the notifier of for a resource and event package, oldest first, as
+`SubscribeHandle`s: the subscribers to NOTIFY when the resource changes (a
+conference focus URI and `"conference"`, RFC 4575). The URI is compared exactly
+after the normalisation a stored resource has (name-addr brackets and display
+name stripped), the event is the package token without its `;id=` parameter,
+case-insensitive. Terminated and expired subscriptions are left out, and so are
+subscriptions the node originated as the subscriber. Like `find`, it reads the
+in-process store: the Redis cache is keyed by dialog id and cannot be searched
+by resource, so a subscription held only there (another replica's, or from
+before a restart) is listed after `await proxy.subscribe_state.get(id)` has
+loaded it.
+
 As a subscriber, `handle = await proxy.subscribe_state.send(ruri, event=..., expires=...)`
 sends the SUBSCRIBE and returns once the 2xx is in. The subscription exists from
 the moment the SUBSCRIBE leaves, because the notifier's first NOTIFY may arrive
