@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.15.10] — 2026-11-02
+
 ### Fixed
 
 - registrant: an IMS UE over UDP opens the TCP listener on its protected server port when its SA set is installed, ahead of the protected REGISTER, not at the next registration tick. A P-CSCF's TCP connection for an over-MTU request right after the REGISTER (RFC 3261 18.1.1, TS 24.229 5.2.2.2) is no longer refused.
