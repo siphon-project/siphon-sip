@@ -316,6 +316,9 @@ async fn an_over_threshold_message_or_publish_over_a_ue_flow_goes_tcp_and_a_smal
     let (_turn, fixture) = SendFixture::turn();
     let lab = UeLab::new(141, true).await;
     lab.pin(&fixture.pool);
+    // Held for the whole test: closing it would let the pool evict the
+    // connection, and the count below would race that eviction.
+    let mut accepted = None;
     for method in ["MESSAGE", "PUBLISH"] {
         let (over_tcp, sent) = send_sized(fixture, method, lab.flow(), 1500);
         assert!(over_tcp, "{method} over the MTU goes over TCP");
@@ -327,8 +330,12 @@ async fn an_over_threshold_message_or_publish_over_a_ue_flow_goes_tcp_and_a_smal
             "{}",
             via(&sent)
         );
-        let (_connection, peer) = lab.accept().await;
-        assert_eq!(peer, lab.source);
+        // Only the first method opens the connection; the second reuses it.
+        if accepted.is_none() {
+            let (connection, peer) = lab.accept().await;
+            assert_eq!(peer, lab.source);
+            accepted = Some(connection);
+        }
 
         let (over_tcp, sent) = send_sized(fixture, method, lab.flow(), 20);
         assert!(!over_tcp, "{method} under the MTU stays UDP");
@@ -336,7 +343,12 @@ async fn an_over_threshold_message_or_publish_over_a_ue_flow_goes_tcp_and_a_smal
         assert_eq!(sent.source_local_addr, Some(lab.source));
     }
     // One pooled connection served both methods.
+    assert!(
+        !lab.sees_connection().await,
+        "a second connection was opened"
+    );
     assert_eq!(fixture.pool.connections_bound_on(lab.ue_ip), 1);
+    drop(accepted);
     fixture
         .pool
         .reconcile_pinned_sources(Default::default(), &Default::default());

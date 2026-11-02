@@ -77,6 +77,40 @@ pub(in crate::dispatcher) fn flow_over_mtu_upgrade(
     crate::script::blocking::block_on_released(path.connect(&state.connection_pool, method))
 }
 
+/// A fork branch's transport and destination after the over-MTU switch (RFC
+/// 3261 §18.1.1): over siphon's own UE flow, the flow's own connection
+/// ([`flow_over_mtu_upgrade`]); with no flow, [`over_mtu_upgrade`], kept on UDP
+/// when its TCP path loops back to us. A callee's flow keeps its transport.
+pub(in crate::dispatcher) fn fork_branch_over_mtu(
+    state: &DispatcherState,
+    flow: Option<&crate::script::api::registrar::PyFlow>,
+    relayed: &SipMessage,
+    target: &str,
+    destination: SocketAddr,
+    outbound_transport: Transport,
+) -> (Transport, SocketAddr) {
+    if flow_over_mtu_upgrade(state, flow, relayed) {
+        return (Transport::Tcp, destination);
+    }
+    if state.mtu.is_none() || flow.is_some() {
+        return (outbound_transport, destination);
+    }
+    match over_mtu_upgrade(
+        state,
+        outbound_transport,
+        relayed.to_bytes().len(),
+        target,
+        destination,
+    ) {
+        Some((_, tcp_addr)) if state.is_own_address(&tcp_addr) => {
+            warn!(%tcp_addr, "fork §18.1.1: TCP path loops back to us — keeping UDP");
+            (outbound_transport, destination)
+        }
+        Some((tcp_transport, tcp_addr)) => (tcp_transport, tcp_addr),
+        None => (outbound_transport, destination),
+    }
+}
+
 /// What the switch does toward a destination with a security association.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProtectedOverMtu {

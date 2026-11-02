@@ -7,7 +7,7 @@ use super::*;
 
 /// The over-MTU UDP-to-TCP decision toward a UE with a security association.
 mod over_mtu;
-pub(super) use over_mtu::{flow_over_mtu_upgrade, over_mtu_upgrade};
+pub(super) use over_mtu::{flow_over_mtu_upgrade, fork_branch_over_mtu, over_mtu_upgrade};
 /// Next hops whose TCP path just failed, not probed again for a while.
 mod probe_cache;
 pub(super) use probe_cache::probe_cache;
