@@ -43,12 +43,20 @@ fn blackholed_peer() -> Option<(SocketAddr, Vec<std::net::TcpStream>, socket2::S
     None
 }
 
-/// A next hop that refuses: a port nothing listens on.
-fn refusing_peer() -> SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("a free port")
+/// A next hop that refuses: bound but not listening, so the kernel answers a
+/// SYN with a reset. The returned socket holds the port while kept, so nothing
+/// else can listen on it and turn the refused probe into a connect.
+fn refusing_peer() -> (SocketAddr, socket2::Socket) {
+    let socket =
+        socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).expect("a socket");
+    let address: SocketAddr = "127.0.0.1:0".parse().expect("an address");
+    socket.bind(&address.into()).expect("a free port");
+    let peer = socket
         .local_addr()
         .expect("bound")
+        .as_socket()
+        .expect("an inet address");
+    (peer, socket)
 }
 
 /// This process's thread count.
@@ -286,7 +294,7 @@ fn two_thousand_over_mtu_requests_to_a_refusing_peer_probe_once() {
         ),
         || {
             let _watchdog = watchdog();
-            let peer = refusing_peer();
+            let (peer, _held) = refusing_peer();
             let storm = storm_from_threads(peer);
             let total: Duration = storm.durations.iter().sum();
             eprintln!(
