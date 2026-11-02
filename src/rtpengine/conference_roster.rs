@@ -52,6 +52,9 @@ pub struct RosterSeat {
     pub party_uri: Option<String>,
     /// `talker`, `listener`, `muted`, `whisper` or `monitor`.
     pub role: String,
+    /// `events` or `forward`: whether the room sends the seat's digits on to
+    /// the other seats.
+    pub dtmf: String,
     /// Unix seconds.
     pub joined_at: f64,
     pub kind: SeatKind,
@@ -103,7 +106,7 @@ struct Rooms {
     seats: HashMap<String, Vec<RosterSeat>>,
     subscribers: Vec<UnboundedSender<ConferenceChange>>,
     /// Roles of seats offered and not yet answered, by room and from-tag.
-    offered: HashMap<(String, String), (String, Instant)>,
+    offered: HashMap<(String, String), (String, String, Instant)>,
 }
 
 static ROOMS: Mutex<Option<Rooms>> = Mutex::new(None);
@@ -203,26 +206,26 @@ fn publish(rooms: &mut Rooms, seat: RosterSeat, change: Change) {
 
 /// Record the role of a seat offered to a participant the focus calls out, for
 /// the answer that seats it.
-pub fn seat_offered(conference_id: &str, from_tag: &str, role: &str) {
+pub fn seat_offered(conference_id: &str, from_tag: &str, role: &str, dtmf: &str) {
     let mut guard = rooms();
     let rooms = guard.get_or_insert_with(Rooms::default);
     let now = Instant::now();
     rooms
         .offered
-        .retain(|_, (_, offered_at)| now.duration_since(*offered_at) < OFFER_LIFETIME);
+        .retain(|_, (_, _, offered_at)| now.duration_since(*offered_at) < OFFER_LIFETIME);
     rooms.offered.insert(
         (conference_id.to_string(), from_tag.to_string()),
-        (role.to_string(), now),
+        (role.to_string(), dtmf.to_string(), now),
     );
 }
 
-/// The role a seat was offered with, taken off the record.
-pub fn take_offered_role(conference_id: &str, from_tag: &str) -> Option<String> {
+/// The role and digit forwarding a seat was offered with, taken off the record.
+pub fn take_offered_role(conference_id: &str, from_tag: &str) -> Option<(String, String)> {
     rooms()
         .as_mut()?
         .offered
         .remove(&(conference_id.to_string(), from_tag.to_string()))
-        .map(|(role, _)| role)
+        .map(|(role, dtmf, _)| (role, dtmf))
 }
 
 /// A participant is seated (`joined`).
@@ -232,6 +235,7 @@ pub fn seat_joined(
     from_tag: &str,
     party_uri: Option<String>,
     role: &str,
+    dtmf: &str,
 ) {
     insert(RosterSeat {
         conference_id: conference_id.to_string(),
@@ -239,6 +243,7 @@ pub fn seat_joined(
         from_tag: from_tag.to_string(),
         party_uri,
         role: role.to_string(),
+        dtmf: dtmf.to_string(),
         joined_at: unix_seconds(),
         kind: SeatKind::Joined,
         owner_call_id: None,
@@ -307,11 +312,14 @@ pub fn seat_left_engine_call(engine_call_id: &str) -> bool {
 
 /// A seat's role changed live. A role change is no change of who is seated, so
 /// nothing is reported.
-pub fn role_changed(conference_id: &str, from_tag: &str, role: &str) {
+pub fn role_changed(conference_id: &str, from_tag: &str, role: &str, dtmf: Option<&str>) {
     if let Some(rooms) = rooms().as_mut() {
         if let Some(room) = rooms.seats.get_mut(conference_id) {
             for seat in room.iter_mut().filter(|seat| seat.from_tag == from_tag) {
                 seat.role = role.to_string();
+                if let Some(dtmf) = dtmf {
+                    seat.dtmf = dtmf.to_string();
+                }
             }
         }
     }
@@ -328,6 +336,7 @@ mod tests {
             "tag",
             Some("sip:a@example.com".into()),
             "talker",
+            "events",
         );
     }
 
@@ -338,6 +347,7 @@ mod tests {
             from_tag: "far".into(),
             party_uri: Some("sip:b@example.com".into()),
             role: "talker".into(),
+            dtmf: "events".into(),
             joined_at: unix_seconds(),
             kind: SeatKind::Adopted,
             owner_call_id: Some(owner.into()),
@@ -437,7 +447,14 @@ mod tests {
     fn a_role_change_updates_the_seat_and_reports_nothing() {
         let mut receiver = subscribe();
         joined("roster-unit-4", "role@192.0.2.1");
-        role_changed("roster-unit-4", "tag", "listener");
+        role_changed("roster-unit-4", "tag", "listener", None);
+        assert_eq!(
+            roster("roster-unit-4")[0].dtmf,
+            "events",
+            "no dtmf given keeps it"
+        );
+        role_changed("roster-unit-4", "tag", "listener", Some("forward"));
+        assert_eq!(roster("roster-unit-4")[0].dtmf, "forward");
         assert_eq!(roster("roster-unit-4")[0].role, "listener");
         assert_eq!(drain(&mut receiver, "roster-unit-4").len(), 1);
         seat_left_joined("roster-unit-4", "role@192.0.2.1");
@@ -460,10 +477,10 @@ mod tests {
 
     #[test]
     fn an_offered_role_is_taken_once_and_unanswered_offers_expire() {
-        seat_offered("roster-unit-6", "callee", "listener");
+        seat_offered("roster-unit-6", "callee", "listener", "forward");
         assert_eq!(
-            take_offered_role("roster-unit-6", "callee").as_deref(),
-            Some("listener")
+            take_offered_role("roster-unit-6", "callee"),
+            Some(("listener".to_string(), "forward".to_string()))
         );
         assert_eq!(take_offered_role("roster-unit-6", "callee"), None);
     }
@@ -480,7 +497,7 @@ mod tests {
                 &format!("owner-{round}@192.0.2.1"),
                 &format!("engine-leak-{round}"),
             );
-            seat_offered(&room, "callee", "talker");
+            seat_offered(&room, "callee", "talker", "events");
             take_offered_role(&room, "callee");
             if round % 2 == 0 {
                 seat_left_engine_call(&format!("engine-leak-{round}"));

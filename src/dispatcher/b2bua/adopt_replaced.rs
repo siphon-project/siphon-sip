@@ -64,6 +64,8 @@ pub struct AdoptRequest {
     /// `on_last_leave="end_owner"`: the conference dialog ends when the last
     /// call adopted under it has left and no other seat but its own remains.
     pub ends_owner_on_last: bool,
+    /// Whether the room forwards the adopted party's digits to the other seats.
+    pub dtmf: crate::rtpengine::backend::ConferenceDtmf,
 }
 
 /// Carry out `request` on the running dispatcher. Resolves to the status the
@@ -162,6 +164,7 @@ pub async fn b2bua_adopt_replaced_with_state(
         internal_call_id: adopted.clone(),
         owner_call_id: referrer.sip_call_id.clone(),
         end_owner_on_last: request.ends_owner_on_last,
+        dtmf: request.dtmf,
     };
     if let Err(error) = backend
         .conference_seat_call(

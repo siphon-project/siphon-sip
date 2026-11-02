@@ -347,7 +347,12 @@ impl PyB2buaControl {
     /// adopted under it has left and no seat but the dialog's own remains in
     /// the room; `"keep"` (default) leaves it. Both are held by siphon, not
     /// the script. `ValueError` for any other value.
-    #[pyo3(signature = (call, conference_id, role="talker", on_owner_leave="end", on_last_leave="keep"))]
+    ///
+    /// `dtmf` is `None` or `"events"` (the party's digits stay
+    /// `@rtpengine.on_dtmf` events) or `"forward"` (the room also regenerates
+    /// them toward the other seats; an engine without `conference_dtmf`
+    /// refuses the seat, 501). `ValueError` for any other value.
+    #[pyo3(signature = (call, conference_id, role="talker", on_owner_leave="end", on_last_leave="keep", dtmf=None))]
     fn adopt_replaced<'py>(
         &self,
         python: Python<'py>,
@@ -356,8 +361,16 @@ impl PyB2buaControl {
         role: &str,
         on_owner_leave: &str,
         on_last_leave: &str,
+        dtmf: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let request = adopt_request(call, conference_id, role, on_owner_leave, on_last_leave)?;
+        let request = adopt_request(
+            call,
+            conference_id,
+            role,
+            on_owner_leave,
+            on_last_leave,
+            dtmf,
+        )?;
         crate::script::awaitable(python, async move {
             Ok(match request {
                 Some(request) => crate::dispatcher::b2bua_adopt_replaced(request).await,
@@ -726,6 +739,7 @@ fn adopt_request(
     role: &str,
     on_owner_leave: &str,
     on_last_leave: &str,
+    dtmf: Option<&str>,
 ) -> PyResult<Option<crate::dispatcher::AdoptRequest>> {
     use crate::rtpengine::backend::ConferenceRole;
     use pyo3::exceptions::PyValueError;
@@ -751,6 +765,7 @@ fn adopt_request(
         "keep" => false,
         other => return Err(refused("on_last_leave", "\"keep\" or \"end_owner\"", other)),
     };
+    let dtmf = super::rtpengine::parse_conference_dtmf(dtmf)?.unwrap_or_default();
     if conference_id.is_empty() {
         return Err(PyValueError::new_err(
             "b2bua.adopt_replaced(conference_id=…) names a room; it is empty",
@@ -777,6 +792,7 @@ fn adopt_request(
                 role,
                 ends_with_owner,
                 ends_owner_on_last,
+                dtmf,
             },
         ))
 }
@@ -964,7 +980,7 @@ mod tests {
         Python::attach(|python| {
             let bound = |call: PyCall| Bound::new(python, call).expect("a call").into_any();
             let refused = |call: PyCall, room: &str, role: &str, leave: &str| {
-                adopt_request(&bound(call), room.to_string(), role, leave, "keep")
+                adopt_request(&bound(call), room.to_string(), role, leave, "keep", None)
                     .expect_err("refused")
                     .to_string()
             };
@@ -985,6 +1001,7 @@ mod tests {
                 "talker",
                 "end",
                 "linger",
+                None,
             )
             .expect_err("an unknown on_last_leave")
             .to_string();
@@ -998,7 +1015,9 @@ mod tests {
                     .contains("on_refer")
             );
             let not_a_call = pyo3::types::PyString::new(python, "call").into_any();
-            assert!(adopt_request(&not_a_call, "room".into(), "talker", "end", "keep").is_err());
+            assert!(
+                adopt_request(&not_a_call, "room".into(), "talker", "end", "keep", None).is_err()
+            );
 
             let blind = adopt_request(
                 &bound(call(None, true)),
@@ -1006,6 +1025,7 @@ mod tests {
                 "talker",
                 "end",
                 "keep",
+                None,
             )
             .expect("read");
             assert!(blind.is_none(), "no Replaces: nothing to merge, 481");
@@ -1016,6 +1036,7 @@ mod tests {
                 "muted",
                 "keep",
                 "end_owner",
+                Some("forward"),
             )
             .expect("read")
             .expect("a request");
@@ -1029,6 +1050,35 @@ mod tests {
             );
             assert!(!request.ends_with_owner);
             assert!(request.ends_owner_on_last);
+            assert_eq!(
+                request.dtmf,
+                crate::rtpengine::backend::ConferenceDtmf::Forward
+            );
+            let events = adopt_request(
+                &bound(call(Some(replaces.clone()), true)),
+                "room".into(),
+                "talker",
+                "end",
+                "keep",
+                Some("events"),
+            )
+            .expect("read")
+            .expect("a request");
+            assert_eq!(
+                events.dtmf,
+                crate::rtpengine::backend::ConferenceDtmf::Events
+            );
+            let bad = adopt_request(
+                &bound(call(Some(replaces.clone()), true)),
+                "room".into(),
+                "talker",
+                "end",
+                "keep",
+                Some("digits"),
+            )
+            .expect_err("an unknown dtmf")
+            .to_string();
+            assert!(bad.contains("dtmf"), "{bad}");
         });
     }
 }

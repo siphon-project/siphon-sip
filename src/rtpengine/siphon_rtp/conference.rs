@@ -12,7 +12,9 @@
 //! engine refuses U+001F in a call-id (RFC 3261 §25.1 allows none), so a key
 //! that starts with it never meets a call's.
 
-use siphon_rtp_proto::{BridgeDirection, CmdResult, Command, ConferenceRole, PlayRepeat};
+use siphon_rtp_proto::{
+    BridgeDirection, CmdResult, Command, ConferenceDtmf, ConferenceRole, PlayRepeat,
+};
 
 use super::{
     expect_ok, expect_sdp, profile_flags_from_ng, proto_play_source, unexpected_result,
@@ -38,6 +40,19 @@ impl SiphonRtpClient {
         self.request(command).await
     }
 
+    /// Refuse a digit-forwarding choice an engine would not honour, when
+    /// `needed`. An engine that does not list `conference_dtmf` ignores the
+    /// unknown field and drops the digits without a word, so `forward` (and an
+    /// explicit route `dtmf`) is sent only once `node_info` lists it. The
+    /// default, `events`, is what every engine does and is not gated, and a
+    /// route without `dtmf` sends none.
+    async fn require_dtmf(&self, needed: bool) -> Result<(), RtpEngineError> {
+        if !needed {
+            return Ok(());
+        }
+        seat::require_conference_dtmf(self.request_in(None, Command::NodeInfo).await?)
+    }
+
     /// Seat a participant: the engine answers its offer with its own endpoint
     /// and the participant's codec, and creates the room on its first seat.
     /// Returns the answer SDP.
@@ -48,10 +63,12 @@ impl SiphonRtpClient {
         offer_sdp: &str,
         role: ConferenceRole,
         flags: &NgFlags,
+        dtmf: ConferenceDtmf,
     ) -> Result<String, RtpEngineError> {
         if flags.received_from.is_some() {
             seat::require_seat_received_from(self.request_in(None, Command::NodeInfo).await?)?;
         }
+        self.require_dtmf(dtmf == ConferenceDtmf::Forward).await?;
         let result = self
             .conference_request(Command::ConferenceJoin {
                 conference_id: conference_id.to_string(),
@@ -59,6 +76,7 @@ impl SiphonRtpClient {
                 sdp: offer_sdp.to_string(),
                 role,
                 profile: profile_flags_from_ng(flags),
+                dtmf,
             })
             .await?;
         let answer_sdp = expect_sdp(result)?;
@@ -86,12 +104,15 @@ impl SiphonRtpClient {
         conference_id: &str,
         from_tag: &str,
         role: ConferenceRole,
+        dtmf: Option<ConferenceDtmf>,
     ) -> Result<(), RtpEngineError> {
+        self.require_dtmf(dtmf.is_some()).await?;
         expect_ok(
             self.conference_request(Command::ConferenceRoute {
                 conference_id: conference_id.to_string(),
                 from_tag: from_tag.to_string(),
                 role,
+                dtmf,
             })
             .await?,
         )
@@ -138,13 +159,16 @@ impl SiphonRtpClient {
         from_tag: &str,
         role: ConferenceRole,
         flags: &NgFlags,
+        dtmf: ConferenceDtmf,
     ) -> Result<String, RtpEngineError> {
+        self.require_dtmf(dtmf == ConferenceDtmf::Forward).await?;
         let result = self
             .conference_request(Command::ConferenceOffer {
                 conference_id: conference_id.to_string(),
                 from_tag: from_tag.to_string(),
                 role,
                 profile: profile_flags_from_ng(flags),
+                dtmf,
             })
             .await?;
         let offer_sdp = expect_sdp(result)?;
@@ -303,11 +327,12 @@ impl SiphonRtpClientSet {
         offer_sdp: &str,
         role: ConferenceRole,
         flags: &NgFlags,
+        dtmf: ConferenceDtmf,
     ) -> Result<String, RtpEngineError> {
         let key = room_affinity_key(conference_id);
         let answer = self
             .select(&key)
-            .conference_join(conference_id, from_tag, offer_sdp, role, flags)
+            .conference_join(conference_id, from_tag, offer_sdp, role, flags, dtmf)
             .await?;
         self.bind_affinity(&key);
         Ok(answer)
@@ -344,9 +369,10 @@ impl SiphonRtpClientSet {
         conference_id: &str,
         from_tag: &str,
         role: ConferenceRole,
+        dtmf: Option<ConferenceDtmf>,
     ) -> Result<(), RtpEngineError> {
         self.select(&room_affinity_key(conference_id))
-            .conference_route(conference_id, from_tag, role)
+            .conference_route(conference_id, from_tag, role, dtmf)
             .await
     }
 
@@ -382,11 +408,12 @@ impl SiphonRtpClientSet {
         from_tag: &str,
         role: ConferenceRole,
         flags: &NgFlags,
+        dtmf: ConferenceDtmf,
     ) -> Result<String, RtpEngineError> {
         let key = room_affinity_key(conference_id);
         let offer = self
             .select(&key)
-            .conference_offer(conference_id, from_tag, role, flags)
+            .conference_offer(conference_id, from_tag, role, flags, dtmf)
             .await?;
         self.bind_affinity(&key);
         Ok(offer)

@@ -35,7 +35,10 @@ pub use siphon_rtp_proto::X3TargetLeg;
 
 mod conference;
 mod release;
-pub use conference::{role_label, AdoptedSeat, BridgeDirection, ConferenceRole, ConferenceSeat};
+pub use conference::{
+    dtmf_label, role_label, AdoptedSeat, BridgeDirection, ConferenceDtmf, ConferenceRole,
+    ConferenceSeat,
+};
 mod scoped;
 pub use scoped::{engine_call_id, split_engine_call_id, split_event_scope, ScopedLeg};
 

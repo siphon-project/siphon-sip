@@ -1962,7 +1962,8 @@ class MockB2bua:
     async def adopt_replaced(self, call: Any, conference_id: str,
                              role: str = "talker",
                              on_owner_leave: str = "end",
-                             on_last_leave: str = "keep") -> int:
+                             on_last_leave: str = "keep",
+                             dtmf: Optional[str] = None) -> int:
         """Merge the call a REFER's ``Replaces`` names into a conference room
         on this node (RFC 4579 section 5.5, a handset's "merge").
 
@@ -2000,6 +2001,11 @@ class MockB2bua:
                 ``Reason: Q.850;cause=16``, when the last call adopted under it
                 has left the room and no seat but the dialog's own remains: a
                 conference of one is over. Held by siphon, not the script.
+            dtmf: ``None`` or ``"events"`` (default): the adopted party's
+                digits stay ``@rtpengine.on_dtmf`` events. ``"forward"`` has
+                the room regenerate them toward the other seats; an engine
+                that does not list ``conference_dtmf`` refuses it (``501``).
+                Anything else raises ``ValueError``.
 
         Returns:
             int: the status for ``b2bua.complete_refer``: ``200``; ``481`` no
@@ -2041,6 +2047,7 @@ class MockB2bua:
         if on_last_leave not in ("keep", "end_owner"):
             raise ValueError(
                 f'b2bua.adopt_replaced(on_last_leave=…) is "keep" or "end_owner" (got {on_last_leave!r})')
+        MockRtpEngine._check_dtmf(dtmf)
         if not conference_id:
             raise ValueError("b2bua.adopt_replaced(conference_id=…) names a room; it is empty")
         if getattr(call, "refer_to", None) is None:
@@ -2059,6 +2066,8 @@ class MockB2bua:
         engine = get_rtpengine()
         if not engine._conference_seat_supported:
             return 501
+        if dtmf == "forward" and not engine._conference_dtmf_supported:
+            return 501
         if held.adoption is not None or engine._conference_seat_refusal is not None:
             return 488
         far_side = "callee" if side == "caller" else "caller"
@@ -2076,6 +2085,7 @@ class MockB2bua:
             "profile": None,
             "adopted": True,
             "kind": "adopted",
+            "dtmf": dtmf or "events",
             "party_uri": _bare_uri(far.uri),
             "owner_call_id": call.call_id,
             "on_last_leave": on_last_leave,
@@ -2147,7 +2157,8 @@ class MockB2bua:
         ``call_id`` (the SIP Call-ID of the dialog with the seated party),
         ``from_tag``, ``party_uri`` (the seated party's own URI, or ``None``),
         ``role`` (``"talker"``, ``"listener"``, ``"muted"``, ``"whisper"`` or
-        ``"monitor"``), ``joined_at`` (unix seconds, a float), ``kind``
+        ``"monitor"``), ``dtmf`` (``"events"`` or ``"forward"``: whether the
+        room sends the seat's digits on to the other seats), ``joined_at`` (unix seconds, a float), ``kind``
         (``"joined"`` for a seat taken with ``rtpengine.conference_join`` /
         ``conference_answer``, ``"adopted"`` for one :meth:`adopt_replaced`
         made) and ``owner_call_id`` (the SIP Call-ID of the conference dialog
@@ -5456,6 +5467,8 @@ class MockRtpEngine:
         # b2bua.adopt_replaced: whether the engine serves conference_seat,
         # and the reason it refuses the next seat with.
         self._conference_seat_supported: bool = True
+        # Whether the engine lists conference_dtmf (digit forwarding).
+        self._conference_dtmf_supported: bool = True
         self._conference_seat_refusal: Optional[str] = None
         self._active_speaker_handlers: list[dict[str, Any]] = []
         self.media_scopes: list[tuple[str, Optional[str]]] = []
@@ -6553,6 +6566,27 @@ class MockRtpEngine:
     _CONFERENCE_ROLES = ("talker", "listener", "muted", "whisper", "monitor")
 
     @staticmethod
+    def _check_dtmf(dtmf: Optional[str]) -> Optional[str]:
+        """Validate ``dtmf=``: ``None``, ``"events"`` or ``"forward"``."""
+        if dtmf not in (None, "events", "forward"):
+            raise ValueError(f'dtmf must be "events" or "forward", got {dtmf!r}')
+        return dtmf
+
+    def _conference_dtmf(self, dtmf: Optional[str], route: bool = False) -> str:
+        """The digit forwarding a seat is given, or kept (``""`` on a route that
+        names none). An engine that does not list ``conference_dtmf`` would drop
+        the digits, so ``"forward"`` (and any explicit route ``dtmf``) is refused
+        there with nothing recorded."""
+        self._check_dtmf(dtmf)
+        needed = dtmf is not None if route else dtmf == "forward"
+        if needed and not self._conference_dtmf_supported:
+            raise RuntimeError(
+                "rtpengine conference seat dtmf forwarding failed: not supported by the "
+                "siphon-rtp (an engine that does not list conference_dtmf) media backend"
+            )
+        return (dtmf or "") if route else (dtmf or "events")
+
+    @staticmethod
     def _conference_role(
         role: str, target: Optional[str], whisper_target: Optional[str]
     ) -> dict[str, Any]:
@@ -6614,6 +6648,7 @@ class MockRtpEngine:
                 "from_tag": from_tag,
                 "party_uri": seat.get("party_uri"),
                 "role": seat.get("role", "talker"),
+                "dtmf": seat.get("dtmf", "events"),
                 "joined_at": seat.get("joined_at", 0.0),
                 "kind": seat.get("kind", "joined"),
                 "owner_call_id": seat.get("owner_call_id"),
@@ -6693,6 +6728,7 @@ class MockRtpEngine:
         target: Optional[str] = None,
         whisper_target: Optional[str] = None,
         profile: Optional[str] = None,
+        dtmf: Optional[str] = None,
     ) -> str:
         """Seat a call in a conference room and resolve to the answer SDP for
         the script's own 2xx.
@@ -6741,6 +6777,14 @@ class MockRtpEngine:
             target: The seat a ``"whisper"`` / ``"monitor"`` role applies to.
             whisper_target: The seat a ``"monitor"`` also whispers to.
             profile: RTP profile name, resolved as for :meth:`answer_local`.
+            dtmf: ``"events"`` (default, also ``None``): the seat's RFC 4733
+                digits only raise ``@rtpengine.on_dtmf``. ``"forward"``: the
+                room also regenerates them toward every other seat, each in
+                that seat's own payload type and clock. An engine that does not
+                list ``conference_dtmf`` refuses ``"forward"``
+                (``RuntimeError``; prime it with
+                :meth:`set_conference_dtmf_supported`). Anything else raises
+                ``ValueError``. The seat's setting is on the roster.
 
         Returns:
             The answer SDP as ``str``.
@@ -6761,6 +6805,7 @@ class MockRtpEngine:
         if not conference_id:
             raise ValueError("rtpengine.conference_join(conference_id) is empty")
         seat_role = self._conference_role(role, target, whisper_target)
+        seat_dtmf = self._conference_dtmf(dtmf)
         call_id, from_tag = self._conference_seat_of(call)
         seated = self.conference_seat(call_id)
         if seated is not None:
@@ -6780,7 +6825,7 @@ class MockRtpEngine:
             **seat_role,
         })
         self._seat_in(conference_id, from_tag, {
-            "call_id": call_id, "profile": profile,
+            "call_id": call_id, "profile": profile, "dtmf": seat_dtmf,
             "party_uri": _party_uri(call), **seat_role,
         })
         return self._conference_join_sdp
@@ -6827,16 +6872,24 @@ class MockRtpEngine:
         role: str,
         target: Optional[str] = None,
         whisper_target: Optional[str] = None,
+        dtmf: Optional[str] = None,
     ) -> bool:
         """Change who a seat hears and who hears it, live (no re-INVITE):
         ``role``, ``target`` and ``whisper_target`` as for
         :meth:`conference_join`. Muting a participant is
         ``conference_route(room, call, "muted")``.
 
+        ``dtmf`` switches the seat's digit forwarding (``"events"`` or
+        ``"forward"``); ``None`` keeps it. An engine that does not list
+        ``conference_dtmf`` refuses an explicit ``dtmf``. A seat the room does
+        not hold raises ``RuntimeError``, as the engine answers an error for
+        it.
+
         Returns:
             ``True`` on success.
         """
         seat_role = self._conference_role(role, target, whisper_target)
+        seat_dtmf = self._conference_dtmf(dtmf, route=True)
         room = self._conference_room(conference_id, "conference_route")
         _, from_tag = self._conference_seat_of(call)
         if from_tag not in room:
@@ -6844,12 +6897,15 @@ class MockRtpEngine:
                 "rtpengine.conference_route failed: no such conference or participant"
             )
         room[from_tag].update(seat_role)
+        if seat_dtmf:
+            room[from_tag]["dtmf"] = seat_dtmf
         self.operations.append(("conference_route", role))
         self.media_calls.append({
             "op": "conference_route",
             "conference_id": conference_id,
             "from_tag": from_tag,
             **seat_role,
+            "dtmf": seat_dtmf or None,
         })
         return True
 
@@ -6932,6 +6988,7 @@ class MockRtpEngine:
         target: Optional[str] = None,
         whisper_target: Optional[str] = None,
         profile: Optional[str] = None,
+        dtmf: Optional[str] = None,
     ) -> str:
         """Offer a seat for a participant the focus calls out, and resolve to
         the offer SDP for the INVITE (RFC 4579 section 5.5, a REFER to the
@@ -6952,6 +7009,7 @@ class MockRtpEngine:
             target: As for :meth:`conference_join`.
             whisper_target: As for :meth:`conference_join`.
             profile: The RTP profile whose offer half shapes the seat.
+            dtmf: As for :meth:`conference_join`.
 
         Returns:
             The offer SDP as ``str``.
@@ -6970,18 +7028,20 @@ class MockRtpEngine:
                 f"rtpengine.conference_offer(seat_tag) must be a SIP token (a From-tag), got {seat_tag!r}"
             )
         seat_role = self._conference_role(role, target, whisper_target)
+        seat_dtmf = self._conference_dtmf(dtmf)
         key = (conference_id, seat_tag)
         if key in self.conference_offers or seat_tag in self.conferences.get(conference_id, {}):
             raise RuntimeError(
                 f"rtpengine.conference_offer failed: {seat_tag} is already offered or seated"
             )
-        self.conference_offers[key] = {"profile": profile, **seat_role}
+        self.conference_offers[key] = {"profile": profile, "dtmf": seat_dtmf, **seat_role}
         self.operations.append(("conference_offer", conference_id))
         self.media_calls.append({
             "op": "conference_offer",
             "conference_id": conference_id,
             "from_tag": seat_tag,
             "profile": profile,
+            "dtmf": seat_dtmf,
             **seat_role,
         })
         return self._conference_offer_sdp
@@ -7233,6 +7293,14 @@ class MockRtpEngine:
         siphon-rtp: :meth:`MockB2bua.adopt_replaced` then resolves ``501``
         (test helper)."""
         self._conference_seat_supported = supported
+
+    def set_conference_dtmf_supported(self, supported: bool = True) -> None:
+        """Model an engine that does (or, with ``False``, does not) list
+        ``conference_dtmf``: ``dtmf="forward"`` on :meth:`conference_join`,
+        :meth:`conference_offer` and ``b2bua.adopt_replaced``, and an explicit
+        ``dtmf`` on :meth:`conference_route`, are then refused with nothing
+        done (``RuntimeError``, ``501`` for the merge) (test helper)."""
+        self._conference_dtmf_supported = supported
 
     def refuse_conference_seat(self, reason: Optional[str] = "room full") -> None:
         """Prime the engine to refuse ``conference_seat`` (a full room, a
@@ -8441,6 +8509,7 @@ class MockRtpEngine:
         self.conference_plays.clear()
         self._conference_join_no_codec = False
         self._conference_seat_supported = True
+        self._conference_dtmf_supported = True
         self._conference_seat_refusal = None
 
 

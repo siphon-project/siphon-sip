@@ -133,6 +133,11 @@ pub(crate) fn profile_flags_from_ng(flags: &NgFlags) -> ProfileFlags {
         // No profile carries a fax pin yet: `false` is what every call already
         // got, and a profile field for it is its own change.
         fax_passthrough: false,
+        // MCPTT floor control is the controller's to declare per call, and no
+        // siphon profile carries it: absent, the engine adds nothing.
+        floor_fmtp: None,
+        floor_keys: Vec::new(),
+        key_mgmt: None,
     }
 }
 
@@ -2282,6 +2287,9 @@ mod tests {
             text_events: true,
             sip_call_id: Some("a84b4c76e66710@pc33.example.test".into()),
             fax_passthrough: false,
+            floor_fmtp: None,
+            floor_keys: Vec::new(),
+            key_mgmt: None,
         };
 
         assert_eq!(profile_flags_from_ng(&ng), expected);

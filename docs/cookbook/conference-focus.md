@@ -139,6 +139,41 @@ async def coach(room, supervisor, agent_tag):
 A seat can also be named by a `(call_id, from_tag)` pair, which is what an
 event handler holds.
 
+`conference_route` on a seat the room does not hold is an error
+(`RuntimeError`), as is a route after the seat has left. Older engines answered
+`ok` for it and did nothing, so a script that routed a seat it never checked
+(a hold handler that mutes a call whose seat is already gone) will now see the
+failure; catch it, or route only calls the roster still lists. An adopted seat
+is named by the engine's tag for the far leg, not by the call's From-tag, so
+route one from `b2bua.conference_roster(room)`'s `from_tag`.
+
+## Digits to the other seats
+
+A seat's RFC 4733 telephone-events are `@rtpengine.on_dtmf` events and never
+leave the seat. `dtmf="forward"` on `conference_join`, `conference_offer` or
+`b2bua.adopt_replaced` has the room also regenerate them toward every other
+seat, each in that seat's own telephone-event payload type, clock and stream, so
+a participant driving an IVR on a merged call is heard by it. Only the seat set
+to `forward` forwards; the others stay on `events` (the default, also `None`).
+`conference_route(..., dtmf=...)` switches it live, and `dtmf=None` keeps the
+seat's setting. Anything else raises `ValueError`.
+
+The usual split: the conference owner's own seat forwards, because its client is
+the one pressing keys on the merged parties, and the adopted seats stay on
+events so the carriers' own tones are not echoed to everyone:
+
+```python
+sdp = await rtpengine.conference_join(room, call, dtmf="forward")   # the owner
+...
+status = await b2bua.adopt_replaced(call, room)                     # adopted: events
+```
+
+The engine has to list `conference_dtmf` in `node_info` (siphon-rtp 0.19); on
+one that does not, `forward` (and an explicit `dtmf` on a route) is refused
+(`RuntimeError`; a merge resolves `501`) and nothing is sent, instead of the
+engine ignoring the field and dropping the digits. The seat's setting is the
+`dtmf` key of `b2bua.conference_roster`.
+
 ## Merging two conferences
 
 ```python

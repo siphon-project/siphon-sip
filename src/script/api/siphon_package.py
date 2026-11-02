@@ -428,7 +428,7 @@ class _B2buaNamespace:
         return control.refer(call_id, target, replaces)
 
     def adopt_replaced(self, call, conference_id, role="talker", on_owner_leave="end",
-                       on_last_leave="keep"):
+                       on_last_leave="keep", dtmf=None):
         """Merge the call a REFER's ``Replaces`` names into a conference room
         on this node (RFC 4579 §5.5, a handset's "merge").
 
@@ -469,6 +469,11 @@ class _B2buaNamespace:
                 left the room and no seat but the dialog's own remains: a
                 conference of one is over. Held by siphon, not the script, so
                 it survives a reload. Any other value raises ``ValueError``.
+            dtmf: ``None`` or ``"events"`` (default): the adopted party's
+                RFC 4733 digits stay ``@rtpengine.on_dtmf`` events.
+                ``"forward"`` has the room regenerate them toward the other
+                seats; an engine without ``conference_dtmf`` refuses it (501).
+                Anything else raises ``ValueError``.
 
         Returns:
             int (awaitable): the status for ``b2bua.complete_refer``: ``200``;
@@ -492,7 +497,7 @@ class _B2buaNamespace:
         control = object.__getattribute__(self, "__dict__").get("_control")
         if control is None:
             raise ValueError("b2bua.adopt_replaced requires a running siphon B2BUA")
-        return control.adopt_replaced(call, conference_id, role, on_owner_leave, on_last_leave)
+        return control.adopt_replaced(call, conference_id, role, on_owner_leave, on_last_leave, dtmf)
 
     def conference_roster(self, conference_id):
         """The seats currently in a conference room, from siphon's own state.
@@ -1130,13 +1135,14 @@ class _RtpEngineNamespace:
         raise NotImplementedError("rtpengine.set_play_gain() not available — no media.rtpengine in config")
 
     async def conference_join(self, conference_id, call, role="talker", target=None,
-                              whisper_target=None, profile=None):
+                              whisper_target=None, profile=None, dtmf=None):
         raise NotImplementedError("rtpengine.conference_join() not available — no media.rtpengine in config")
 
     async def conference_leave(self, conference_id, call):
         raise NotImplementedError("rtpengine.conference_leave() not available — no media.rtpengine in config")
 
-    async def conference_route(self, conference_id, call, role, target=None, whisper_target=None):
+    async def conference_route(self, conference_id, call, role, target=None, whisper_target=None,
+                               dtmf=None):
         raise NotImplementedError("rtpengine.conference_route() not available — no media.rtpengine in config")
 
     async def conference_bridge(self, conference_a, conference_b, direction="both"):
