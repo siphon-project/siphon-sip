@@ -726,6 +726,9 @@ pub struct RegistrantManager {
     /// message at all — and a de-registration has to be built at the moment the
     /// entry is removed, while its Call-ID and CSeq are still there.
     egress: std::sync::OnceLock<RegistrantEgress>,
+    /// What an immediate stream reconcile needs, installed by
+    /// [`registration_loop`] (see [`Self::reconcile_streams_now`]).
+    stream_reconcile: std::sync::OnceLock<refresh::StreamReconcile>,
     /// De-registrations built by [`Self::remove`], waiting for the loop to send
     /// them. Holds finished messages rather than live entries, so a removed
     /// trunk is gone from `entries` immediately.
@@ -797,6 +800,7 @@ impl RegistrantManager {
             event_sender,
             ue_spi_counter: AtomicU32::new(Self::UE_SPI_BASE),
             egress: std::sync::OnceLock::new(),
+            stream_reconcile: std::sync::OnceLock::new(),
             pending_deregistrations: std::sync::Mutex::new(Vec::new()),
             pending_sa_deletions: std::sync::Mutex::new(Vec::new()),
             teardowns: std::sync::Mutex::new(Vec::new()),
