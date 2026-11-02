@@ -591,6 +591,17 @@ async fn the_roster_and_the_owner_link_drain_to_baseline() {
                 caller_sends(state, &conference, "BYE", "3 BYE");
             }
         }
+        if round % 3 != 0 && round % 2 == 0 {
+            // The last call leaving ends the owner, on a task of its own: its
+            // BYE is on the wire before this round's frames are read.
+            assert!(
+                eventually(|| state
+                    .call_actors
+                    .get_call(&conference.internal_call_id)
+                    .is_none())
+                .await
+            );
+        }
         drain(&dispatcher.udp);
         rooms.push(room);
     }
