@@ -236,6 +236,7 @@ impl IpsecManager {
             why,
             "IPsec: SA pair taken into use"
         );
+        self.lift_restart_bars(pair);
         for old in old {
             self.retire_pair(
                 old.ue_addr,
@@ -274,6 +275,7 @@ impl IpsecManager {
                     pcscf_port_c = pair.pcscf_port_c,
                     "IPsec: SA pair taken into use, the set in use went"
                 );
+                self.lift_restart_bars(&pair);
             }
         }
     }

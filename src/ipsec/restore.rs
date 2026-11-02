@@ -21,6 +21,13 @@
 //! unanswered, and it performs an initial registration (TS 24.229 clause
 //! 5.1.1.4.1): fresh AKA, new SAs, a new binding. A network that wants that
 //! sooner uses P-CSCF restoration (TS 23.380 clause 5).
+//!
+//! The bars for a UE address lift when a new SA pair for it is taken into use
+//! ([`IpsecManager::lift_restart_bars`]): that UE performed an initial
+//! registration, so it dropped its old SAs and nothing is left to protect on
+//! any endpoint the old binding named, whatever ports the new pair uses. A
+//! pair still pending (an authentication in progress, which the UE does not
+//! hold yet) lifts nothing.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -158,6 +165,22 @@ impl IpsecManager {
             && self
                 .find_sa_by_ue(&destination.ip(), destination.port())
                 .is_none()
+    }
+
+    /// A new SA pair for `pair`'s UE address was taken into use: the UE
+    /// registered afresh (TS 24.229 clause 5.1.1.4.1), so it holds none of the
+    /// SAs a restart lost and every restart bar on that address is obsolete.
+    /// Bars of pairs this manager deleted itself ([`super::deleted_flows`]) and
+    /// of other UE addresses stay. Called from every point that takes a P-CSCF
+    /// pair into use, including a pair that is in use from creation.
+    pub(super) fn lift_restart_bars(&self, pair: &super::SecurityAssociationPair) {
+        if pair.role != super::SaRole::PCscf || self.orphaned_flows.endpoints.is_empty() {
+            return;
+        }
+        let ue_addr = pair.ue_addr;
+        self.orphaned_flows
+            .endpoints
+            .retain(|endpoint, _| endpoint.ip() != ue_addr);
     }
 
     /// Forget the barred endpoints whose binding would have expired by now.
