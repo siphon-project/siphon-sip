@@ -13,6 +13,10 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **After a restart, a P-CSCF no longer refuses terminating requests to a UE that has re-registered with new SAs.** The egress bars on the endpoints of a binding whose SAs were lost (a Contact port or old server port the new pair does not cover) lifted only when the old binding would have expired. They now lift when a new SA pair for that UE address is taken into use (TS 24.229 §5.1.1.4.1); a pair still pending lifts nothing.
+
 ## [1.15.9] — 2026-11-01
 
 ### Added
