@@ -127,6 +127,8 @@ pub(crate) struct NativeCommand {
     pub(crate) ws_tee: Option<String>,
     /// Whether the engine refused the command because it holds no such call.
     pub(crate) refused: bool,
+    /// The `dtmf` a `conference_seat` carried (`events` or `forward`).
+    pub(crate) dtmf: Option<String>,
     /// The frame's `scope`: the node's or a per-call one. The engine keys a
     /// call by `(scope, call_id)`.
     pub(crate) scope: Option<String>,
@@ -146,6 +148,7 @@ struct Recorded {
     detail: Option<String>,
     repeat: Option<String>,
     profile: Option<siphon_rtp_proto::ProfileFlags>,
+    dtmf: Option<String>,
 }
 
 /// What the engine makes of a command on a call `offer_far` grew (or the
@@ -231,6 +234,7 @@ impl Recorded {
             detail: None,
             repeat: None,
             profile: None,
+            dtmf: None,
         }
     }
 }
@@ -282,9 +286,13 @@ fn seat_command(command: &Command) -> (Option<Recorded>, Option<String>, bool, b
             call_id,
             from_tag,
             conference_id,
+            dtmf,
             ..
         } => (
             Some(Recorded {
+                dtmf: serde_json::to_value(dtmf)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string)),
                 detail: Some(conference_id.clone()),
                 ..Recorded::new("conference_seat", call_id, from_tag)
             }),
@@ -610,6 +618,7 @@ impl NativeTestEngine {
                                         .as_ref()
                                         .and_then(|profile| profile.ws_tee.clone()),
                                     refused,
+                                    dtmf: record.dtmf.clone(),
                                     scope: scope.clone(),
                                     address_family: record
                                         .profile

@@ -14,7 +14,7 @@
 //! only once `node_info` lists `conference_seat` (as an `ogg_opus` recording is
 //! gated on `record_ogg_opus`).
 
-use siphon_rtp_proto::{CmdResult, Command, ConferenceRole};
+use siphon_rtp_proto::{CmdResult, Command, ConferenceDtmf, ConferenceRole};
 
 use super::super::{expect_ok, per_call, result_kind, SiphonRtpClient, SiphonRtpClientSet};
 use super::room_affinity_key;
@@ -48,6 +48,22 @@ pub(crate) fn require_seat_received_from(result: CmdResult) -> Result<(), RtpEng
         CONFERENCE_RECEIVED_FROM_FEATURE,
         "a conference seat with received_from",
         "siphon-rtp (an engine that does not list conference_received_from)",
+    )
+}
+
+/// What an engine lists in `node_info.features` when its conference seating
+/// verbs take `dtmf: "forward"` and `conference_route` takes `dtmf`.
+pub(crate) const CONFERENCE_DTMF_FEATURE: &str = "conference_dtmf";
+
+/// Whether a `node_info` answer lists `conference_dtmf`. An engine without it
+/// ignores the field and drops the digits silently, so a seat that asks for
+/// them forwarded is refused rather than made.
+pub(crate) fn require_conference_dtmf(result: CmdResult) -> Result<(), RtpEngineError> {
+    require_feature(
+        result,
+        CONFERENCE_DTMF_FEATURE,
+        "conference seat dtmf forwarding",
+        "siphon-rtp (an engine that does not list conference_dtmf)",
     )
 }
 
@@ -91,8 +107,12 @@ impl SiphonRtpClient {
         from_tag: &str,
         conference_id: &str,
         role: ConferenceRole,
+        dtmf: ConferenceDtmf,
     ) -> Result<(), RtpEngineError> {
         require_conference_seat(self.request_in(None, Command::NodeInfo).await?)?;
+        if dtmf == ConferenceDtmf::Forward {
+            require_conference_dtmf(self.request_in(None, Command::NodeInfo).await?)?;
+        }
         // A call verb: the frame carries the call's scope, as every verb
         // naming a call does.
         expect_ok(
@@ -101,6 +121,7 @@ impl SiphonRtpClient {
                 from_tag: from_tag.to_string(),
                 conference_id: conference_id.to_string(),
                 role,
+                dtmf,
             })
             .await?,
         )
@@ -117,6 +138,7 @@ impl SiphonRtpClientSet {
         from_tag: &str,
         conference_id: &str,
         role: ConferenceRole,
+        dtmf: ConferenceDtmf,
     ) -> Result<(), RtpEngineError> {
         let room_key = room_affinity_key(conference_id);
         let call_index = if self.clients.len() == 1 {
@@ -145,7 +167,7 @@ impl SiphonRtpClientSet {
             )));
         };
         client
-            .conference_seat(call_id, from_tag, conference_id, role)
+            .conference_seat(call_id, from_tag, conference_id, role, dtmf)
             .await?;
         if self.clients.len() > 1 {
             self.affinity.entry(room_key).or_insert(call_index);

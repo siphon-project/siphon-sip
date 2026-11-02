@@ -826,6 +826,7 @@ mod tests {
                 "v=0\r\n",
                 ConferenceRole::Talker,
                 &NgFlags::default(),
+                siphon_rtp_proto::ConferenceDtmf::Events,
             )
             .await
             .expect("seated");
@@ -868,6 +869,7 @@ mod tests {
                 "v=0\r\n",
                 ConferenceRole::Talker,
                 &NgFlags::default(),
+                siphon_rtp_proto::ConferenceDtmf::Events,
             )
             .await
             .expect("seated");

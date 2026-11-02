@@ -30,6 +30,7 @@ mod answer;
 mod answer_local;
 mod capture;
 mod conference;
+pub(crate) use conference::parse_dtmf as parse_conference_dtmf;
 mod decorators;
 mod message;
 mod offer;
@@ -1769,10 +1770,16 @@ impl PyRtpEngine {
     ///     profile: As for :meth:`answer_local`. A profile with a codec policy,
     ///         ``ws_uri``, ``ws_tee``, ``record_call`` or a DSP knob raises
     ///         ``ValueError``: siphon-rtp does not apply them to a seat.
+    ///     dtmf: ``"events"`` (default, also ``None``): the seat's RFC 4733
+    ///         digits only raise ``@rtpengine.on_dtmf``. ``"forward"``: the
+    ///         room also regenerates them toward every other seat, each in that
+    ///         seat's own payload type and clock. An engine that does not list
+    ///         ``conference_dtmf`` refuses ``"forward"`` (``RuntimeError``)
+    ///         rather than drop the digits. Anything else is a ``ValueError``.
     ///
     /// Raises ``ValueError`` when the engine cannot encode the room mix in the
     /// participant's codec, or the call is already seated.
-    #[pyo3(signature = (conference_id, call, role="talker", target=None, whisper_target=None, profile=None))]
+    #[pyo3(signature = (conference_id, call, role="talker", target=None, whisper_target=None, profile=None, dtmf=None))]
     #[allow(clippy::too_many_arguments)]
     fn conference_join<'py>(
         &self,
@@ -1783,6 +1790,7 @@ impl PyRtpEngine {
         target: Option<String>,
         whisper_target: Option<String>,
         profile: Option<&str>,
+        dtmf: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         conference::join(
             self,
@@ -1793,6 +1801,7 @@ impl PyRtpEngine {
             target,
             whisper_target,
             profile,
+            dtmf,
         )
     }
 
@@ -1810,8 +1819,12 @@ impl PyRtpEngine {
     }
 
     /// Change who a seat hears and who hears it, live: ``role``, ``target``
-    /// and ``whisper_target`` as for :meth:`conference_join`.
-    #[pyo3(signature = (conference_id, call, role, target=None, whisper_target=None))]
+    /// and ``whisper_target`` as for :meth:`conference_join`. ``dtmf`` switches
+    /// the seat's digit forwarding (``"events"`` or ``"forward"``); ``None``
+    /// keeps it. An engine that does not list ``conference_dtmf`` refuses an
+    /// explicit ``dtmf``. A seat the room does not hold is an error
+    /// (``RuntimeError``) on an engine from siphon-rtp 0.19.
+    #[pyo3(signature = (conference_id, call, role, target=None, whisper_target=None, dtmf=None))]
     fn conference_route<'py>(
         &self,
         python: Python<'py>,
@@ -1820,6 +1833,7 @@ impl PyRtpEngine {
         role: &str,
         target: Option<String>,
         whisper_target: Option<String>,
+        dtmf: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         conference::route(
             self,
@@ -1829,6 +1843,7 @@ impl PyRtpEngine {
             role,
             target,
             whisper_target,
+            dtmf,
         )
     }
 
@@ -1882,7 +1897,10 @@ impl PyRtpEngine {
     ///     call_id = b2bua.originate(target, sdp=sdp, ...)
     ///     # @b2bua.on_answer(call, reply):
     ///     await rtpengine.conference_answer(room, (call.call_id, tag), reply.body)
-    #[pyo3(signature = (conference_id, seat_tag, role="talker", target=None, whisper_target=None, profile=None))]
+    ///
+    /// ``dtmf`` is ``"events"`` (default, also ``None``) or ``"forward"``, as
+    /// for :meth:`conference_join`; the seat keeps it from the answer on.
+    #[pyo3(signature = (conference_id, seat_tag, role="talker", target=None, whisper_target=None, profile=None, dtmf=None))]
     #[allow(clippy::too_many_arguments)]
     fn conference_offer<'py>(
         &self,
@@ -1893,6 +1911,7 @@ impl PyRtpEngine {
         target: Option<String>,
         whisper_target: Option<String>,
         profile: Option<&str>,
+        dtmf: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         conference::offer(
             self,
@@ -1903,6 +1922,7 @@ impl PyRtpEngine {
             target,
             whisper_target,
             profile,
+            dtmf,
         )
     }
 

@@ -26,7 +26,7 @@ use crate::rtpengine::siphon_rtp::PlayMediaOutcome;
 // types, for the reason `X3TargetLeg` is: a local twin would only add a
 // conversion that could be wrong, and a wrong role seats a participant with the
 // wrong audience.
-pub use siphon_rtp_proto::{BridgeDirection, ConferenceRole, PlayRepeat};
+pub use siphon_rtp_proto::{BridgeDirection, ConferenceDtmf, ConferenceRole, PlayRepeat};
 
 use crate::rtpengine::conference_roster::{self, RosterSeat, SeatKind};
 
@@ -38,6 +38,14 @@ pub fn role_label(role: &ConferenceRole) -> &'static str {
         ConferenceRole::Muted => "muted",
         ConferenceRole::Whisper { .. } => "whisper",
         ConferenceRole::Monitor { .. } => "monitor",
+    }
+}
+
+/// The name of a digit-forwarding mode, as the roster and a script spell it.
+pub fn dtmf_label(dtmf: ConferenceDtmf) -> &'static str {
+    match dtmf {
+        ConferenceDtmf::Events => "events",
+        ConferenceDtmf::Forward => "forward",
     }
 }
 
@@ -55,6 +63,8 @@ pub struct AdoptedSeat {
     pub owner_call_id: String,
     /// `on_last_leave="end_owner"`.
     pub end_owner_on_last: bool,
+    /// Whether the room forwards the seat's digits to the other seats.
+    pub dtmf: ConferenceDtmf,
 }
 
 /// A seat this process holds: which room, and the from-tag the engine knows
@@ -118,7 +128,7 @@ impl MediaBackend {
             return Err(self.no_mixer("conference_seat"));
         };
         let role_name = role_label(&role);
-        set.conference_seat(engine_call_id, from_tag, conference_id, role)
+        set.conference_seat(engine_call_id, from_tag, conference_id, role, adopted.dtmf)
             .await?;
         SEATED_CALLS.insert(engine_call_id.to_string(), conference_id.to_string());
         conference_roster::seat_adopted(RosterSeat {
@@ -127,6 +137,7 @@ impl MediaBackend {
             from_tag: from_tag.to_string(),
             party_uri: adopted.party_uri,
             role: role_name.to_string(),
+            dtmf: dtmf_label(adopted.dtmf).to_string(),
             joined_at: conference_roster::unix_seconds(),
             kind: SeatKind::Adopted,
             owner_call_id: Some(adopted.owner_call_id),
@@ -168,8 +179,16 @@ impl MediaBackend {
         role: ConferenceRole,
         flags: &NgFlags,
     ) -> Result<String, RtpEngineError> {
-        self.conference_join_party(call_id, seat, offer_sdp, role, flags, None)
-            .await
+        self.conference_join_party(
+            call_id,
+            seat,
+            offer_sdp,
+            role,
+            flags,
+            None,
+            ConferenceDtmf::Events,
+        )
+        .await
     }
 
     /// [`Self::conference_join`], recording the seated party's own URI on the
@@ -182,13 +201,21 @@ impl MediaBackend {
         role: ConferenceRole,
         flags: &NgFlags,
         party_uri: Option<String>,
+        dtmf: ConferenceDtmf,
     ) -> Result<String, RtpEngineError> {
         let Self::SiphonRtp(set) = self else {
             return Err(self.no_mixer("conference_join"));
         };
         let role_name = role_label(&role);
         let answer = set
-            .conference_join(&seat.conference_id, &seat.from_tag, offer_sdp, role, flags)
+            .conference_join(
+                &seat.conference_id,
+                &seat.from_tag,
+                offer_sdp,
+                role,
+                flags,
+                dtmf,
+            )
             .await?;
         conference_roster::seat_joined(
             &seat.conference_id,
@@ -196,6 +223,7 @@ impl MediaBackend {
             &seat.from_tag,
             party_uri,
             role_name,
+            dtmf_label(dtmf),
         );
         SEATS.insert(call_id.to_string(), seat);
         Ok(answer)
@@ -265,13 +293,19 @@ impl MediaBackend {
         &self,
         seat: &ConferenceSeat,
         role: ConferenceRole,
+        dtmf: Option<ConferenceDtmf>,
     ) -> Result<(), RtpEngineError> {
         match self {
             Self::SiphonRtp(set) => {
                 let role_name = role_label(&role);
-                set.conference_route(&seat.conference_id, &seat.from_tag, role)
+                set.conference_route(&seat.conference_id, &seat.from_tag, role, dtmf)
                     .await?;
-                conference_roster::role_changed(&seat.conference_id, &seat.from_tag, role_name);
+                conference_roster::role_changed(
+                    &seat.conference_id,
+                    &seat.from_tag,
+                    role_name,
+                    dtmf.map(dtmf_label),
+                );
                 Ok(())
             }
             Self::RtpEngine(_) | Self::RtpProxy(_) => Err(self.no_mixer("conference_route")),
@@ -317,15 +351,21 @@ impl MediaBackend {
         seat: &ConferenceSeat,
         role: ConferenceRole,
         flags: &NgFlags,
+        dtmf: ConferenceDtmf,
     ) -> Result<String, RtpEngineError> {
         let Self::SiphonRtp(set) = self else {
             return Err(self.no_mixer("conference_offer"));
         };
         let role_name = role_label(&role);
         let offer = set
-            .conference_offer(&seat.conference_id, &seat.from_tag, role, flags)
+            .conference_offer(&seat.conference_id, &seat.from_tag, role, flags, dtmf)
             .await?;
-        conference_roster::seat_offered(&seat.conference_id, &seat.from_tag, role_name);
+        conference_roster::seat_offered(
+            &seat.conference_id,
+            &seat.from_tag,
+            role_name,
+            dtmf_label(dtmf),
+        );
         Ok(offer)
     }
 
@@ -363,14 +403,16 @@ impl MediaBackend {
             received_from,
         )
         .await?;
-        let role_name = conference_roster::take_offered_role(&seat.conference_id, &seat.from_tag)
-            .unwrap_or_else(|| "talker".to_string());
+        let (role_name, dtmf_name) =
+            conference_roster::take_offered_role(&seat.conference_id, &seat.from_tag)
+                .unwrap_or_else(|| ("talker".to_string(), "events".to_string()));
         conference_roster::seat_joined(
             &seat.conference_id,
             call_id,
             &seat.from_tag,
             party_uri,
             &role_name,
+            &dtmf_name,
         );
         SEATS.insert(call_id.to_string(), seat);
         Ok(())

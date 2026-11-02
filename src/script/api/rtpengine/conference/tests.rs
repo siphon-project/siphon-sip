@@ -466,7 +466,8 @@ async fn a_seat_the_focus_calls_out_is_offered_then_seated_on_its_answer() {
         engine.frames("conference_offer"),
         vec![
             json!({"command": "conference_offer", "conference_id": "room-7", "from_tag": "carol",
-                    "role": {"role": "listener"}, "profile": engine.frames("conference_offer")[0]["profile"].clone()})
+                    "role": {"role": "listener"}, "profile": engine.frames("conference_offer")[0]["profile"].clone(),
+                    "dtmf": "events"})
         ]
     );
     assert_eq!(
@@ -737,4 +738,142 @@ async fn a_script_records_a_room_and_gets_the_closed_file() {
                      "silence_ms": 3000 })
         ]
     );
+}
+
+/// `accept`, with a `node_info` that lists `features`.
+fn listing(request: &Value, features: &[&str]) -> Value {
+    if request["command"] == "node_info" {
+        return json!({
+            "result": "node_info",
+            "node": {
+                "node_id": "engine-1", "version": "0.19.0", "media_addresses": [],
+                "codecs": [], "features": features, "max_sessions": 0, "draining": false,
+            },
+        });
+    }
+    accept(request)
+}
+
+fn lists_dtmf(request: &Value) -> Value {
+    listing(request, &["conference_dtmf"])
+}
+
+fn lists_nothing(request: &Value) -> Value {
+    listing(request, &[])
+}
+
+/// `dtmf=` on `conference_join`, `conference_offer` and `conference_route` as a
+/// script passes it: `"forward"` reaches the frame, `None` is the default
+/// `events` (and, on a route, no field at all), a bad value is a `ValueError`
+/// before anything is sent, and an engine without `conference_dtmf` refuses
+/// `forward` with nothing but the feature check on the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dtmf_reaches_the_frame_and_an_engine_without_the_feature_refuses_forward() {
+    let engine = FakeEngine::start(lists_dtmf, Vec::new()).await;
+    let bound = namespace(engine.backend(), ProfileRegistry::new());
+    let outcomes = with_namespace(bound, |python, namespace| {
+        let mut outcomes = Vec::new();
+        let call_for = |call_id: &str, tag: &str| participant(python, call_id, tag);
+        let with = |dtmf: Option<&str>| {
+            let kwargs = PyDict::new(python);
+            if let Some(dtmf) = dtmf {
+                kwargs.set_item("dtmf", dtmf).expect("dtmf");
+            }
+            kwargs
+        };
+        for (call_id, tag, dtmf) in [
+            ("d-a@example.com", "owner", Some("forward")),
+            ("d-b@example.com", "plain", None),
+            ("d-c@example.com", "explicit", Some("events")),
+            ("d-d@example.com", "bad", Some("digits")),
+        ] {
+            let args = PyTuple::new(
+                python,
+                [python_str(python, "room-d"), call_for(call_id, tag)],
+            )
+            .expect("args");
+            outcomes.push(call_verb(
+                python,
+                namespace,
+                "conference_join",
+                &args,
+                &with(dtmf),
+            ));
+        }
+        let args = PyTuple::new(python, ["room-d", "callee"]).expect("args");
+        outcomes.push(call_verb(
+            python,
+            namespace,
+            "conference_offer",
+            &args,
+            &with(Some("forward")),
+        ));
+        let pair = ("d-a@example.com", "owner")
+            .into_pyobject(python)
+            .expect("pair")
+            .into_any();
+        let args = PyTuple::new(python, [python_str(python, "room-d"), pair]).expect("args");
+        let kwargs = with(Some("events"));
+        kwargs.set_item("role", "muted").expect("role");
+        outcomes.push(call_verb(
+            python,
+            namespace,
+            "conference_route",
+            &args,
+            &kwargs,
+        ));
+        let kwargs = with(None);
+        kwargs.set_item("role", "talker").expect("role");
+        outcomes.push(call_verb(
+            python,
+            namespace,
+            "conference_route",
+            &args,
+            &kwargs,
+        ));
+        outcomes
+    })
+    .await;
+
+    assert!(outcomes[..3].iter().all(Result::is_ok), "{outcomes:?}");
+    assert!(
+        outcomes[3]
+            .as_ref()
+            .is_err_and(|error| error.starts_with("ValueError") && error.contains("dtmf")),
+        "{:?}",
+        outcomes[3]
+    );
+    assert!(outcomes[4..].iter().all(Result::is_ok), "{outcomes:?}");
+    let joins = engine.frames("conference_join");
+    let dtmf: Vec<_> = joins.iter().map(|frame| frame["dtmf"].clone()).collect();
+    assert_eq!(
+        dtmf,
+        [json!("forward"), json!("events"), json!("events")],
+        "the bad value sent nothing"
+    );
+    assert_eq!(
+        engine.frames("conference_offer")[0]["dtmf"],
+        json!("forward")
+    );
+    let routes = engine.frames("conference_route");
+    assert_eq!(routes[0]["dtmf"], json!("events"));
+    assert!(routes[1].get("dtmf").is_none(), "{}", routes[1]);
+
+    let bare = FakeEngine::start(lists_nothing, Vec::new()).await;
+    let bound = namespace(bare.backend(), ProfileRegistry::new());
+    let outcome = with_namespace(bound, |python, namespace| {
+        let call = participant(python, "e-a@example.com", "owner");
+        let args = PyTuple::new(python, [python_str(python, "room-e"), call]).expect("args");
+        let kwargs = PyDict::new(python);
+        kwargs.set_item("dtmf", "forward").expect("dtmf");
+        call_verb(python, namespace, "conference_join", &args, &kwargs)
+    })
+    .await;
+    let refused = outcome.expect_err("refused");
+    assert!(
+        refused.contains("conference_dtmf") || refused.contains("not supported"),
+        "{refused}"
+    );
+    assert!(bare.frames("conference_join").is_empty());
+    assert!(MediaBackend::conference_seat("e-a@example.com").is_none());
 }

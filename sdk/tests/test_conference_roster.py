@@ -28,7 +28,8 @@ from siphon import b2bua
 @b2bua.on_refer
 async def on_refer(call):
     call.accept_refer(mode="script")
-    status = await b2bua.adopt_replaced(call, "room-1", on_last_leave=builtins.ON_LAST_LEAVE)
+    status = await b2bua.adopt_replaced(call, "room-1", on_last_leave=builtins.ON_LAST_LEAVE,
+                                      dtmf=builtins.DTMF)
     b2bua.complete_refer(call.call_id, status)
 
 @b2bua.on_bye
@@ -43,6 +44,7 @@ def harness():
 
     h = SipTestHarness(local_domains=["example.com"])
     builtins.ON_LAST_LEAVE = "end_owner"
+    builtins.DTMF = None
     builtins.BYE_SEEN = []
     h.load_source(SCRIPT)
     yield h
@@ -115,7 +117,7 @@ class TestRoster:
         assert adopted["owner_call_id"] == OWNER
         assert adopted["role"] == "talker"
         assert isinstance(adopted["joined_at"], float)
-        assert set(adopted) == {"call_id", "from_tag", "party_uri", "role",
+        assert set(adopted) == {"call_id", "from_tag", "party_uri", "role", "dtmf",
                                 "joined_at", "kind", "owner_call_id"}
 
     def test_an_unknown_room_is_empty(self, harness):
@@ -290,3 +292,93 @@ class TestForResource:
                 state.for_resource("<sip:room-1@conf.example.com>", "CONFERENCE")] == [mine.id, also.id]
         assert state.for_resource("sip:room-9@conf.example.com", "conference") == []
         assert state.for_resource("sip:room-1x@conf.example.com", "conference") == []
+
+
+class TestDtmf:
+    """``dtmf="events" | "forward"`` on the seating verbs and on a merge."""
+
+    def run(self, harness, coroutine):
+        return harness._loop.run_until_complete(coroutine)
+
+    def test_a_seat_defaults_to_events_and_forward_shows_on_the_roster(self, harness):
+        engine = mock_module.get_rtpengine()
+        self.run(harness, engine.conference_join(ROOM, (OWNER, "owner-tag"), dtmf="forward"))
+        self.run(harness, engine.conference_join(ROOM, ("guest@192.0.2.50", "g")))
+        roster = mock_module.get_b2bua().conference_roster(ROOM)
+        assert [(seat["call_id"], seat["dtmf"]) for seat in roster] == [
+            (OWNER, "forward"), ("guest@192.0.2.50", "events")]
+
+    def test_an_offered_seat_keeps_its_dtmf_to_the_answer(self, harness):
+        engine = mock_module.get_rtpengine()
+        self.run(harness, engine.conference_offer(ROOM, "callee-tag", dtmf="forward"))
+        self.run(harness, engine.conference_answer(ROOM, ("callee@192.0.2.60", "callee-tag"), "v=0\r\n"))
+        assert mock_module.get_b2bua().conference_roster(ROOM)[0]["dtmf"] == "forward"
+
+    def test_route_names_it_or_keeps_it(self, harness):
+        engine = mock_module.get_rtpengine()
+        self.run(harness, engine.conference_join(ROOM, (OWNER, "owner-tag"), dtmf="forward"))
+        self.run(harness, engine.conference_route(ROOM, (OWNER, "owner-tag"), "muted"))
+        seat = mock_module.get_b2bua().conference_roster(ROOM)[0]
+        assert (seat["role"], seat["dtmf"]) == ("muted", "forward")
+        self.run(harness, engine.conference_route(ROOM, (OWNER, "owner-tag"), "talker", dtmf="events"))
+        assert mock_module.get_b2bua().conference_roster(ROOM)[0]["dtmf"] == "events"
+        assert engine.media_calls[-1]["dtmf"] == "events"
+
+    def test_a_route_on_an_unknown_seat_is_an_error(self, harness):
+        engine = mock_module.get_rtpengine()
+        self.run(harness, engine.conference_join(ROOM, (OWNER, "owner-tag")))
+        with pytest.raises(RuntimeError, match="no such conference"):
+            self.run(harness, engine.conference_route(ROOM, ("x@192.0.2.1", "nobody"), "muted", dtmf="forward"))
+
+    def test_an_unknown_value_raises_before_anything_is_done(self, harness):
+        engine = mock_module.get_rtpengine()
+        for verb in (
+            lambda: engine.conference_join(ROOM, (OWNER, "owner-tag"), dtmf="digits"),
+            lambda: engine.conference_offer(ROOM, "tag", dtmf="digits"),
+        ):
+            with pytest.raises(ValueError, match="dtmf"):
+                self.run(harness, verb())
+        assert engine.conferences == {} and engine.conference_offers == {}
+
+    def test_an_engine_without_the_feature_refuses_forward_and_an_explicit_route_dtmf(self, harness):
+        engine = mock_module.get_rtpengine()
+        engine.set_conference_dtmf_supported(False)
+        with pytest.raises(RuntimeError, match="conference_dtmf"):
+            self.run(harness, engine.conference_join(ROOM, (OWNER, "owner-tag"), dtmf="forward"))
+        with pytest.raises(RuntimeError, match="conference_dtmf"):
+            self.run(harness, engine.conference_offer(ROOM, "tag", dtmf="forward"))
+        assert engine.conferences == {} and engine.conference_offers == {}
+        # events is what every engine does; a route naming nothing sends nothing.
+        self.run(harness, engine.conference_join(ROOM, (OWNER, "owner-tag")))
+        self.run(harness, engine.conference_route(ROOM, (OWNER, "owner-tag"), "muted"))
+        with pytest.raises(RuntimeError, match="conference_dtmf"):
+            self.run(harness, engine.conference_route(ROOM, (OWNER, "owner-tag"), "talker", dtmf="events"))
+
+    def test_an_adopted_seat_stays_on_events_unless_asked(self, harness):
+        b2bua = mock_module.get_b2bua()
+        import builtins
+
+        plain, forwarded = held_call("plain"), held_call("fwd")
+        assert merge(harness, plain) == 200
+        builtins.DTMF = "forward"
+        assert merge(harness, forwarded) == 200
+        assert [seat["dtmf"] for seat in b2bua.conference_roster(ROOM)] == ["events", "forward"]
+        assert [adoption["call_id"] for adoption in b2bua.adoptions] == ["plain-a@192.0.2.1", "fwd-a@192.0.2.1"]
+
+    def test_a_merge_asking_for_forwarding_on_an_engine_without_it_is_501(self, harness):
+        import builtins
+
+        builtins.DTMF = "forward"
+        mock_module.get_rtpengine().set_conference_dtmf_supported(False)
+        held = held_call("refused")
+        assert merge(harness, held) == 501
+        assert held.caller is not None and held.adoption is None
+        assert mock_module.get_b2bua().conference_roster(ROOM) == []
+
+    def test_a_bad_value_on_a_merge_raises(self, harness):
+        b2bua = mock_module.get_b2bua()
+        held = held_call("bad")
+        call = Call(call_id=OWNER, state="answered", refer_to="sip:x@example.com",
+                    refer_replaces=held.caller.replaces(), refer_side="a")
+        with pytest.raises(ValueError, match="dtmf"):
+            self.run(harness, b2bua.adopt_replaced(call, ROOM, dtmf="digits"))

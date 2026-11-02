@@ -686,6 +686,7 @@ the seats were taken:
 | `from_tag` | the seat's From-tag |
 | `party_uri` | the seated party's own URI, or `None` |
 | `role` | `talker`, `listener`, `muted`, `whisper` or `monitor` |
+| `dtmf` | `"events"` or `"forward"`: whether the room sends the seat's RFC 4733 digits on to the other seats |
 | `joined_at` | unix seconds, a float |
 | `kind` | `"joined"` (`conference_join` / `conference_answer`) or `"adopted"` (`adopt_replaced`) |
 | `owner_call_id` | the conference dialog that adopted the call; `None` for a joined seat |
@@ -706,3 +707,11 @@ delivered.
 on_last_leave="keep")`: `on_last_leave="end_owner"` BYEs the conference dialog
 (`Reason: Q.850;cause=16`) once the last call adopted under it has left and no
 seat but its own remains in the room; any other value raises `ValueError`.
+
+`rtpengine.conference_join(..., dtmf=None)`, `rtpengine.conference_offer(..., dtmf=None)`
+and `b2bua.adopt_replaced(..., dtmf=None)` take `"events"` (default) or
+`"forward"`; `rtpengine.conference_route(..., dtmf=None)` switches it live and
+`None` keeps the seat's setting. Any other value raises `ValueError`. An engine
+that does not list `conference_dtmf` refuses `"forward"` and an explicit route
+`dtmf` (`RuntimeError`, `501` for a merge) with nothing sent. `conference_route`
+on a seat the room does not hold is an error (`RuntimeError`).

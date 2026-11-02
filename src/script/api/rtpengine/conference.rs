@@ -18,7 +18,7 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use tracing::debug;
 
-use crate::rtpengine::backend::{BridgeDirection, ConferenceRole, ConferenceSeat};
+use crate::rtpengine::backend::{BridgeDirection, ConferenceDtmf, ConferenceRole, ConferenceSeat};
 use crate::rtpengine::profile::NgFlags;
 use crate::rtpengine::{MediaBackend, RtpEngineError};
 
@@ -69,6 +69,20 @@ pub(super) fn parse_role(
         _ => return refuse(format!("role must be one of {ROLES}, got {role:?}")),
     };
     Ok(parsed)
+}
+
+/// Read `dtmf=`: whether the room regenerates a seat's telephone-events toward
+/// the other seats. `None` is the default, `"events"` (the digits stay events),
+/// for a seat being made, and "keep the setting" for a route.
+pub(crate) fn parse_dtmf(dtmf: Option<&str>) -> PyResult<Option<ConferenceDtmf>> {
+    match dtmf {
+        None => Ok(None),
+        Some("events") => Ok(Some(ConferenceDtmf::Events)),
+        Some("forward") => Ok(Some(ConferenceDtmf::Forward)),
+        Some(other) => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "dtmf must be \"events\" or \"forward\", got {other:?}"
+        ))),
+    }
 }
 
 /// Read `direction=` of a bridge.
@@ -216,9 +230,11 @@ pub(super) fn join<'py>(
     target: Option<String>,
     whisper_target: Option<String>,
     profile: Option<&str>,
+    dtmf: Option<&str>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conference_id = room_id(conference_id, "conference_join(conference_id)")?;
     let role = parse_role(role, target, whisper_target)?;
+    let dtmf = parse_dtmf(dtmf)?.unwrap_or_default();
     let message = extract_message(call)?;
     let (call_id, from_tag, offer_sdp) = extract_offer_params(&message)?;
     let party_uri = party_uri_of(call);
@@ -273,7 +289,15 @@ pub(super) fn join<'py>(
             from_tag,
         };
         let answer_sdp = client
-            .conference_join_party(&call_id, seat.clone(), &offer_sdp, role, &flags, party_uri)
+            .conference_join_party(
+                &call_id,
+                seat.clone(),
+                &offer_sdp,
+                role,
+                &flags,
+                party_uri,
+                dtmf,
+            )
             .await
             .map_err(join_failure)?;
         debug!(
@@ -315,14 +339,16 @@ pub(super) fn route<'py>(
     role: &str,
     target: Option<String>,
     whisper_target: Option<String>,
+    dtmf: Option<&str>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conference_id = room_id(conference_id, "conference_route(conference_id)")?;
     let role = parse_role(role, target, whisper_target)?;
+    let dtmf = parse_dtmf(dtmf)?;
     let (_, seat) = seat_of(conference_id, call)?;
     let client = Arc::clone(&engine.client);
     crate::script::awaitable(python, async move {
         client
-            .conference_route(&seat, role)
+            .conference_route(&seat, role, dtmf)
             .await
             .map_err(|error| failure("conference_route", error))?;
         Ok(true)
@@ -391,10 +417,12 @@ pub(super) fn offer<'py>(
     target: Option<String>,
     whisper_target: Option<String>,
     profile: Option<&str>,
+    dtmf: Option<&str>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let conference_id = room_id(conference_id, "conference_offer(conference_id)")?;
     let from_tag = seat_tag(seat_tag_value)?;
     let role = parse_role(role, target, whisper_target)?;
+    let dtmf = parse_dtmf(dtmf)?.unwrap_or_default();
     // The engine is the offerer toward the participant, the far side of the
     // call the focus places: the profile's offer half shapes what it is sent.
     let profile_name = profile.unwrap_or(super::DEFAULT_PROFILE).to_string();
@@ -428,7 +456,7 @@ pub(super) fn offer<'py>(
             from_tag,
         };
         let offer_sdp = client
-            .conference_offer(&seat, role, &flags)
+            .conference_offer(&seat, role, &flags, dtmf)
             .await
             .map_err(|error| failure("conference_offer", error))?;
         debug!(
