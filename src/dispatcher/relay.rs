@@ -967,7 +967,6 @@ pub(super) fn relay_fork_request(
 /// next hop (RFC 3327 §5.3 + RFC 3261 §16.6 step 6).  The Request-URI stays the
 /// branch target either way.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)] // shares its body with relay_request, which carries the same allowance
 pub(super) fn relay_fork_branch(
     message: &SipMessage,
     target: &str,
@@ -1021,9 +1020,7 @@ pub(super) fn relay_fork_branch(
     // §16.6 step 6) or, with no route set, the target URI.
     // The routed host and its verify_server go with a resolved destination, so
     // a new TLS connection presents and verifies the name it was routed on.
-    let (mut destination, mut outbound_transport, tls_server_name, verify_server) = if let Some(
-        flow,
-    ) = flow
+    let (destination, outbound_transport, tls_server_name, verify_server) = if let Some(flow) = flow
     {
         let Some(transport) = transport_from_token(&flow.transport) else {
             warn!(target = %target, branch = branch_index, transport = %flow.transport, "fork: unknown flow transport");
@@ -1072,30 +1069,18 @@ pub(super) fn relay_fork_branch(
         return; // caller handles the error for the whole fork
     }
 
-    // RFC 3261 §18.1.1 — bias an over-MTU UDP fork branch to TCP.  Skipped for a
-    // flow-pinned branch (its transport is fixed by connection reuse).
-    // Over siphon's own UE flow: the same rule on the flow's own connection,
-    // with the flow's socket in the Via (see `relay_request`).
+    // RFC 3261 §18.1.1 — bias an over-MTU UDP fork branch to TCP (see
+    // `fork_branch_over_mtu`). Over siphon's own UE flow the Via keeps the
+    // flow's socket (see `relay_request`).
     let flow_transport = outbound_transport;
-    if flow_over_mtu_upgrade(state, flow, &relayed) {
-        outbound_transport = Transport::Tcp;
-    }
-    if state.mtu.is_some() && flow.is_none() {
-        if let Some((tcp_transport, tcp_addr)) = over_mtu_upgrade(
-            state,
-            outbound_transport,
-            relayed.to_bytes().len(),
-            target,
-            destination,
-        ) {
-            if state.is_own_address(&tcp_addr) {
-                warn!(%tcp_addr, "fork §18.1.1: TCP path loops back to us — keeping UDP");
-            } else {
-                outbound_transport = tcp_transport;
-                destination = tcp_addr;
-            }
-        }
-    }
+    let (outbound_transport, destination) = fork_branch_over_mtu(
+        state,
+        flow,
+        &relayed,
+        target,
+        destination,
+        outbound_transport,
+    );
 
     // A script send_socket= egress pin applies to this branch only when it has
     // no captured flow (a flow already pins egress) and its transport matches
