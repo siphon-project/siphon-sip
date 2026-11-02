@@ -29,7 +29,7 @@
 
 use crate::b2bua::actor::{same_party, AdoptRefusal, AdoptedSwap, DialogParty};
 use crate::dispatcher::*;
-use crate::rtpengine::backend::ConferenceRole;
+use crate::rtpengine::backend::{AdoptedSeat, ConferenceRole};
 use crate::rtpengine::error::RtpEngineError;
 
 /// The `Reason` (RFC 3326) on the BYE that ends the dialog the `Replaces`
@@ -61,6 +61,9 @@ pub struct AdoptRequest {
     pub role: ConferenceRole,
     /// Whether the adopted call ends with the conference dialog.
     pub ends_with_owner: bool,
+    /// `on_last_leave="end_owner"`: the conference dialog ends when the last
+    /// call adopted under it has left and no other seat but its own remains.
+    pub ends_owner_on_last: bool,
 }
 
 /// Carry out `request` on the running dispatcher. Resolves to the status the
@@ -144,12 +147,29 @@ pub async fn b2bua_adopt_replaced_with_state(
         warn!(call_id = %adopted, "b2bua.adopt_replaced: the call has no media session naming the far party on this backend — 488");
         return 488;
     };
+    let Some(far_party) = state.call_actors.far_party(&adopted, named.on_a_leg) else {
+        state.call_actors.abandon_adoption(&adopted);
+        info!(call_id = %adopted, "b2bua.adopt_replaced: the call ended while it was being seated — 481");
+        return 481;
+    };
+    let seat = AdoptedSeat {
+        sip_call_id: far_party.sip_call_id.clone(),
+        party_uri: far_party
+            .uri
+            .as_deref()
+            .map(crate::subscribe_state::strip_nameaddr)
+            .filter(|uri| !uri.is_empty()),
+        internal_call_id: adopted.clone(),
+        owner_call_id: referrer.sip_call_id.clone(),
+        end_owner_on_last: request.ends_owner_on_last,
+    };
     if let Err(error) = backend
         .conference_seat_call(
             &engine_call_id,
             &far_tag,
             &request.conference_id,
             request.role.clone(),
+            seat,
         )
         .await
     {

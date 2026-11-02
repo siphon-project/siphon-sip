@@ -2365,6 +2365,22 @@ impl PyCall {
         super::call_adopt::party_dict(python, self.refer_replaces_call.as_ref())
     }
 
+    /// The room this call is seated in, as `(conference_id, owner_call_id)`, or
+    /// `None` when it is in none: `owner_call_id` is the SIP Call-ID of the
+    /// conference dialog that adopted the call (`b2bua.adopt_replaced`), and
+    /// `None` for a call seated with `rtpengine.conference_join` /
+    /// `conference_answer`. Read from siphon's roster, so it is there in
+    /// `@b2bua.on_bye` and every other handler for as long as the seat is,
+    /// whatever a reload did to the script.
+    #[getter]
+    fn conference(&self) -> PyResult<Option<(String, Option<String>)>> {
+        let call_id = self.call_id()?.unwrap_or_default();
+        Ok(
+            crate::rtpengine::conference_roster::seat_of_call(&call_id, &self.id)
+                .map(|seat| (seat.conference_id, seat.owner_call_id)),
+        )
+    }
+
     /// Set outbound credentials for B-leg digest auth.
     ///
     /// When the B-leg returns 401/407, SIPhon will automatically retry

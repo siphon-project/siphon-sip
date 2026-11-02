@@ -28,6 +28,35 @@ use crate::rtpengine::siphon_rtp::PlayMediaOutcome;
 // wrong audience.
 pub use siphon_rtp_proto::{BridgeDirection, ConferenceRole, PlayRepeat};
 
+use crate::rtpengine::conference_roster::{self, RosterSeat, SeatKind};
+
+/// The name of a routing role, as the roster and a script spell it.
+pub fn role_label(role: &ConferenceRole) -> &'static str {
+    match role {
+        ConferenceRole::Talker => "talker",
+        ConferenceRole::Listener => "listener",
+        ConferenceRole::Muted => "muted",
+        ConferenceRole::Whisper { .. } => "whisper",
+        ConferenceRole::Monitor { .. } => "monitor",
+    }
+}
+
+/// What the roster records of a call whose leg `conference_seat` moves into a
+/// room.
+#[derive(Debug, Clone)]
+pub struct AdoptedSeat {
+    /// The SIP Call-ID of the dialog with the seated party.
+    pub sip_call_id: String,
+    /// The seated party's own URI.
+    pub party_uri: Option<String>,
+    /// siphon's internal id of the call.
+    pub internal_call_id: String,
+    /// The SIP Call-ID of the conference dialog that adopted it.
+    pub owner_call_id: String,
+    /// `on_last_leave="end_owner"`.
+    pub end_owner_on_last: bool,
+}
+
 /// A seat this process holds: which room, and the from-tag the engine knows
 /// the participant by.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,13 +112,28 @@ impl MediaBackend {
         from_tag: &str,
         conference_id: &str,
         role: ConferenceRole,
+        adopted: AdoptedSeat,
     ) -> Result<(), RtpEngineError> {
         let Self::SiphonRtp(set) = self else {
             return Err(self.no_mixer("conference_seat"));
         };
+        let role_name = role_label(&role);
         set.conference_seat(engine_call_id, from_tag, conference_id, role)
             .await?;
         SEATED_CALLS.insert(engine_call_id.to_string(), conference_id.to_string());
+        conference_roster::seat_adopted(RosterSeat {
+            conference_id: conference_id.to_string(),
+            call_id: adopted.sip_call_id,
+            from_tag: from_tag.to_string(),
+            party_uri: adopted.party_uri,
+            role: role_name.to_string(),
+            joined_at: conference_roster::unix_seconds(),
+            kind: SeatKind::Adopted,
+            owner_call_id: Some(adopted.owner_call_id),
+            engine_call_id: Some(engine_call_id.to_string()),
+            internal_call_id: Some(adopted.internal_call_id),
+            end_owner_on_last: adopted.end_owner_on_last,
+        });
         Ok(())
     }
 
@@ -99,6 +143,7 @@ impl MediaBackend {
         let Some((_, room)) = SEATED_CALLS.remove(engine_call_id) else {
             return;
         };
+        conference_roster::seat_left_engine_call(engine_call_id);
         if let Self::SiphonRtp(set) = self {
             if !Self::room_has_seats(&room) {
                 set.forget_room(&room);
@@ -123,12 +168,35 @@ impl MediaBackend {
         role: ConferenceRole,
         flags: &NgFlags,
     ) -> Result<String, RtpEngineError> {
+        self.conference_join_party(call_id, seat, offer_sdp, role, flags, None)
+            .await
+    }
+
+    /// [`Self::conference_join`], recording the seated party's own URI on the
+    /// roster.
+    pub async fn conference_join_party(
+        &self,
+        call_id: &str,
+        seat: ConferenceSeat,
+        offer_sdp: &str,
+        role: ConferenceRole,
+        flags: &NgFlags,
+        party_uri: Option<String>,
+    ) -> Result<String, RtpEngineError> {
         let Self::SiphonRtp(set) = self else {
             return Err(self.no_mixer("conference_join"));
         };
+        let role_name = role_label(&role);
         let answer = set
             .conference_join(&seat.conference_id, &seat.from_tag, offer_sdp, role, flags)
             .await?;
+        conference_roster::seat_joined(
+            &seat.conference_id,
+            call_id,
+            &seat.from_tag,
+            party_uri,
+            role_name,
+        );
         SEATS.insert(call_id.to_string(), seat);
         Ok(answer)
     }
@@ -165,7 +233,9 @@ impl MediaBackend {
         // Kept on any other failure: the engine may still hold the seat, and a
         // later leave or delete must still find it.
         if outcome.is_ok() {
-            SEATS.remove_if(call_id, |_, held| held == seat);
+            if SEATS.remove_if(call_id, |_, held| held == seat).is_some() {
+                conference_roster::seat_left_joined(&seat.conference_id, call_id);
+            }
             if !Self::room_has_seats(&seat.conference_id) {
                 set.forget_room(&seat.conference_id);
             }
@@ -198,8 +268,11 @@ impl MediaBackend {
     ) -> Result<(), RtpEngineError> {
         match self {
             Self::SiphonRtp(set) => {
+                let role_name = role_label(&role);
                 set.conference_route(&seat.conference_id, &seat.from_tag, role)
-                    .await
+                    .await?;
+                conference_roster::role_changed(&seat.conference_id, &seat.from_tag, role_name);
+                Ok(())
             }
             Self::RtpEngine(_) | Self::RtpProxy(_) => Err(self.no_mixer("conference_route")),
         }
@@ -248,8 +321,12 @@ impl MediaBackend {
         let Self::SiphonRtp(set) = self else {
             return Err(self.no_mixer("conference_offer"));
         };
-        set.conference_offer(&seat.conference_id, &seat.from_tag, role, flags)
-            .await
+        let role_name = role_label(&role);
+        let offer = set
+            .conference_offer(&seat.conference_id, &seat.from_tag, role, flags)
+            .await?;
+        conference_roster::seat_offered(&seat.conference_id, &seat.from_tag, role_name);
+        Ok(offer)
     }
 
     /// Seat an offered seat on the participant's answer, recording it under
@@ -262,6 +339,20 @@ impl MediaBackend {
         answer_sdp: &str,
         received_from: Option<std::net::IpAddr>,
     ) -> Result<(), RtpEngineError> {
+        self.conference_answer_party(call_id, seat, answer_sdp, received_from, None)
+            .await
+    }
+
+    /// [`Self::conference_answer`], recording the seated party's own URI on the
+    /// roster.
+    pub async fn conference_answer_party(
+        &self,
+        call_id: &str,
+        seat: ConferenceSeat,
+        answer_sdp: &str,
+        received_from: Option<std::net::IpAddr>,
+        party_uri: Option<String>,
+    ) -> Result<(), RtpEngineError> {
         let Self::SiphonRtp(set) = self else {
             return Err(self.no_mixer("conference_answer"));
         };
@@ -272,6 +363,15 @@ impl MediaBackend {
             received_from,
         )
         .await?;
+        let role_name = conference_roster::take_offered_role(&seat.conference_id, &seat.from_tag)
+            .unwrap_or_else(|| "talker".to_string());
+        conference_roster::seat_joined(
+            &seat.conference_id,
+            call_id,
+            &seat.from_tag,
+            party_uri,
+            &role_name,
+        );
         SEATS.insert(call_id.to_string(), seat);
         Ok(())
     }

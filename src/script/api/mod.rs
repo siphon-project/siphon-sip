@@ -16,6 +16,7 @@ mod call_failure_response;
 mod call_media;
 mod call_take_over;
 pub mod cdr;
+pub(crate) mod conference_roster;
 pub mod config;
 pub mod diameter;
 mod diameter_cx;

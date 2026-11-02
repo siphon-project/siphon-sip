@@ -632,6 +632,34 @@ class Call:
 
         return mock_module.get_b2bua().replaces_call_facts(self._refer_replaces)
 
+    @property
+    def conference(self) -> Optional[tuple]:
+        """The room this call is seated in, as ``(conference_id,
+        owner_call_id)``, or ``None`` when it is in none.
+
+        ``owner_call_id`` is the SIP Call-ID of the conference dialog that
+        adopted the call (``b2bua.adopt_replaced``), ``None`` for a call seated
+        with ``rtpengine.conference_join`` / ``conference_answer``. siphon
+        reads it from its roster, so it is there in ``@b2bua.on_bye`` and every
+        other handler for as long as the seat is, whatever a reload did to the
+        script.
+
+        Example::
+
+            @b2bua.on_bye
+            def bye(call, initiator):
+                if call.conference is not None:
+                    room, owner = call.conference
+        """
+        from siphon_sdk import mock_module
+
+        engine = mock_module.get_rtpengine()
+        for conference_id, room in engine.conferences.items():
+            for seat in room.values():
+                if self.call_id in (seat["call_id"], seat.get("sip_call_id")):
+                    return conference_id, seat.get("owner_call_id")
+        return None
+
     # -- Call control ----------------------------------------------------------
 
     async def ro_authorize(

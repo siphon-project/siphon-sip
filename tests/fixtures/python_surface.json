@@ -98,7 +98,7 @@
       "adopt_replaced": {
         "doc": "Merge the call a REFER's `Replaces` names into a conference room on this",
         "kind": "method_descriptor",
-        "sig": "($self, call, conference_id, role=\"talker\", on_owner_leave=\"end\")"
+        "sig": "($self, call, conference_id, role=\"talker\", on_owner_leave=\"end\", on_last_leave=\"keep\")"
       },
       "bridge": {
         "doc": "Join two answered calls this process owns, so the two parties hear each",
@@ -109,6 +109,11 @@
         "doc": "Report the outcome of a REFER accepted with",
         "kind": "method_descriptor",
         "sig": "($self, call_id, code, reason=None)"
+      },
+      "conference_roster": {
+        "doc": "The seats currently in a conference room, from siphon's own state: a",
+        "kind": "method_descriptor",
+        "sig": "($self, conference_id)"
       },
       "originate": {
         "doc": "Imperatively send an outbound REFER on a live B2BUA call by SIP Call-ID.",
@@ -233,6 +238,10 @@
       },
       "call_id": {
         "doc": "Call-ID header value.",
+        "kind": "getset_descriptor"
+      },
+      "conference": {
+        "doc": "The room this call is seated in, as `(conference_id, owner_call_id)`, or",
         "kind": "getset_descriptor"
       },
       "dial": {
@@ -3246,6 +3255,11 @@
         "doc": "Look up a live dialog by its three identity tags. Used to",
         "kind": "method_descriptor",
         "sig": "($self, call_id, local_tag, remote_tag)"
+      },
+      "for_resource": {
+        "doc": "The live subscriptions this node is the notifier of for one resource",
+        "kind": "method_descriptor",
+        "sig": "($self, uri, event)"
       },
       "get": {
         "doc": "Look up a previously-created handle by id.  Returns ``None`` if",

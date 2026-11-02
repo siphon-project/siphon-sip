@@ -94,6 +94,9 @@ pub enum HandlerKind {
     /// `@b2bua.on_reoffer_answered` — the final response the offerer of an
     /// in-dialog offer got. A notification.
     B2buaReofferAnswered,
+    /// `@b2bua.on_conference_change` — a seat came into or left a conference
+    /// room, handed the room's roster after the change.
+    B2buaConferenceChange,
     /// `@b2bua.on_route_failure` — one carrier of a `call.route(...)` sequential
     /// failover returned a non-2xx (or rang out). Fires once per failed attempt,
     /// including the last, so a script can count a carrier out or feed its own
@@ -1109,6 +1112,7 @@ fn extract_handlers(python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<V
             "b2bua.on_info" => HandlerKind::B2buaInfo,
             "b2bua.on_reoffer" => HandlerKind::B2buaReoffer,
             "b2bua.on_reoffer_answered" => HandlerKind::B2buaReofferAnswered,
+            "b2bua.on_conference_change" => HandlerKind::B2buaConferenceChange,
             "b2bua.on_route_failure" => HandlerKind::B2buaRouteFailure,
             "b2bua.on_cancel" => HandlerKind::B2buaCancel,
             "registrar.on_change" => HandlerKind::RegistrarOnChange,

@@ -12,6 +12,7 @@
 pub mod backend;
 pub mod bencode;
 pub mod client;
+pub mod conference_roster;
 pub mod error;
 pub mod events;
 pub mod media_flags;

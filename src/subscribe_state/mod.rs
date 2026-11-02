@@ -391,6 +391,42 @@ impl SubscribeStore {
         removed
     }
 
+    /// The live subscriptions this node holds as notifier to `resource_uri`
+    /// for the event package `event`.
+    ///
+    /// `resource_uri` is normalised as the resource of a stored subscription
+    /// is (the `To` URI, name-addr brackets and display name stripped) and then
+    /// compared exactly. `event` is the package token: the part of the `Event`
+    /// header before its parameters, compared case-insensitively. A terminated
+    /// or expired dialog, and one this node originated as the subscriber, is
+    /// not listed.
+    ///
+    /// L1 only, like [`Self::find_by_tags`]: the L2 cache is keyed by dialog id
+    /// and cannot be searched by resource, so a dialog that is only in Redis
+    /// (another replica's, or from before a restart) is listed once
+    /// [`Self::get`] has hydrated it into L1.
+    pub fn for_resource(&self, resource_uri: &str, event: &str) -> Vec<SubscribeDialog> {
+        let resource = strip_nameaddr(resource_uri);
+        let package = event_package(event);
+        let mut found: Vec<SubscribeDialog> = self
+            .dialogs
+            .iter()
+            .filter(|entry| {
+                let dialog = entry.value();
+                !dialog.terminated
+                    && !dialog.is_outbound
+                    && dialog.remaining_secs() > 0
+                    && dialog.local_uri == resource
+                    && event_package(&dialog.event) == package
+            })
+            .map(|entry| entry.value().clone())
+            .collect();
+        found.sort_by(|left, right| {
+            (left.created_at_unix, &left.id).cmp(&(right.created_at_unix, &right.id))
+        });
+        found
+    }
+
     /// Find a dialog by its three identity tags. Used to correlate an
     /// in-dialog NOTIFY (received via `@proxy.on_request("NOTIFY")`)
     /// back to the outbound SUBSCRIBE we sent that established the
@@ -421,6 +457,17 @@ impl SubscribeStore {
         }
         None
     }
+}
+
+/// The event package of an `Event` header value: the token before its
+/// parameters, lower-cased.
+fn event_package(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// Pull ``tag=...`` from a From/To header value.
@@ -726,5 +773,66 @@ mod tests {
         dialog.terminated = true;
         store.put(dialog);
         assert!(store.find_by_tags("c1", "ltag", "rtag").is_none());
+    }
+
+    #[test]
+    fn for_resource_lists_only_live_subscribers_of_that_resource_and_package() {
+        let store = SubscribeStore::new();
+        let mut first = sample_dialog("first");
+        first.local_uri = "sip:room-1@conf.example.com".to_string();
+        first.created_at_unix -= 10;
+        let mut second = sample_dialog("second");
+        second.local_uri = "sip:room-1@conf.example.com".to_string();
+        second.event = "Conference;id=4".to_string();
+        let mut other_room = sample_dialog("other-room");
+        other_room.local_uri = "sip:room-2@conf.example.com".to_string();
+        let mut other_package = sample_dialog("other-package");
+        other_package.local_uri = "sip:room-1@conf.example.com".to_string();
+        other_package.event = "presence".to_string();
+        let mut terminated = sample_dialog("terminated");
+        terminated.local_uri = "sip:room-1@conf.example.com".to_string();
+        terminated.terminated = true;
+        let mut expired = sample_dialog("expired");
+        expired.local_uri = "sip:room-1@conf.example.com".to_string();
+        expired.expires_secs = 0;
+        let mut ours = sample_dialog("ours");
+        ours.local_uri = "sip:room-1@conf.example.com".to_string();
+        ours.is_outbound = true;
+        for dialog in [
+            second,
+            first,
+            other_room,
+            other_package,
+            terminated,
+            expired,
+            ours,
+        ] {
+            store.put(dialog);
+        }
+        let ids = |uri: &str, event: &str| -> Vec<String> {
+            store
+                .for_resource(uri, event)
+                .into_iter()
+                .map(|dialog| dialog.id)
+                .collect()
+        };
+        assert_eq!(
+            ids("sip:room-1@conf.example.com", "conference"),
+            ["first", "second"],
+            "oldest first; terminated, expired, outbound, other room and package left out"
+        );
+        assert_eq!(
+            ids("<sip:room-1@conf.example.com>", "CONFERENCE"),
+            ["first", "second"],
+            "the resource is normalised as a stored one is, the package case-folded"
+        );
+        assert_eq!(
+            ids("sip:room-2@conf.example.com", "conference"),
+            ["other-room"]
+        );
+        assert!(ids("sip:room-3@conf.example.com", "conference").is_empty());
+        assert!(ids("sip:room-1@conf.example.com", "dialog").is_empty());
+        // Exact: a longer user part is another resource.
+        assert!(ids("sip:room-1x@conf.example.com", "conference").is_empty());
     }
 }

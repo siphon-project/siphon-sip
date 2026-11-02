@@ -292,6 +292,27 @@ fn seat_command(command: &Command) -> (Option<Recorded>, Option<String>, bool, b
             false,
             true,
         ),
+        // A seat a participant dialled in for: the room is the engine's, no
+        // call is.
+        Command::ConferenceJoin {
+            conference_id,
+            from_tag,
+            ..
+        } => (
+            Some(Recorded::new("conference_join", conference_id, from_tag)),
+            Some(NATIVE_ENGINE_ANSWER.to_string()),
+            false,
+            false,
+        ),
+        Command::ConferenceLeave {
+            conference_id,
+            from_tag,
+        } => (
+            Some(Recorded::new("conference_leave", conference_id, from_tag)),
+            None,
+            false,
+            false,
+        ),
         _ => (None, None, false, false),
     }
 }
@@ -536,7 +557,9 @@ impl NativeTestEngine {
                             Command::AttachX3 { .. } | Command::DetachX3 { .. } => {
                                 x3_command(&request.command)
                             }
-                            Command::ConferenceSeat { .. } => seat_command(&request.command),
+                            Command::ConferenceSeat { .. }
+                            | Command::ConferenceJoin { .. }
+                            | Command::ConferenceLeave { .. } => seat_command(&request.command),
                             _ => (None, None, false, false),
                         };
                         let mut refused = false;

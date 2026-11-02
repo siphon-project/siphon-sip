@@ -427,7 +427,8 @@ class _B2buaNamespace:
             return False
         return control.refer(call_id, target, replaces)
 
-    def adopt_replaced(self, call, conference_id, role="talker", on_owner_leave="end"):
+    def adopt_replaced(self, call, conference_id, role="talker", on_owner_leave="end",
+                       on_last_leave="keep"):
         """Merge the call a REFER's ``Replaces`` names into a conference room
         on this node (RFC 4579 §5.5, a handset's "merge").
 
@@ -461,6 +462,13 @@ class _B2buaNamespace:
             on_owner_leave: ``"end"`` (default) tears the adopted call down
                 with a BYE (``Reason: Q.850;cause=16``) when the conference
                 dialog that adopted it ends; ``"keep"`` leaves it in the room.
+            on_last_leave: ``"keep"`` (default) leaves the conference dialog
+                alone. ``"end_owner"`` ends it, with a BYE carrying
+                ``Reason: Q.850;cause=16`` through the normal teardown (its CDR
+                and charging close), when the last call adopted under it has
+                left the room and no seat but the dialog's own remains: a
+                conference of one is over. Held by siphon, not the script, so
+                it survives a reload. Any other value raises ``ValueError``.
 
         Returns:
             int (awaitable): the status for ``b2bua.complete_refer``: ``200``;
@@ -484,7 +492,36 @@ class _B2buaNamespace:
         control = object.__getattribute__(self, "__dict__").get("_control")
         if control is None:
             raise ValueError("b2bua.adopt_replaced requires a running siphon B2BUA")
-        return control.adopt_replaced(call, conference_id, role, on_owner_leave)
+        return control.adopt_replaced(call, conference_id, role, on_owner_leave, on_last_leave)
+
+    def conference_roster(self, conference_id):
+        """The seats currently in a conference room, from siphon's own state.
+
+        A list of dicts, in the order the seats were taken, one per seat:
+
+        * ``call_id``: the SIP Call-ID of the dialog with the seated party.
+        * ``from_tag``: the seat's From-tag (what ``@rtpengine.on_active_speaker``
+          names it by).
+        * ``party_uri``: the seated party's own URI, or ``None``.
+        * ``role``: ``"talker"``, ``"listener"``, ``"muted"``, ``"whisper"`` or
+          ``"monitor"``.
+        * ``joined_at``: unix seconds, a float.
+        * ``kind``: ``"joined"`` for a seat taken with ``rtpengine.conference_join``
+          / ``conference_answer``, ``"adopted"`` for one ``adopt_replaced`` made.
+        * ``owner_call_id``: the SIP Call-ID of the conference dialog that adopted
+          the call, ``None`` for a joined seat.
+
+        An empty list for a room nobody is seated in. Nothing here is the
+        script's: it reads the same after a reload, so a stateless script can
+        build a conference-info body (RFC 4575) from it at any time.
+
+        Usage:
+            users = [seat["party_uri"] for seat in b2bua.conference_roster(room)]
+        """
+        control = object.__getattribute__(self, "__dict__").get("_control")
+        if control is None:
+            return []
+        return control.conference_roster(conference_id)
 
     def complete_refer(self, call_id, code, reason=None):
         """Report how a REFER the script accepted with
@@ -837,6 +874,40 @@ class _B2buaNamespace:
         """
         is_async = _asyncio.iscoroutinefunction(fn)
         _registry.register("b2bua.on_reoffer_answered", None, fn, is_async)
+        return fn
+
+    @staticmethod
+    def on_conference_change(fn):
+        """Register handler for a change of who is seated in a conference room.
+
+        Called as ``fn(conference_id, owner_call_id, change, call_id, roster)``
+        once for each seat that comes in (``rtpengine.conference_join`` /
+        ``conference_answer``, a successful ``b2bua.adopt_replaced``) and once
+        for each seat that goes out, whatever the reason (the call's BYE, a
+        credit or duration teardown, ``rtpengine.conference_leave`` or
+        ``delete``, a silent seat, the conference dialog ending the calls it
+        adopted: one ``"left"`` per seat).
+
+        * ``change`` is ``"joined"`` or ``"left"``.
+        * ``call_id`` is the SIP Call-ID of the seat that changed.
+        * ``owner_call_id`` is the SIP Call-ID of the conference dialog that
+          adopted that seat; for a joined seat, the dialog the adopted seats in
+          the room agree on, else ``None``.
+        * ``roster`` is the room after the change, the same dicts as
+          ``b2bua.conference_roster(conference_id)``.
+
+        Runs off the SIP message path, from siphon's state after the change was
+        made, so it fires the same after a script reload. A sync or ``async``
+        handler; a raise is logged and counted, and changes nothing.
+
+        Usage:
+            @b2bua.on_conference_change
+            async def changed(conference_id, owner_call_id, change, call_id, roster):
+                for handle in proxy.subscribe_state.for_resource(focus_uri(conference_id), "conference"):
+                    await handle.notify(body=conference_info(roster), content_type="application/conference-info+xml")
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("b2bua.on_conference_change", None, fn, is_async)
         return fn
 
     @staticmethod
@@ -1487,6 +1558,9 @@ class _SubscribeStateStub:
 
     def find(self, call_id, local_tag, remote_tag):
         raise NotImplementedError(self._ERROR.format(name="find"))
+
+    def for_resource(self, uri, event):
+        raise NotImplementedError(self._ERROR.format(name="for_resource"))
 
     def send(
         self,

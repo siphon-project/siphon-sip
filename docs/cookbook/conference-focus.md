@@ -224,6 +224,100 @@ parties talking on its credit. `"keep"` leaves it in the room. The link is held
 by siphon, not the script, so it survives a script reload. `role=` is
 `"talker"` (default), `"listener"` or `"muted"`.
 
+`on_last_leave="end_owner"` ends the conference dialog the other way round:
+when the last call adopted under it has left and no seat but the dialog's own
+remains in the room, siphon BYEs the dialog with `Reason: Q.850;cause=16`
+through the normal teardown, so its CDR and charging close. A conference of one
+is over. The default, `"keep"`, leaves the dialog to the client. It is held
+like `on_owner_leave`, by siphon, so a reload does not lose it. When several
+calls were adopted with different values, the call that leaves last decides.
+
+## Roster and conference-info (RFC 4575)
+
+A focus tells its subscribers who is in the room with `application/conference-info+xml`
+NOTIFYs (RFC 4575, event package `conference`). A script that holds nothing of
+its own, because a reload empties module state and a conference outlives a
+deploy, reads the room from siphon and is told when it changes:
+
+- `b2bua.conference_roster(conference_id)` is a list of dicts, one per seat in
+  the room, in the order they were seated: `call_id` (the SIP Call-ID of the
+  dialog with the seated party), `from_tag`, `party_uri`, `role`, `joined_at`
+  (unix seconds, a float), `kind` and `owner_call_id`. `kind` is `"joined"` for a
+  seat `rtpengine.conference_join` or `conference_answer` took and `"adopted"`
+  for one `adopt_replaced` made; `owner_call_id` is the conference dialog that
+  adopted it, `None` for a joined seat. An unknown room is an empty list.
+- `call.conference` is `(conference_id, owner_call_id)` for a call seated in a
+  room, else `None`. It reads in `@b2bua.on_bye` too, before the teardown frees
+  the seat.
+- `@b2bua.on_conference_change` is called as
+  `fn(conference_id, owner_call_id, change, call_id, roster)` once for each seat
+  that comes in and once for each seat that goes out, whatever ended it: the
+  adopted call's BYE, a credit or duration teardown, a silent seat, a
+  `conference_leave` or `delete`, the conference dialog ending the calls it
+  adopted (one `"left"` per seat). `change` is `"joined"` or `"left"`, `call_id`
+  the seat that changed, and `roster` the room after the change. `owner_call_id`
+  is the dialog that adopted that seat; for a joined seat it is the dialog the
+  adopted seats in the room agree on, else `None`. It runs off the SIP message
+  path, from siphon's state, so it fires the same after a reload.
+- `proxy.subscribe_state.for_resource(uri, event)` lists the live subscriptions
+  to a resource: the subscribers to NOTIFY.
+
+```python
+from xml.sax.saxutils import quoteattr
+
+from siphon import b2bua, proxy
+
+FOCUS = "sip:{room}@conf.example.com"
+
+
+def conference_info(room, roster, state):
+    users = "".join(
+        f"<user entity={quoteattr(seat['party_uri'] or 'sip:anonymous@anonymous.invalid')} state=\"full\">"
+        f"<endpoint entity={quoteattr(seat['call_id'])}><status>connected</status></endpoint></user>"
+        for seat in roster
+    )
+    return (
+        "<?xml version=\"1.0\"?>"
+        f"<conference-info xmlns=\"urn:ietf:params:xml:ns:conference-info\" "
+        f"entity={quoteattr(FOCUS.format(room=room))} state=\"{state}\" version=\"{{version}}\">"
+        f"<users>{users}</users></conference-info>"
+    )
+
+
+async def notify(handle, room, roster, state):
+    # version= is monotonic per subscription (RFC 4575 §5.4, RFC 6665 §4.4.1).
+    body = conference_info(room, roster, state).replace("{version}", str(handle.next_event_version()))
+    await handle.notify(body=body, content_type="application/conference-info+xml")
+
+
+@proxy.on_request("SUBSCRIBE")
+async def subscribe(request):
+    room = room_of(request.ruri)                      # your own mapping
+    handle = proxy.subscribe_state.accept(request, expires=3600)
+    if handle is not None:
+        # Full state first (RFC 4575 §5.4), from siphon's roster.
+        await notify(handle, room, b2bua.conference_roster(room), "full")
+
+
+@b2bua.on_conference_change
+async def changed(conference_id, owner_call_id, change, call_id, roster):
+    for handle in proxy.subscribe_state.for_resource(FOCUS.format(room=conference_id), "conference"):
+        await notify(handle, conference_id, roster, "full")
+```
+
+Sending full state on every change is the simplest correct thing; a script that
+wants `state="partial"` deltas builds them from `change` and `call_id`.
+`for_resource` compares the resource exactly after the normalisation a stored
+subscription's resource has (brackets and display name stripped), takes the
+event package token case-insensitively, and leaves out terminated and expired
+subscriptions and the ones this node originated. It reads the in-process store,
+like `find`: the Redis cache is keyed by dialog id and cannot be searched by
+resource, so a subscription held only there is listed once
+`await proxy.subscribe_state.get(id)` has loaded it.
+
+With `on_last_leave="end_owner"` the roster events are what tell the subscribers
+the room is over: the last adopted call's `"left"` is followed by the owner's own.
+
 ## Calling a participant in
 
 To add someone who has not dialled in (RFC 4579 §5.5, a REFER to the focus
