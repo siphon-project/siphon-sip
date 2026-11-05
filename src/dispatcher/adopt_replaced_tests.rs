@@ -17,11 +17,15 @@
 
 use std::sync::Arc;
 
-use super::dial_bridge_test_harness::{answered_caller_from, caller_sends, eventually, Caller};
+use super::dial_bridge_test_harness::{
+    answered_caller_from, caller_sends, eventually, in_dialog_response, Caller,
+};
 use super::dialog_state_events_tests::{header, inbound};
+use super::dialog_state_transfer_tests::respond;
 use super::originate_test_harness::{drain, socket, Sent};
 use super::test_dispatcher::{test_dispatcher_with_script, TestDispatcher};
 use super::*;
+use crate::media::sdp::SdpBody;
 use crate::rtpengine::test_native_engine::NativeTestEngine;
 use crate::sip::headers::refer::Replaces;
 
@@ -1098,4 +1102,623 @@ async fn adoption_bookkeeping_drains_to_baseline() {
         .all(|call| crate::rtpengine::MediaBackend::seated_call_room(call).is_none()));
     assert_eq!(state.call_actors.count(), calls_before);
     assert_eq!(sessions.len(), sessions_before);
+}
+
+/// `sdp(host, version)` with a direction attribute on its stream.
+fn sdp_directed(host: &str, version: u32, direction: &str) -> String {
+    format!("{}a={direction}\r\n", sdp(host, version))
+}
+
+/// The subscriber held the carrier before merging, as a handset does: the
+/// relayed `sendonly` offer is the session in force toward the carrier, and the
+/// carrier's `recvonly` answer its own description. `siphon_sends` is what siphon
+/// last offered the carrier.
+fn carrier_on_hold(dispatcher: &TestDispatcher, held: &Held, siphon_sends: &str, carrier: &str) {
+    let carrier_on_a_leg = held.caller.address == CARRIER;
+    let calls = &dispatcher.state.call_actors;
+    calls.set_leg_sent_sdp(
+        &held.internal_call_id,
+        carrier_on_a_leg,
+        sdp_directed("192.0.2.1", 2, siphon_sends).into_bytes(),
+    );
+    calls.set_leg_last_sdp(
+        &held.internal_call_id,
+        carrier_on_a_leg,
+        sdp_directed(host_of(CARRIER), 2, carrier).as_bytes(),
+    );
+}
+
+/// The Via branch of a request siphon sent.
+fn branch_of(request: &SipMessage) -> String {
+    header(request, "Via")
+        .split(";branch=")
+        .nth(1)
+        .and_then(|rest| rest.split([';', ',', ' ']).next())
+        .expect("a branch")
+        .to_string()
+}
+
+/// The re-INVITEs that went to the carrier.
+fn reinvites_to_carrier(sent: &[Sent]) -> Vec<SipMessage> {
+    sent.iter()
+        .filter(|frame| frame.is(Method::Invite) && frame.destination == socket(CARRIER))
+        .map(|frame| frame.message.clone())
+        .collect()
+}
+
+/// The session in force toward the carrier, now the call's one leg.
+fn in_force_toward_carrier(dispatcher: &TestDispatcher, held: &Held) -> String {
+    let leg = dispatcher
+        .state
+        .call_actors
+        .clone_leg(&held.internal_call_id, true)
+        .expect("the carrier's leg");
+    String::from_utf8(leg.dialog.last_sent_sdp.expect("a session in force")).expect("text")
+}
+
+fn engine_offer_answer_commands(engine: &NativeTestEngine) -> usize {
+    ["reoffer", "answer_local", "offer", "answer"]
+        .iter()
+        .map(|name| engine.commands(name).len())
+        .sum()
+}
+
+/// Merge `held` with the carrier on hold, and return the one re-INVITE that
+/// takes it off.
+async fn merged_on_hold(
+    dispatcher: &TestDispatcher,
+    conference: &Caller,
+    held: &Held,
+    replaces: Replaces,
+) -> SipMessage {
+    carrier_on_hold(dispatcher, held, "sendonly", "recvonly");
+    let (status, sent) = merge(dispatcher, conference, request(conference, replaces, true)).await;
+    assert_eq!(status, 200, "the merge happened");
+    assert!(reported(&sent).starts_with("SIP/2.0 200 "));
+    let reinvites = reinvites_to_carrier(&sent);
+    assert_eq!(reinvites.len(), 1, "one resume: {sent:?}");
+    reinvites.into_iter().next().expect("one")
+}
+
+/// A carrier the subscriber held before merging is taken off hold: one
+/// re-INVITE on its dialog, the session in force with `a=sendrecv` at the next
+/// `o=` version, and nothing else changed. Its 200 is ACKed and becomes the
+/// session in force, and the media engine is told nothing, since a seat takes
+/// no offer/answer. Either way round the call was placed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carrier_merged_on_hold_is_re_invited_sendrecv() {
+    let engine = NativeTestEngine::start().await;
+    let dispatcher = focus(&engine);
+    for (name, called_out) in [("resume-out", true), ("resume-in", false)] {
+        let conference =
+            conference_dialog(&dispatcher, &format!("conf-{name}@192.0.2.10"), SUBSCRIBER);
+        let held = if called_out {
+            subscriber_called_out(&dispatcher, &engine, name, SUBSCRIBER)
+        } else {
+            subscriber_was_called(&dispatcher, &engine, name, SUBSCRIBER)
+        };
+        let replaces = if called_out {
+            held.replaces_caller()
+        } else {
+            held.replaces_callee()
+        };
+        // The carrier's dialog's own `o=` session id, and the version the next
+        // SDP siphon sends it carries.
+        let carrier_on_a_leg = !called_out;
+        let identity = dispatcher
+            .state
+            .call_actors
+            .clone_leg(&held.internal_call_id, carrier_on_a_leg)
+            .map(|leg| {
+                (
+                    leg.dialog.sdp_session_id.to_string(),
+                    leg.dialog.sdp_version.to_string(),
+                )
+            })
+            .expect("the carrier's leg");
+        let reinvite = merged_on_hold(&dispatcher, &conference, &held, replaces).await;
+        let engine_before = engine_offer_answer_commands(&engine);
+
+        let offer = SdpBody::parse(&String::from_utf8_lossy(&reinvite.body));
+        let audio = &offer.media_sections[0];
+        assert!(audio.has_attr("sendrecv"), "{name}");
+        assert!(!audio.has_attr("sendonly"), "{name}");
+        assert_eq!(audio.port, 41000, "{name}: the same session");
+        let origin: Vec<&str> = offer.origin().expect("an o=").split_whitespace().collect();
+        assert_eq!(
+            (origin[1], origin[2]),
+            (identity.0.as_str(), identity.1.as_str()),
+            "{name}: the dialog's session at its next version"
+        );
+        let carrier_dialog = if called_out {
+            &held.b_call_id
+        } else {
+            &held.a_call_id
+        };
+        assert_eq!(header(&reinvite, "Call-ID"), *carrier_dialog, "{name}");
+        let branch = branch_of(&reinvite);
+        assert!(is_script_reoffer(&branch), "{name}: waiting on its status");
+
+        respond(
+            &dispatcher,
+            &held.internal_call_id,
+            CARRIER,
+            &reinvite,
+            in_dialog_response(
+                &reinvite,
+                200,
+                "OK",
+                "sip:far@198.51.100.77:5060",
+                Some(&sdp_directed(host_of(CARRIER), 3, "sendrecv")),
+            ),
+        );
+        let sent = drain(&dispatcher.udp);
+        assert!(
+            sent.iter()
+                .any(|frame| frame.is(Method::Ack) && frame.destination == socket(CARRIER)),
+            "{name}: the 200 is ACKed: {sent:?}"
+        );
+        assert!(reinvites_to_carrier(&sent).is_empty(), "{name}: no retry");
+        assert!(in_force_toward_carrier(&dispatcher, &held).contains("a=sendrecv"));
+        assert_eq!(
+            engine_offer_answer_commands(&engine),
+            engine_before,
+            "{name}"
+        );
+        assert!(
+            eventually(|| !is_script_reoffer(&branch)).await,
+            "{name}: the waiter drains"
+        );
+        let call = dispatcher
+            .state
+            .call_actors
+            .get_call(&held.internal_call_id)
+            .expect("the call carries on");
+        assert!(call
+            .adoption
+            .as_ref()
+            .is_some_and(|adoption| adoption.seated));
+    }
+}
+
+/// A carrier that answers the resume `recvonly` holds the room itself, which is
+/// its choice: the seat stays and it is not asked again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carrier_answering_the_resume_recvonly_is_left_as_it_chose() {
+    let engine = NativeTestEngine::start().await;
+    let dispatcher = focus(&engine);
+    let conference = conference_dialog(&dispatcher, "conf-chose@192.0.2.10", SUBSCRIBER);
+    let held = subscriber_called_out(&dispatcher, &engine, "chose", SUBSCRIBER);
+    let reinvite = merged_on_hold(&dispatcher, &conference, &held, held.replaces_caller()).await;
+    respond(
+        &dispatcher,
+        &held.internal_call_id,
+        CARRIER,
+        &reinvite,
+        in_dialog_response(
+            &reinvite,
+            200,
+            "OK",
+            "sip:far@198.51.100.77:5060",
+            Some(&sdp_directed(host_of(CARRIER), 3, "recvonly")),
+        ),
+    );
+    let sent = drain(&dispatcher.udp);
+    assert!(reinvites_to_carrier(&sent).is_empty(), "no retry: {sent:?}");
+    assert!(dispatcher
+        .state
+        .call_actors
+        .get_call(&held.internal_call_id)
+        .is_some_and(|call| call
+            .adoption
+            .as_ref()
+            .is_some_and(|adoption| adoption.seated)));
+}
+
+/// A carrier that refuses the resume keeps the session it had (RFC 3261 §14.1):
+/// the merge was already reported 200, the seat stays, the refusal is ACKed and
+/// not retried.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_resume_leaves_the_merge_and_the_seat() {
+    let engine = NativeTestEngine::start().await;
+    let dispatcher = focus(&engine);
+    let conference = conference_dialog(&dispatcher, "conf-refused@192.0.2.10", SUBSCRIBER);
+    let held = subscriber_called_out(&dispatcher, &engine, "refused", SUBSCRIBER);
+    let reinvite = merged_on_hold(&dispatcher, &conference, &held, held.replaces_caller()).await;
+    let branch = branch_of(&reinvite);
+    respond(
+        &dispatcher,
+        &held.internal_call_id,
+        CARRIER,
+        &reinvite,
+        in_dialog_response(
+            &reinvite,
+            488,
+            "Not Acceptable Here",
+            "sip:far@198.51.100.77:5060",
+            None,
+        ),
+    );
+    let sent = drain(&dispatcher.udp);
+    assert!(
+        sent.iter()
+            .any(|frame| frame.is(Method::Ack) && frame.destination == socket(CARRIER)),
+        "the 488 is ACKed: {sent:?}"
+    );
+    assert!(reinvites_to_carrier(&sent).is_empty(), "no retry");
+    assert!(
+        in_force_toward_carrier(&dispatcher, &held).contains("a=sendonly"),
+        "the session it had"
+    );
+    assert!(eventually(|| !is_script_reoffer(&branch)).await);
+    assert!(dispatcher
+        .state
+        .call_actors
+        .get_call(&held.internal_call_id)
+        .is_some_and(|call| call
+            .adoption
+            .as_ref()
+            .is_some_and(|adoption| adoption.seated)));
+}
+
+/// A carrier that held the subscriber (siphon answered it `recvonly`) holds the
+/// room the same way once merged: its hold is its own, so no resume is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carrier_holding_the_call_itself_is_not_re_invited() {
+    let engine = NativeTestEngine::start().await;
+    let dispatcher = focus(&engine);
+    let conference = conference_dialog(&dispatcher, "conf-own-hold@192.0.2.10", SUBSCRIBER);
+    let held = subscriber_called_out(&dispatcher, &engine, "own-hold", SUBSCRIBER);
+    carrier_on_hold(&dispatcher, &held, "recvonly", "sendonly");
+    let (status, sent) = merge(
+        &dispatcher,
+        &conference,
+        request(&conference, held.replaces_caller(), true),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(reinvites_to_carrier(&sent).is_empty(), "{sent:?}");
+}
+
+/// The session timer on the carrier's dialog, now the call's one leg.
+fn carrier_timer(
+    dispatcher: &TestDispatcher,
+    held: &Held,
+) -> crate::b2bua::actor::SessionTimerState {
+    dispatcher
+        .state
+        .call_actors
+        .leg_session_timer(&held.internal_call_id, true)
+        .expect("the carrier's dialog runs a session timer")
+}
+
+/// The refreshes siphon sent the carrier: UPDATEs and re-INVITEs.
+fn refreshes_to_carrier(sent: &[Sent]) -> Vec<SipMessage> {
+    sent.iter()
+        .filter(|frame| {
+            (frame.is(Method::Update) || frame.is(Method::Invite))
+                && frame.destination == socket(CARRIER)
+        })
+        .map(|frame| frame.message.clone())
+        .collect()
+}
+
+/// Run the session-timer sweep and return what it sent the carrier.
+fn sweep(dispatcher: &TestDispatcher) -> Vec<SipMessage> {
+    tokio::task::block_in_place(|| session_timer_sweep(&dispatcher.state));
+    refreshes_to_carrier(&drain(&dispatcher.udp))
+}
+
+/// Move the carrier's last refresh `seconds` into the past.
+fn age_the_session(dispatcher: &TestDispatcher, held: &Held, seconds: u64) {
+    assert!(dispatcher.state.call_actors.update_leg_session_timer(
+        &held.internal_call_id,
+        true,
+        |timer| {
+            timer.last_refresh -= std::time::Duration::from_secs(seconds);
+        }
+    ));
+}
+
+/// The far party answers a refresh `status`, taking `Session-Expires` from
+/// `session_expires` on a 2xx.
+fn carrier_answers(
+    dispatcher: &TestDispatcher,
+    held: &Held,
+    refresh: &SipMessage,
+    status: u16,
+    session_expires: Option<&str>,
+) -> Vec<Sent> {
+    let mut response = in_dialog_response(
+        refresh,
+        status,
+        if status == 200 {
+            "OK"
+        } else {
+            "Call Does Not Exist"
+        },
+        "sip:far@198.51.100.77:5060",
+        None,
+    );
+    if let Some(value) = session_expires {
+        response.headers.add("Session-Expires", value.to_string());
+        response.headers.add("Require", "timer".to_string());
+    }
+    respond(
+        dispatcher,
+        &held.internal_call_id,
+        CARRIER,
+        refresh,
+        response,
+    );
+    drain(&dispatcher.udp)
+}
+
+/// A merged call on a node that runs no session timer of its own: nobody is
+/// left to refresh the carrier's dialog, whose refreshes the subscriber's leg
+/// used to send. siphon takes the refresh over at once with an UPDATE asking to
+/// refresh itself (RFC 4028 §7.4), keeps the interval the carrier's 2xx sets, and
+/// refreshes again at half of it. The call stays up.
+#[tokio::test(flavor = "multi_thread")]
+async fn siphon_refreshes_the_session_of_a_merged_call() {
+    let engine = NativeTestEngine::start().await;
+    let dispatcher = focus(&engine);
+    let state = &dispatcher.state;
+    let conference = conference_dialog(&dispatcher, "conf-refresh-own@192.0.2.10", SUBSCRIBER);
+    let held = subscriber_called_out(&dispatcher, &engine, "refresh-own", SUBSCRIBER);
+    state
+        .call_actors
+        .set_leg_peer_allows_update(&held.internal_call_id, false, true);
+    let (status, sent) = merge(
+        &dispatcher,
+        &conference,
+        request(&conference, held.replaces_caller(), true),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        refreshes_to_carrier(&sent).is_empty(),
+        "the merge itself sends no refresh"
+    );
+    let timer = carrier_timer(&dispatcher, &held);
+    assert!(timer.siphon_refreshes);
+
+    let refreshes = sweep(&dispatcher);
+    assert_eq!(refreshes.len(), 1, "a refresh at once");
+    let refresh = &refreshes[0];
+    assert_eq!(
+        refresh.method(),
+        Some(&Method::Update),
+        "UPDATE where it is allowed"
+    );
+    assert!(
+        refresh.body.is_empty(),
+        "an UPDATE refresh carries no offer"
+    );
+    assert_eq!(header(refresh, "Session-Expires"), "1800;refresher=uac");
+    assert!(header(refresh, "Supported").contains("timer"));
+    assert_eq!(header(refresh, "Call-ID"), held.b_call_id);
+
+    carrier_answers(&dispatcher, &held, refresh, 200, Some("120;refresher=uac"));
+    let timer = carrier_timer(&dispatcher, &held);
+    assert_eq!(
+        (timer.session_expires, timer.siphon_refreshes),
+        (120, true),
+        "the carrier's 2xx sets the interval"
+    );
+    assert!(
+        sweep(&dispatcher).is_empty(),
+        "not due before half the interval"
+    );
+
+    age_the_session(&dispatcher, &held, 61);
+    let refreshes = sweep(&dispatcher);
+    assert_eq!(refreshes.len(), 1, "due at half the interval");
+    assert_eq!(
+        header(&refreshes[0], "Session-Expires"),
+        "120;refresher=uac"
+    );
+    carrier_answers(
+        &dispatcher,
+        &held,
+        &refreshes[0],
+        200,
+        Some("120;refresher=uac"),
+    );
+    assert!(state
+        .call_actors
+        .get_call(&held.internal_call_id)
+        .is_some_and(|call| call
+            .adoption
+            .as_ref()
+            .is_some_and(|adoption| adoption.seated)));
+}
+
+/// A carrier dialog whose timer siphon already ran, with the subscriber's leg as
+/// the refresher, keeps its interval and last refresh, with siphon refreshing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relayed_session_timer_is_taken_over_where_it_stands() {
+    let engine = NativeTestEngine::start().await;
+    let dispatcher = focus(&engine);
+    let conference = conference_dialog(&dispatcher, "conf-refresh-kept@192.0.2.10", SUBSCRIBER);
+    let held = subscriber_called_out(&dispatcher, &engine, "refresh-kept", SUBSCRIBER);
+    dispatcher.state.call_actors.set_leg_session_timer(
+        &held.internal_call_id,
+        false,
+        Some(crate::b2bua::actor::SessionTimerState::new(
+            120,
+            false,
+            90,
+            std::time::Instant::now(),
+        )),
+    );
+    let (status, _) = merge(
+        &dispatcher,
+        &conference,
+        request(&conference, held.replaces_caller(), true),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let timer = carrier_timer(&dispatcher, &held);
+    assert_eq!((timer.session_expires, timer.siphon_refreshes), (120, true));
+    assert!(sweep(&dispatcher).is_empty(), "the last refresh stands");
+    age_the_session(&dispatcher, &held, 61);
+    let refreshes = sweep(&dispatcher);
+    assert_eq!(refreshes.len(), 1);
+    assert_eq!(
+        header(&refreshes[0], "Session-Expires"),
+        "120;refresher=uac"
+    );
+}
+
+/// A carrier that does not allow UPDATE is refreshed with a re-INVITE of the
+/// session in force. Its answer is not sent to the media engine, since a seat
+/// takes no offer/answer, and the 200 is ACKed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_re_invite_refresh_of_a_seat_leaves_the_media_engine_alone() {
+    let engine = NativeTestEngine::start().await;
+    let dispatcher = focus(&engine);
+    let conference = conference_dialog(&dispatcher, "conf-refresh-inv@192.0.2.10", SUBSCRIBER);
+    let held = subscriber_called_out(&dispatcher, &engine, "refresh-inv", SUBSCRIBER);
+    let (status, _) = merge(
+        &dispatcher,
+        &conference,
+        request(&conference, held.replaces_caller(), true),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let engine_before = engine_offer_answer_commands(&engine);
+    let refreshes = sweep(&dispatcher);
+    assert_eq!(refreshes.len(), 1);
+    let refresh = &refreshes[0];
+    assert_eq!(refresh.method(), Some(&Method::Invite));
+    assert_eq!(
+        refresh.body, held.sent_to_callee,
+        "the session in force, unchanged"
+    );
+    let mut response = in_dialog_response(
+        refresh,
+        200,
+        "OK",
+        "sip:far@198.51.100.77:5060",
+        Some(&sdp(host_of(CARRIER), 1)),
+    );
+    response
+        .headers
+        .add("Session-Expires", "120;refresher=uac".to_string());
+    respond(
+        &dispatcher,
+        &held.internal_call_id,
+        CARRIER,
+        refresh,
+        response,
+    );
+    let sent = drain(&dispatcher.udp);
+    assert!(sent
+        .iter()
+        .any(|frame| frame.is(Method::Ack) && frame.destination == socket(CARRIER)));
+    assert_eq!(engine_offer_answer_commands(&engine), engine_before);
+    assert_eq!(carrier_timer(&dispatcher, &held).session_expires, 120);
+}
+
+/// A refresh the carrier answers 481 ends the merged call through the normal
+/// teardown (RFC 4028 §10): the engine call is deleted and the seat freed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_answered_481_ends_the_merged_call_and_frees_the_seat() {
+    let engine = NativeTestEngine::start().await;
+    let dispatcher = focus(&engine);
+    let state = &dispatcher.state;
+    let conference = conference_dialog(&dispatcher, "conf-refresh-481@192.0.2.10", SUBSCRIBER);
+    let held = subscriber_called_out(&dispatcher, &engine, "refresh-481", SUBSCRIBER);
+    state
+        .call_actors
+        .set_leg_peer_allows_update(&held.internal_call_id, false, true);
+    let (status, _) = merge(
+        &dispatcher,
+        &conference,
+        request(&conference, held.replaces_caller(), true),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(crate::rtpengine::MediaBackend::seated_call_room(&held.a_call_id).is_some());
+    let refreshes = sweep(&dispatcher);
+    assert_eq!(refreshes.len(), 1);
+    carrier_answers(&dispatcher, &held, &refreshes[0], 481, None);
+    assert!(
+        eventually(|| state.call_actors.get_call(&held.internal_call_id).is_none()).await,
+        "the call ended"
+    );
+    assert!(
+        eventually(|| !engine.holds(&held.a_call_id)).await,
+        "the engine call is deleted"
+    );
+    assert!(crate::rtpengine::MediaBackend::seated_call_room(&held.a_call_id).is_none());
+}
+
+/// The resume of a party merged on hold is the first refresh: it asks to
+/// refresh, the sweep sends nothing while it is in flight, and its 2xx sets the
+/// interval. A refused resume has the refresh go out at once instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_resume_is_the_first_refresh() {
+    let engine = NativeTestEngine::start().await;
+    let dispatcher = focus(&engine);
+    for (name, resume_status) in [("first-refresh-ok", 200), ("first-refresh-refused", 488)] {
+        let conference =
+            conference_dialog(&dispatcher, &format!("conf-{name}@192.0.2.10"), SUBSCRIBER);
+        let held = subscriber_called_out(&dispatcher, &engine, name, SUBSCRIBER);
+        let resume = merged_on_hold(&dispatcher, &conference, &held, held.replaces_caller()).await;
+        assert_eq!(
+            header(&resume, "Session-Expires"),
+            "1800;refresher=uac",
+            "{name}"
+        );
+        assert!(
+            sweep(&dispatcher).is_empty(),
+            "{name}: nothing crosses the resume"
+        );
+
+        let mut response = in_dialog_response(
+            &resume,
+            resume_status,
+            if resume_status == 200 {
+                "OK"
+            } else {
+                "Not Acceptable Here"
+            },
+            "sip:far@198.51.100.77:5060",
+            (resume_status == 200)
+                .then(|| sdp_directed(host_of(CARRIER), 3, "sendrecv"))
+                .as_deref(),
+        );
+        if resume_status == 200 {
+            response
+                .headers
+                .add("Session-Expires", "120;refresher=uac".to_string());
+        }
+        respond(
+            &dispatcher,
+            &held.internal_call_id,
+            CARRIER,
+            &resume,
+            response,
+        );
+        drain(&dispatcher.udp);
+        if resume_status == 200 {
+            assert_eq!(
+                carrier_timer(&dispatcher, &held).session_expires,
+                120,
+                "{name}"
+            );
+            assert!(
+                sweep(&dispatcher).is_empty(),
+                "{name}: refreshed by the resume"
+            );
+        } else {
+            assert!(
+                eventually(|| carrier_timer(&dispatcher, &held).retry_at.is_some()).await,
+                "{name}: the refresh is due"
+            );
+            assert_eq!(sweep(&dispatcher).len(), 1, "{name}: refreshed at once");
+        }
+    }
 }

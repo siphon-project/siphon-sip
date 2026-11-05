@@ -201,6 +201,8 @@ pub async fn b2bua_adopt_replaced_with_state(
     };
     follow_the_far_party(state, &adopted, &swap, &far_tag);
     end_the_replaced_dialog(state, &adopted, &swap);
+    // A party the handset held before merging would keep that hold in the room.
+    resume_held_far_party(state, &adopted);
     info!(
         call_id = %adopted,
         conference_id = %request.conference_id,

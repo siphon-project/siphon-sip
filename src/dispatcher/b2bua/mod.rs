@@ -13,6 +13,7 @@
 
 mod ack;
 mod adopt_replaced;
+mod adopt_resume;
 mod b_leg;
 mod bridge;
 mod bridge_offered;
@@ -78,6 +79,7 @@ mod update_media;
 
 pub use ack::*;
 pub use adopt_replaced::*;
+pub use adopt_resume::*;
 pub use b_leg::*;
 pub use bridge::*;
 pub use bridge_relay::*;

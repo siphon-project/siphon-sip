@@ -249,7 +249,13 @@ pub fn b2bua_send_session_refresh(call_id: &str, on_a_leg: bool, state: &Dispatc
     let session_expires = timer.refresh_interval();
     let headers = refresh_request_headers(&leg, on_a_leg, &timer);
 
-    let offer = session_refresh_offer(&leg, call_id, on_a_leg, state);
+    // A seat takes no offer/answer, so a merged call is refreshed without one
+    // wherever its party allows UPDATE (§7.4 recommends it anyway).
+    let offer = if leg.dialog.peer_allows_update && is_seated_adoption(state, call_id) {
+        None
+    } else {
+        session_refresh_offer(&leg, call_id, on_a_leg, state)
+    };
     let (method, tracking_target) = match (&offer, leg.dialog.peer_allows_update) {
         (None, true) => (
             Method::Update,
