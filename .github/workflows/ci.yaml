@@ -156,7 +156,10 @@ jobs:
   # clippy lint or rustc warning into a hard failure so the clippy-clean
   # baseline cannot regress.
   clippy:
-    runs-on: ubuntu-latest
+    # Every job that installs Python with deadsnakes/action stays on 24.04:
+    # ubuntu-26.04 ships its own python3.14, which the action refuses to
+    # install over ("package python3.14 is not from deadsnakes").
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -204,7 +207,7 @@ jobs:
   # build. `--locked` because the floor is a property of the committed lockfile.
   minimum-rust:
     name: minimum rust
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -244,7 +247,7 @@ jobs:
   # scripts/cut-release.sh). Mirrors rust-tests' build env (the crate links
   # PyO3, so the benches need free-threaded Python 3.14 + libsctp-dev to build).
   benches:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -318,7 +321,7 @@ jobs:
   # combined leg rides on the `full` aggregate feature, so it picks the new
   # module up from Cargo.toml without a workflow edit.
   siphon-bin:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: siphon-bin
@@ -2793,7 +2796,7 @@ jobs:
   # planes (RtpEngineSet → --ng, SiphonRtpClient → --control) in ~2s with no
   # container networking and no Rust build of the engine.
   siphon-rtp-engine-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: rust-tests
     steps:
       - uses: actions/checkout@v7
@@ -3331,7 +3334,7 @@ jobs:
   # times out rather than passing quietly. Runs the binary natively rather than
   # through compose because the scenario needs no second downstream.
   sipp-b2bua-answer-fail:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -3363,7 +3366,7 @@ jobs:
   # RFC 3326 Q.850;cause=102. The opt-out arm is the one that keeps the other two
   # honest — a cap applied unconditionally would pass them both.
   sipp-b2bua-max-duration:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -3391,7 +3394,7 @@ jobs:
   # the callee, whose scenario expects only the resume the script relays and
   # marks. Both hooks log what they saw, and the runner checks those lines.
   sipp-b2bua-reoffer:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -3415,7 +3418,7 @@ jobs:
 
   # ── Fuzz testing (nightly) ─────────────────────────────────────────────
   fuzz:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: rust-tests
     steps:
       - uses: actions/checkout@v7
