@@ -208,9 +208,134 @@ pub fn classify(offer: Option<&SdpBody>, in_force: Option<&SdpBody>) -> ReofferK
     }
 }
 
+/// The session in force toward a party, `sdp`, taken off a hold siphon's side
+/// placed on it: every stream it has not rejected that does not receive
+/// (`sendonly`, `inactive`) is offered `sendrecv`, and the rest is unchanged, so
+/// a stream the party holds itself (siphon's side `recvonly`) stays its choice.
+/// The `o=` is left as it is; the sender stamps it.
+///
+/// A party whose dialog outlives the one that held it (a merge that replaced
+/// that dialog, RFC 3891) would otherwise keep a hold nobody holds any more.
+///
+/// `None` when there is nothing to resume: every stream already receives, no
+/// stream is active, the body is not text, or a stream is held by a `0.0.0.0`
+/// connection, which a direction cannot undo.
+pub fn sendrecv_offer(sdp: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(sdp).ok()?;
+    let mut session = SdpBody::parse(text);
+    let active: Vec<usize> = (0..session.media_sections.len())
+        .filter(|&index| session.media_sections[index].port != 0)
+        .collect();
+    if active.is_empty() {
+        return None;
+    }
+    if active
+        .iter()
+        .any(|&index| connection_is_unspecified(&session, &session.media_sections[index]))
+    {
+        return None;
+    }
+    let directions: Vec<(bool, bool)> = session
+        .media_sections
+        .iter()
+        .map(|section| stated_direction(&session, section))
+        .collect();
+    if !active.iter().any(|&index| !directions[index].1) {
+        return None;
+    }
+    for &index in &active {
+        let (send, receive) = directions[index];
+        let attribute = if receive {
+            direction_attribute(send, receive)
+        } else {
+            "sendrecv"
+        };
+        let section = &mut session.media_sections[index];
+        for name in DIRECTION_ATTRIBUTES {
+            section.remove_attr(name);
+        }
+        section.set_attr(attribute, "");
+    }
+    for name in DIRECTION_ATTRIBUTES {
+        session.session_remove_attr(name);
+    }
+    Some(session.to_string().into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resumed(body: &str) -> Option<SdpBody> {
+        sendrecv_offer(body.as_bytes())
+            .map(|bytes| SdpBody::parse(std::str::from_utf8(&bytes).unwrap()))
+    }
+
+    const HEAD: &str =
+        "v=0\r\no=- 7 3 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n";
+
+    #[test]
+    fn a_sendonly_or_inactive_stream_is_offered_sendrecv() {
+        for held in ["a=sendonly", "a=inactive"] {
+            let body =
+                format!("{HEAD}m=audio 40000 RTP/AVP 0 8\r\na=rtpmap:0 PCMU/8000\r\n{held}\r\n");
+            let offer = resumed(&body).unwrap_or_else(|| panic!("{held} is resumed"));
+            let audio = &offer.media_sections[0];
+            assert!(audio.has_attr("sendrecv"), "{held}");
+            for other in ["sendonly", "recvonly", "inactive"] {
+                assert!(!audio.has_attr(other), "{held}: {other} left");
+            }
+            assert_eq!(audio.port, 40000);
+            assert_eq!(audio.formats, vec!["0", "8"]);
+            assert_eq!(offer.origin(), Some("- 7 3 IN IP4 192.0.2.10"));
+            assert_eq!(offer.connection(), Some("IN IP4 192.0.2.10"));
+        }
+    }
+
+    #[test]
+    fn a_session_level_hold_is_resumed_on_every_stream() {
+        let body =
+            format!("{HEAD}a=sendonly\r\nm=audio 40000 RTP/AVP 0\r\nm=video 40002 RTP/AVP 96\r\n");
+        let offer = resumed(&body).expect("a session-level hold is resumed");
+        assert!(!offer.session_has_attr("sendonly"));
+        assert!(offer
+            .media_sections
+            .iter()
+            .all(|stream| stream.has_attr("sendrecv")));
+        assert_eq!(effective_direction(&offer), Some("sendrecv"));
+    }
+
+    #[test]
+    fn a_rejected_stream_and_a_held_party_s_own_hold_are_left_alone() {
+        let body = format!(
+            "{HEAD}m=audio 40000 RTP/AVP 0\r\na=sendonly\r\nm=video 0 RTP/AVP 96\r\nm=audio 40004 RTP/AVP 0\r\na=recvonly\r\n"
+        );
+        let offer = resumed(&body).expect("the held stream is resumed");
+        assert!(offer.media_sections[0].has_attr("sendrecv"));
+        assert_eq!(offer.media_sections[1].port, 0);
+        assert!(!offer.media_sections[1].has_attr("sendrecv"));
+        assert!(
+            offer.media_sections[2].has_attr("recvonly"),
+            "the far party's hold is its own"
+        );
+    }
+
+    #[test]
+    fn nothing_to_resume_is_none() {
+        for direction in ["", "a=sendrecv\r\n", "a=recvonly\r\n"] {
+            let body = format!("{HEAD}m=audio 40000 RTP/AVP 0\r\n{direction}");
+            assert!(resumed(&body).is_none(), "{direction:?}");
+        }
+        assert!(resumed(&format!("{HEAD}m=audio 0 RTP/AVP 0\r\na=sendonly\r\n")).is_none());
+        assert!(resumed(HEAD).is_none(), "no stream");
+        assert!(sendrecv_offer(&[0xff, 0xfe]).is_none(), "not text");
+    }
+
+    #[test]
+    fn a_zero_address_hold_is_not_resumed_by_direction_alone() {
+        let body = "v=0\r\no=- 7 3 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=sendonly\r\n";
+        assert!(resumed(body).is_none());
+    }
 
     fn sdp(connection: &str, media: &str) -> SdpBody {
         SdpBody::parse(&format!(

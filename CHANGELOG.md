@@ -13,6 +13,11 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`b2bua.adopt_replaced` takes a party merged while on hold off hold.** A handset holds a call before it merges it: the `sendonly` re-INVITE is relayed and the far party answers `recvonly` and stops sending. Seated in place with no SIP, that party kept the hold in the room, heard everyone and was heard by no one until it hung up. The hold belonged to the dialog the merge replaces (RFC 3891), so after the seat siphon now sends the far party one re-INVITE: the session in force with only the direction changed to `sendrecv`, at the next `o=` version, like a session refresh, and without the media engine, which mixes the party as soon as it sends again. A party already `sendrecv` still gets no SIP, and one that answers `recvonly` or `inactive` is left as it chose. A refusal, a Timer B timeout, or an answer at another address, port or codec is logged as a warning and the call stays seated. The merge resolves `200` without waiting for the answer, so the REFER's NOTIFY is not held up.
+- **A merged call no longer drops when its session timer runs out.** The far party's session was refreshed by the leg `b2bua.adopt_replaced` ends, whose refreshes siphon relayed, so nothing refreshed it after the merge and the party ended the call when its session expired, typically within two minutes. siphon is now the refresher on that dialog for the rest of the call (RFC 4028): a timer siphon already ran is kept with siphon refreshing at half its interval, and on a node that runs no session timer siphon installs one and refreshes at once with `refresher=uac` (the configured `session_timer.session_expires`, else 1800), the party's 2xx setting the real interval. The resume of a held party is that first refresh. A merged call is refreshed with an UPDATE without a body where the party allows UPDATE, otherwise with a re-INVITE of the session in force whose answer is not sent to the media engine, since a seat takes no offer/answer. A 408 or 481 to a refresh ends the call through the normal teardown, which frees the seat.
+
 ## [1.15.11] — 2026-11-02
 
 ### Added

@@ -225,6 +225,25 @@ What it does:
    `conference_seat`: same ports, same session, and no SIP toward that party.
 4. Sends the named leg a BYE with
    `Reason: SIP;cause=200;text="Merged into conference"`.
+5. Takes the far party off hold when the handset held it before merging, as
+   phones do. The hold belonged to the dialog the merge just ended, so the far
+   party gets one re-INVITE: the session in force, same ports and codecs, at the
+   next `o=` version, with `a=sendrecv`. A far party already `sendrecv` gets no
+   SIP. One that answers `recvonly` or `inactive` holds the room itself and is
+   left that way. A refusal, or no answer before Timer B, is logged as a
+   warning and the call stays seated. The merge has already resolved `200`, so
+   the REFER's NOTIFY does not wait for the far party. An answer that moves the
+   address, port or codec is also a warning, since a seat cannot follow it.
+6. Becomes the far party's session refresher (RFC 4028). That party's session
+   was refreshed by the handset's leg the merge just ended, so without this it
+   would run out a session interval later. A timer siphon already ran keeps its
+   interval, with siphon refreshing at half of it. Where siphon runs no session
+   timer, it refreshes at once asking to be the refresher (the configured
+   `session_timer.session_expires`, else 1800), and the party's 2xx sets the
+   interval. The resume of step 5 is that first refresh. The refresh is an
+   UPDATE without a body where the party allows UPDATE, otherwise a re-INVITE
+   of the session in force. A 408 or 481 to it ends the call through the normal
+   teardown.
 
 It resolves to the status the REFER's NOTIFY reports:
 
