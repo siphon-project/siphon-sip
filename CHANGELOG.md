@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.15.12] — 2026-11-05
+
 ### Fixed
 
 - **`b2bua.adopt_replaced` takes a party merged while on hold off hold.** A handset holds a call before it merges it: the `sendonly` re-INVITE is relayed and the far party answers `recvonly` and stops sending. Seated in place with no SIP, that party kept the hold in the room, heard everyone and was heard by no one until it hung up. The hold belonged to the dialog the merge replaces (RFC 3891), so after the seat siphon now sends the far party one re-INVITE: the session in force with only the direction changed to `sendrecv`, at the next `o=` version, like a session refresh, and without the media engine, which mixes the party as soon as it sends again. A party already `sendrecv` still gets no SIP, and one that answers `recvonly` or `inactive` is left as it chose. A refusal, a Timer B timeout, or an answer at another address, port or codec is logged as a warning and the call stays seated. The merge resolves `200` without waiting for the answer, so the REFER's NOTIFY is not held up.
