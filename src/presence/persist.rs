@@ -325,7 +325,7 @@ const RESTORE_BATCH: usize = 500;
 /// batches of [`RESTORE_BATCH`].
 #[cfg(feature = "redis-backend")]
 pub async fn restore_presence_subscriptions(
-    connection: &mut redis::aio::MultiplexedConnection,
+    connection: &mut (impl redis::aio::ConnectionLike + Send + Sync),
     key_prefix: &str,
     store: &super::PresenceStore,
 ) -> Result<(RestoreCounts, Vec<String>), String> {
@@ -385,4 +385,20 @@ pub async fn restore_presence_subscriptions(
         }
     }
     Ok((counts, dropped_ids))
+}
+
+/// Spawn presence persistence using the shared recovering connection.
+#[cfg(feature = "redis-backend")]
+pub fn spawn_presence_writer_with_connection(
+    connection: crate::redis_target::RedisConnection,
+    key_prefix: String,
+    ttl_slack_secs: u64,
+) -> PresenceBackendWriter {
+    spawn_presence_writer(
+        PresenceRedisSink {
+            link: RedisLink::from_connection(connection),
+            key_prefix,
+        },
+        ttl_slack_secs,
+    )
 }

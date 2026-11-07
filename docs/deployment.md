@@ -437,3 +437,67 @@ That's enough to run a redundant SIPhon `StatefulSet` behind a `Service`. Scale 
 `replicas`; pair it with subscriber-affinity at your ingress if you need any-pod
 terminating delivery. Anything fancier (HPA on cps, per-pod SRV, Diameter SCTP) is a
 deployment-specific exercise, not something to bake into a starter manifest.
+
+### Redis / Valkey Sentinel
+
+Registrar persistence and named caches accept either the existing `url` or a
+`sentinel` block. Do not specify both. iFC profiles and presence subscriptions
+use the registrar's target automatically.
+
+```yaml
+registrar:
+  backend: redis
+  redis:
+    sentinel:
+      addresses: ["localhost:26379", "localhost:26380", "localhost:26381"]
+      master: primary
+      password: "${REDIS_PASSWORD}"
+      sentinel_password: "${SENTINEL_PASSWORD}"
+      db: 0
+    key_prefix: "siphon:reg:"
+
+cache:
+  - name: routing
+    sentinel:
+      addresses: ["localhost:26379", "localhost:26380", "localhost:26381"]
+      master: primary
+      db: 1
+```
+
+`addresses` and `master` are required. `password` authenticates to the data
+nodes; `sentinel_password` authenticates to the sentinels. Both passwords are
+optional. `db` defaults to zero. Environment variables expand as in the rest
+of the YAML configuration. Existing `url: redis://localhost:6379/0` entries
+need no changes.
+
+For a sharded registrar, set `shard_count` and list that many targets under
+`urls`. Legacy URL strings remain accepted; mapping entries use the same
+shared target shape:
+
+```yaml
+registrar:
+  backend: redis
+  redis:
+    shard_count: 2
+    urls:
+      - "redis://localhost:6379/0"
+      - sentinel:
+          addresses: ["localhost:26379", "localhost:26380", "localhost:26381"]
+          master: second-primary
+```
+
+Without a separate top-level target, iFC and presence use the first shard.
+On a connection error, `READONLY`, or `MASTERDOWN`, the async connection
+rediscovers the primary and retries the operation once. Discovery/connection
+has a two-second deadline, commands have a 500 ms response timeout, and
+reconnect attempts have a 100 ms backoff. Each Sentinel endpoint gets up to
+500 ms, within the discovery deadline. An operation including time queued
+behind another reconnect is bounded to five seconds. A failed retry returns an error and
+logs the failure; persistence writers retain pending state under their existing
+retry policy. A write whose response was lost may already have executed:
+non-idempotent commands and pipelines can be replayed, so this is not an
+exactly-once guarantee. Reads that succeed on an old replica do not trigger
+rediscovery.
+
+Cache `store` and `delete` return `false` when the Redis write fails, even if
+the local LRU was updated; they no longer report a failed write as successful.

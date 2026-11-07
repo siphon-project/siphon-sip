@@ -398,6 +398,16 @@ registrar:
   # Survives restarts; required when RTPEngine or dialog state also uses Redis.
   # redis:
   #   url: "redis://127.0.0.1:6379"
+  #   # Or a Redis / Valkey Sentinel group instead of url (exactly one of the
+  #   # two). The primary is rediscovered after a failover; iFC and presence
+  #   # persistence use the same target. See docs/deployment.md.
+  #   # sentinel:
+  #   #   addresses: ["192.0.2.10:26379", "192.0.2.11:26379", "192.0.2.12:26379"]
+  #   #   master: primary
+  #   #   password: "${REDIS_PASSWORD}"             # optional, data nodes
+  #   #   sentinel_password: "${SENTINEL_PASSWORD}" # optional, Sentinels
+  #   #   db: 0                                     # optional, default 0
+  #   # Sharded: shard_count plus urls, each a URL string or a sentinel: mapping.
   #   key_prefix: "siphon:reg:"   # namespace prefix (default: "siphon:reg:")
   #   ttl_slack_secs: 30          # extra seconds beyond expires for race safety
   #   presence_key_prefix: "siphon:presence:"
@@ -1040,6 +1050,7 @@ auth:
 # cache:
 #   - name: "cnam"
 #     url: "redis://127.0.0.1:6379"
+#     # or sentinel: {addresses: [...], master: primary}, as for the registrar
 #     local_ttl_secs: 60       # optional in-process LRU in front of Redis
 #     local_max_entries: 10000
 

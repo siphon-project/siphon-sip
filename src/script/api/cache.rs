@@ -67,8 +67,9 @@ impl PyCacheNamespace {
 
     /// Store a value in a named cache with optional TTL.
     ///
-    /// Returns `True` if the named cache exists and the value was stored,
-    /// `False` if the cache name is unknown.
+    /// Returns `True` if the value was stored, `False` if the cache name is
+    /// unknown or the Redis write failed (the local LRU, when configured,
+    /// still holds the value).
     ///
     /// Args:
     ///     name: Cache name (from ``siphon.yaml`` cache list).
@@ -95,8 +96,9 @@ impl PyCacheNamespace {
 
     /// Delete a key from a named cache.
     ///
-    /// Returns `True` if the named cache exists (key may or may not have existed),
-    /// `False` if the cache name is unknown.
+    /// Returns `True` if the delete reached the backend (the key may or may not
+    /// have existed), `False` if the cache name is unknown or the Redis delete
+    /// failed (the key is still gone from the local LRU).
     fn delete<'py>(
         &self,
         py: Python<'py>,

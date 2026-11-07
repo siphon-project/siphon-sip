@@ -936,6 +936,9 @@ impl From<&InitialFilterCriteria> for MatchedApplicationServer {
 
 mod writer;
 
+#[cfg(feature = "redis-backend")]
+pub use writer::spawn_ifc_backend_writer_with_connection;
+
 #[cfg(test)]
 pub(crate) use writer::spawn_ifc_writer;
 #[cfg(feature = "redis-backend")]
@@ -955,7 +958,7 @@ pub use writer::{IfcBackendWriter, IfcWrite, DEFAULT_IFC_PROFILE_TTL_SECS};
 /// Returns `(profile_count, ifc_count)` — number of AoRs restored and total iFCs.
 #[cfg(feature = "redis-backend")]
 pub async fn restore_ifc_profiles(
-    connection: &mut redis::aio::MultiplexedConnection,
+    connection: &mut (impl redis::aio::ConnectionLike + Send + Sync),
     key_prefix: &str,
     store: &IfcStore,
 ) -> Result<(usize, usize), String> {

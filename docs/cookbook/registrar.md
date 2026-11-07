@@ -188,3 +188,8 @@ curl http://127.0.0.1:9091/admin/registrations/sip:alice@example.com
 - Real example: [`examples/registrar_proxy.py`](https://github.com/siphon-project/siphon-sip/blob/main/examples/registrar_proxy.py) (adds external-API contact notifications) and [`scripts/proxy_default.py`](https://github.com/siphon-project/siphon-sip/blob/main/scripts/proxy_default.py).
 - [Stateful proxy](proxy.md) — routing and forking in more depth.
 - [Hardening & security](security.md) — auth backends, rate limiting, bans.
+
+Redis targets also support a `sentinel` block in place of `url`; see
+[Redis / Valkey Sentinel](../deployment.md#redis--valkey-sentinel) for the shared
+registrar/cache form, credentials, sharding, and recovery behavior. iFC persistence
+inherits the registrar target.

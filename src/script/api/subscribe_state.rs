@@ -1696,7 +1696,7 @@ mod tests {
                 name: cache_name.to_string(),
                 // Unreachable on purpose: the local LRU alone stands in for
                 // the shared cache, the way `cache_tests.rs` does it.
-                url: "redis://127.0.0.1:1".to_string(),
+                target: ("redis://127.0.0.1:1".to_string()).into(),
                 local_ttl_secs: Some(60),
                 local_max_entries: Some(16),
             },
@@ -1729,10 +1729,20 @@ mod tests {
         };
         dialog.event_version = 2;
         let json = serde_json::to_string(&dialog).expect("serialize dialog");
-        assert!(
+        // Redis is deliberately unreachable: persistence reports failure,
+        // while the local LRU still supplies this test's simulated L2 cache.
+        assert_eq!(
             manager
                 .store(cache_name, "subscribe_dialog:cache-only", &json, Some(900))
+                .await,
+            !cfg!(feature = "redis-backend")
+        );
+        assert_eq!(
+            manager
+                .fetch(cache_name, "subscribe_dialog:cache-only")
                 .await
+                .as_deref(),
+            Some(json.as_str())
         );
 
         let store = Arc::new(

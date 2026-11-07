@@ -38,11 +38,11 @@ struct CacheEntry {
 struct NamedCache {
     /// Redis connection URL (connected lazily on first use).
     #[cfg(feature = "redis-backend")]
-    url: String,
+    target: crate::redis_target::RedisTarget,
 
     /// Redis async connection (established lazily).
     #[cfg(feature = "redis-backend")]
-    redis: tokio::sync::OnceCell<redis::aio::MultiplexedConnection>,
+    redis: tokio::sync::OnceCell<crate::redis_target::RedisConnection>,
 
     /// Local LRU cache (if `local_ttl_secs` is configured).
     local: Option<Mutex<LocalLru>>,
@@ -113,7 +113,7 @@ impl NamedCache {
 
         Self {
             #[cfg(feature = "redis-backend")]
-            url: config.url.clone(),
+            target: config.target.clone(),
             #[cfg(feature = "redis-backend")]
             redis: tokio::sync::OnceCell::new(),
             local,
@@ -165,7 +165,7 @@ impl NamedCache {
     /// `ttl_secs` is the Redis expiry; the local LRU bounds itself by size, so
     /// without `redis-backend` there is nothing to apply it to.
     #[cfg_attr(not(feature = "redis-backend"), allow(unused_variables))]
-    async fn store(&self, key: &str, value: &str, ttl_secs: Option<u64>) {
+    async fn store(&self, key: &str, value: &str, ttl_secs: Option<u64>) -> bool {
         // Write to local LRU
         if let Some(local) = &self.local {
             if let Ok(mut lru) = local.lock() {
@@ -176,11 +176,13 @@ impl NamedCache {
         // Write to Redis
         #[cfg(feature = "redis-backend")]
         {
-            self.redis_store(key, value, ttl_secs).await;
+            return self.redis_store(key, value, ttl_secs).await;
         }
+        #[cfg(not(feature = "redis-backend"))]
+        true
     }
 
-    async fn delete(&self, key: &str) {
+    async fn delete(&self, key: &str) -> bool {
         // Remove from local LRU
         if let Some(local) = &self.local {
             if let Ok(mut lru) = local.lock() {
@@ -191,12 +193,14 @@ impl NamedCache {
         // Remove from Redis
         #[cfg(feature = "redis-backend")]
         {
-            self.redis_delete(key).await;
+            return self.redis_delete(key).await;
         }
+        #[cfg(not(feature = "redis-backend"))]
+        true
     }
 
     #[cfg(feature = "redis-backend")]
-    async fn redis_delete(&self, key: &str) {
+    async fn redis_delete(&self, key: &str) -> bool {
         if let Some(mut connection) = self.get_redis_connection().await {
             if let Err(error) = redis::cmd("DEL")
                 .arg(key)
@@ -204,24 +208,26 @@ impl NamedCache {
                 .await
             {
                 warn!(key = key, "Redis DEL failed: {error}");
+                return false;
             }
+            return true;
         }
+        false
     }
 
     #[cfg(feature = "redis-backend")]
-    async fn get_redis_connection(&self) -> Option<redis::aio::MultiplexedConnection> {
+    async fn get_redis_connection(&self) -> Option<crate::redis_target::RedisConnection> {
         let connection = self
             .redis
             .get_or_try_init(|| async {
-                let client = redis::Client::open(self.url.as_str())?;
-                client.get_multiplexed_async_connection().await
+                crate::redis_target::RedisConnection::connect(self.target.clone()).await
             })
             .await;
 
         match connection {
             Ok(connection) => Some(connection.clone()),
             Err(error) => {
-                warn!(url = %self.url, "Redis connection failed: {error}");
+                warn!(target = ?self.target, "Redis connection failed: {error}");
                 None
             }
         }
@@ -244,7 +250,7 @@ impl NamedCache {
     }
 
     #[cfg(feature = "redis-backend")]
-    async fn redis_store(&self, key: &str, value: &str, ttl_secs: Option<u64>) {
+    async fn redis_store(&self, key: &str, value: &str, ttl_secs: Option<u64>) -> bool {
         if let Some(mut connection) = self.get_redis_connection().await {
             let result = if let Some(ttl) = ttl_secs {
                 redis::cmd("SETEX")
@@ -262,8 +268,11 @@ impl NamedCache {
             };
             if let Err(error) = result {
                 warn!(key = key, "Redis SET failed: {error}");
+                return false;
             }
+            return true;
         }
+        false
     }
 
     /// Append `item` to the right of a Redis list. Returns the new
@@ -525,8 +534,7 @@ impl CacheManager {
     /// Store a value in a named cache with optional TTL.
     pub async fn store(&self, name: &str, key: &str, value: &str, ttl_secs: Option<u64>) -> bool {
         if let Some(cache) = self.caches.get(name) {
-            cache.store(key, value, ttl_secs).await;
-            true
+            cache.store(key, value, ttl_secs).await
         } else {
             false
         }
@@ -535,8 +543,7 @@ impl CacheManager {
     /// Delete a key from a named cache.
     pub async fn delete(&self, name: &str, key: &str) -> bool {
         if let Some(cache) = self.caches.get(name) {
-            cache.delete(key).await;
-            true
+            cache.delete(key).await
         } else {
             false
         }
@@ -613,10 +620,18 @@ mod tests {
         NamedCacheConfig {
             name: name.to_string(),
             // Use a bogus URL so tests never hit a real Redis instance
-            url: "redis://127.0.0.1:1".to_string(),
+            target: ("redis://127.0.0.1:1".to_string()).into(),
             local_ttl_secs: ttl_secs,
             local_max_entries: max_entries,
         }
+    }
+
+    #[cfg(feature = "redis-backend")]
+    #[tokio::test]
+    async fn failed_writes_are_reported_to_cache_callers() {
+        let manager = CacheManager::new(&[make_config("failed", Some(60), Some(100))]);
+        assert!(!manager.store("failed", "key", "value", None).await);
+        assert!(!manager.delete("failed", "key").await);
     }
 
     #[tokio::test]
@@ -634,7 +649,7 @@ mod tests {
     async fn local_lru_ttl_expiry() {
         let configs = [NamedCacheConfig {
             name: "ttl_test".to_string(),
-            url: "redis://127.0.0.1:1".to_string(),
+            target: ("redis://127.0.0.1:1".to_string()).into(),
             local_ttl_secs: Some(0), // 0-second TTL = expires immediately
             local_max_entries: Some(100),
         }];

@@ -10,7 +10,7 @@ use siphon::config::NamedCacheConfig;
 fn make_config(name: &str, ttl_secs: u64, max_entries: usize) -> NamedCacheConfig {
     NamedCacheConfig {
         name: name.to_string(),
-        url: "redis://127.0.0.1:1".to_string(),
+        target: ("redis://127.0.0.1:1".to_string()).into(),
         local_ttl_secs: Some(ttl_secs),
         local_max_entries: Some(max_entries),
     }
@@ -24,7 +24,10 @@ async fn fetch_miss_then_store_then_hit() {
     assert!(manager.fetch("cnam", "msisdn:1234").await.is_none());
 
     // Store
-    assert!(manager.store("cnam", "msisdn:1234", "Alice", None).await);
+    assert_eq!(
+        manager.store("cnam", "msisdn:1234", "Alice", None).await,
+        !cfg!(feature = "redis-backend")
+    );
 
     // Hit
     assert_eq!(manager.fetch("cnam", "msisdn:1234").await.unwrap(), "Alice");

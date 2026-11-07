@@ -155,7 +155,7 @@ async fn redis_writes_drain_through_a_new_connection_after_the_link_drops() {
     let cutter = LinkCutter::start(upstream).await;
     let prefix = format!("siphon-test:{}:", unique("redis_reconnect"));
     let config = |url: String| RedisBackendConfig {
-        url,
+        target: url.into(),
         key_prefix: prefix.clone(),
         ..RedisBackendConfig::default()
     };
@@ -182,7 +182,7 @@ async fn a_redis_read_after_the_link_drops_recovers() {
     let (scheme, upstream, path) = split_authority(&url);
     let cutter = LinkCutter::start(upstream).await;
     let backend = RedisBackend::connect(RedisBackendConfig {
-        url: format!("{scheme}{}{path}", cutter.address()),
+        target: format!("{scheme}{}{path}", cutter.address()).into(),
         key_prefix: format!("siphon-test:{}:", unique("redis_read")),
         ..RedisBackendConfig::default()
     })

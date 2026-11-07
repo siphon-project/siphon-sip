@@ -269,8 +269,9 @@ fn default_enum_server_hold_down_secs() -> u64 {
 pub struct NamedCacheConfig {
     /// Identifier used in `cache.fetch(name, key)` calls.
     pub name: String,
-    /// Redis URL (currently the only supported backend).
-    pub url: String,
+    /// Redis URL or Sentinel master set.
+    #[serde(flatten)]
+    pub target: crate::redis_target::RedisTarget,
     /// If set, a local LRU cache is maintained in front of Redis.
     pub local_ttl_secs: Option<u64>,
     pub local_max_entries: Option<usize>,

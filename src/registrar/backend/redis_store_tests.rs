@@ -33,7 +33,7 @@ fn unique_prefix(test: &str) -> String {
 
 async fn backend(url: &str, prefix: &str, slack: u64, max_lifetime: u64) -> RedisBackend {
     RedisBackend::connect(RedisBackendConfig {
-        url: url.to_string(),
+        target: (url.to_string()).into(),
         key_prefix: prefix.to_string(),
         ttl_slack_secs: slack,
         ..RedisBackendConfig::default()

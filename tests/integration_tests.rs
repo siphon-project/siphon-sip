@@ -101,3 +101,10 @@ mod stir_tests;
 // entries to REGISTERs, sources and the address lifecycle, on mock transports.
 #[path = "integration/registrant_multi_ue_tests.rs"]
 mod registrant_multi_ue_tests;
+
+#[path = "integration/redis_target_tests.rs"]
+mod redis_target_tests;
+
+#[cfg(feature = "redis-backend")]
+#[path = "integration/redis_sentinel_tests.rs"]
+mod redis_sentinel_tests;
