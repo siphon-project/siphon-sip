@@ -326,6 +326,8 @@ fn default_ifc_key_prefix() -> String {
 /// Top-level `sbi:` configuration for 5G Service-Based Interface.
 #[derive(Debug, Deserialize, Clone)]
 pub struct SbiYamlConfig {
+    /// Outbound SBI TLS trust anchors and optional client identity.
+    pub tls: Option<crate::sbi::SbiTlsConfig>,
     /// NRF discovery endpoint URL.
     pub nrf_url: Option<String>,
     /// Default timeout for SBI requests in seconds.
@@ -374,6 +376,7 @@ fn default_sbi_timeout() -> u64 {
 impl SbiYamlConfig {
     pub fn to_sbi_config(&self) -> crate::sbi::SbiConfig {
         crate::sbi::SbiConfig {
+            tls: self.tls.clone(),
             nrf_url: self.nrf_url.clone(),
             timeout_secs: self.timeout_secs,
             oauth2_client_id: self.oauth2_client_id.clone(),

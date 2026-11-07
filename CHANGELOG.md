@@ -20,6 +20,11 @@ entry, but a working config keeps working.
 ### Changed
 
 - **`cache.store` and `cache.delete` return `False` when the Redis write fails.** They returned `True` whenever the cache name was known, so a script could not tell a value that only reached the local LRU from one that reached Redis. The local LRU is still updated either way. A cache without Redis is unchanged. Mirrored in the SDK mock's docstrings.
+- SBI outbound TLS supports a private CA bundle, a PEM client certificate and key for mutual TLS, and optional removal of public roots through `sbi.tls`. Npcf and Nbsf share the manager's TLS settings, retaining the BSF timeout override. TLS files are loaded once; rotation requires a restart.
+
+### Changed
+
+- **BREAKING (Rust API):** `SbiManager::new` returns `Result` so invalid TLS material or HTTP client construction fails startup instead of silently using a default client. Rust consumers must handle the error.
 
 ## [1.15.12] — 2026-11-05
 
