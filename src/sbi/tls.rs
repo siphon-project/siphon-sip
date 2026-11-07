@@ -103,6 +103,7 @@ impl LoadedTls {
     pub(super) fn build(
         &self,
         config: &super::SbiConfig,
+        bearer: &super::bearer::LoadedBearer,
         timeout: std::time::Duration,
     ) -> Result<reqwest::Client, String> {
         let mut builder = reqwest::Client::builder().timeout(timeout);
@@ -115,7 +116,7 @@ impl LoadedTls {
         if let Some(identity) = &self.identity {
             builder = builder.identity(identity.clone());
         }
-        builder.build().map_err(|error| {
+        bearer.apply(builder).build().map_err(|error| {
             // reqwest's Display omits the underlying TLS error; Debug includes it.
             format!(
                 "SBI HTTP client construction failed (TLS files {:?}): {error:?}",

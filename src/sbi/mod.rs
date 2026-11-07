@@ -7,6 +7,7 @@
 //! Uses `reqwest` for HTTP transport. Full NRF discovery and OAuth2
 //! token management are planned for future implementation.
 
+mod bearer;
 pub mod nbsf;
 pub mod nchf;
 pub mod npcf;
@@ -52,6 +53,12 @@ impl Communication {
 pub struct SbiConfig {
     /// Outbound TLS trust and optional mutual authentication.
     pub tls: Option<SbiTlsConfig>,
+    /// Static bearer credential file, loaded once by the manager.
+    pub bearer_token_file: Option<String>,
+    /// Peer URLs used for startup transport validation with bearer authentication.
+    pub npcf_url: Option<String>,
+    pub bsf_url: Option<String>,
+    pub nchf_url: Option<String>,
     /// NRF discovery endpoint (optional, for service discovery).
     pub nrf_url: Option<String>,
     /// Default timeout for SBI requests in seconds.
@@ -65,6 +72,10 @@ impl Default for SbiConfig {
     fn default() -> Self {
         Self {
             tls: None,
+            bearer_token_file: None,
+            npcf_url: None,
+            bsf_url: None,
+            nchf_url: None,
             nrf_url: None,
             timeout_secs: 5,
             oauth2_client_id: None,
@@ -79,18 +90,24 @@ pub struct SbiManager {
     config: SbiConfig,
     http_client: reqwest::Client,
     tls: tls::LoadedTls,
+    bearer: bearer::LoadedBearer,
 }
 
 impl SbiManager {
-    /// Load TLS files and build the shared client, failing on invalid configuration.
+    /// Load TLS and bearer token files and build the shared client, failing on invalid configuration.
     pub fn new(config: SbiConfig) -> Result<Self, String> {
+        let bearer = bearer::LoadedBearer::load(&config)?;
         let tls = tls::LoadedTls::load(config.tls.as_ref())?;
-        let http_client =
-            tls.build(&config, std::time::Duration::from_secs(config.timeout_secs))?;
+        let http_client = tls.build(
+            &config,
+            &bearer,
+            std::time::Duration::from_secs(config.timeout_secs),
+        )?;
         Ok(Self {
             config,
             http_client,
             tls,
+            bearer,
         })
     }
 
@@ -99,7 +116,7 @@ impl SbiManager {
         &self,
         timeout: std::time::Duration,
     ) -> Result<reqwest::Client, String> {
-        self.tls.build(&self.config, timeout)
+        self.tls.build(&self.config, &self.bearer, timeout)
     }
 
     /// Get the HTTP client for making SBI requests.
@@ -157,7 +174,7 @@ mod tests {
             timeout_secs: 10,
             oauth2_client_id: Some("siphon-pcscf".to_string()),
             oauth2_client_secret: Some("secret123".to_string()),
-            tls: None,
+            ..Default::default()
         };
         assert_eq!(
             config.nrf_url.as_deref(),

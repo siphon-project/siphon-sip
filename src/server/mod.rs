@@ -385,7 +385,7 @@ impl SiphonServer {
             });
             (Arc::new(config), Some((path.to_owned(), document)))
         };
-        // Validate SBI TLS before starting listeners or background tasks. Read
+        // Validate SBI TLS and bearer authentication before starting listeners or background tasks. Read
         // files once and retain the material for timeout-specific clients.
         let sbi_clients = config.sbi.as_ref().map(|sbi| {
             let result = (|| -> Result<_, String> {

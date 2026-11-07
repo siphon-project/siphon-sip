@@ -326,6 +326,8 @@ fn default_ifc_key_prefix() -> String {
 /// Top-level `sbi:` configuration for 5G Service-Based Interface.
 #[derive(Debug, Deserialize, Clone)]
 pub struct SbiYamlConfig {
+    /// Static bearer credential file (environment expansion supported).
+    pub bearer_token_file: Option<String>,
     /// Outbound SBI TLS trust anchors and optional client identity.
     pub tls: Option<crate::sbi::SbiTlsConfig>,
     /// NRF discovery endpoint URL.
@@ -377,6 +379,10 @@ impl SbiYamlConfig {
     pub fn to_sbi_config(&self) -> crate::sbi::SbiConfig {
         crate::sbi::SbiConfig {
             tls: self.tls.clone(),
+            bearer_token_file: self.bearer_token_file.clone(),
+            npcf_url: self.npcf_url.clone(),
+            bsf_url: self.bsf_url.clone(),
+            nchf_url: self.nchf_url.clone(),
             nrf_url: self.nrf_url.clone(),
             timeout_secs: self.timeout_secs,
             oauth2_client_id: self.oauth2_client_id.clone(),
