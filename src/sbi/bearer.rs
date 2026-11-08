@@ -1,16 +1,16 @@
 //! Startup-only loading and validation of static bearer credentials.
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, PROXY_AUTHORIZATION};
 
 /// The loaded credential never exposes its contents through Debug.
 #[derive(Default)]
-pub(super) struct LoadedBearer(Option<HeaderValue>);
+pub(super) struct LoadedBearer(Option<(HeaderName, HeaderValue)>);
 
 impl std::fmt::Debug for LoadedBearer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_tuple("LoadedBearer")
-            .field(&self.0.as_ref().map(|_| "[REDACTED]"))
+            .field(&self.0.as_ref().map(|(name, _)| (name, "[REDACTED]")))
             .finish()
     }
 }
@@ -48,15 +48,19 @@ impl LoadedBearer {
         let mut header = HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|_| format!("SBI bearer token file '{path}': invalid header value"))?;
         header.set_sensitive(true);
-        Ok(Self(Some(header)))
+        let name = match config.bearer_token_header {
+            super::SbiBearerHeader::Authorization => AUTHORIZATION,
+            super::SbiBearerHeader::ProxyAuthorization => PROXY_AUTHORIZATION,
+        };
+        Ok(Self(Some((name, header))))
     }
 
     pub(super) fn apply(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-        let Some(header) = &self.0 else {
+        let Some((name, header)) = &self.0 else {
             return builder;
         };
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, header.clone());
+        headers.insert(name.clone(), header.clone());
         // reqwest defaults fill only vacant entries, preserving explicit credentials.
         builder.default_headers(headers)
     }
