@@ -16,10 +16,13 @@ entry, but a working config keeps working.
 ### Added
 
 - **Redis / Valkey Sentinel targets.** `registrar.redis`, each registrar shard in `urls` and each named `cache` take `sentinel: {addresses, master, password, sentinel_password, db}` instead of `url` (exactly one of the two). iFC and presence persistence follow the registrar's target. After a failover the new primary is rediscovered, with bounded backoff off the request path, and the failed command is retried once. Without `sentinel` nothing changes.
+- SBI outbound TLS supports a private CA bundle, a PEM client certificate and key for mutual TLS, and optional removal of public roots through `sbi.tls`. Npcf and Nbsf share the manager's TLS settings, retaining the BSF timeout override. TLS files are loaded once; rotation requires a restart.
+- Optional `sbi.bearer_token_file` adds static bearer authentication to every manager-built SBI client, preserving explicit Authorization headers. Tokens are loaded once, validated and redacted; configured remote HTTP peers are refused when a token is set. Restart to rotate the token.
 
 ### Changed
 
 - **`cache.store` and `cache.delete` return `False` when the Redis write fails.** They returned `True` whenever the cache name was known, so a script could not tell a value that only reached the local LRU from one that reached Redis. The local LRU is still updated either way. A cache without Redis is unchanged. Mirrored in the SDK mock's docstrings.
+- **BREAKING (Rust API):** `SbiManager::new` returns `Result` so invalid TLS material or HTTP client construction fails startup instead of silently using a default client. Rust consumers must handle the error.
 
 ## [1.15.12] — 2026-11-05
 

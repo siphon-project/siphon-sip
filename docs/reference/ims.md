@@ -38,6 +38,71 @@ matches = isc.evaluate(
 5G Service-Based Interface — N5/Npcf policy authorization plus Nbsf_Management
 PCF discovery.
 
+### Outbound TLS
+
+Use HTTPS endpoint URLs for TLS on SBI (TS 33.501 clause 13.1). The optional
+`tls` block applies to the manager's HTTP client and the Npcf and Nbsf clients
+created at startup:
+
+```yaml
+sbi:
+  npcf_url: "https://pcf.example.com"
+  bsf_url: "https://bsf.example.com"
+  tls:
+    ca: "${SBI_TLS_DIR}/ca.pem"
+    cert: "${SBI_TLS_DIR}/client-chain.pem"
+    key: "${SBI_TLS_DIR}/client-key.pem"
+    trust_public_roots: true
+```
+
+`ca` is an optional PEM bundle of trusted CA certificates. `cert` is a PEM
+client certificate chain (leaf first), and `key` is its PEM private key; both
+must be supplied together for mutual TLS. Paths support the usual `${VAR}`
+expansion. `trust_public_roots` defaults to `true`, adding the configured CAs
+to the public roots. Set it to `false` to trust only the supplied CAs. Omitting
+`tls` preserves public roots and sends no client certificate.
+
+Unreadable files, invalid certificates or keys, mismatched identities, and
+HTTP client construction failures stop startup with an error. Files are read
+once when the manager is created. Restart after certificate or CA rotation,
+including cert-manager updates: SIGHUP and script reload do not rebuild this
+manager. This block configures outbound connections, not the callback listener.
+
+Rust consumers should handle the `Result` returned by `SbiManager::new` and
+clone `manager.client()` for Npcf, Nbsf, Nchf, or other SBI requests.
+`client_with_timeout` builds a client with the same cached TLS material and a
+different timeout. NRF discovery and access-token requests are not yet
+implemented; future implementations must use this configured client too.
+
+### Static bearer authentication
+
+For an SCP or producer that authenticates consumers with a pre-shared token:
+
+```yaml
+sbi:
+  npcf_url: "https://pcf.example.com"
+  bsf_url: "https://bsf.example.com"
+  bearer_token_file: "${SBI_TOKEN_DIR}/bearer-token"
+```
+
+The optional path supports normal environment expansion and can be used alongside
+`sbi.tls`. The file is read once at startup, with surrounding whitespace trimmed.
+Empty or unreadable files and tokens outside RFC 6750's `b64token` grammar stop
+startup with an error naming the file. Tokens contain ASCII letters, digits,
+`-`, `.`, `_`, `~`, `+`, or `/`, optionally followed by trailing `=` padding.
+Token values are redacted from Debug output.
+
+Every client built by `SbiManager`, including timeout-specific clients, sends
+`Authorization: Bearer <token>` unless the request supplies its own Authorization
+header. Omitting the setting preserves the existing behavior. Restart to rotate
+the token; reload does not reread it.
+
+With a token configured, `npcf_url`, `bsf_url`, `nchf_url`, and `nrf_url` must
+use HTTPS, except that HTTP is allowed for loopback IP literals and `localhost`.
+Remote HTTP endpoints fail startup. Use HTTPS for dynamically discovered PCF
+endpoints too (`pcf_scheme: https`); startup validation covers configured URLs.
+Rust consumers must supply their peer URLs in `SbiConfig` for this validation.
+
 ### PCF callbacks
 
 The PCF calls back over HTTP on the address in `sbi.notif_listen`. Advertise

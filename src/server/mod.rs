@@ -385,6 +385,28 @@ impl SiphonServer {
             });
             (Arc::new(config), Some((path.to_owned(), document)))
         };
+        // Validate SBI TLS and bearer authentication before starting listeners or background tasks. Read
+        // files once and retain the material for timeout-specific clients.
+        let sbi_clients = config.sbi.as_ref().map(|sbi| {
+            let result = (|| -> Result<_, String> {
+                let manager = crate::sbi::SbiManager::new(sbi.to_sbi_config())?;
+                let bsf_http = sbi
+                    .bsf_url
+                    .as_ref()
+                    .map(|_| {
+                        manager.client_with_timeout(std::time::Duration::from_millis(
+                            sbi.bsf_timeout_ms
+                                .unwrap_or(sbi.timeout_secs.saturating_mul(1000)),
+                        ))
+                    })
+                    .transpose()?;
+                Ok((manager, bsf_http))
+            })();
+            result.unwrap_or_else(|error| {
+                eprintln!("Failed to initialize SBI client: {error}");
+                std::process::exit(1);
+            })
+        });
         // One `Server` / `User-Agent` pair shared by the dispatcher, the UAC
         // and the registrant; `POST /admin/config/reload` swaps it.
         let identity = crate::config::IdentityHeaders::resolve(
@@ -2386,9 +2408,7 @@ impl SiphonServer {
         // into the dispatcher below.
 
         // --- SBI client ---
-        if let Some(ref sbi_config) = config.sbi {
-            let sbi_internal_config = sbi_config.to_sbi_config();
-            let _sbi_manager = crate::sbi::SbiManager::new(sbi_internal_config);
+        if let (Some(sbi_config), Some((sbi_manager, bsf_http))) = (&config.sbi, sbi_clients) {
             info!("SBI client initialized");
             if let Some(ref nrf_url) = sbi_config.nrf_url {
                 info!(nrf_url = %nrf_url, "NRF discovery endpoint configured");
@@ -2403,34 +2423,25 @@ impl SiphonServer {
                 );
                 let requester_nf_type = sbi_config.requester_nf_type.as_deref().unwrap_or("AF");
 
-                let http_client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(sbi_config.timeout_secs))
-                    .build()
-                    .unwrap_or_default();
+                let http_client = sbi_manager.client().clone();
                 let npcf_client = std::sync::Arc::new(
                     crate::sbi::npcf::NpcfClient::new(npcf_url, http_client)
                         .with_communication(communication),
                 );
 
-                // Optional Nbsf_Management (BSF) discovery client. Its own
-                // reqwest client carries the BSF-specific timeout
-                // (bsf_timeout_ms, falling back to timeout_secs).
-                let bsf_client = sbi_config.bsf_url.as_ref().map(|bsf_url| {
-                    let bsf_timeout = std::time::Duration::from_millis(
-                        sbi_config
-                            .bsf_timeout_ms
-                            .unwrap_or(sbi_config.timeout_secs.saturating_mul(1000)),
-                    );
-                    let bsf_http = reqwest::Client::builder()
-                        .timeout(bsf_timeout)
-                        .build()
-                        .unwrap_or_default();
-                    std::sync::Arc::new(
-                        crate::sbi::nbsf::BsfClient::new(bsf_url, bsf_http)
-                            .with_communication(communication)
-                            .with_requester_nf_type(requester_nf_type),
-                    )
-                });
+                // The BSF timeout override uses the same startup-loaded TLS material.
+                let bsf_client =
+                    sbi_config
+                        .bsf_url
+                        .as_ref()
+                        .zip(bsf_http)
+                        .map(|(bsf_url, http)| {
+                            std::sync::Arc::new(
+                                crate::sbi::nbsf::BsfClient::new(bsf_url, http)
+                                    .with_communication(communication)
+                                    .with_requester_nf_type(requester_nf_type),
+                            )
+                        });
                 let pcf_scheme = crate::sbi::nbsf::Scheme::from_config_str(
                     sbi_config.pcf_scheme.as_deref().unwrap_or("http"),
                 );
