@@ -379,7 +379,11 @@ impl SbiYamlConfig {
     pub fn to_sbi_config(&self) -> crate::sbi::SbiConfig {
         crate::sbi::SbiConfig {
             tls: self.tls.clone(),
-            bearer_token_file: self.bearer_token_file.clone(),
+            // Empty is unset, as for a path taken from the environment.
+            bearer_token_file: self
+                .bearer_token_file
+                .clone()
+                .filter(|path| !path.trim().is_empty()),
             npcf_url: self.npcf_url.clone(),
             bsf_url: self.bsf_url.clone(),
             nchf_url: self.nchf_url.clone(),
@@ -388,5 +392,25 @@ impl SbiYamlConfig {
             oauth2_client_id: self.oauth2_client_id.clone(),
             oauth2_client_secret: self.oauth2_client_secret.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod empty_bearer_tests {
+    #[test]
+    fn an_empty_bearer_token_file_is_unset() {
+        for value in ["\"\"", "\"  \""] {
+            let yaml = format!("bearer_token_file: {value}\n");
+            let config: super::SbiYamlConfig =
+                serde_saphyr::from_str(&yaml).expect("sbi config parses");
+            assert_eq!(config.to_sbi_config().bearer_token_file, None, "{value}");
+        }
+        let config: super::SbiYamlConfig =
+            serde_saphyr::from_str("bearer_token_file: /run/secrets/token\n")
+                .expect("sbi config parses");
+        assert_eq!(
+            config.to_sbi_config().bearer_token_file.as_deref(),
+            Some("/run/secrets/token")
+        );
     }
 }

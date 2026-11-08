@@ -24,6 +24,7 @@ entry, but a working config keeps working.
 
 ### Changed
 
+- **An empty SBI credential path is unset.** `sbi.bearer_token_file` and the `ca`, `cert` and `key` of `sbi.tls` given as an empty string (`"${SBI_CA_FILE:-}"` with the variable unset) are now left out instead of failing startup, so one configuration file serves a deployment with SBI TLS and a token and one without. A certificate without its key is still refused.
 - **`cache.store` and `cache.delete` return `False` when the Redis write fails.** They returned `True` whenever the cache name was known, so a script could not tell a value that only reached the local LRU from one that reached Redis. The local LRU is still updated either way. A cache without Redis is unchanged. Mirrored in the SDK mock's docstrings.
 - **BREAKING (Rust API):** `SbiManager::new` returns `Result` so invalid TLS material or HTTP client construction fails startup instead of silently using a default client. Rust consumers must handle the error.
 
