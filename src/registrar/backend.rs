@@ -506,11 +506,10 @@ impl RegistrarBackend for MemoryBackend {
 /// Redis backend configuration.
 #[derive(Debug, Clone)]
 pub struct RedisBackendConfig {
-    /// Redis connection URL (e.g., "redis://127.0.0.1:6379").
-    /// Used when `shard_count` is 0.
-    pub url: String,
-    /// List of shard URLs. Must have `shard_count` entries when sharding is enabled.
-    pub urls: Vec<String>,
+    /// Redis URL or Sentinel master set, used when `shard_count` is 0.
+    pub target: crate::redis_target::RedisTarget,
+    /// Shard targets. Must have `shard_count` entries when sharding is enabled.
+    pub urls: Vec<crate::redis_target::RedisTarget>,
     /// Key prefix for registrar entries.
     pub key_prefix: String,
     /// Number of shards. 0 = no sharding (use `url`), >0 = shard by AoR hash.
@@ -523,7 +522,7 @@ pub struct RedisBackendConfig {
 impl Default for RedisBackendConfig {
     fn default() -> Self {
         Self {
-            url: "redis://127.0.0.1:6379".to_string(),
+            target: crate::redis_target::RedisTarget::default(),
             urls: Vec::new(),
             key_prefix: "siphon:reg:".to_string(),
             shard_count: 0,

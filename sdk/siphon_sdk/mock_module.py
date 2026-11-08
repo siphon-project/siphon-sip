@@ -5079,7 +5079,9 @@ class MockCache:
                 so the value is accepted and ignored.
 
         Returns:
-            ``True`` if stored, ``False`` if cache name unknown.
+            ``True`` if stored, ``False`` if the cache name is unknown or the
+            Redis write failed (the local LRU, when configured, still holds
+            the value). The mock never fails a write.
         """
         if name not in self._stores:
             return False
@@ -5091,7 +5093,13 @@ class MockCache:
         return name in self._stores
 
     async def delete(self, name: str, key: str) -> bool:
-        """Delete a key. Returns ``True`` if the cache exists."""
+        """Delete a key.
+
+        Returns:
+            ``True`` if the delete reached the backend (the key may or may not
+            have existed), ``False`` if the cache name is unknown or the Redis
+            delete failed. The mock never fails a delete.
+        """
         if name not in self._stores:
             return False
         self._stores[name].pop(key, None)

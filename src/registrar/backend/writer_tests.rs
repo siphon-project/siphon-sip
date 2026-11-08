@@ -414,7 +414,7 @@ async fn an_eviction_burst_through_the_writer_reaches_redis_in_full() {
         .unwrap_or_default()
         .as_nanos();
     let config = RedisBackendConfig {
-        url,
+        target: url.into(),
         key_prefix: format!("siphon-test:writer-burst:{}:{nanos}:", std::process::id()),
         ..RedisBackendConfig::default()
     };

@@ -209,3 +209,5 @@ pub(crate) mod log_capture {
         }
     }
 }
+
+pub mod redis_target;

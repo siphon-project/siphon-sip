@@ -251,10 +251,10 @@ pub(super) async fn init_registrar_backend(config: &Config) {
                 }
             };
             let redis_config = backend::RedisBackendConfig {
-                url: redis_cfg.url.clone(),
-                urls: Vec::new(),
+                target: redis_cfg.target.clone(),
+                urls: redis_cfg.urls.clone(),
                 key_prefix: redis_cfg.key_prefix.clone(),
-                shard_count: 0,
+                shard_count: redis_cfg.shard_count,
                 ttl_slack_secs: redis_cfg.ttl_slack_secs as u64,
             };
             match backend::RedisBackend::connect(redis_config).await {
@@ -276,7 +276,7 @@ pub(super) async fn init_registrar_backend(config: &Config) {
 
                     // --- iFC profile persistence (shares the same Redis instance) ---
                     init_ifc_redis_backend(
-                        &redis_cfg.url,
+                        &redis_cfg.target,
                         u64::from(redis_cfg.ttl_slack_secs),
                         config,
                     )
@@ -356,20 +356,14 @@ pub(super) async fn init_presence_redis_backend(redis: &crate::config::RedisBack
     let Some(store) = crate::presence::global_store() else {
         return;
     };
-    let client = match redis::Client::open(redis.url.as_str()) {
-        Ok(client) => client,
-        Err(error) => {
-            error!(%error, "failed to open Redis client for presence subscriptions");
-            return;
-        }
-    };
-    let mut connection = match client.get_multiplexed_async_connection().await {
-        Ok(connection) => connection,
-        Err(error) => {
-            error!(%error, "failed to connect to Redis for presence subscriptions");
-            return;
-        }
-    };
+    let mut connection =
+        match crate::redis_target::RedisConnection::connect(redis.target.clone()).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                error!(%error, "failed to connect to Redis for presence subscriptions");
+                return;
+            }
+        };
 
     let started = std::time::Instant::now();
     let dropped = match crate::presence::persist::restore_presence_subscriptions(
@@ -394,8 +388,7 @@ pub(super) async fn init_presence_redis_backend(redis: &crate::config::RedisBack
         }
     };
 
-    let writer = crate::presence::persist::spawn_presence_redis_writer(
-        client,
+    let writer = crate::presence::persist::spawn_presence_writer_with_connection(
         connection,
         redis.presence_key_prefix.clone(),
         u64::from(redis.ttl_slack_secs),
@@ -417,7 +410,7 @@ pub(super) async fn init_presence_redis_backend(redis: &crate::config::RedisBack
 /// skipped with a loud warning rather than silently doing nothing.
 #[cfg(not(feature = "redis-backend"))]
 pub(super) async fn init_ifc_redis_backend(
-    _redis_url: &str,
+    _redis_target: &crate::redis_target::RedisTarget,
     _ttl_slack_secs: u64,
     _config: &Config,
 ) {
@@ -432,7 +425,11 @@ pub(super) async fn init_ifc_redis_backend(
 /// Called from `init_registrar_backend` when the registrar uses a Redis backend,
 /// reusing the same Redis instance for iFC profile storage.
 #[cfg(feature = "redis-backend")]
-pub(super) async fn init_ifc_redis_backend(redis_url: &str, ttl_slack_secs: u64, config: &Config) {
+pub(super) async fn init_ifc_redis_backend(
+    redis_target: &crate::redis_target::RedisTarget,
+    ttl_slack_secs: u64,
+    config: &Config,
+) {
     use crate::script::api::ifc_store_arc;
 
     let ifc_store = match ifc_store_arc() {
@@ -446,21 +443,14 @@ pub(super) async fn init_ifc_redis_backend(redis_url: &str, ttl_slack_secs: u64,
         .map(|isc| isc.ifc_key_prefix.clone())
         .unwrap_or_else(|| "siphon:ifc:".to_owned());
 
-    let client = match redis::Client::open(redis_url) {
-        Ok(client) => client,
-        Err(error) => {
-            error!(%error, "failed to open Redis client for iFC backend");
-            return;
-        }
-    };
-
-    let mut connection = match client.get_multiplexed_async_connection().await {
-        Ok(connection) => connection,
-        Err(error) => {
-            error!(%error, "failed to connect to Redis for iFC backend");
-            return;
-        }
-    };
+    let mut connection =
+        match crate::redis_target::RedisConnection::connect(redis_target.clone()).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                error!(%error, "failed to connect to Redis for iFC backend");
+                return;
+            }
+        };
 
     // Restore iFC profiles from Redis.
     match crate::ifc::restore_ifc_profiles(&mut connection, &ifc_key_prefix, ifc_store).await {
@@ -479,12 +469,8 @@ pub(super) async fn init_ifc_redis_backend(redis_url: &str, ttl_slack_secs: u64,
     // TTL slack, and every store of the profile (each SAR) renews it, so a
     // profile outlives its registration by at most that and no longer.
     let ttl_secs = u64::from(config.registrar.max_expires).saturating_add(ttl_slack_secs);
-    let writer = crate::ifc::spawn_ifc_backend_writer_with_client_and_ttl(
-        client,
-        connection,
-        ifc_key_prefix,
-        ttl_secs,
-    );
+    let writer =
+        crate::ifc::spawn_ifc_backend_writer_with_connection(connection, ifc_key_prefix, ttl_secs);
     ifc_store.set_backend_writer(writer);
     info!("iFC Redis backend writer initialized");
 }

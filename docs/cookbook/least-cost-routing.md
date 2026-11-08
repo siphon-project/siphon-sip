@@ -448,3 +448,8 @@ The carrier that won is on `call.active_route` (a `Route`: `carrier_id`,
 
 See the [Online charging (OCS)](online-charging-ocs.md) recipe for the full Ro
 setup (reserve-before-connect gate, re-auth timer, CGRateS).
+
+Redis targets also support a `sentinel` block in place of `url`; see
+[Redis / Valkey Sentinel](../deployment.md#redis--valkey-sentinel) for the shared
+registrar/cache form, credentials, sharding, and recovery behavior. iFC persistence
+inherits the registrar target.

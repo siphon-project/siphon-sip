@@ -13,6 +13,14 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **Redis / Valkey Sentinel targets.** `registrar.redis`, each registrar shard in `urls` and each named `cache` take `sentinel: {addresses, master, password, sentinel_password, db}` instead of `url` (exactly one of the two). iFC and presence persistence follow the registrar's target. After a failover the new primary is rediscovered, with bounded backoff off the request path, and the failed command is retried once. Without `sentinel` nothing changes.
+
+### Changed
+
+- **`cache.store` and `cache.delete` return `False` when the Redis write fails.** They returned `True` whenever the cache name was known, so a script could not tell a value that only reached the local LRU from one that reached Redis. The local LRU is still updated either way. A cache without Redis is unchanged. Mirrored in the SDK mock's docstrings.
+
 ## [1.15.12] — 2026-11-05
 
 ### Fixed

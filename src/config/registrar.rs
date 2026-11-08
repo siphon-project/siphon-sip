@@ -146,8 +146,29 @@ pub enum RegistrarBackendType {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(try_from = "RawRedisBackendConfig")]
 pub struct RedisBackendConfig {
-    pub url: String,
+    pub target: crate::redis_target::RedisTarget,
+    pub urls: Vec<crate::redis_target::RedisTarget>,
+    pub shard_count: usize,
+    /// Key prefix for all registrar entries (default: "siphon:reg:").
+    pub key_prefix: String,
+    /// Extra seconds beyond `expires` to retain keys, to avoid race conditions.
+    pub ttl_slack_secs: u32,
+    /// Key prefix of the presence store's subscriptions, written through to
+    /// this same Redis and restored at boot (default: "siphon:presence:").
+    /// Kept apart from `key_prefix`, so neither restore walks the other's keys.
+    pub presence_key_prefix: String,
+}
+
+#[derive(Deserialize)]
+struct RawRedisBackendConfig {
+    #[serde(flatten)]
+    pub target: crate::redis_target::TargetFields,
+    #[serde(default, deserialize_with = "crate::redis_target::deserialize_shards")]
+    pub urls: Vec<crate::redis_target::RedisTarget>,
+    #[serde(default)]
+    pub shard_count: usize,
     /// Key prefix for all registrar entries (default: "siphon:reg:").
     #[serde(default = "default_redis_key_prefix")]
     pub key_prefix: String,
@@ -159,6 +180,32 @@ pub struct RedisBackendConfig {
     /// Kept apart from `key_prefix`, so neither restore walks the other's keys.
     #[serde(default = "default_presence_key_prefix")]
     pub presence_key_prefix: String,
+}
+
+impl TryFrom<RawRedisBackendConfig> for RedisBackendConfig {
+    type Error = String;
+    fn try_from(raw: RawRedisBackendConfig) -> Result<Self, Self::Error> {
+        if raw.urls.len() != raw.shard_count {
+            return Err("Redis shard_count must match the number of urls".into());
+        }
+        // In sharded mode the first shard also hosts iFC and presence data.
+        let target = if raw.target.url.is_none() && raw.target.sentinel.is_none() {
+            match raw.urls.first() {
+                Some(target) => target.clone(),
+                None => return Err("Redis requires exactly one of url or sentinel".into()),
+            }
+        } else {
+            raw.target.resolve()?
+        };
+        Ok(Self {
+            target,
+            urls: raw.urls,
+            shard_count: raw.shard_count,
+            key_prefix: raw.key_prefix,
+            ttl_slack_secs: raw.ttl_slack_secs,
+            presence_key_prefix: raw.presence_key_prefix,
+        })
+    }
 }
 
 fn default_redis_key_prefix() -> String {

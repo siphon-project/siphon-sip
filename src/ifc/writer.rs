@@ -228,3 +228,13 @@ impl WriteSink<String, IfcWrite> for IfcRedisSink {
         .await
     }
 }
+
+/// Spawn persistence using the shared recovering connection.
+#[cfg(feature = "redis-backend")]
+pub fn spawn_ifc_backend_writer_with_connection(
+    connection: crate::redis_target::RedisConnection,
+    key_prefix: String,
+    ttl_secs: u64,
+) -> IfcBackendWriter {
+    spawn_ifc_redis_writer(RedisLink::from_connection(connection), key_prefix, ttl_secs)
+}

@@ -854,8 +854,8 @@ log:
     assert_eq!(config.registrar.backend, RegistrarBackendType::Redis);
     assert_eq!(config.registrar.default_expires, 1800);
     assert_eq!(
-        config.registrar.redis.as_ref().unwrap().url,
-        "redis://127.0.0.1:6379"
+        config.registrar.redis.as_ref().unwrap().target,
+        crate::redis_target::RedisTarget::Url("redis://127.0.0.1:6379".into())
     );
     assert_eq!(config.auth.users.get("alice").unwrap(), "secret");
     assert_eq!(config.log.level, LogLevel::Debug);

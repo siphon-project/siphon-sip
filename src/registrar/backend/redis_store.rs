@@ -61,13 +61,11 @@ impl RedisBackend {
             }
             config.urls.clone()
         } else {
-            vec![config.url.clone()]
+            vec![config.target.clone()]
         };
         let mut links = Vec::with_capacity(urls.len());
         for url in &urls {
-            let client = redis::Client::open(url.as_str())
-                .map_err(|error| BackendError::Connection(error.to_string()))?;
-            links.push(RedisLink::connect(client).await?);
+            links.push(RedisLink::connect_target(url.clone()).await?);
         }
         if config.shard_count > 0 {
             tracing::info!(
