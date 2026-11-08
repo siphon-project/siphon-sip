@@ -52,8 +52,18 @@ pub(super) fn router(script_state: Arc<ArcSwap<ScriptState>>) -> Router {
         .with_state(CallbackState { script_state })
 }
 
-/// Bind `address` and serve the callback routes on it.
-pub(super) fn spawn_listener(address: SocketAddr, script_state: Arc<ArcSwap<ScriptState>>) {
+/// Validate TLS at startup, then bind and serve the configured callback listener.
+pub(super) fn spawn_listener(
+    config: &crate::config::SbiYamlConfig,
+    script_state: Arc<ArcSwap<ScriptState>>,
+) -> Result<(), String> {
+    let acceptor = super::sbi_notif_tls::load(config.notif_tls.as_ref())?;
+    let Some(listen) = &config.notif_listen else {
+        return Ok(());
+    };
+    let address: SocketAddr = listen
+        .parse()
+        .map_err(|error| format!("Invalid sbi.notif_listen address '{listen}': {error}"))?;
     let app = router(script_state);
     tokio::spawn(async move {
         match tokio::net::TcpListener::bind(address).await {
@@ -62,7 +72,9 @@ pub(super) fn spawn_listener(address: SocketAddr, script_state: Arc<ArcSwap<Scri
                     %address,
                     "SBI callback listener started on /sbi/events/notify and /sbi/events/terminate"
                 );
-                if let Err(error) = axum::serve(listener, app).await {
+                if let Some(acceptor) = acceptor {
+                    super::sbi_notif_tls::serve(listener, app, acceptor).await;
+                } else if let Err(error) = axum::serve(listener, app).await {
                     error!("SBI callback server failed: {error}");
                 }
             }
@@ -71,6 +83,7 @@ pub(super) fn spawn_listener(address: SocketAddr, script_state: Arc<ArcSwap<Scri
             }
         }
     });
+    Ok(())
 }
 
 async fn handle_callback(

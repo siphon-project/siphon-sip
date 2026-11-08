@@ -109,8 +109,8 @@ Rust consumers must supply their peer URLs in `SbiConfig` for this validation.
 
 ### PCF callbacks
 
-The PCF calls back over HTTP on the address in `sbi.notif_listen`. Advertise
-`http://<notif_listen>/sbi/events` as `notif_uri`; the PCF appends the
+The PCF calls back on the address in `sbi.notif_listen` (plain HTTP by default).
+Advertise the externally reachable callback base as `notif_uri`; the PCF appends the
 TS 29.514 suffix for each callback, so one listener serves both.
 
 `notifUri` is a required attribute of the create (TS 29.514), so
@@ -124,6 +124,36 @@ sbi:
   notif_listen: "0.0.0.0:8080"
   notif_uri: "http://192.0.2.10:8080/sbi/events"   # how the PCF reaches notif_listen
 ```
+
+To serve HTTPS directly, configure `notif_tls`. TLS negotiates `h2` through
+ALPN for TS 29.500 HTTP/2, with `http/1.1` as a fallback:
+
+```yaml
+sbi:
+  notif_listen: "0.0.0.0:8443"
+  notif_uri: "https://notif.example.net:8443/sbi/events"
+  notif_tls:
+    cert: "${SBI_NOTIF_CERT:-}"
+    key: "${SBI_NOTIF_KEY:-}"
+    client_ca: "${SBI_NOTIF_CLIENT_CA:-}"
+```
+
+`cert` is the PEM server certificate chain (leaf first); `key` is its PEM
+private key. Set both environment variables to enable TLS. A nonempty
+`client_ca` names a PEM CA bundle: clients must present a certificate verified
+against it (mutual TLS). Without it, no client certificate is requested.
+These inbound settings are independent of the outbound `sbi.tls` settings.
+
+Empty paths count as unset. With no `notif_tls`, or both `cert` and `key`
+unset, the listener stays plain HTTP; `client_ca` alone does not enable TLS.
+Setting only one of `cert` and `key` fails startup. Unreadable or invalid TLS
+files fail startup and name the offending file; there is no fallback to HTTP.
+Files are loaded once at startup; restart to rotate certificates or trust anchors.
+Handshake failures affect only that connection.
+
+`notif_uri` is always the operator's advertised URI and is never rewritten.
+Use `https://` when the PCF reaches a TLS endpoint, accounting for any proxy
+or address translation in front of the listener.
 
 | Route | Body (verbatim dict) | Hook |
 |---|---|---|

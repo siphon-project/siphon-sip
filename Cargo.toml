@@ -98,8 +98,9 @@ http = "1"
 # handler needs the peer certificate (to bind `admfIdentifier` to it) and the
 # TLS acceptor has to be ours to get at it. Both crates are already in the
 # tree via axum/reqwest; naming them here adds no new supply chain.
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+# SBI notification TLS serves the axum Router over HTTP/2 or HTTP/1.1.
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 http-body-util = "0.1"
 
 # Diameter AVP decoding

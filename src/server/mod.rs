@@ -11,11 +11,14 @@ pub(crate) mod shutdown_sequence;
 use shutdown_sequence::run_shutdown_sequence;
 mod event_clock;
 mod sbi_callbacks;
+mod sbi_notif_tls;
 
 #[cfg(test)]
 mod event_clock_tests;
 #[cfg(test)]
 mod sbi_callbacks_tests;
+#[cfg(test)]
+mod sbi_notif_tls_tests;
 #[cfg(test)]
 mod tests;
 
@@ -2406,16 +2409,9 @@ impl SiphonServer {
 
             // N5 callback listener: TS 29.514 eventNotification and
             // terminationRequest (see server::sbi_callbacks).
-            if let Some(ref notif_listen) = sbi_config.notif_listen {
-                let notif_addr: std::net::SocketAddr =
-                    notif_listen.parse().unwrap_or_else(|error| {
-                        eprintln!(
-                            "Invalid sbi.notif_listen address '{}': {error}",
-                            notif_listen
-                        );
-                        std::process::exit(1);
-                    });
-                sbi_callbacks::spawn_listener(notif_addr, engine.state_arc());
+            if let Err(error) = sbi_callbacks::spawn_listener(sbi_config, engine.state_arc()) {
+                eprintln!("{error}");
+                std::process::exit(1);
             }
         }
 

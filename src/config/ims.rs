@@ -363,6 +363,8 @@ pub struct SbiYamlConfig {
     pub requester_nf_type: Option<String>,
     /// Listen address for incoming PCF event notifications (e.g. "0.0.0.0:8080").
     pub notif_listen: Option<String>,
+    /// Optional inbound TLS identity and client trust anchors.
+    pub notif_tls: Option<SbiNotifTlsConfig>,
     /// The callback base URI the PCF reaches this node at, for example
     /// `http://192.0.2.10:8080/sbi/events`. Sent as `notifUri` on every N5
     /// create that does not pass its own `notif_uri`. TS 29.514 requires the
@@ -412,5 +414,48 @@ mod empty_bearer_tests {
             config.to_sbi_config().bearer_token_file.as_deref(),
             Some("/run/secrets/token")
         );
+    }
+}
+
+/// Inbound PCF notification TLS. Empty paths are treated as unset.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(try_from = "NotifTlsFields")]
+pub struct SbiNotifTlsConfig {
+    pub cert: Option<String>,
+    pub key: Option<String>,
+    pub client_ca: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NotifTlsFields {
+    cert: Option<String>,
+    key: Option<String>,
+    client_ca: Option<String>,
+}
+
+impl TryFrom<NotifTlsFields> for SbiNotifTlsConfig {
+    type Error = String;
+
+    fn try_from(fields: NotifTlsFields) -> Result<Self, Self::Error> {
+        let config = Self {
+            cert: fields.cert.filter(|path| !path.is_empty()),
+            key: fields.key.filter(|path| !path.is_empty()),
+            client_ca: fields.client_ca.filter(|path| !path.is_empty()),
+        };
+        config.identity()?;
+        Ok(config)
+    }
+}
+
+impl SbiNotifTlsConfig {
+    /// Validate also for callers constructing the Rust configuration directly.
+    pub(crate) fn identity(&self) -> Result<Option<(&str, &str)>, String> {
+        let cert = self.cert.as_deref().filter(|path| !path.is_empty());
+        let key = self.key.as_deref().filter(|path| !path.is_empty());
+        match (cert, key) {
+            (None, None) => Ok(None),
+            (Some(cert), Some(key)) => Ok(Some((cert, key))),
+            _ => Err("sbi.notif_tls.cert and sbi.notif_tls.key must be supplied together".into()),
+        }
     }
 }
