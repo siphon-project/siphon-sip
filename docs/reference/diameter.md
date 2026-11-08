@@ -663,6 +663,49 @@ same client replaces an older one. Client-mode peers under `diameter.peers` are
 never used here; reach those with `send_request(peer=...)`.
 
 
+### Relaying to a directly connected peer
+
+```python
+peer = diameter.peer_for_host(host, tenant="default")
+```
+
+The open connection to the peer whose Origin-Host is `host`, as a peer
+`req.forward_to` takes, or `None`. Every connection of a Diameter server is
+listed, whichever side opened it: a backend in `servers`, an upstream in
+`connect_to`, a client that dialled in. A peer is listed by the Origin-Host
+it gave in its CER or CEA, from the moment the connection opens, compared
+without regard to case; the entry goes when the connection ends, and a newer
+connection of the same peer replaces an older one.
+
+A relay sends a request whose Destination-Host is a directly connected peer
+to that peer, and routes by realm otherwise (RFC 6733 section 6.1.6). Most
+requests an HSS, an OCS or a PCRF originates name their Destination-Host:
+an S6a Cancel-Location towards the MME that holds the subscriber, a Cx
+Registration-Termination towards the S-CSCF, an S6c Alert-Service-Centre
+towards the SMSC.
+
+```python
+@diameter.on_request
+async def handle(req):
+    if req.dest_host:
+        peer = diameter.peer_for_host(req.dest_host, tenant=req.peer.tenant)
+        if peer is not None:
+            return await req.forward_to(peer)
+    ...  # the route table, by realm and application
+```
+
+`forward_to` appends a Route-Record with the identity of the peer the
+request came from, `request.peer.host` (the Origin-Host of its CER or CEA),
+and answers 3005 when a Route-Record already holds this node's own identity
+or the one given as `identity=` (RFC 6733 sections 6.1.7 and 6.1.9). An
+answer it makes for a next hop that is gone (3002) or silent (3004) carries
+the Hop-by-Hop and End-to-End Identifiers the request came with.
+
+Either end of a connection may send requests (RFC 6733 section 2.1). A
+request a backend sends on a connection this node opened to it (`servers`)
+goes to `@diameter.on_request` like any other, so an HSS behind a relay can
+reach the MMEs and S-CSCFs that are the relay's clients.
+
 ### Requests this node originates
 
 ```python

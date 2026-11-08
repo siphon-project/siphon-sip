@@ -607,6 +607,7 @@ pub fn spawn_diameter_incoming(
                     tenant: "default".to_string(),
                     addr: format!("{}:{}", config.host, config.port),
                     transport: "tcp".to_string(),
+                    host: peer.remote_origin_host().unwrap_or_default().to_owned(),
                 };
                 let origin_host = config.origin_host.clone();
                 let origin_realm = config.origin_realm.clone();

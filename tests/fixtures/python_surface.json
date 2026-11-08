@@ -699,6 +699,10 @@
       "addr": {
         "kind": "getset_descriptor"
       },
+      "host": {
+        "doc": "The Origin-Host the peer gave in its CER or CEA: the identity of the",
+        "kind": "getset_descriptor"
+      },
       "name": {
         "kind": "getset_descriptor"
       },
@@ -801,6 +805,11 @@
         "doc": "Get the number of connected peers.",
         "kind": "method_descriptor",
         "sig": "($self)"
+      },
+      "peer_for_host": {
+        "doc": "The directly connected peer whose Origin-Host is `host`, for",
+        "kind": "method_descriptor",
+        "sig": "($self, host, tenant=None)"
       },
       "peer_pool": {
         "doc": "Build a backend peer pool for `target` (a peer name or list of names)",
