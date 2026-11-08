@@ -15,6 +15,7 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`diameter.peer_for_host(host, tenant=None)`: relay to a directly connected peer.** Returns the open connection whose peer gave `host` as Origin-Host in its CER or CEA, whichever side opened it (`servers`, `connect_to`, clients of the listener), for `req.forward_to`; `None` when there is none. A relay sends a request whose Destination-Host is a directly connected peer to that peer (RFC 6733 section 6.1.6), which a request towards an MME, an S-CSCF or an SMSC needs. Hosts compare without regard to case; a peer is listed from the moment its connection opens and removed when it closes. Mirrored in the SDK mock (`add_peer_host`).
 - **Redis / Valkey Sentinel targets.** `registrar.redis`, each registrar shard in `urls` and each named `cache` take `sentinel: {addresses, master, password, sentinel_password, db}` instead of `url` (exactly one of the two). iFC and presence persistence follow the registrar's target. After a failover the new primary is rediscovered, with bounded backoff off the request path, and the failed command is retried once. Without `sentinel` nothing changes.
 - SBI outbound TLS supports a private CA bundle, a PEM client certificate and key for mutual TLS, and optional removal of public roots through `sbi.tls`. Npcf and Nbsf share the manager's TLS settings, retaining the BSF timeout override. TLS files are loaded once; rotation requires a restart.
 - Optional `sbi.bearer_token_file` adds static bearer authentication to every manager-built SBI client, preserving explicit Authorization headers. Tokens are loaded once, validated and redacted; configured remote HTTP peers are refused when a token is set. Restart to rotate the token.
@@ -23,6 +24,12 @@ entry, but a working config keeps working.
 
 - **`cache.store` and `cache.delete` return `False` when the Redis write fails.** They returned `True` whenever the cache name was known, so a script could not tell a value that only reached the local LRU from one that reached Redis. The local LRU is still updated either way. A cache without Redis is unchanged. Mirrored in the SDK mock's docstrings.
 - **BREAKING (Rust API):** `SbiManager::new` returns `Result` so invalid TLS material or HTTP client construction fails startup instead of silently using a default client. Rust consumers must handle the error.
+
+### Fixed
+
+- **`forward_to` answers with the Hop-by-Hop Identifier the request came with when the next hop fails.** The 3002 or 3004 siphon makes for a backend that is gone, silent or answers what does not parse carried the identifier siphon had used towards the backend, so the peer that sent the request could not match the answer and waited for its own timer (RFC 6733 section 6.2).
+- **Route-Record names the peer a relayed request came from.** `forward_to` recorded this node's own identity; it now records the Origin-Host the previous peer gave in its CER or CEA (RFC 6733 section 6.1.9), so the next hop sees the whole path. The loop check still looks for this node, under its own identity and the one given as `identity=`. The identity is readable as `request.peer.host`.
+- **A request a Diameter backend sends on its `servers` connection is served.** siphon read and dropped every request arriving on a connection it opened to a relay backend, without an answer, so an HSS behind a DRA could not send Cancel-Location, Insert-Subscriber-Data, Delete-Subscriber-Data or Registration-Termination, nor an Alert-Service-Centre over S6c. These requests now go to `@diameter.on_request` like those on `connect_to` and listener connections (RFC 6733 section 2.1: either end may send requests).
 
 ## [1.15.12] — 2026-11-05
 

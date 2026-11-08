@@ -10113,13 +10113,19 @@ class MockEventSink:
 
 
 class MockPeer:
-    """A backend peer handle returned by :class:`MockPeerPool` picks."""
+    """A peer handle: a :class:`MockPeerPool` pick, a
+    :meth:`MockDiameter.peer_for_host` result, or ``request.peer``.
 
-    def __init__(self, name: str, tenant: str, connected: bool = True) -> None:
+    ``host`` is the Origin-Host the peer gave in its CER or CEA, which
+    ``forward_to`` records in Route-Record; empty when not known.
+    """
+
+    def __init__(self, name: str, tenant: str, connected: bool = True, host: str = "") -> None:
         self.name = name
         self.tenant = tenant
         self.addr = f"{name}.example.org:3868"
         self.transport = "tcp"
+        self.host = host
         self._connected = connected
 
     def __bool__(self) -> bool:
@@ -10682,6 +10688,8 @@ class MockDiameter:
 
     def __init__(self) -> None:
         self._peers: dict[str, bool] = {}  # peer_name -> connected
+        # (tenant, lower-case Origin-Host) -> configured peer name
+        self._peer_hosts: dict[tuple[str, str], str] = {}
         self._uar_responses: dict[str, dict] = {}  # public_identity -> response
         self._mar_responses: dict[str, dict] = {}
         self._zh_mar_responses: dict[str, dict] = {}
@@ -11296,6 +11304,21 @@ class MockDiameter:
             name: Peer name.
             connected: Whether the peer should appear as connected.
         """
+        self._peers[name] = connected
+
+    def add_peer_host(self, host: str, name: str, tenant: str = "default",
+                      connected: bool = True) -> None:
+        """Register a directly connected peer by the Origin-Host it gave in
+        its CER or CEA, for :meth:`peer_for_host` (test helper).
+
+        Args:
+            host: The peer's Origin-Host.
+            name: The configured peer it belongs to (``servers``,
+                ``connect_to`` or ``clients``).
+            tenant: Its tenant (``"default"`` for a single-domain server).
+            connected: Whether its connection is open.
+        """
+        self._peer_hosts[(tenant, host.lower())] = name
         self._peers[name] = connected
 
     def set_default_server_name(self, server_name: str) -> None:
@@ -12130,6 +12153,29 @@ class MockDiameter:
         :meth:`add_peer(connected=True)`."""
         names = [target] if isinstance(target, str) else list(target)
         return MockPeerPool(self, tenant, names)
+
+    def peer_for_host(self, host: str, tenant: Optional[str] = None) -> Optional[MockPeer]:
+        """The directly connected peer whose Origin-Host is ``host``, for
+        ``req.forward_to``, or ``None`` when no open connection has it.
+
+        Covers every connection of a Diameter server, whichever side opened
+        it (``servers``, ``connect_to``, ``clients``). A peer is known by the
+        Origin-Host of its CER or CEA, compared without regard to case. A
+        relay sends a request whose Destination-Host is a directly connected
+        peer to that peer (RFC 6733 section 6.1.6)::
+
+            peer = diameter.peer_for_host(req.dest_host, tenant=req.peer.tenant)
+            if peer is not None:
+                return await req.forward_to(peer)
+
+        ``tenant`` defaults to ``"default"``. Register peers in tests with
+        :meth:`add_peer_host`.
+        """
+        scope = tenant or "default"
+        name = self._peer_hosts.get((scope, (host or "").lower()))
+        if name is None or not self._peers.get(name, False):
+            return None
+        return MockPeer(name, scope, host=host)
 
     @staticmethod
     def ip_in_cidr(addr: str, cidr: str) -> bool:

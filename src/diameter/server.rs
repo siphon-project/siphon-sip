@@ -291,6 +291,7 @@ impl ServerHandshake {
         }
 
         let admitted = peer::spawn_connection_tasks(conn_config, stream, incoming_tx);
+        admitted.set_remote_identity(&asserted, peer::identity_avp(&cer.avps, "Origin-Realm"));
         info!(
             tenant = %acl_match.tenant,
             peer = %acl_match.peer,

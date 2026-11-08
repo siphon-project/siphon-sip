@@ -69,14 +69,24 @@ pub fn rewrite_origin(msg: &mut DiameterMsg, origin_host: &str, origin_realm: &s
     msg.avps.push(Avp::utf8(avp::ORIGIN_REALM, 0, origin_realm));
 }
 
-/// Prepare an inbound request for forwarding: detect a loop through us, then
-/// append our Route-Record. Returns [`ForwardError::LoopDetected`] when our
-/// identity is already present.
-pub fn prepare_forward(msg: &mut DiameterMsg, local_identity: &str) -> Result<(), ForwardError> {
-    if has_route_record(msg, local_identity) {
+/// Prepare an inbound request for forwarding (RFC 6733 sections 6.1.7 and
+/// 6.1.9): a loop when a Route-Record already holds one of this node's
+/// `local_identities`, else append a Route-Record with `previous_hop`, the
+/// identity of the peer the request was received from. Every agent records
+/// the peer before it, so a request that comes back to this node carries
+/// this node's identity, recorded by a neighbour.
+pub fn prepare_forward(
+    msg: &mut DiameterMsg,
+    local_identities: &[&str],
+    previous_hop: &str,
+) -> Result<(), ForwardError> {
+    if local_identities
+        .iter()
+        .any(|identity| has_route_record(msg, identity))
+    {
         return Err(ForwardError::LoopDetected);
     }
-    append_route_record(msg, local_identity);
+    append_route_record(msg, previous_hop);
     Ok(())
 }
 
@@ -222,18 +232,38 @@ mod tests {
     }
 
     #[test]
-    fn prepare_forward_appends_then_detects_loop() {
+    fn prepare_forward_records_the_peer_the_request_came_from() {
         let mut msg = sample_request();
-        // First pass: clean, appends our record.
-        assert_eq!(prepare_forward(&mut msg, "diam.example.org"), Ok(()));
-        assert_eq!(msg.find_all(avp::ROUTE_RECORD, 0).count(), 1);
-        // Second pass through the same Diameter server: loop.
         assert_eq!(
-            prepare_forward(&mut msg, "diam.example.org"),
-            Err(ForwardError::LoopDetected)
+            prepare_forward(&mut msg, &["dra-1.example.org"], "mme-1.example.org"),
+            Ok(())
         );
-        // No duplicate Route-Record was added on the loop path.
-        assert_eq!(msg.find_all(avp::ROUTE_RECORD, 0).count(), 1);
+        let records: Vec<_> = msg
+            .find_all(avp::ROUTE_RECORD, 0)
+            .filter_map(|record| record.as_str())
+            .collect();
+        assert_eq!(records, ["mme-1.example.org"]);
+    }
+
+    #[test]
+    fn prepare_forward_finds_a_loop_through_any_identity_of_this_node() {
+        // The next agent recorded this node; the request came back.
+        for identity in ["dra-1.example.org", "hidden.example.org"] {
+            let mut msg = sample_request();
+            append_route_record(&mut msg, "mme-1.example.org");
+            append_route_record(&mut msg, identity);
+            assert_eq!(
+                prepare_forward(
+                    &mut msg,
+                    &["dra-1.example.org", "hidden.example.org"],
+                    "dra-2.example.org"
+                ),
+                Err(ForwardError::LoopDetected),
+                "{identity}"
+            );
+            // No Route-Record was added on the loop path.
+            assert_eq!(msg.find_all(avp::ROUTE_RECORD, 0).count(), 2);
+        }
     }
 
     #[test]

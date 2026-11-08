@@ -16,6 +16,7 @@ pub mod cx;
 #[cfg(test)]
 pub(crate) mod cx_test_support;
 pub mod dictionary;
+pub(crate) mod directory;
 pub mod event_sink;
 pub mod forward;
 pub mod gba;

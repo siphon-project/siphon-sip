@@ -2163,6 +2163,36 @@ impl PyDiameter {
         Ok(crate::script::api::diameter_server::PyPeerPool::new(pool))
     }
 
+    /// The directly connected peer whose Origin-Host is `host`, for
+    /// `request.forward_to`, or None when no open connection has it.
+    ///
+    /// Covers every connection of a Diameter server, whichever side opened
+    /// it: backends in `servers`, upstreams in `connect_to` and clients that
+    /// dialled in. A peer is known by the Origin-Host it gave in its CER or
+    /// CEA, compared without regard to case, from the moment the connection
+    /// opens. A relay sends a request whose Destination-Host is a directly
+    /// connected peer to that peer (RFC 6733 section 6.1.6):
+    ///
+    /// ```python,ignore
+    /// peer = diameter.peer_for_host(req.dest_host, tenant=req.peer.tenant)
+    /// if peer is not None:
+    ///     return await req.forward_to(peer)
+    /// ```
+    ///
+    /// `tenant` defaults to `"default"`, the tenant of a single-domain server.
+    #[pyo3(signature = (host, tenant=None))]
+    fn peer_for_host(
+        &self,
+        host: &str,
+        tenant: Option<String>,
+    ) -> Option<crate::script::api::diameter_server::PyPeer> {
+        let tenant = tenant.unwrap_or_else(|| "default".to_string());
+        let (name, peer) = crate::diameter::directory::find(&tenant, host)?;
+        Some(crate::script::api::diameter_server::PyPeer::for_connection(
+            peer, name, tenant,
+        ))
+    }
+
     /// Whether `addr` falls within `cidr` (helper for routing scripts).
     #[staticmethod]
     fn ip_in_cidr(addr: &str, cidr: &str) -> PyResult<bool> {

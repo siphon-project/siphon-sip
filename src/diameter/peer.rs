@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -200,6 +200,9 @@ pub struct DiameterPeer {
     state: Arc<AtomicU8>,
     /// Shutdown signal
     shutdown: Arc<Notify>,
+    /// The other end's Origin-Host and Origin-Realm, from its CER (an
+    /// accepted connection) or its CEA (a connection this node dialled).
+    remote: OnceLock<(String, String)>,
 }
 
 impl DiameterPeer {
@@ -235,6 +238,24 @@ impl DiameterPeer {
     /// Whether the peer is `Open` and ready to carry requests.
     pub fn is_open(&self) -> bool {
         self.state() == PeerState::Open
+    }
+
+    /// The Origin-Host the other end gave in the capabilities exchange.
+    pub fn remote_origin_host(&self) -> Option<&str> {
+        self.remote.get().map(|(host, _)| host.as_str())
+    }
+
+    /// The Origin-Realm the other end gave in the capabilities exchange.
+    pub fn remote_origin_realm(&self) -> Option<&str> {
+        self.remote.get().map(|(_, realm)| realm.as_str())
+    }
+
+    /// Record the other end's identity once the capabilities exchange is
+    /// done. The first record stands: a connection has one peer.
+    pub(crate) fn set_remote_identity(&self, origin_host: &str, origin_realm: &str) {
+        let _ = self
+            .remote
+            .set((origin_host.to_owned(), origin_realm.to_owned()));
     }
 
     /// Send a request and wait for the answer (default 10s timeout).
@@ -382,6 +403,7 @@ impl DiameterPeer {
             session_high: session_high_seed(),
             state: Arc::new(AtomicU8::new(PeerState::Open.as_u8())),
             shutdown: Arc::new(Notify::new()),
+            remote: OnceLock::new(),
         }
     }
 
@@ -575,6 +597,7 @@ where
         session_high: session_high_seed(),
         state: state.clone(),
         shutdown: shutdown.clone(),
+        remote: OnceLock::new(),
     });
 
     if let Some(metrics) = crate::metrics::try_metrics() {
@@ -826,8 +849,19 @@ pub async fn connect_with_transport(
 
     let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingRequest>(32);
     let peer = spawn_connection_tasks(config, stream, incoming_tx);
+    peer.set_remote_identity(
+        identity_avp(&cea.avps, "Origin-Host"),
+        identity_avp(&cea.avps, "Origin-Realm"),
+    );
 
     Ok((peer, incoming_rx))
+}
+
+/// A DiameterIdentity AVP of a decoded CER or CEA, or "" when absent.
+pub(crate) fn identity_avp<'a>(avps: &'a serde_json::Value, name: &str) -> &'a str {
+    avps.get(name)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
 }
 
 /// Connect with auto-reconnect. Returns the same interface as `connect` but
@@ -918,6 +952,10 @@ pub async fn accept(
 
     let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingRequest>(32);
     let peer = spawn_connection_tasks(config, stream, incoming_tx);
+    peer.set_remote_identity(
+        identity_avp(&cer.avps, "Origin-Host"),
+        identity_avp(&cer.avps, "Origin-Realm"),
+    );
 
     Ok((peer, incoming_rx))
 }
