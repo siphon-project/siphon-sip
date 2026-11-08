@@ -29,8 +29,11 @@ pub struct AclMatch {
 #[error("invalid allowed_ips entry: {0:?}")]
 pub struct AclParseError(pub String);
 
-/// Source-IP ACL: an ordered list of `(CIDR, tenant, peer)` scanned
-/// first-match. Built from `diameter.tenants.<name>.clients[].allowed_ips`.
+/// Source-IP ACL: a list of `(CIDR, tenant, peer)` where the longest prefix
+/// containing the address wins, and the first added among equal ones. Built
+/// from `diameter.tenants.<name>.clients[].allowed_ips`; the tenants come out
+/// of a map in no fixed order, so the order of entries of different tenants
+/// cannot decide.
 ///
 /// A `HashMap<IpAddr,_>` cannot express CIDR membership, and CER frequency is
 /// per-connection (not per-message), so a linear scan over even hundreds of
@@ -57,16 +60,22 @@ impl SourceIpAcl {
         Ok(())
     }
 
-    /// First matching `(tenant, peer)` for `addr`, or `None` if no CIDR
+    /// The `(tenant, peer)` of the most specific CIDR containing `addr` (the
+    /// first added among equally specific ones), or `None` if no CIDR
     /// contains it (→ drop the connection).
     pub fn lookup(&self, addr: IpAddr) -> Option<AclMatch> {
-        self.entries
-            .iter()
-            .find(|(net, _, _)| net.contains(&addr))
-            .map(|(_, tenant, peer)| AclMatch {
-                tenant: tenant.clone(),
-                peer: peer.clone(),
-            })
+        let mut best: Option<&(IpNet, String, String)> = None;
+        for entry in &self.entries {
+            if entry.0.contains(&addr)
+                && best.is_none_or(|current| entry.0.prefix_len() > current.0.prefix_len())
+            {
+                best = Some(entry);
+            }
+        }
+        best.map(|(_, tenant, peer)| AclMatch {
+            tenant: tenant.clone(),
+            peer: peer.clone(),
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -166,15 +175,46 @@ mod tests {
         assert!(acl.lookup("2001:dead::1".parse().unwrap()).is_none());
     }
 
+    /// The tenants come out of a map, so entries of different tenants are
+    /// added in no fixed order: the most specific prefix decides, whatever
+    /// the order (a test client's /32 inside a tenant's pod network).
     #[test]
-    fn acl_first_match_wins() {
+    fn acl_longest_prefix_wins_whatever_the_order() {
+        for broad_first in [true, false] {
+            let mut acl = SourceIpAcl::new();
+            let entries = [
+                ("10.0.0.0/8", "broad", "broad-peer"),
+                ("10.1.0.5", "narrow", "narrow-peer"),
+            ];
+            let ordered: Vec<_> = if broad_first {
+                entries.to_vec()
+            } else {
+                entries.iter().rev().copied().collect()
+            };
+            for (cidr, tenant, peer) in ordered {
+                acl.add_str(cidr, tenant, peer).unwrap();
+            }
+            let found = acl.lookup("10.1.0.5".parse().unwrap()).unwrap();
+            assert_eq!(
+                (found.tenant.as_str(), found.peer.as_str()),
+                ("narrow", "narrow-peer"),
+                "{broad_first}"
+            );
+            assert_eq!(
+                acl.lookup("10.2.0.1".parse().unwrap()).unwrap().peer,
+                "broad-peer"
+            );
+        }
+    }
+
+    #[test]
+    fn acl_equal_prefixes_keep_the_first_entry() {
         let mut acl = SourceIpAcl::new();
-        acl.add_str("10.0.0.0/8", "broad", "broad-peer").unwrap();
-        acl.add_str("10.1.0.0/16", "narrow", "narrow-peer").unwrap();
-        // 10.1.0.5 falls in both; first entry wins.
+        acl.add_str("10.1.0.0/16", "a", "first").unwrap();
+        acl.add_str("10.1.0.0/16", "b", "second").unwrap();
         assert_eq!(
             acl.lookup("10.1.0.5".parse().unwrap()).unwrap().peer,
-            "broad-peer"
+            "first"
         );
     }
 
