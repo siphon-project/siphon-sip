@@ -929,8 +929,16 @@ impl SiphonServer {
                 // The P-CSCF side of the SA selectors, per family (a dual-stack
                 // P-CSCF needs both, 3GPP TS 33.203): a concrete UDP bind, never a
                 // wildcard, which would program SAs that match no packet.
+                let protected_ports: Vec<u16> = ipsec_config
+                    .pcscf_port_c
+                    .as_slice()
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(ipsec_config.pcscf_port_s))
+                    .collect();
                 let (pcscf_addr_v4, pcscf_addr_v6) = crate::ipsec::runtime::pcscf_sa_addresses(
                     config.listen.udp.iter().map(|entry| entry.address()),
+                    &protected_ports,
                 );
 
                 let ipsec_manager_for_singleton = Arc::clone(&manager);

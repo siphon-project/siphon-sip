@@ -31,7 +31,11 @@ pub fn install(manager: Arc<IpsecManager>, config: Arc<IpsecConfig>) {
 /// The P-CSCF address to program as the local side of the IPsec SAs, one per
 /// address family, taken from the UDP listen addresses.
 ///
-/// The first concrete bind of a family wins. An unspecified bind (`0.0.0.0` /
+/// The address a UE sends protected traffic to is the one the protected
+/// ports listen on (TS 33.203 clause 7.1), so a concrete bind on one of
+/// `protected_ports` wins: a P-CSCF whose core side is on another address
+/// (listed first, as the default egress towards the core) still programs its
+/// Gm address. Without one, the first concrete bind of a family wins. An unspecified bind (`0.0.0.0` /
 /// `[::]`) is never returned: the kernel matches inbound ESP on the packet's
 /// real destination, so an SA installed with the wildcard matches no packet and
 /// every protected request is dropped. A family whose only listeners are
@@ -39,25 +43,33 @@ pub fn install(manager: Arc<IpsecManager>, config: Arc<IpsecConfig>) {
 /// SAs that cannot work, and an error at startup says why.
 pub fn pcscf_sa_addresses<'a>(
     listen: impl IntoIterator<Item = &'a str>,
+    protected_ports: &[u16],
 ) -> (Option<IpAddr>, Option<IpAddr>) {
     let (mut v4, mut v6) = (None, None);
+    let (mut protected_v4, mut protected_v6) = (None, None);
     let (mut wildcard_v4, mut wildcard_v6) = (false, false);
     for address in listen {
         let Ok(socket) = address.parse::<std::net::SocketAddr>() else {
             continue;
         };
         let ip = socket.ip();
-        let (slot, wildcard) = if ip.is_ipv6() {
-            (&mut v6, &mut wildcard_v6)
+        let (slot, protected, wildcard) = if ip.is_ipv6() {
+            (&mut v6, &mut protected_v6, &mut wildcard_v6)
         } else {
-            (&mut v4, &mut wildcard_v4)
+            (&mut v4, &mut protected_v4, &mut wildcard_v4)
         };
         if ip.is_unspecified() {
             *wildcard = true;
-        } else if slot.is_none() {
+            continue;
+        }
+        if slot.is_none() {
             *slot = Some(ip);
         }
+        if protected.is_none() && protected_ports.contains(&socket.port()) {
+            *protected = Some(ip);
+        }
     }
+    let (v4, v6) = (protected_v4.or(v4), protected_v6.or(v6));
     for (family, address, wildcard) in [("IPv4", v4, wildcard_v4), ("IPv6", v6, wildcard_v6)] {
         if address.is_none() && wildcard {
             error!(
@@ -517,8 +529,31 @@ mod tests {
     #[test]
     fn sa_address_is_never_a_wildcard_bind() {
         assert_eq!(
-            pcscf_sa_addresses(["0.0.0.0:5060", "0.0.0.0:5064", "[::]:5066"]),
+            pcscf_sa_addresses(["0.0.0.0:5060", "0.0.0.0:5064", "[::]:5066"], &[5064, 5066]),
             (None, None)
+        );
+    }
+
+    /// A P-CSCF with a core side of its own lists that listener first (it is
+    /// the default egress towards the core); the UE sends to the protected
+    /// ports on the Gm address, so that address is the SAs' local side.
+    #[test]
+    fn sa_address_is_the_address_of_the_protected_ports() {
+        let gm: IpAddr = "192.0.2.80".parse().expect("v4");
+        let gm6: IpAddr = "2001:db8::80".parse().expect("v6");
+        assert_eq!(
+            pcscf_sa_addresses(
+                [
+                    "198.51.100.200:5060",
+                    "192.0.2.80:5060",
+                    "192.0.2.80:5064",
+                    "192.0.2.80:5066",
+                    "[2001:db8::200]:5060",
+                    "[2001:db8::80]:5066",
+                ],
+                &[5064, 5066],
+            ),
+            (Some(gm), Some(gm6))
         );
     }
 
@@ -527,14 +562,17 @@ mod tests {
         let v4: IpAddr = "192.0.2.10".parse().expect("v4");
         let v6: IpAddr = "2001:db8::10".parse().expect("v6");
         assert_eq!(
-            pcscf_sa_addresses(["0.0.0.0:5060", "192.0.2.10:5064", "192.0.2.11:5066"]),
+            pcscf_sa_addresses(["0.0.0.0:5060", "192.0.2.10:5064", "192.0.2.11:5066"], &[]),
             (Some(v4), None)
         );
         assert_eq!(
-            pcscf_sa_addresses(["[::]:5060", "[2001:db8::10]:5064", "192.0.2.10:5066"]),
+            pcscf_sa_addresses(["[::]:5060", "[2001:db8::10]:5064", "192.0.2.10:5066"], &[]),
             (Some(v4), Some(v6))
         );
-        assert_eq!(pcscf_sa_addresses(["not-an-address"]), (None, None));
+        assert_eq!(
+            pcscf_sa_addresses(["not-an-address"], &[5066]),
+            (None, None)
+        );
     }
 
     /// A P-CSCF-side SA pair with the TS 33.203 §6.3 asymmetric port layout.
