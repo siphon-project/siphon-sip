@@ -10,9 +10,12 @@
 # Environment variable expansion:
 #   Any value can reference environment variables with ${VAR} syntax.
 #   Use ${VAR:-default} to provide a fallback when the variable is unset or empty.
+#   A fallback may name another variable, so one setting falls back on another:
+#   ${LISTEN_ADDRESS:-${ADVERTISED_ADDRESS:-192.0.2.10}}.
 #
 #   Examples:
 #     url: "redis://${REDIS_HOST:-localhost}:6379"
+#     url: "${REDIS_URL:-redis://${REDIS_HOST:-localhost}:6379}"
 #     - "${LISTEN_IP:-0.0.0.0}:5060"
 #     cert: "${TLS_CERT_PATH:-/etc/siphon/tls/cert.pem}"
 

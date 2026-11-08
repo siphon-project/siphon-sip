@@ -7,10 +7,8 @@
 
 use crate::error::{Result, SiphonError};
 use indexmap::IndexMap;
-use regex::Regex;
 use serde::Deserialize;
 use std::path::Path;
-use std::sync::LazyLock;
 
 mod admin;
 mod auth;
@@ -19,6 +17,7 @@ mod cdr;
 mod charging;
 mod control;
 mod diameter;
+mod env;
 mod gateway;
 mod ims;
 mod lawful_intercept;
@@ -36,6 +35,7 @@ mod stir;
 mod tests;
 mod tls;
 pub mod yaml;
+pub use env::expand_env_vars;
 
 pub use admin::{
     AdminAuthConfig, AdminCaptureConfig, AdminConfig, AdminLogTailConfig, AdminUiConfig, CorsConfig,
@@ -160,44 +160,6 @@ pub fn outbound_transport_error(field: &str, token: &str) -> String {
          to fall through to udp instead of being refused, so traffic left on a transport the \
          config never named."
     )
-}
-// ---------------------------------------------------------------------------
-// Environment variable expansion — `${VAR}` and `${VAR:-default}`
-// ---------------------------------------------------------------------------
-
-static ENV_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}").expect("env var regex")
-});
-
-/// Expand `${VAR}` and `${VAR:-default}` patterns in a config string.
-///
-/// - `${VAR}` is replaced with the environment variable's value, or the empty
-///   string if unset/empty.
-/// - `${VAR:-fallback}` uses `fallback` when the variable is unset or empty.
-///
-/// Public so an extension that loads its own config file (the
-/// `extensions.<name>` path form) expands it with the same rules as
-/// `siphon.yaml`, rather than carrying a copy that can drift.
-///
-/// ```
-/// use siphon::config::expand_env_vars;
-///
-/// let expanded = expand_env_vars("listen: \"127.0.0.1:${SIPHON_DOC_UNSET_PORT:-8090}\"");
-/// assert_eq!(expanded, "listen: \"127.0.0.1:8090\"");
-/// ```
-pub fn expand_env_vars(input: &str) -> String {
-    ENV_VAR_RE
-        .replace_all(input, |caps: &regex::Captures| {
-            let var_name = &caps[1];
-            match std::env::var(var_name) {
-                Ok(value) if !value.is_empty() => value,
-                _ => caps
-                    .get(2)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default(),
-            }
-        })
-        .into_owned()
 }
 
 /// Allocator runtime tuning — how the process *manages* memory, distinct from
