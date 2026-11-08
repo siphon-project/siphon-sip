@@ -2213,9 +2213,15 @@ auth:
 #   product_name: "SIPhon"              # advertised in CER/CEA (default: SIPhon)
 #   transport: tcp                       # tcp | sctp (default for all peers)
 #   watchdog_interval: 30                # DWR/DWA interval in seconds
+#   resolve_interval: 30                 # DNS group refresh in seconds
 #   reconnect_delay: 5                   # seconds between reconnect attempts
 
 #   peers:
+#     # Optional DNS group (also supported on servers and tenants.<t>.servers):
+#     # - name: dra
+#     #   host: dra.example.net
+#     #   destination_realm: example.net
+#     #   all_addresses: true             # Default false; one connection per address
 #     - name: "hss1"
 #       host: "hss1.example.com"
 #       port: 3868

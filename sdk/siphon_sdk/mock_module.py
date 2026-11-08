@@ -10133,7 +10133,13 @@ class MockPeer:
 
 
 class MockPeerPool:
-    """Mock backend pool. Picks return a :class:`MockPeer` for the first
+    """DNS groups in production expand to OPEN members named ``name@address``.
+
+    Picks expose the member name; sticky picks bind to that member until it
+    becomes unavailable or the affinity expires. Configure mock member names
+    explicitly when testing this behavior; the mock does not resolve DNS.
+
+    Mock backend pool. Picks return a :class:`MockPeer` for the first
     connected member; round-robin advances a cursor."""
 
     def __init__(self, diameter: "MockDiameter", tenant: str, names: list) -> None:

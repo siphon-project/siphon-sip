@@ -16,6 +16,10 @@
 //! block for the backend round-trip, so serial dispatch would head-of-line-block
 //! every tenant.
 
+mod backend;
+#[cfg(test)]
+use backend::spawn_backend_connection;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -135,7 +139,7 @@ pub fn spawn(
             );
         }
         for server in &tenant.servers {
-            spawn_backend_connection(
+            backend::spawn(
                 tenant_name,
                 tenant,
                 server,
@@ -145,6 +149,7 @@ pub fn spawn(
                 Arc::clone(&applications),
                 product_name,
                 product_version,
+                config.resolve_interval,
             );
         }
         for upstream in &tenant.connect_to {
@@ -303,80 +308,6 @@ fn warn_if_sctp_without_feature(config: &DiameterConfig) {
 
 #[cfg(feature = "sctp")]
 fn warn_if_sctp_without_feature(_config: &DiameterConfig) {}
-
-/// Connect one backend server as an outbound client, reconnecting on drop.
-/// Supports both TCP and SCTP transports. Requests the backend sends on the
-/// connection (an HSS's Cancel-Location, an OCS's Re-Auth) are served like
-/// any other: RFC 6733 lets either end of a connection send requests.
-#[allow(clippy::too_many_arguments)]
-fn spawn_backend_connection(
-    tenant_name: &str,
-    tenant: &crate::config::DiameterTenant,
-    server: &crate::config::DiameterServerEntry,
-    manager: Arc<DiameterManager>,
-    engine: Arc<ScriptEngine>,
-    semaphore: Arc<Semaphore>,
-    applications: TenantApplications,
-    product_name: &str,
-    product_version: &str,
-) {
-    let transport = server.transport.clone();
-    let mut config = PeerConfig {
-        host: server.host.clone(),
-        port: server.port,
-        origin_host: tenant.identity.origin_host.clone(),
-        origin_realm: tenant.identity.origin_realm.clone(),
-        destination_host: None,
-        destination_realm: tenant.identity.origin_realm.clone(),
-        local_ip: std::net::Ipv4Addr::UNSPECIFIED,
-        application_ids: vec![],
-        watchdog_interval: 30,
-        reconnect_delay: 5,
-        product_name: product_name.to_string(),
-        firmware_revision: peer::version_to_firmware_revision(product_version),
-    };
-    let name = server.name.clone();
-    let tenant_name = tenant_name.to_string();
-    let identity = (
-        tenant.identity.origin_host.clone(),
-        tenant.identity.origin_realm.clone(),
-    );
-    let peer_info = PyInboundPeer {
-        name: name.clone(),
-        tenant: tenant_name.clone(),
-        addr: format!("{}:{}", server.host, server.port),
-        transport: transport.clone(),
-        // The peer's CER/CEA identity, once connected (`serve_requests`).
-        host: String::new(),
-    };
-    tokio::spawn(async move {
-        loop {
-            // Asked per attempt: the CER advertises what the script serves now.
-            config.application_ids = applications(&tenant_name);
-            match peer::connect_with_transport(config.clone(), &transport).await {
-                Ok((connected, incoming_rx)) => {
-                    let client = Arc::new(DiameterClient::new(Arc::clone(&connected)));
-                    manager.register_backend(&tenant_name, &name, client);
-                    info!(peer = %name, tenant = %tenant_name, "Diameter server backend connected");
-                    serve_requests(
-                        connected,
-                        incoming_rx,
-                        peer_info.clone(),
-                        Arc::clone(&engine),
-                        Arc::clone(&semaphore),
-                        identity.clone(),
-                    )
-                    .await;
-                    warn!(peer = %name, "Diameter server backend disconnected, reconnecting");
-                }
-                Err(error) => {
-                    warn!(peer = %name, %error, "Diameter server backend connect failed, retrying in 5s");
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
-    });
-}
 
 /// Dial an outbound connection and **serve** the inbound requests it carries
 /// via `@diameter.on_request` — the HSS-dials-Diameter server case. siphon sends the CER
@@ -2881,6 +2812,7 @@ mod backend_connection_tests {
                 "t-relay",
                 &tenant,
                 &DiameterServerEntry {
+                    all_addresses: false,
                     name: "hss".to_string(),
                     host: "127.0.0.1".to_string(),
                     port: hss_port,
@@ -2902,6 +2834,7 @@ mod backend_connection_tests {
                     "epc.example.net".to_string(),
                 ),
                 DiameterServerEntry {
+                    all_addresses: false,
                     name: "mme".to_string(),
                     host: "127.0.0.1".to_string(),
                     port: mme_port,
@@ -3042,6 +2975,7 @@ mod backend_connection_tests {
                 ..DiameterTenant::default()
             };
             let server = DiameterServerEntry {
+                all_addresses: false,
                 name: "hss".to_string(),
                 host: "127.0.0.1".to_string(),
                 port,
