@@ -120,7 +120,21 @@ async fn next_write_recovers_after_sentinel_failover() {
         let mut pipeline_connection = RedisConnection::connect(serde_saphyr::from_str(&yaml).unwrap()).await.unwrap();
         let _: () = connection.set("before", "first").await.unwrap();
         let _: i64 = redis::cmd("WAIT").arg(1).arg(3000).query_async(&mut primary).await.unwrap();
-        let _: () = redis::cmd("SENTINEL").arg("FAILOVER").arg("primary").query_async(&mut sentinel).await.unwrap();
+        // Sentinel refuses a failover with NOGOODSLAVE until it has refreshed
+        // the replica's state on its own INFO period, which can lag the
+        // replica's link coming up. Any other refusal is a failure.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let refused: redis::RedisResult<()> =
+                redis::cmd("SENTINEL").arg("FAILOVER").arg("primary").query_async(&mut sentinel).await;
+            match refused {
+                Ok(()) => break,
+                Err(error) if error.to_string().contains("NOGOODSLAVE") && std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(error) => panic!("SENTINEL FAILOVER refused: {error}"),
+            }
+        }
         wait_for_new_primary(&ports).await;
         // Exactly one caller operation, using the connection opened before failover.
         let _: () = connection.set("after", "second").await.unwrap();
