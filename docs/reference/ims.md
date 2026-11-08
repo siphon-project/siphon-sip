@@ -85,6 +85,10 @@ sbi:
   bearer_token_file: "${SBI_TOKEN_DIR}/bearer-token"
 ```
 
+An empty `bearer_token_file`, `ca`, `cert` or `key` is unset, so a shared
+configuration can take each from the environment (`"${SBI_CA_FILE:-}"`) and
+leave it out where the variable is not set.
+
 The optional path supports normal environment expansion and can be used alongside
 `sbi.tls`. The file is read once at startup, with surrounding whitespace trimmed.
 Empty or unreadable files and tokens outside RFC 6750's `b64token` grammar stop

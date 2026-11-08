@@ -29,10 +29,13 @@ impl TryFrom<TlsFields> for SbiTlsConfig {
     type Error = String;
 
     fn try_from(fields: TlsFields) -> Result<Self, Self::Error> {
+        // An empty path is unset, so a configuration can take each one from
+        // the environment (`ca: "${SBI_CA_FILE:-}"`) and leave it out there.
+        let set = |path: Option<String>| path.filter(|path| !path.trim().is_empty());
         let config = Self {
-            ca: fields.ca,
-            cert: fields.cert,
-            key: fields.key,
+            ca: set(fields.ca),
+            cert: set(fields.cert),
+            key: set(fields.key),
             trust_public_roots: fields.trust_public_roots,
         };
         config.validate()?;
@@ -123,5 +126,25 @@ impl LoadedTls {
                 config.tls
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod empty_path_tests {
+    use super::SbiTlsConfig;
+
+    #[test]
+    fn an_empty_path_is_unset_so_a_configuration_can_take_it_from_the_environment() {
+        let config: SbiTlsConfig = serde_saphyr::from_str("ca: \"\"\ncert: \"\"\nkey: \"  \"\n")
+            .expect("empty paths are unset");
+        assert_eq!((config.ca, config.cert, config.key), (None, None, None));
+        assert!(config.trust_public_roots);
+    }
+
+    #[test]
+    fn a_certificate_without_its_key_is_still_refused() {
+        assert!(
+            serde_saphyr::from_str::<SbiTlsConfig>("cert: /run/tls/tls.crt\nkey: \"\"\n").is_err()
+        );
     }
 }
