@@ -56,6 +56,9 @@ fn default_diameter_route_algorithm() -> String {
 /// each application interface.
 #[derive(Debug, Deserialize, Clone)]
 pub struct DiameterConfig {
+    /// DNS refresh interval for address groups, in seconds.
+    #[serde(default = "default_watchdog_interval")]
+    pub resolve_interval: u64,
     /// Origin-Host identity for this SIPhon node (used in all client-mode CER
     /// messages). Optional for pure Diameter server deployments, which carry identity
     /// per-tenant under `tenants.<name>.identity` instead.
@@ -273,6 +276,9 @@ pub struct DiameterClientEntry {
 /// An outbound (server) peer the Diameter server relays to, using the tenant's identity.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct DiameterServerEntry {
+    /// Connect to every resolved address and refresh membership periodically.
+    #[serde(default)]
+    pub all_addresses: bool,
     pub name: String,
     pub host: String,
     #[serde(default = "default_diameter_port")]
@@ -304,6 +310,9 @@ fn default_event_sink_backend() -> String {
 /// A named Diameter peer endpoint.
 #[derive(Debug, Deserialize, Clone)]
 pub struct DiameterPeerEntry {
+    /// Connect to every resolved address and refresh membership periodically.
+    #[serde(default)]
+    pub all_addresses: bool,
     /// Unique name for this peer (referenced in routes).
     pub name: String,
     /// Peer hostname or IP address.

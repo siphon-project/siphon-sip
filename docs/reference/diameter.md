@@ -824,3 +824,23 @@ the script decides whether to repeat.
 AVP lists back with Wireshark's Diameter dissector: Cx RTR, Sh PNR, Rx ASR
 and RAR, Gx RAR with a rule installation, Gx CCR-I, -U and -T on one
 session, and S6a CLR, IDR and DSR.
+
+### DNS address groups
+
+Set `all_addresses: true` on an entry in `diameter.peers`, `diameter.servers`,
+or `diameter.tenants.<tenant>.servers` to connect to every address returned for
+its host, for example a Kubernetes headless Service. The default is `false`,
+which preserves the single-connection behavior. `diameter.resolve_interval`
+sets the refresh period in seconds (default `30`; zero uses one second).
+New addresses get independent reconnect loops; removed addresses are shut down
+and deregistered. A DNS error retains the current members until a later refresh.
+
+Each member is registered and reported in logs and metrics as `<name>@<address>`,
+for example `dra@192.0.2.7`. The original name remains usable in routes,
+`send_request(peer=...)`, and `diameter.peer_pool(["dra"])`. Only OPEN members
+are eligible. Requests rotate round-robin within each group, while the route
+or pool algorithm still selects among its configured peer names. Session
+failover lists include every open member. Sticky pool picks bind the session
+to a specific member and select another when it goes down. Pool picks expose
+the member name. Backend members also serve inbound requests and remain
+available through `diameter.peer_for_host` using their advertised Origin-Host.

@@ -57,8 +57,8 @@ impl PeerPool {
     pub fn live_count(&self) -> usize {
         self.peers
             .iter()
-            .filter(|name| self.manager.live_backend(&self.tenant, name).is_some())
-            .count()
+            .map(|name| self.manager.open_members(Some(&self.tenant), name).len())
+            .sum()
     }
 
     /// Pick the next live peer in round-robin order, skipping dead ones.
@@ -76,8 +76,8 @@ impl PeerPool {
         for offset in 0..count {
             let idx = (start.wrapping_add(offset)) % count;
             let name = &self.peers[idx];
-            if let Some(client) = self.manager.live_backend(&self.tenant, name) {
-                return Some((name.clone(), client));
+            if let Some(picked) = self.manager.live_named(Some(&self.tenant), name) {
+                return Some(picked);
             }
         }
         None
@@ -97,7 +97,12 @@ impl PeerPool {
         let live: Vec<(&String, u32)> = self
             .peers
             .iter()
-            .filter(|name| self.manager.live_backend(&self.tenant, name).is_some())
+            .filter(|name| {
+                !self
+                    .manager
+                    .open_members(Some(&self.tenant), name)
+                    .is_empty()
+            })
             .map(|name| (name, weights.get(name).copied().unwrap_or(1).max(1)))
             .collect();
         if live.is_empty() {
@@ -109,10 +114,7 @@ impl PeerPool {
         for (name, weight) in live {
             accumulated += weight;
             if tick < accumulated {
-                return self
-                    .manager
-                    .live_backend(&self.tenant, name)
-                    .map(|client| (name.clone(), client));
+                return self.manager.live_named(Some(&self.tenant), name);
             }
         }
         None

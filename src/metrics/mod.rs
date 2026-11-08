@@ -2711,31 +2711,33 @@ mod tests {
     fn diameter_request_counters() {
         init().unwrap();
         let metrics = metrics().unwrap();
+        // The registry is the process's: labels of their own, which no other
+        // test sends, keep these counts exact while tests run in parallel.
 
         metrics
             .diameter_requests_total
-            .with_label_values(&["UAR"])
+            .with_label_values(&["counter-test-uar"])
             .inc();
         metrics
             .diameter_requests_total
-            .with_label_values(&["UAR"])
+            .with_label_values(&["counter-test-uar"])
             .inc();
         metrics
             .diameter_requests_total
-            .with_label_values(&["SAR"])
+            .with_label_values(&["counter-test-sar"])
             .inc();
 
         assert_eq!(
             metrics
                 .diameter_requests_total
-                .with_label_values(&["UAR"])
+                .with_label_values(&["counter-test-uar"])
                 .get(),
             2
         );
         assert_eq!(
             metrics
                 .diameter_requests_total
-                .with_label_values(&["SAR"])
+                .with_label_values(&["counter-test-sar"])
                 .get(),
             1
         );
