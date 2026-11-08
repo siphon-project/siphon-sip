@@ -470,6 +470,14 @@ optional. `db` defaults to zero. Environment variables expand as in the rest
 of the YAML configuration. Existing `url: redis://localhost:6379/0` entries
 need no changes.
 
+The same target fits in a URL, wherever siphon takes one (`url:` of the
+registrar and of a cache, a shard in `urls`):
+`redis+sentinel://[:password@]host[:port][,host[:port]...]/master[/db][?sentinel_password=...]`.
+The port defaults to 26379 and the credentials are percent-decoded. A
+configuration that writes its URL from the environment, such as
+`url: "${CACHE_URL:-redis://192.0.2.10:6379}"`, then moves between one
+Redis and a Sentinel set without changing shape.
+
 For a sharded registrar, set `shard_count` and list that many targets under
 `urls`. Legacy URL strings remain accepted; mapping entries use the same
 shared target shape:
