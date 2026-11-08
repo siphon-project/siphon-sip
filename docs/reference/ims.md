@@ -101,6 +101,16 @@ Every client built by `SbiManager`, including timeout-specific clients, sends
 header. Omitting the setting preserves the existing behavior. Restart to rotate
 the token; reload does not reread it.
 
+A token that identifies the consumer to the SCP it sends through goes in
+`Proxy-Authorization` instead (RFC 9110 section 11.7.2), which leaves
+`Authorization` to a producer's access token:
+
+```yaml
+sbi:
+  bearer_token_file: "${SBI_TOKEN_DIR}/scp-token"
+  bearer_token_header: proxy-authorization   # default: authorization
+```
+
 With a token configured, `npcf_url`, `bsf_url`, `nchf_url`, and `nrf_url` must
 use HTTPS, except that HTTP is allowed for loopback IP literals and `localhost`.
 Remote HTTP endpoints fail startup. Use HTTPS for dynamically discovered PCF

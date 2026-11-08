@@ -8,11 +8,26 @@
 //! token management are planned for future implementation.
 
 mod bearer;
+#[cfg(test)]
+mod bearer_tests;
 pub mod nbsf;
 pub mod nchf;
 pub mod npcf;
 mod tls;
 pub use tls::SbiTlsConfig;
+
+/// The header a static bearer token travels in (`sbi.bearer_token_header`):
+/// `Authorization` for a producer that authenticates consumers itself, or
+/// `Proxy-Authorization` for a token that identifies the consumer to the SCP
+/// it sends through (RFC 9110 section 11.7.2), leaving `Authorization` to a
+/// producer's access token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SbiBearerHeader {
+    #[default]
+    Authorization,
+    ProxyAuthorization,
+}
 
 /// SBI communication model (TS 29.500 §6.10).
 ///
@@ -55,6 +70,8 @@ pub struct SbiConfig {
     pub tls: Option<SbiTlsConfig>,
     /// Static bearer credential file, loaded once by the manager.
     pub bearer_token_file: Option<String>,
+    /// The header the bearer token is sent in.
+    pub bearer_token_header: SbiBearerHeader,
     /// Peer URLs used for startup transport validation with bearer authentication.
     pub npcf_url: Option<String>,
     pub bsf_url: Option<String>,
@@ -73,6 +90,7 @@ impl Default for SbiConfig {
         Self {
             tls: None,
             bearer_token_file: None,
+            bearer_token_header: SbiBearerHeader::Authorization,
             npcf_url: None,
             bsf_url: None,
             nchf_url: None,

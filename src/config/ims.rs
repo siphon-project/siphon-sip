@@ -328,6 +328,10 @@ fn default_ifc_key_prefix() -> String {
 pub struct SbiYamlConfig {
     /// Static bearer credential file (environment expansion supported).
     pub bearer_token_file: Option<String>,
+    /// The header the bearer token is sent in: `authorization` (default) or
+    /// `proxy-authorization` (a token for the SCP).
+    #[serde(default)]
+    pub bearer_token_header: crate::sbi::SbiBearerHeader,
     /// Outbound SBI TLS trust anchors and optional client identity.
     pub tls: Option<crate::sbi::SbiTlsConfig>,
     /// NRF discovery endpoint URL.
@@ -386,6 +390,7 @@ impl SbiYamlConfig {
                 .bearer_token_file
                 .clone()
                 .filter(|path| !path.trim().is_empty()),
+            bearer_token_header: self.bearer_token_header,
             npcf_url: self.npcf_url.clone(),
             bsf_url: self.bsf_url.clone(),
             nchf_url: self.nchf_url.clone(),
@@ -414,6 +419,28 @@ mod empty_bearer_tests {
             config.to_sbi_config().bearer_token_file.as_deref(),
             Some("/run/secrets/token")
         );
+    }
+
+    #[test]
+    fn the_bearer_header_is_authorization_unless_proxy_authorization_is_named() {
+        use crate::sbi::SbiBearerHeader;
+        let header = |yaml: &str| {
+            serde_saphyr::from_str::<super::SbiYamlConfig>(yaml)
+                .map(|config| config.to_sbi_config().bearer_token_header)
+        };
+        assert_eq!(
+            header("timeout_secs: 5\n").ok(),
+            Some(SbiBearerHeader::Authorization)
+        );
+        assert_eq!(
+            header("bearer_token_header: authorization\n").ok(),
+            Some(SbiBearerHeader::Authorization)
+        );
+        assert_eq!(
+            header("bearer_token_header: proxy-authorization\n").ok(),
+            Some(SbiBearerHeader::ProxyAuthorization)
+        );
+        assert!(header("bearer_token_header: cookie\n").is_err());
     }
 }
 
