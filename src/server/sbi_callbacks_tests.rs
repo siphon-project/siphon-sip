@@ -47,14 +47,14 @@ def raising_on_event(document):
     raise RuntimeError('script bug')
 ";
 
-struct Recording {
-    script_state: Arc<ArcSwap<ScriptState>>,
+pub(super) struct Recording {
+    pub(super) script_state: Arc<ArcSwap<ScriptState>>,
     received: Py<PyAny>,
 }
 
 /// Build a script state holding the recording handlers. `on_event_name`
 /// picks which Python function is registered as `@sbi.on_event`.
-fn recording(on_event_name: &str) -> Recording {
+pub(super) fn recording(on_event_name: &str) -> Recording {
     Python::initialize();
     Python::attach(|python| {
         let globals = PyDict::new(python);
@@ -99,7 +99,7 @@ fn recording(on_event_name: &str) -> Recording {
 
 impl Recording {
     /// Every (decorator, document) pair the handlers saw, in order.
-    fn received(&self) -> Vec<(String, serde_json::Value)> {
+    pub(super) fn received(&self) -> Vec<(String, serde_json::Value)> {
         Python::attach(|python| {
             let entries: Vec<(String, String)> = self
                 .received
