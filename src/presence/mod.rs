@@ -10,6 +10,9 @@ pub mod metrics;
 pub mod persist;
 pub mod pidf;
 pub mod rls;
+mod shared;
+#[cfg(feature = "redis-backend")]
+pub(crate) mod shared_redis;
 pub mod winfo;
 
 use std::collections::hash_map::DefaultHasher;
@@ -23,6 +26,8 @@ use tracing::{debug, warn};
 
 use crate::registrar::backend::WriteSequence;
 use persist::{PresenceBackendWriter, StoredSubscription};
+use shared::Counter;
+pub use shared::SharedPresence;
 
 /// Process-wide presence store, installed at startup so background tasks
 /// (the dispatcher cleanup tick) can reach it to expire stale documents and
@@ -427,6 +432,10 @@ pub struct PresenceStore {
     /// The write-through to the registrar's Redis, when it has one
     /// ([`persist`]).  Every change to a subscription is written through.
     backend: OnceLock<PresenceBackendWriter>,
+    /// Read-through and numbering over the shared store ([`shared`]).
+    shared: OnceLock<SharedPresence>,
+    /// Resource or subscription id → when the shared store was last read for it.
+    fetched: DashMap<String, Instant>,
 }
 
 /// A subscription's write-through, snapshotted under its entry.
@@ -440,6 +449,8 @@ impl PresenceStore {
             documents: DashMap::new(),
             watchers: DashMap::new(),
             backend: OnceLock::new(),
+            shared: OnceLock::new(),
+            fetched: DashMap::new(),
         }
     }
 
@@ -524,15 +535,24 @@ impl PresenceStore {
 
     /// Look up a subscription by ID, returning a clone.
     pub fn get_subscription(&self, id: &str) -> Option<Subscription> {
+        self.ensure_local(id);
         self.subscriptions.get(id).map(|entry| entry.clone())
     }
 
     /// The version the next document on subscription `id` carries, advancing
     /// its count ([`Subscription::take_version`]).  `None` for an unknown id.
     pub fn next_version(&self, id: &str) -> Option<u32> {
+        self.ensure_local(id);
+        let reserved = self.reserve(id, Counter::Version);
         let (version, snapshot) = {
             let mut entry = self.subscriptions.get_mut(id)?;
-            let version = entry.take_version();
+            let version = match reserved {
+                Some(number) => {
+                    entry.next_version = entry.next_version.max(number.saturating_add(1));
+                    number
+                }
+                None => entry.take_version(),
+            };
             (version, self.snapshot(&entry))
         };
         self.write_through(snapshot);
@@ -543,13 +563,21 @@ impl PresenceStore {
     ///
     /// Returns `None` if the subscription doesn't exist or has no dialog state.
     pub fn prepare_notify(&self, id: &str) -> Option<NotifyDialogState> {
+        self.ensure_local(id);
+        let reserved = self.reserve(id, Counter::Cseq);
         let (dialog, snapshot) = {
             let mut entry = self.subscriptions.get_mut(id)?;
             let subscription = entry.value_mut();
             let call_id = subscription.call_id.clone()?;
             let local_uri = subscription.notify_from_uri().to_string();
             let remote_uri = subscription.notify_to_uri().to_string();
-            let cseq = subscription.next_cseq();
+            let cseq = match reserved {
+                Some(number) => {
+                    subscription.local_cseq = subscription.local_cseq.max(number);
+                    number
+                }
+                None => subscription.next_cseq(),
+            };
             let dialog = NotifyDialogState {
                 subscriber: subscription.subscriber.clone(),
                 local_uri,
@@ -572,6 +600,7 @@ impl PresenceStore {
 
     /// Remove a subscription entirely (from both subscriptions and watchers maps).
     pub fn remove_subscription(&self, id: &str) {
+        self.ensure_local(id);
         let mut sequence = None;
         if let Some((_, subscription)) = self.subscriptions.remove_if(id, |_, _| {
             sequence = self.removal_sequence();
@@ -620,6 +649,7 @@ impl PresenceStore {
 
     /// Refresh a subscription's expiry. Returns `true` if the subscription was found.
     pub fn refresh_subscription(&self, id: &str, expires: Duration) -> bool {
+        self.ensure_local(id);
         let snapshot = match self.subscriptions.get_mut(id) {
             Some(mut entry) => {
                 entry.refresh(expires);
@@ -645,7 +675,7 @@ impl PresenceStore {
     /// shadow a fresh re-SUBSCRIBE that reused the Call-ID. Returns the first
     /// live match, or `None`.
     pub fn find_subscription_by_dialog(&self, call_id: &str, from_tag: &str) -> Option<String> {
-        self.subscriptions.iter().find_map(|entry| {
+        let local = self.subscriptions.iter().find_map(|entry| {
             let subscription = entry.value();
             if subscription.state != SubscriptionState::Terminated
                 && subscription.call_id.as_deref() == Some(call_id)
@@ -655,7 +685,8 @@ impl PresenceStore {
             } else {
                 None
             }
-        })
+        });
+        local.or_else(|| self.find_in_shared_by_dialog(call_id, from_tag))
     }
 
     /// Terminate a subscription (sets state to `Terminated` but does not remove it).
@@ -663,6 +694,7 @@ impl PresenceStore {
     /// A terminated subscription is never restored, so its stored copy goes
     /// now rather than with the removal.
     pub fn terminate_subscription(&self, id: &str) {
+        self.ensure_local(id);
         let sequence = match self.subscriptions.get_mut(id) {
             Some(mut entry) => {
                 entry.terminate();
@@ -675,6 +707,7 @@ impl PresenceStore {
 
     /// Get all active (non-terminated, non-expired) subscriptions for a resource URI.
     pub fn subscriptions_for(&self, resource: &str) -> Vec<Subscription> {
+        self.refresh_resource(resource);
         let watcher_ids = match self.watchers.get(resource) {
             Some(ids) => ids.clone(),
             None => return Vec::new(),
@@ -814,10 +847,15 @@ impl PresenceStore {
             .map(|entry| entry.key().clone())
             .collect();
 
-        let expired_subscription_count = expired_subscription_ids.len();
+        let mut expired_subscription_count = 0usize;
         for subscription_id in expired_subscription_ids {
-            self.remove_subscription(&subscription_id);
+            // Over a shared store another node may have refreshed it.
+            if self.confirm_expired(&subscription_id) {
+                self.remove_subscription(&subscription_id);
+                expired_subscription_count += 1;
+            }
         }
+        self.trim_fetched();
 
         // Remove expired documents.
         let mut expired_document_count = 0usize;
@@ -1577,3 +1615,7 @@ mod tests {
         assert_eq!(versions, (0..2000).collect::<Vec<u32>>());
     }
 }
+
+#[cfg(test)]
+#[path = "shared_tests.rs"]
+mod shared_tests;

@@ -302,6 +302,34 @@ impl PyPresence {
         self.store.next_version(subscription_id)
     }
 
+    /// Claim the right to send one notification on a subscription.
+    ///
+    /// With several notifier nodes behind one name, a change can reach more
+    /// than one of them (a Cx push, a registration event each node observes).
+    /// Each calls this with the same ``change_id`` for each subscription it is
+    /// about to NOTIFY; exactly one gets ``True`` and sends, the others skip.
+    /// The claim is an atomic set-if-absent in the shared Redis, kept ten
+    /// minutes. Use an id that names the change and is the same on every node
+    /// (a registration's Call-ID and CSeq, a Cx transaction id), not one each
+    /// node makes up.
+    ///
+    /// Always ``True`` without a shared store (no Redis registrar backend, or
+    /// ``registrar.redis.read_through_ttl_ms: 0``), and ``True`` when the store
+    /// cannot be reached (a NOTIFY sent twice is the lesser harm; logged).
+    /// With a shared store this is one blocking Redis round trip: the
+    /// interpreter is released for it, but an ``async def`` handler's event
+    /// loop waits.
+    ///
+    /// Args:
+    ///     subscription_id: The subscription ID.
+    ///     change_id: Names the change being notified, the same on every node.
+    ///
+    /// Returns:
+    ///     ``True`` if this node won the claim and should send the NOTIFY.
+    fn claim_notification(&self, subscription_id: &str, change_id: &str) -> bool {
+        self.store.claim_notification(subscription_id, change_id)
+    }
+
     /// List subscribers (watchers) for a resource.
     ///
     /// Returns active, non-expired subscriptions for the given resource URI.

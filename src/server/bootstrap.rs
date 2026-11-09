@@ -397,6 +397,14 @@ pub(super) async fn init_presence_redis_backend(redis: &crate::config::RedisBack
         }
     };
 
+    let shared = (redis.read_through_ttl_ms > 0).then(|| {
+        crate::presence::SharedPresence::redis(
+            connection.clone(),
+            redis.presence_key_prefix.clone(),
+            std::time::Duration::from_millis(redis.read_through_ttl_ms),
+            u64::from(redis.ttl_slack_secs),
+        )
+    });
     let writer = crate::presence::persist::spawn_presence_writer_with_connection(
         connection,
         redis.presence_key_prefix.clone(),
@@ -408,6 +416,9 @@ pub(super) async fn init_presence_redis_backend(redis: &crate::config::RedisBack
         writer.remove_at(&id, writer.sequence());
     }
     store.set_backend_writer(writer);
+    if let Some(shared) = shared {
+        store.set_shared(shared);
+    }
 }
 
 /// Stand-in when the `redis-backend` feature is off.

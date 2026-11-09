@@ -127,6 +127,10 @@ every one it has ever seen. In Redis, under `registrar.redis.key_prefix`:
 | `{prefix}alias:{uri}` | the AoR whose implicit registration set lists `uri`, so a node that never saw the AoR still resolves the alias | the state key's, refreshed with it on every save |
 | `{prefix}expired:{marker}:{aor}` | an expiry claim (see below) | 10 minutes |
 | `{prefix}index` | sorted set of AoRs, scored by the epoch second the last contact expires | none; members whose score has passed are dropped on every read and once a minute |
+| `{presence_key_prefix}watchers:{resource}` | set of the subscription ids watching a resource | the longest TTL of its members, renewed by every save |
+| `{presence_key_prefix}dialog:{call_id}:{from_tag}` | the id of that dialog's subscription | the subscription's |
+| `{presence_key_prefix}seq:cseq:{id}`, `seq:ver:{id}` | the next NOTIFY CSeq and the next reginfo version of a subscription | the subscription's remaining lifetime + `ttl_slack_secs`, renewed by every number handed out |
+| `{presence_key_prefix}claim:{id}:{marker}` | a notification claim (see below) | 10 minutes |
 | `{isc.ifc_key_prefix}{aor}` | the iFC profile XML | `max_expires` + `ttl_slack_secs`, renewed by every `isc.store_profile()` |
 | `{registrar.redis.presence_key_prefix}{id}` | one presence subscription: its dialog (Call-ID, tags, route set, remote target, local and remote URI), the CSeq of its last NOTIFY, its next reginfo version, event, resource and expiry | the subscription's remaining lifetime + `ttl_slack_secs`, renewed by every change |
 
@@ -196,6 +200,40 @@ a crash, unlike a stop, can lose the last few milliseconds of them, so a NOTIFY
 sent just before one may be followed after the restart by one with the same CSeq,
 which the subscriber answers with an error that ends that transaction only.
 With `postgres` the subscriptions stay in memory, as before.
+
+### Several notifiers over one Redis
+
+An S-CSCF fleet notifies reg-event watchers from whichever node saw the change,
+and the SUBSCRIBE that created a watcher landed on another. With
+`registrar.backend: redis` the presence store reads through to the same Redis,
+on the same `registrar.redis.read_through_ttl_ms` window as the registrar (see
+above), so the node that sees a registration change can NOTIFY every watcher:
+
+- The watchers of a resource (`presence.subscribers()`), a dialog
+  (`presence.find_by_dialog()`) and a subscription this node has not seen
+  (`refresh`, `unsubscribe`, `terminate`, `notify`, `next_version`) are read
+  from Redis when the node does not hold them, or holds the resource's set
+  older than the window. A subscription made, refreshed or ended on one node
+  is seen on another within that window plus a round trip.
+- **CSeq and reginfo version are reserved in Redis**, atomically, per
+  subscription: two nodes NOTIFYing one dialog never send the same CSeq or
+  version, and each is above everything either sent before (RFC 3261
+  section 12.2.1.1, RFC 3680 section 5.2). If Redis cannot be reached the
+  node counts on its own and logs an error: a NOTIFY not sent is worse than
+  one a subscriber may answer with an error.
+- **`presence.claim_notification(subscription_id, change_id)`** is an atomic
+  set-if-absent: of the nodes that react to one change, only the one that
+  wins sends that subscription's NOTIFY. Name the change by something every
+  node knows (a registration's Call-ID and CSeq, a Cx transaction id).
+  Registration events themselves already fire on one node (the node that took
+  the change, or the winner of an expiry claim), so a script that reacts to
+  `@registrar.on_change` needs no claim.
+- The expiry sweep re-reads Redis before it ends a subscription whose copy
+  ran out, since another node may have refreshed it.
+- The calls above that read Redis block their thread for one round trip, with
+  the interpreter released; in an `async def` handler that thread is the
+  asyncio driver's, so keep the window long enough that most calls are served
+  from memory.
 
 Store the iFC profile from the SAR of every REGISTER, re-registrations
 included, as the example S-CSCF script does: a profile stored only at initial

@@ -25,6 +25,7 @@ use dashmap::DashMap;
 use tokio::sync::broadcast;
 
 pub use event_hold::{RegisterEventHold, RegisterExchange};
+pub(crate) use shared::block_on_shared;
 pub use shared::SharedReader;
 
 use crate::sip::uri::SipUri;
