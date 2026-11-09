@@ -31,6 +31,7 @@ pub(super) fn spawn_backend_connection(
         application_ids: vec![],
         watchdog_interval: server.watchdog_interval.unwrap_or(30),
         reconnect_delay: server.reconnect_delay.unwrap_or(5),
+        source_address: server.source_address,
         lifecycle: server.lifecycle(),
         product_name: product_name.to_string(),
         firmware_revision: peer::version_to_firmware_revision(product_version),

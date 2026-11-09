@@ -321,6 +321,11 @@ pub struct DiameterServerEntry {
     /// Ceiling of the reconnect backoff in seconds (default 60).
     #[serde(default)]
     pub reconnect_delay_max: Option<u64>,
+    /// Local address to originate the connection from, for a host with
+    /// several. Bound before the connect, any port; unset leaves it to the
+    /// routing table.
+    #[serde(default)]
+    pub source_address: Option<std::net::IpAddr>,
 }
 
 impl DiameterServerEntry {
@@ -380,6 +385,11 @@ pub struct DiameterPeerEntry {
     pub watchdog_interval: Option<u64>,
     /// Reconnect delay override in seconds.
     pub reconnect_delay: Option<u64>,
+    /// Local address to originate the connection from, for a host with
+    /// several. Bound before the connect, any port; unset leaves it to the
+    /// routing table.
+    #[serde(default)]
+    pub source_address: Option<std::net::IpAddr>,
     /// Reconnect backoff ceiling override in seconds.
     #[serde(default)]
     pub reconnect_delay_max: Option<u64>,
@@ -511,6 +521,7 @@ impl DiameterConfig {
             application_ids,
             watchdog_interval: peer.watchdog_interval.unwrap_or(self.watchdog_interval),
             reconnect_delay: peer.reconnect_delay.unwrap_or(self.reconnect_delay),
+            source_address: peer.source_address,
             lifecycle: crate::diameter::lifecycle::PeerLifecycle {
                 disconnect_timeout_ms: self.disconnect_timeout_ms,
                 reconnect_delay_max: peer.reconnect_delay_max.unwrap_or(self.reconnect_delay_max),

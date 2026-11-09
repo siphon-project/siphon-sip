@@ -113,8 +113,47 @@ impl SctpAsyncStream {
 
     /// Connect to an SCTP peer.
     pub async fn connect(addr: SocketAddr) -> io::Result<Self> {
-        let stream = SctpStream::connect(addr).await?;
-        Ok(Self::new(stream))
+        Self::connect_from(addr, None).await
+    }
+
+    /// Connect to an SCTP peer from the local address `source` (any port),
+    /// bound before the connect; `None` leaves the choice to the kernel.
+    pub async fn connect_from(
+        addr: SocketAddr,
+        source: Option<std::net::IpAddr>,
+    ) -> io::Result<Self> {
+        let Some(source) = source else {
+            return Ok(Self::new(SctpStream::connect(addr).await?));
+        };
+        if source.is_ipv4() != addr.is_ipv4() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source_address and peer address are of different families",
+            ));
+        }
+        let family = if addr.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        };
+        // tokio-sctp builds its sockets with a socket2 of another major
+        // version than ours, so its `Domain` cannot be named here. The
+        // descriptor is made directly and handed to its socket type, which
+        // takes any `FromRawFd`; it is closed when that is dropped.
+        //
+        // SAFETY: `socket(2)` returns a new descriptor or -1; a descriptor
+        // is owned by nothing else, so the wrapper may own it.
+        let socket = unsafe {
+            let descriptor = libc::socket(family, libc::SOCK_STREAM, libc::IPPROTO_SCTP);
+            if descriptor < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            tokio_sctp::SctpSocket {
+                inner: std::os::fd::FromRawFd::from_raw_fd(descriptor),
+            }
+        };
+        socket.bind_sys(SocketAddr::new(source, 0))?;
+        Ok(Self::new(SctpStream::connect_from(socket, addr).await?))
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -305,13 +344,25 @@ impl DiameterListener {
 
 /// Connect to a Diameter peer over TCP or SCTP.
 pub async fn connect(addr: &str, transport: &str) -> io::Result<DiameterStream> {
+    connect_from(addr, transport, None).await
+}
+
+/// Connect to a Diameter peer over TCP or SCTP from the local address
+/// `source` (any port), bound before the connect. A node on a multi-homed
+/// host originates from the address its peer expects, not from the default
+/// route's. `None` leaves the choice to the kernel.
+pub async fn connect_from(
+    addr: &str,
+    transport: &str,
+    source: Option<std::net::IpAddr>,
+) -> io::Result<DiameterStream> {
     match transport {
         #[cfg(feature = "sctp")]
         "sctp" => {
             let addr: SocketAddr = addr.parse().map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidInput, format!("bad address: {}", e))
             })?;
-            let stream = SctpAsyncStream::connect(addr).await?;
+            let stream = SctpAsyncStream::connect_from(addr, source).await?;
             Ok(DiameterStream::Sctp(stream))
         }
         #[cfg(not(feature = "sctp"))]
@@ -321,8 +372,80 @@ pub async fn connect(addr: &str, transport: &str) -> io::Result<DiameterStream> 
              rebuild with `--features sctp`",
         )),
         _ => {
-            let stream = TcpStream::connect(addr).await?;
+            let stream = match source {
+                None => TcpStream::connect(addr).await?,
+                Some(source) => {
+                    let remote = tokio::net::lookup_host(addr)
+                        .await?
+                        .find(|remote| remote.is_ipv4() == source.is_ipv4())
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("{addr} has no address of the family of source_address"),
+                            )
+                        })?;
+                    let socket = if source.is_ipv4() {
+                        tokio::net::TcpSocket::new_v4()?
+                    } else {
+                        tokio::net::TcpSocket::new_v6()?
+                    };
+                    socket.bind(SocketAddr::new(source, 0))?;
+                    socket.connect(remote).await?
+                }
+            };
             Ok(DiameterStream::Tcp(stream))
         }
+    }
+}
+
+#[cfg(test)]
+mod source_address_tests {
+    use super::*;
+
+    /// The address a listener sees a connection arrive from.
+    async fn seen_from(source: Option<std::net::IpAddr>) -> std::net::IpAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move { listener.accept().await.unwrap().1.ip() });
+        let _stream = connect_from(&address.to_string(), "tcp", source)
+            .await
+            .unwrap();
+        accepted.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_configured_source_address_is_where_the_connection_comes_from() {
+        let source: std::net::IpAddr = "127.0.0.3".parse().unwrap();
+        assert_eq!(seen_from(Some(source)).await, source);
+    }
+
+    #[tokio::test]
+    async fn without_a_source_address_the_kernel_chooses() {
+        let expected: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(seen_from(None).await, expected);
+    }
+
+    #[tokio::test]
+    async fn a_source_address_of_the_wrong_family_is_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let result = connect_from(&address.to_string(), "tcp", Some("::1".parse().unwrap())).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn the_entries_of_the_configuration_take_a_source_address() {
+        let entry: crate::config::DiameterServerEntry =
+            serde_saphyr::from_str("{name: a, host: example.net, source_address: 192.0.2.7}")
+                .unwrap();
+        assert_eq!(entry.source_address, Some("192.0.2.7".parse().unwrap()));
+        let peer: crate::config::DiameterPeerEntry = serde_saphyr::from_str(
+            "{name: a, host: example.net, destination_realm: example.net, source_address: 192.0.2.7}",
+        )
+        .unwrap();
+        assert_eq!(peer.source_address, Some("192.0.2.7".parse().unwrap()));
+        let absent: crate::config::DiameterServerEntry =
+            serde_saphyr::from_str("{name: a, host: example.net}").unwrap();
+        assert_eq!(absent.source_address, None);
     }
 }

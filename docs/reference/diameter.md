@@ -889,3 +889,12 @@ without REOPEN only when it said it was rebooting; one that just dropped, or
 stopped answering, is in REOPEN on its next connection. Detecting a dead peer
 takes two to three watchdog intervals, as the RFC has it; lower
 `watchdog_interval` for faster failover.
+
+### Originating from a chosen address
+
+`source_address` on an entry of `diameter.peers`, `servers` or `connect_to`
+(an IP address, any port) makes the connection to that peer originate from it:
+the socket is bound to the address before it connects, over TCP and, in a
+build with the `sctp` feature, SCTP. Use it on a host with several addresses
+where the one the peer expects is not the default route's. The address must
+be of the family of the peer's. Unset, the kernel chooses as before.

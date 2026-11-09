@@ -134,6 +134,7 @@ mod tests {
             application_ids: vec![],
             watchdog_interval: 30,
             reconnect_delay: 1,
+            source_address: None,
             lifecycle: crate::diameter::lifecycle::PeerLifecycle {
                 reconnect_delay_max: 2,
                 ..Default::default()

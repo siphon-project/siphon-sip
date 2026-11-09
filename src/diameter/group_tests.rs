@@ -15,6 +15,7 @@ fn register(manager: &DiameterManager, name: &str, tenant: Option<&str>) -> Arc<
         application_ids: vec![],
         watchdog_interval: 30,
         reconnect_delay: 5,
+        source_address: None,
         lifecycle: Default::default(),
         product_name: "test".into(),
         firmware_revision: 1,

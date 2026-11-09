@@ -39,6 +39,9 @@ pub struct PeerConfig {
     pub watchdog_interval: u64,
     /// Reconnect delay in seconds (client mode only)
     pub reconnect_delay: u64,
+    /// Local address to originate the connection from (client mode), bound
+    /// before the connect; any port. None: the kernel's choice.
+    pub source_address: Option<std::net::IpAddr>,
     /// Disconnect and reconnect timers.
     pub lifecycle: crate::diameter::lifecycle::PeerLifecycle,
     /// Product name advertised in CER/CEA
@@ -1018,9 +1021,10 @@ pub async fn connect_with_transport(
         addr, transport, config.origin_host
     );
 
-    let mut stream = crate::diameter::transport::connect(&addr, transport)
-        .await
-        .map_err(|e| format!("{} connect to {} failed: {}", transport, addr, e))?;
+    let mut stream =
+        crate::diameter::transport::connect_from(&addr, transport, config.source_address)
+            .await
+            .map_err(|e| format!("{} connect to {} failed: {}", transport, addr, e))?;
 
     info!("Diameter: connected to {} via {}", addr, transport);
 
@@ -1250,6 +1254,7 @@ mod tests {
             application_ids: vec![(dictionary::VENDOR_3GPP, dictionary::CX_APP_ID)],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
             lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 100,
@@ -1291,6 +1296,7 @@ mod tests {
             ],
             watchdog_interval: 3600,
             reconnect_delay: 5,
+            source_address: None,
             lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 1,
@@ -1356,6 +1362,7 @@ mod tests {
             ],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
             lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 1,
@@ -1418,6 +1425,7 @@ mod tests {
             application_ids: vec![(dictionary::VENDOR_3GPP, dictionary::CX_APP_ID)],
             watchdog_interval: 3600,
             reconnect_delay: 5,
+            source_address: None,
             lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 1,
@@ -1828,6 +1836,7 @@ mod tests {
             application_ids: vec![(dictionary::VENDOR_3GPP, dictionary::CX_APP_ID)],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
             lifecycle: Default::default(),
             product_name: "HSS".to_string(),
             firmware_revision: 200,
@@ -1894,6 +1903,7 @@ mod tests {
             application_ids: vec![],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
             lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 100,

@@ -175,6 +175,7 @@ mod tests {
             application_ids: vec![],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
             lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 1,
