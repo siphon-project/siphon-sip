@@ -135,6 +135,12 @@ def test_find_by_dialog_resolves_refresh_and_unsubscribe():
     assert presence.subscription_count() == 0
 
 
+def test_claim_notification_is_always_won_without_a_shared_store():
+    presence = _fresh_presence()
+    assert presence.claim_notification("sub-1", "change-1") is True
+    assert presence.claim_notification("sub-1", "change-1") is True
+
+
 def test_find_by_dialog_ignores_non_dialog_subscription():
     """subscribe() (no dialog state) is not findable by dialog."""
     presence = _fresh_presence()

@@ -413,6 +413,9 @@ registrar:
   #   # Sharded: shard_count plus urls, each a URL string or a sentinel: mapping.
   #   key_prefix: "siphon:reg:"   # namespace prefix (default: "siphon:reg:")
   #   ttl_slack_secs: 30          # extra seconds beyond expires for race safety
+  #   read_through_ttl_ms: 1000   # how long a node serves an AoR from memory before
+  #   # reading Redis again: the bound on how stale another node's registration,
+  #   # refresh or removal can look. 0 = memory only (no read-through).
   #   presence_key_prefix: "siphon:presence:"
   #   # presence subscriptions (presence.subscribe_dialog) are written through
   #   # to this Redis under their own prefix and restored at boot, so a

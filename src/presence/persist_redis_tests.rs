@@ -84,6 +84,13 @@ async fn keys(connection: &mut redis::aio::MultiplexedConnection, prefix: &str) 
         .query_async(connection)
         .await
         .expect("keys");
+    // The subscriptions, not the indexes and counters beside them.
+    keys.retain(|key| {
+        let id = key.strip_prefix(prefix).unwrap_or(key);
+        !super::shared_redis::AUXILIARY_PREFIXES
+            .iter()
+            .any(|auxiliary| id.starts_with(auxiliary))
+    });
     keys.sort();
     keys
 }
@@ -245,4 +252,73 @@ async fn restoring_thousands_of_subscriptions_is_quick() {
         .query_async(&mut connection)
         .await
         .expect("cleanup");
+}
+
+/// A notifier node: its own memory, writing through to and reading through
+/// the Redis under `prefix`.
+async fn shared_notifier(prefix: &str) -> PresenceStore {
+    let url = std::env::var("SIPHON_TEST_REDIS_URL").expect("url");
+    let connection = crate::redis_target::RedisConnection::connect(url.into())
+        .await
+        .expect("connect");
+    let store = PresenceStore::new();
+    store.set_backend_writer(persist::spawn_presence_writer_with_connection(
+        connection.clone(),
+        prefix.to_string(),
+        30,
+    ));
+    store.set_shared(SharedPresence::redis(
+        connection,
+        prefix.to_string(),
+        Duration::from_millis(50),
+        30,
+    ));
+    store
+}
+
+/// Two notifiers over one Redis: a subscription made on one is found,
+/// refreshed, numbered and claimed from the other, and a restart's restore
+/// does not mistake the indexes for subscriptions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_notifiers_over_one_redis_share_subscriptions_and_numbers() {
+    let Some(mut connection) = connection().await else {
+        return;
+    };
+    let prefix = unique_prefix("two-nodes");
+    let (a, b) = (
+        shared_notifier(&prefix).await,
+        shared_notifier(&prefix).await,
+    );
+
+    a.add_subscription(dialog("sub-1", Duration::from_secs(600)));
+    redis_holds(&mut connection, &prefix, &["sub-1"]).await;
+
+    assert_eq!(b.subscriptions_for(AOR).len(), 1);
+    assert_eq!(
+        b.find_subscription_by_dialog("call-sub-1", "ftag")
+            .as_deref(),
+        Some("sub-1")
+    );
+    let mut cseqs = Vec::new();
+    let mut versions = Vec::new();
+    for round in 0..6 {
+        let node = if round % 2 == 0 { &a } else { &b };
+        cseqs.push(node.prepare_notify("sub-1").expect("a NOTIFY").cseq);
+        versions.push(node.next_version("sub-1").expect("a version"));
+    }
+    assert_eq!(cseqs, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(versions, vec![0, 1, 2, 3, 4, 5]);
+
+    assert!(a.claim_notification("sub-1", "change-1"));
+    assert!(!b.claim_notification("sub-1", "change-1"));
+
+    // The indexes beside the subscription are not restored as subscriptions.
+    let (_restarted, counts) = notifier(&prefix).await;
+    assert_eq!(counts.restored, 1);
+    assert_eq!(counts.dropped, 0);
+
+    b.remove_subscription("sub-1");
+    redis_holds(&mut connection, &prefix, &[]).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(a.subscriptions_for(AOR).is_empty(), "an end on b reaches a");
 }

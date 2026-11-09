@@ -159,6 +159,12 @@ pub struct RedisBackendConfig {
     /// this same Redis and restored at boot (default: "siphon:presence:").
     /// Kept apart from `key_prefix`, so neither restore walks the other's keys.
     pub presence_key_prefix: String,
+    /// How long, in milliseconds, a node serves an AoR from its own memory
+    /// before reading Redis again (default 1000). This is the bound on how
+    /// stale another node's registration, refresh or removal can look.
+    /// `0` turns read-through off: lookups read only this process's memory,
+    /// loaded at boot and written through (the behaviour before it existed).
+    pub read_through_ttl_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -180,6 +186,8 @@ struct RawRedisBackendConfig {
     /// Kept apart from `key_prefix`, so neither restore walks the other's keys.
     #[serde(default = "default_presence_key_prefix")]
     pub presence_key_prefix: String,
+    #[serde(default = "default_read_through_ttl_ms")]
+    pub read_through_ttl_ms: u64,
 }
 
 impl TryFrom<RawRedisBackendConfig> for RedisBackendConfig {
@@ -204,6 +212,7 @@ impl TryFrom<RawRedisBackendConfig> for RedisBackendConfig {
             key_prefix: raw.key_prefix,
             ttl_slack_secs: raw.ttl_slack_secs,
             presence_key_prefix: raw.presence_key_prefix,
+            read_through_ttl_ms: raw.read_through_ttl_ms,
         })
     }
 }
@@ -214,6 +223,10 @@ fn default_redis_key_prefix() -> String {
 
 fn default_presence_key_prefix() -> String {
     crate::presence::persist::DEFAULT_PRESENCE_KEY_PREFIX.to_owned()
+}
+
+fn default_read_through_ttl_ms() -> u64 {
+    1000
 }
 
 fn default_ttl_slack() -> u32 {

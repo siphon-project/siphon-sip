@@ -124,7 +124,13 @@ every one it has ever seen. In Redis, under `registrar.redis.key_prefix`:
 |---|---|---|
 | `{prefix}{aor}` | hash, contact URI to binding | longest contact's remaining lifetime + `ttl_slack_secs`, set on every save |
 | `{prefix}state:{aor}` | Service-Route, P-Asserted-Identity, P-Associated-URI | the binding hash's, refreshed on every save; written before the AoR has a binding, `max_expires` + `ttl_slack_secs` |
+| `{prefix}alias:{uri}` | the AoR whose implicit registration set lists `uri`, so a node that never saw the AoR still resolves the alias | the state key's, refreshed with it on every save |
+| `{prefix}expired:{marker}:{aor}` | an expiry claim (see below) | 10 minutes |
 | `{prefix}index` | sorted set of AoRs, scored by the epoch second the last contact expires | none; members whose score has passed are dropped on every read and once a minute |
+| `{presence_key_prefix}watchers:{resource}` | set of the subscription ids watching a resource | the longest TTL of its members, renewed by every save |
+| `{presence_key_prefix}dialog:{call_id}:{from_tag}` | the id of that dialog's subscription | the subscription's |
+| `{presence_key_prefix}seq:cseq:{id}`, `seq:ver:{id}` | the next NOTIFY CSeq and the next reginfo version of a subscription | the subscription's remaining lifetime + `ttl_slack_secs`, renewed by every number handed out |
+| `{presence_key_prefix}claim:{id}:{marker}` | a notification claim (see below) | 10 minutes |
 | `{isc.ifc_key_prefix}{aor}` | the iFC profile XML | `max_expires` + `ttl_slack_secs`, renewed by every `isc.store_profile()` |
 | `{registrar.redis.presence_key_prefix}{id}` | one presence subscription: its dialog (Call-ID, tags, route set, remote target, local and remote URI), the CSeq of its last NOTIFY, its next reginfo version, event, resource and expiry | the subscription's remaining lifetime + `ttl_slack_secs`, renewed by every change |
 
@@ -136,6 +142,44 @@ restarts and does not depend on keyspace expiry events. Boot is the one place
 siphon walks keys, by cursor `SCAN` (never `KEYS`): the iFC and auxiliary-state
 restore, the presence subscription restore, and building the index when a node
 finds none (a keyspace written by a version without it).
+
+### Several nodes over one Redis: read-through and single-owner expiry
+
+Each node keeps its bindings in memory and writes every change through to
+Redis. With `registrar.backend: redis` it also reads through: a lookup
+(`lookup`, `lookup_all`, `is_registered`, `registered_aor`, the implicit-set
+resolution, `service_route`, `associated_uris`) first re-reads the AoR from Redis
+when the node's copy is older than `registrar.redis.read_through_ttl_ms`
+(default 1000). So a binding another node wrote, refreshed or removed is seen
+here within **that window plus one Redis round trip**, once the write has reached
+Redis (milliseconds; longer only while Redis is unreachable). The window is the
+whole consistency contract: nothing is pushed, a node serving an AoR inside it
+may answer with what it had.
+
+- A node reads its own writes at once. While a write of its own for an AoR has
+  not reached Redis, or the AoR changed locally while the read was in flight,
+  the read does not overwrite the node's copy.
+- A read costs one blocking round trip (up to three for an alias a node has
+  never seen) on the thread that made the lookup, at most once per AoR per
+  window. The wait releases the interpreter if the thread is attached to it (and a tokio worker hands its core over). A node that
+  cannot reach Redis serves its own copy, logs the error, and tries again after
+  one window. A lookup on a current-thread runtime cannot block and serves the
+  local copy.
+- An alias of an implicit registration set resolves on a node that never saw
+  the primary, through the `alias:` key. It is checked against the primary's own
+  stored `associated_uris`, so a stale key is never followed.
+- Expiry has one owner. A node whose copy of a binding ran out re-reads Redis
+  first, because another node may have refreshed it, and drops its copy without
+  an event if so. Otherwise it claims the expiry with an atomic `SET NX`; only
+  the winner fires `@registrar.on_change` with `expired`, the others drop the
+  AoR silently. A node that never held the AoR announces nothing, so an AoR
+  whose only holder died is not announced until another node reads it.
+- `read_through_ttl_ms: 0` turns all of this off: lookups read only the node's
+  own memory, loaded at boot and written through, as before. A node on the
+  `postgres` backend never reads through (its store has no atomic claim).
+- Raising the window lowers Redis traffic and widens the staleness; lowering it
+  does the reverse. Under a second is cheap, a few hundred milliseconds is
+  what a P-CSCF in front of several S-CSCF nodes wants for TS 23.380 restoration.
 
 ### Presence subscriptions across a restart
 
@@ -156,6 +200,40 @@ a crash, unlike a stop, can lose the last few milliseconds of them, so a NOTIFY
 sent just before one may be followed after the restart by one with the same CSeq,
 which the subscriber answers with an error that ends that transaction only.
 With `postgres` the subscriptions stay in memory, as before.
+
+### Several notifiers over one Redis
+
+An S-CSCF fleet notifies reg-event watchers from whichever node saw the change,
+and the SUBSCRIBE that created a watcher landed on another. With
+`registrar.backend: redis` the presence store reads through to the same Redis,
+on the same `registrar.redis.read_through_ttl_ms` window as the registrar (see
+above), so the node that sees a registration change can NOTIFY every watcher:
+
+- The watchers of a resource (`presence.subscribers()`), a dialog
+  (`presence.find_by_dialog()`) and a subscription this node has not seen
+  (`refresh`, `unsubscribe`, `terminate`, `notify`, `next_version`) are read
+  from Redis when the node does not hold them, or holds the resource's set
+  older than the window. A subscription made, refreshed or ended on one node
+  is seen on another within that window plus a round trip.
+- **CSeq and reginfo version are reserved in Redis**, atomically, per
+  subscription: two nodes NOTIFYing one dialog never send the same CSeq or
+  version, and each is above everything either sent before (RFC 3261
+  section 12.2.1.1, RFC 3680 section 5.2). If Redis cannot be reached the
+  node counts on its own and logs an error: a NOTIFY not sent is worse than
+  one a subscriber may answer with an error.
+- **`presence.claim_notification(subscription_id, change_id)`** is an atomic
+  set-if-absent: of the nodes that react to one change, only the one that
+  wins sends that subscription's NOTIFY. Name the change by something every
+  node knows (a registration's Call-ID and CSeq, a Cx transaction id).
+  Registration events themselves already fire on one node (the node that took
+  the change, or the winner of an expiry claim), so a script that reacts to
+  `@registrar.on_change` needs no claim.
+- The expiry sweep re-reads Redis before it ends a subscription whose copy
+  ran out, since another node may have refreshed it.
+- The calls above that read Redis block their thread for one round trip, with
+  the interpreter released; in an `async def` handler that thread is the
+  asyncio driver's, so keep the window long enough that most calls are served
+  from memory.
 
 Store the iFC profile from the SAR of every REGISTER, re-registrations
 included, as the example S-CSCF script does: a profile stored only at initial

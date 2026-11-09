@@ -1547,6 +1547,11 @@
       }
     },
     "PresenceNamespace": {
+      "claim_notification": {
+        "doc": "Claim the right to send one notification on a subscription.",
+        "kind": "method_descriptor",
+        "sig": "($self, subscription_id, change_id)"
+      },
       "document_count": {
         "doc": "Get the total number of entities with published documents.",
         "kind": "method_descriptor",

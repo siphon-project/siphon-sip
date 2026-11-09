@@ -158,8 +158,14 @@ impl StoredSubscription {
 /// One write-through: the desired Redis state of one subscription's key.
 #[derive(Debug)]
 pub enum PresenceWrite {
-    /// Store the subscription's JSON for `ttl_secs`.
-    Save { json: String, ttl_secs: u64 },
+    /// Store the subscription's JSON for `ttl_secs`, and index it by the
+    /// `resource` it watches and its `dialog` (Call-ID, From-tag).
+    Save {
+        json: String,
+        ttl_secs: u64,
+        resource: String,
+        dialog: Option<(String, String)>,
+    },
     /// Remove the subscription.
     Remove,
 }
@@ -212,7 +218,12 @@ impl PresenceBackendWriter {
         self.queue.enqueue(
             stored.id.clone(),
             &stored.id,
-            PresenceWrite::Save { json, ttl_secs },
+            PresenceWrite::Save {
+                json,
+                ttl_secs,
+                resource: stored.resource.clone(),
+                dialog: stored.call_id.clone().zip(stored.from_tag.clone()),
+            },
             sequence,
         );
     }
@@ -221,6 +232,11 @@ impl PresenceBackendWriter {
     pub fn remove_at(&self, id: &str, sequence: WriteSequence) {
         self.queue
             .enqueue(id.to_string(), id, PresenceWrite::Remove, sequence);
+    }
+
+    /// Whether a write of subscription `id` has not been applied yet.
+    pub(crate) fn is_unsettled(&self, id: &str) -> bool {
+        self.queue.is_unsettled(&id.to_string())
     }
 
     /// Subscriptions whose latest write has not been applied yet.
@@ -292,8 +308,28 @@ impl WriteSink<String, PresenceWrite> for PresenceRedisSink {
                 let mut lease = self.link.lease().await?;
                 let connection = &mut lease.connection;
                 let result: Result<(), redis::RedisError> = match write {
-                    PresenceWrite::Save { json, ttl_secs } => {
-                        connection.set_ex(&key, json.as_str(), *ttl_secs).await
+                    PresenceWrite::Save {
+                        json,
+                        ttl_secs,
+                        resource,
+                        dialog,
+                    } => {
+                        let save = redis::Script::new(super::shared_redis::SAVE_SCRIPT);
+                        let mut invocation = save.prepare_invoke();
+                        invocation
+                            .key(&key)
+                            .key(format!("{}watchers:{resource}", self.key_prefix));
+                        if let Some((call_id, from_tag)) = dialog {
+                            invocation
+                                .key(format!("{}dialog:{call_id}:{from_tag}", self.key_prefix));
+                        }
+                        invocation
+                            .arg(json.as_str())
+                            .arg(*ttl_secs)
+                            .arg(id.as_str())
+                            .invoke_async::<i64>(connection)
+                            .await
+                            .map(|_| ())
                     }
                     PresenceWrite::Remove => connection.del(&key).await,
                 };
@@ -364,6 +400,13 @@ pub async fn restore_presence_subscriptions(
             // Gone between the SCAN and the MGET: its TTL ran out.
             let Some(json) = value else { continue };
             let id = key.strip_prefix(key_prefix).unwrap_or(key).to_string();
+            // An index or a counter, not a subscription.
+            if super::shared_redis::AUXILIARY_PREFIXES
+                .iter()
+                .any(|auxiliary| id.starts_with(auxiliary))
+            {
+                continue;
+            }
             match serde_json::from_str::<StoredSubscription>(&json)
                 .map_err(|error| error.to_string())
                 .map(|stored| stored.into_subscription(now))

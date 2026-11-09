@@ -12,6 +12,7 @@ pub mod event_hold;
 pub(crate) mod proxy_grant;
 pub mod reginfo;
 pub mod restore_eviction;
+mod shared;
 pub(crate) mod update;
 
 use std::net::SocketAddr;
@@ -24,6 +25,8 @@ use dashmap::DashMap;
 use tokio::sync::broadcast;
 
 pub use event_hold::{RegisterEventHold, RegisterExchange};
+pub(crate) use shared::block_on_shared;
+pub use shared::SharedReader;
 
 use crate::sip::uri::SipUri;
 use crate::transport::Transport;
@@ -540,6 +543,11 @@ pub struct Registrar {
     event_sender: broadcast::Sender<RegistrationEvent>,
     /// Optional backend writer for write-through persistence (set once at startup).
     backend_writer: OnceLock<backend::BackendWriter>,
+    /// Read-through to the store the writer writes to, when it is shared
+    /// between nodes ([`shared`]). Set once at startup.
+    shared: OnceLock<SharedReader>,
+    /// AoR → when the shared store was last read for it.
+    shared_fetched: DashMap<Aor, Instant>,
     /// Identity tag stamped onto every locally accepted contact.  Set once
     /// at startup; `None` means scripts can't tell who owns a binding (the
     /// pre-Tier-2 default).
@@ -571,6 +579,8 @@ impl Registrar {
             config,
             event_sender,
             backend_writer: OnceLock::new(),
+            shared: OnceLock::new(),
+            shared_fetched: DashMap::new(),
             instance_identity: OnceLock::new(),
         }
     }
@@ -1136,7 +1146,7 @@ impl Registrar {
     /// not routing targets — see [`lookup_all`](Self::lookup_all) for the
     /// merged view that reg-event NOTIFY emission uses.
     pub fn lookup(&self, aor: &str) -> Vec<Contact> {
-        let primary = self.resolve_alias(aor);
+        let primary = self.resolve_fresh(aor);
         let mut out: Vec<Contact> = match self.bindings.get(primary.as_str()) {
             Some(entry) => entry
                 .value()
@@ -1157,7 +1167,7 @@ impl Registrar {
     /// so a watcher (UE or AS) sees both the UE's routable bindings and
     /// the iFC-matched AS's `+g.3gpp.*` feature tags.
     pub fn lookup_all(&self, aor: &str) -> Vec<Contact> {
-        let primary = self.resolve_alias(aor);
+        let primary = self.resolve_fresh(aor);
         let mut out: Vec<Contact> = match self.bindings.get(primary.as_str()) {
             Some(entry) => entry
                 .value()
@@ -1185,7 +1195,7 @@ impl Registrar {
     /// unregistered, matching the IMS lifecycle (no UE binding → AS
     /// contacts should never have been written, or should be cleaned up).
     pub fn is_registered(&self, aor: &str) -> bool {
-        let primary = self.resolve_alias(aor);
+        let primary = self.resolve_fresh(aor);
         match self.bindings.get(primary.as_str()) {
             Some(entry) => entry
                 .value()
@@ -1200,7 +1210,7 @@ impl Registrar {
     /// `auth_user`. What `auth.verify_integrity_protected` asks before it lets a
     /// protected re-/de-REGISTER skip the challenge.
     pub fn is_registered_by(&self, aor: &str, auth_user: &str) -> bool {
-        let primary = self.resolve_alias(aor);
+        let primary = self.resolve_fresh(aor);
         self.bindings.get(primary.as_str()).is_some_and(|entry| {
             entry.value().iter().any(|contact| {
                 contact.kind == ContactKind::Ue
@@ -1216,7 +1226,7 @@ impl Registrar {
     /// What a watcher of the AoR subscribed to, however the caller spelled it
     /// (an alias, a default port, angle brackets).
     pub fn registered_aor(&self, aor: &str) -> Option<Aor> {
-        let primary = self.resolve_alias(aor);
+        let primary = self.resolve_fresh(aor);
         let live = self.bindings.get(primary.as_str()).is_some_and(|entry| {
             entry
                 .value()
@@ -1242,7 +1252,7 @@ impl Registrar {
     /// `contact_uri` (matched as [`lookup_contact`](Self::lookup_contact)
     /// matches). `false` once it was de-registered, expired, or reaped.
     pub fn has_live_contact(&self, aor: &str, contact_uri: &str) -> bool {
-        let primary = self.resolve_alias(aor);
+        let primary = self.resolve_fresh(aor);
         let Some(target) = contact_target(contact_uri) else {
             return false;
         };
@@ -1919,7 +1929,7 @@ impl Registrar {
             .strip_suffix('>')
             .unwrap_or(sip_instance.trim());
 
-        let primary = self.resolve_alias(aor);
+        let primary = self.resolve_fresh(aor);
         match self.bindings.get(primary.as_str()) {
             Some(entry) => entry
                 .value()
@@ -1955,7 +1965,7 @@ impl Registrar {
 
     /// Retrieve stored Service-Route headers for an AoR.
     pub fn service_routes(&self, aor: &str) -> Vec<String> {
-        let primary = self.resolve_alias(aor);
+        let primary = self.resolve_fresh(aor);
         self.service_routes
             .get(primary.as_str())
             .map(|entry| entry.value().clone())
@@ -1984,7 +1994,7 @@ impl Registrar {
 
     /// Retrieve stored P-Associated-URI list for an AoR.
     pub fn associated_uris(&self, aor: &str) -> Vec<String> {
-        let primary = self.resolve_alias(aor);
+        let primary = self.resolve_fresh(aor);
         self.associated_uris
             .get(primary.as_str())
             .map(|entry| entry.value().clone())
@@ -2067,7 +2077,7 @@ impl Registrar {
 
     /// Look up stored P-Asserted-Identity for an AoR.
     pub fn asserted_identity(&self, aor: &str) -> Option<String> {
-        let primary = self.resolve_alias(aor);
+        let primary = self.resolve_fresh(aor);
         self.asserted_identities
             .get(primary.as_str())
             .map(|v| v.value().clone())
@@ -2086,11 +2096,15 @@ impl Registrar {
         let mut tokens_to_remove: Vec<String> = Vec::new();
         let mut conns_to_deindex: Vec<(u64, String)> = Vec::new();
         let mut contacts_to_deindex: Vec<(u64, String)> = Vec::new();
+        let mut lost: std::collections::HashMap<Aor, Vec<Contact>> = Default::default();
         for mut entry in self.bindings.iter_mut() {
             let aor_key = entry.key().clone();
             let before = entry.value().len();
             entry.value_mut().retain(|c| {
                 if c.is_expired() {
+                    if self.shared.get().is_some() {
+                        lost.entry(aor_key.clone()).or_default().push(c.clone());
+                    }
                     for key in self.contact_index.keys_of_binding(c) {
                         contacts_to_deindex.push((key, aor_key.clone()));
                     }
@@ -2132,7 +2146,22 @@ impl Registrar {
                 metrics.registrations_active.sub(empty_aors.len() as i64);
             }
         }
+        self.trim_shared_freshness();
+        let mut announced = 0;
         for aor in &empty_aors {
+            // Over a shared store every node that cached the AoR sees it run
+            // out: re-read the store, and announce only if this node wins the
+            // claim.
+            let verdict = match lost.get(aor) {
+                Some(contacts) => self.judge_expiry(
+                    aor,
+                    &shared::expiry_marker(&contacts.iter().collect::<Vec<_>>()),
+                ),
+                None => shared::ExpiryVerdict::Announce,
+            };
+            if verdict == shared::ExpiryVerdict::Keep {
+                continue;
+            }
             self.bindings
                 .remove_if(aor, |_, contacts| contacts.is_empty());
             // The auxiliary state follows the binding. Note this drops it from
@@ -2143,9 +2172,12 @@ impl Registrar {
             // on that basis would destroy state a peer replica is still serving.
             self.prune_aliases_to(aor);
             self.remove_aor_state_entries(aor);
-            self.emit_event(RegistrationEvent::Expired { aor: aor.clone() });
+            if verdict == shared::ExpiryVerdict::Announce {
+                self.emit_event(RegistrationEvent::Expired { aor: aor.clone() });
+            }
+            announced += 1;
         }
-        empty_aors.len()
+        announced
     }
 }
 
