@@ -83,7 +83,11 @@ pub fn olr_avp(olr: &Olr) -> Avp {
     grouped(
         avp::OC_OLR,
         vec![
-            Avp::raw(avp::OC_SEQUENCE_NUMBER, 0, olr.sequence.to_be_bytes().to_vec()),
+            Avp::raw(
+                avp::OC_SEQUENCE_NUMBER,
+                0,
+                olr.sequence.to_be_bytes().to_vec(),
+            ),
             Avp::u32(avp::OC_REPORT_TYPE, 0, olr.report_type as u32),
             Avp::u32(avp::OC_REDUCTION_PERCENTAGE, 0, olr.reduction_percentage),
             Avp::u32(avp::OC_VALIDITY_DURATION, 0, olr.validity_secs),
@@ -92,7 +96,9 @@ pub fn olr_avp(olr: &Olr) -> Avp {
 }
 
 fn child<'a>(children: &'a [Avp], code: u32) -> Option<&'a Avp> {
-    children.iter().find(|avp| avp.code == code && avp.vendor == 0)
+    children
+        .iter()
+        .find(|avp| avp.code == code && avp.vendor == 0)
 }
 
 fn as_u64(avp: &Avp) -> Option<u64> {
@@ -393,9 +399,7 @@ impl ReportingState {
 
     /// The reduction this node reports now, given `pending` requests.
     pub fn reduction(&self, pending: usize, now: Instant) -> u32 {
-        let by_depth = self
-            .depth_scale
-            .map_or(0, |scale| scale.reduction(pending));
+        let by_depth = self.depth_scale.map_or(0, |scale| scale.reduction(pending));
         self.application_reduction(now).max(by_depth)
     }
 
@@ -425,9 +429,7 @@ impl ReportingState {
                 });
                 Some(self.report(sequence, 0))
             }
-            (Some(held), _)
-                if held.reduction == reduction && held.expires > now + validity / 2 =>
-            {
+            (Some(held), _) if held.reduction == reduction && held.expires > now + validity / 2 => {
                 Some(self.report(held.sequence, reduction))
             }
             (_, _) => {
@@ -531,4 +533,470 @@ pub fn install(overload: Overload) {
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *current = std::sync::Arc::new(overload);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diameter::codec::{encode_avps, FLAG_PROXIABLE, FLAG_REQUEST};
+    use crate::diameter::forward;
+
+    fn request(avps: Vec<Avp>) -> DiameterMsg {
+        DiameterMsg {
+            flags: FLAG_REQUEST | FLAG_PROXIABLE,
+            command_code: 318,
+            application_id: 16_777_251,
+            hop_by_hop: 1,
+            end_to_end: 2,
+            avps,
+        }
+    }
+
+    fn olr(sequence: u64, reduction: u32, validity: u32) -> Olr {
+        Olr {
+            sequence,
+            report_type: ReportType::Host,
+            validity_secs: validity,
+            reduction_percentage: reduction,
+        }
+    }
+
+    fn key(host: &str) -> ReportKey {
+        ReportKey::new(ReportType::Host, host, 16_777_251)
+    }
+
+    // Hand-assembled from RFC 7683 section 7 (AVP codes 621 to 627, no M or V
+    // bit, every length a multiple of four), not produced by the encoder.
+    const SUPPORTED_FEATURES_LOSS: [u8; 24] = [
+        0x00, 0x00, 0x02, 0x6d, 0x00, 0x00, 0x00, 0x18, // OC-Supported-Features, 24
+        0x00, 0x00, 0x02, 0x6e, 0x00, 0x00, 0x00, 0x10, // OC-Feature-Vector, 16
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // OLR_DEFAULT_ALGO
+    ];
+    const OLR_30_PERCENT: [u8; 60] = [
+        0x00, 0x00, 0x02, 0x6f, 0x00, 0x00, 0x00, 0x3c, // OC-OLR, 60
+        0x00, 0x00, 0x02, 0x70, 0x00, 0x00, 0x00, 0x10, // OC-Sequence-Number
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // 1
+        0x00, 0x00, 0x02, 0x72, 0x00, 0x00, 0x00, 0x0c, // OC-Report-Type
+        0x00, 0x00, 0x00, 0x00, // HOST_REPORT
+        0x00, 0x00, 0x02, 0x73, 0x00, 0x00, 0x00, 0x0c, // OC-Reduction-Percentage
+        0x00, 0x00, 0x00, 0x1e, // 30
+        0x00, 0x00, 0x02, 0x71, 0x00, 0x00, 0x00, 0x0c, // OC-Validity-Duration
+        0x00, 0x00, 0x00, 0x1e, // 30 s
+    ];
+
+    #[test]
+    fn oc_supported_features_encodes_to_the_rfc_7683_bytes() {
+        assert_eq!(
+            encode_avps(&[supported_features_avp(FEATURE_LOSS)]),
+            SUPPORTED_FEATURES_LOSS
+        );
+    }
+
+    #[test]
+    fn oc_olr_encodes_to_the_rfc_7683_bytes() {
+        assert_eq!(encode_avps(&[olr_avp(&olr(1, 30, 30))]), OLR_30_PERCENT);
+    }
+
+    #[test]
+    fn the_hand_assembled_bytes_decode_to_the_values() {
+        let mut wire = request(vec![]).to_wire();
+        let mut body = SUPPORTED_FEATURES_LOSS.to_vec();
+        body.extend_from_slice(&OLR_30_PERCENT);
+        let length = (wire.len() + body.len()) as u32;
+        wire.extend_from_slice(&body);
+        wire[1..4].copy_from_slice(&length.to_be_bytes()[1..]);
+        let message = DiameterMsg::from_wire(&wire).unwrap();
+        assert!(supports_loss(&message));
+        assert_eq!(parse_olr(&message), Some(olr(1, 30, 30)));
+    }
+
+    #[test]
+    fn a_message_without_doic_advertises_nothing() {
+        let message = request(vec![]);
+        assert_eq!(advertised_features(&message), 0);
+        assert!(!supports_loss(&message));
+        assert_eq!(parse_olr(&message), None);
+    }
+
+    #[test]
+    fn an_unknown_algorithm_bit_alone_is_not_loss_support() {
+        let message = request(vec![supported_features_avp(0x8)]);
+        assert!(!supports_loss(&message));
+    }
+
+    #[test]
+    fn a_report_missing_its_sequence_or_type_or_above_100_percent_is_not_usable() {
+        let mut no_sequence = olr_avp(&olr(1, 30, 30));
+        if let AvpData::Grouped(children) = &mut no_sequence.value {
+            children.retain(|child| child.code != avp::OC_SEQUENCE_NUMBER);
+        }
+        assert_eq!(parse_olr(&request(vec![no_sequence])), None);
+        let mut no_type = olr_avp(&olr(1, 30, 30));
+        if let AvpData::Grouped(children) = &mut no_type.value {
+            children.retain(|child| child.code != avp::OC_REPORT_TYPE);
+        }
+        assert_eq!(parse_olr(&request(vec![no_type])), None);
+        assert_eq!(parse_olr(&request(vec![olr_avp(&olr(1, 101, 30))])), None);
+    }
+
+    #[test]
+    fn a_missing_reduction_is_zero_a_missing_validity_thirty_and_a_long_one_is_capped() {
+        let mut sparse = olr_avp(&olr(7, 50, 30));
+        if let AvpData::Grouped(children) = &mut sparse.value {
+            children.retain(|child| {
+                child.code != avp::OC_REDUCTION_PERCENTAGE
+                    && child.code != avp::OC_VALIDITY_DURATION
+            });
+        }
+        assert_eq!(parse_olr(&request(vec![sparse])), Some(olr(7, 0, 30)));
+        let long = olr_avp(&olr(7, 50, 1_000_000));
+        assert_eq!(
+            parse_olr(&request(vec![long])).map(|olr| olr.validity_secs),
+            Some(MAX_VALIDITY_SECS)
+        );
+    }
+
+    #[test]
+    fn a_relay_passes_the_oc_avps_through_unchanged() {
+        // Both directions: a request carrying OC-Supported-Features and an
+        // answer carrying OC-OLR go through the relay primitives intact, the
+        // identity rewrite included.
+        let mut forwarded = request(vec![
+            Avp::utf8(avp::ORIGIN_HOST, 0, "client.example.org"),
+            supported_features_avp(FEATURE_LOSS),
+        ]);
+        forward::prepare_forward(&mut forwarded, &["relay.example.org"], "client.example.org")
+            .unwrap();
+        forward::rewrite_origin(&mut forwarded, "relay.example.org", "example.org");
+        let received = DiameterMsg::from_wire(&forwarded.to_wire()).unwrap();
+        assert_eq!(
+            received.find(avp::OC_SUPPORTED_FEATURES, 0),
+            Some(&supported_features_avp(FEATURE_LOSS))
+        );
+
+        let mut answer =
+            forward::build_answer(&forwarded, "server.example.org", "example.org", 2001, None);
+        answer.avps.push(olr_avp(&olr(9, 40, 60)));
+        let mut relayed = DiameterMsg::from_wire(&answer.to_wire()).unwrap();
+        relayed.hop_by_hop = 77;
+        relayed.end_to_end = 88;
+        let delivered = DiameterMsg::from_wire(&relayed.to_wire()).unwrap();
+        assert_eq!(parse_olr(&delivered), Some(olr(9, 40, 60)));
+    }
+
+    // ── reacting node ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_report_abates_its_percentage_of_requests_within_tolerance() {
+        let table = ReactingTable::default();
+        let now = Instant::now();
+        assert_eq!(
+            table.update(key("hss.example.org"), &olr(1, 30, 30), now),
+            Update::Applied
+        );
+        let keys = [key("hss.example.org")];
+        let total = 20_000;
+        let abated = (0..total)
+            .filter(|_| table.abate(&keys, now, random_unit()).is_some())
+            .count();
+        let share = abated as f64 / total as f64 * 100.0;
+        assert!(
+            (share - 30.0).abs() < 1.5,
+            "abated {share:.2} % instead of 30 %"
+        );
+    }
+
+    #[test]
+    fn nothing_is_abated_without_a_report_or_for_another_node() {
+        let table = ReactingTable::default();
+        let now = Instant::now();
+        assert!(table.is_idle());
+        assert!(table.abate(&[key("hss.example.org")], now, 0.0).is_none());
+        table.update(key("hss.example.org"), &olr(1, 100, 30), now);
+        assert!(table.abate(&[key("other.example.org")], now, 0.0).is_none());
+        assert!(table.abate(&[key("HSS.example.org")], now, 0.0).is_some());
+        let other_application = ReportKey::new(ReportType::Host, "hss.example.org", 4);
+        assert!(table.abate(&[other_application], now, 0.0).is_none());
+    }
+
+    #[test]
+    fn abatement_stops_when_the_validity_runs_out() {
+        let table = ReactingTable::default();
+        let start = Instant::now();
+        table.update(key("hss.example.org"), &olr(1, 100, 30), start);
+        let keys = [key("hss.example.org")];
+        assert!(table
+            .abate(&keys, start + Duration::from_secs(29), 0.0)
+            .is_some());
+        assert!(table
+            .abate(&keys, start + Duration::from_secs(30), 0.0)
+            .is_none());
+        assert!(table.is_idle(), "the expired report is dropped");
+    }
+
+    #[test]
+    fn a_newer_sequence_replaces_a_report_and_zero_ends_it() {
+        let table = ReactingTable::default();
+        let now = Instant::now();
+        table.update(key("hss.example.org"), &olr(5, 80, 30), now);
+        // Older and repeated numbers are ignored.
+        assert_eq!(
+            table.update(key("hss.example.org"), &olr(4, 10, 30), now),
+            Update::Ignored
+        );
+        assert_eq!(
+            table.update(key("hss.example.org"), &olr(5, 10, 30), now),
+            Update::Ignored
+        );
+        assert_eq!(
+            table
+                .reduction_for(&[key("hss.example.org")], now)
+                .map(|found| found.0),
+            Some(80)
+        );
+        // A newer one replaces it.
+        assert_eq!(
+            table.update(key("hss.example.org"), &olr(6, 20, 30), now),
+            Update::Applied
+        );
+        assert_eq!(
+            table
+                .reduction_for(&[key("hss.example.org")], now)
+                .map(|found| found.0),
+            Some(20)
+        );
+        // A newer one asking for nothing ends it.
+        assert_eq!(
+            table.update(key("hss.example.org"), &olr(7, 0, 30), now),
+            Update::Ended
+        );
+        assert!(table.abate(&[key("hss.example.org")], now, 0.0).is_none());
+        assert!(table.is_idle());
+    }
+
+    #[test]
+    fn a_zero_validity_ends_a_report() {
+        let table = ReactingTable::default();
+        let now = Instant::now();
+        table.update(key("a.example.org"), &olr(1, 50, 30), now);
+        assert_eq!(
+            table.update(key("a.example.org"), &olr(2, 50, 0), now),
+            Update::Ended
+        );
+        assert!(table.is_idle());
+    }
+
+    #[test]
+    fn a_report_after_expiry_is_taken_whatever_its_sequence() {
+        let table = ReactingTable::default();
+        let start = Instant::now();
+        table.update(key("a.example.org"), &olr(100, 50, 10), start);
+        let later = start + Duration::from_secs(20);
+        assert_eq!(
+            table.update(key("a.example.org"), &olr(1, 60, 10), later),
+            Update::Applied
+        );
+    }
+
+    #[test]
+    fn the_strongest_of_the_reports_that_apply_wins() {
+        let table = ReactingTable::default();
+        let now = Instant::now();
+        table.update(key("hss.example.org"), &olr(1, 20, 30), now);
+        table.update(
+            ReportKey::new(ReportType::Realm, "example.org", 16_777_251),
+            &olr(1, 60, 30),
+            now,
+        );
+        let keys = [
+            key("hss.example.org"),
+            ReportKey::new(ReportType::Realm, "example.org", 16_777_251),
+        ];
+        assert_eq!(
+            table.reduction_for(&keys, now).map(|found| found.0),
+            Some(60)
+        );
+        assert_eq!(table.len(), 2);
+    }
+
+    // ── reporting node ──────────────────────────────────────────────────
+
+    #[test]
+    fn the_depth_scale_rises_linearly_between_its_marks() {
+        let scale = DepthScale {
+            start: 100,
+            full: 200,
+            max_reduction: 80,
+        };
+        assert_eq!(scale.reduction(0), 0);
+        assert_eq!(scale.reduction(100), 0);
+        assert_eq!(scale.reduction(150), 40);
+        assert_eq!(scale.reduction(200), 80);
+        assert_eq!(scale.reduction(10_000), 80);
+    }
+
+    #[test]
+    fn the_application_sets_the_reported_reduction_and_it_lapses() {
+        let reporting = ReportingState::new(30, None);
+        let now = Instant::now();
+        assert_eq!(reporting.reduction(0, now), 0);
+        reporting.set(40, Some(Duration::from_secs(10)), now);
+        assert_eq!(reporting.reduction(0, now), 40);
+        assert_eq!(reporting.reduction(0, now + Duration::from_secs(11)), 0);
+        reporting.set(70, None, now);
+        assert_eq!(reporting.reduction(0, now + Duration::from_secs(3600)), 70);
+        reporting.set(0, None, now);
+        assert_eq!(reporting.reduction(0, now), 0);
+    }
+
+    #[test]
+    fn the_larger_of_the_application_and_the_pending_depth_is_reported() {
+        let reporting = ReportingState::new(
+            30,
+            Some(DepthScale {
+                start: 0,
+                full: 100,
+                max_reduction: 100,
+            }),
+        );
+        let now = Instant::now();
+        reporting.set(30, None, now);
+        assert_eq!(reporting.reduction(10, now), 30);
+        assert_eq!(reporting.reduction(60, now), 60);
+    }
+
+    #[test]
+    fn a_report_keeps_its_sequence_within_its_validity_and_a_change_raises_it() {
+        let reporting = ReportingState::new(30, None);
+        let now = Instant::now();
+        assert!(reporting.olr(0, now).is_none(), "nothing to report");
+        reporting.set(50, None, now);
+        let first = reporting.olr(0, now).unwrap();
+        assert_eq!(first.reduction_percentage, 50);
+        let repeat = reporting.olr(0, now + Duration::from_secs(5)).unwrap();
+        assert_eq!(repeat.sequence, first.sequence, "same report, same number");
+        reporting.set(60, None, now);
+        let changed = reporting.olr(0, now + Duration::from_secs(6)).unwrap();
+        assert!(changed.sequence > first.sequence);
+        assert_eq!(changed.reduction_percentage, 60);
+        // Past half its validity it is renewed under a new number.
+        let renewed = reporting.olr(0, now + Duration::from_secs(6 + 20)).unwrap();
+        assert!(renewed.sequence > changed.sequence);
+        assert_eq!(renewed.validity_secs, 30);
+    }
+
+    #[test]
+    fn the_end_of_an_overload_is_reported_once_with_no_reduction() {
+        let reporting = ReportingState::new(30, None);
+        let now = Instant::now();
+        reporting.set(50, None, now);
+        let during = reporting.olr(0, now).unwrap();
+        reporting.set(0, None, now);
+        let end = reporting.olr(0, now + Duration::from_secs(1)).unwrap();
+        assert_eq!(end.reduction_percentage, 0);
+        assert!(end.sequence > during.sequence);
+        assert!(reporting.olr(0, now + Duration::from_secs(2)).is_none());
+    }
+
+    #[test]
+    fn an_answer_to_a_doic_capable_request_carries_the_report_and_others_do_not() {
+        let reporting = ReportingState::new(30, None);
+        let now = Instant::now();
+        reporting.set(50, None, now);
+
+        let mut capable = request(vec![]);
+        capable.flags = 0;
+        assert!(reporting.annotate(&mut capable, FEATURE_LOSS, 0, now));
+        assert!(supports_loss(&capable), "the answer says it supports DOIC");
+        assert_eq!(
+            parse_olr(&capable).map(|found| found.reduction_percentage),
+            Some(50)
+        );
+
+        let mut legacy = request(vec![]);
+        assert!(!reporting.annotate(&mut legacy, 0, 0, now));
+        assert!(
+            legacy.avps.is_empty(),
+            "a requester without DOIC gets nothing"
+        );
+        let mut other_algorithm = request(vec![]);
+        assert!(!reporting.annotate(&mut other_algorithm, 0x8, 0, now));
+        assert!(other_algorithm.avps.is_empty());
+    }
+
+    #[test]
+    fn a_capable_requester_is_told_of_support_even_when_there_is_nothing_to_report() {
+        let reporting = ReportingState::new(30, None);
+        let mut answer = request(vec![]);
+        assert!(!reporting.annotate(&mut answer, FEATURE_LOSS, 0, Instant::now()));
+        assert!(supports_loss(&answer));
+        assert_eq!(parse_olr(&answer), None);
+    }
+
+    #[test]
+    fn an_answer_that_already_carries_doic_from_a_node_behind_is_not_touched() {
+        let reporting = ReportingState::new(30, None);
+        let now = Instant::now();
+        reporting.set(90, None, now);
+        let mut relayed = request(vec![olr_avp(&olr(3, 10, 30))]);
+        let before = relayed.clone();
+        assert!(!reporting.annotate(&mut relayed, FEATURE_LOSS, 0, now));
+        assert_eq!(relayed, before);
+    }
+
+    /// Emit the DOIC AVPs for `scripts/validate_diameter_overload.sh`, which
+    /// has Wireshark's dissector read them back.
+    #[test]
+    fn emit_doic_messages_for_external_dissection() {
+        let Ok(path) = std::env::var("SIPHON_DIAMETER_OVERLOAD_HEX_OUT") else {
+            return;
+        };
+        let mut capable_request = request(vec![
+            Avp::utf8(avp::SESSION_ID, 0, "client.example.org;1;1"),
+            Avp::utf8(avp::ORIGIN_HOST, 0, "client.example.org"),
+            Avp::utf8(avp::ORIGIN_REALM, 0, "example.org"),
+            supported_features_avp(FEATURE_LOSS),
+        ]);
+        capable_request.command_code = 280;
+        capable_request.application_id = 0;
+        let reporting = ReportingState::new(30, None);
+        reporting.set(30, None, Instant::now());
+        let mut answer = forward::build_answer(
+            &capable_request,
+            "server.example.org",
+            "example.org",
+            2001,
+            None,
+        );
+        reporting.annotate(&mut answer, FEATURE_LOSS, 0, Instant::now());
+        let mut realm_report = forward::build_answer(
+            &capable_request,
+            "server.example.org",
+            "example.org",
+            2001,
+            None,
+        );
+        realm_report.avps.push(olr_avp(&Olr {
+            sequence: 0x0102_0304_0506_0708,
+            report_type: ReportType::Realm,
+            validity_secs: 86_400,
+            reduction_percentage: 100,
+        }));
+        let mut dump = String::new();
+        for wire in [
+            capable_request.to_wire(),
+            answer.to_wire(),
+            realm_report.to_wire(),
+        ] {
+            for (offset, chunk) in wire.chunks(16).enumerate() {
+                dump.push_str(&format!("{:06x}", offset * 16));
+                for byte in chunk {
+                    dump.push_str(&format!(" {byte:02x}"));
+                }
+                dump.push('\n');
+            }
+            dump.push('\n');
+        }
+        std::fs::write(path, dump).unwrap();
+    }
 }

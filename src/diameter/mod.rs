@@ -27,6 +27,7 @@ pub(crate) mod gba_test_vectors;
 pub mod group;
 pub mod lifecycle;
 pub(crate) mod originate;
+pub mod overload;
 pub mod peer;
 pub mod pool;
 pub(crate) mod reauthorize;

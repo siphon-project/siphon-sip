@@ -584,6 +584,48 @@ static AVP_TABLE: &[AvpDef] = &[
 
     // GBA: Zh and Zn (TS 29.109 Table 6.1)
     AvpDef {
+        code: 621,
+        vendor_id: 0,
+        name: "OC-Supported-Features",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 622,
+        vendor_id: 0,
+        name: "OC-Feature-Vector",
+        data_type: AvpType::Unsigned64,
+    },
+    AvpDef {
+        code: 623,
+        vendor_id: 0,
+        name: "OC-OLR",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 624,
+        vendor_id: 0,
+        name: "OC-Sequence-Number",
+        data_type: AvpType::Unsigned64,
+    },
+    AvpDef {
+        code: 625,
+        vendor_id: 0,
+        name: "OC-Validity-Duration",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 626,
+        vendor_id: 0,
+        name: "OC-Report-Type",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 627,
+        vendor_id: 0,
+        name: "OC-Reduction-Percentage",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
         code: 400,
         vendor_id: TGPP,
         name: "GBA-UserSecSettings",
@@ -1888,7 +1930,11 @@ pub fn avp_is_mandatory(code: u32, vendor_id: u32) -> bool {
         ),
         0 => !matches!(
             code,
-            avp::FIRMWARE_REVISION | avp::PRODUCT_NAME | avp::ERROR_MESSAGE | ERROR_REPORTING_HOST
+            avp::FIRMWARE_REVISION
+                | avp::PRODUCT_NAME
+                | avp::ERROR_MESSAGE
+                | ERROR_REPORTING_HOST
+                | avp::OC_SUPPORTED_FEATURES..=avp::OC_REDUCTION_PERCENTAGE
         ),
         _ => true,
     }

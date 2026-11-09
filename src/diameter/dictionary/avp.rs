@@ -26,6 +26,15 @@ pub const EXPERIMENTAL_RESULT: u32 = 297;
 pub const EXPERIMENTAL_RESULT_CODE: u32 = 298;
 pub const FAILED_AVP: u32 = 279;
 
+// RFC 7683 Diameter Overload Indication Conveyance (DOIC), section 7
+pub const OC_SUPPORTED_FEATURES: u32 = 621;
+pub const OC_FEATURE_VECTOR: u32 = 622;
+pub const OC_OLR: u32 = 623;
+pub const OC_SEQUENCE_NUMBER: u32 = 624;
+pub const OC_VALIDITY_DURATION: u32 = 625;
+pub const OC_REPORT_TYPE: u32 = 626;
+pub const OC_REDUCTION_PERCENTAGE: u32 = 627;
+
 // RFC 6733 §8.21 Event-Timestamp / §8.19 Acct-Interim-Interval
 pub const EVENT_TIMESTAMP: u32 = 55;
 pub const ACCT_INTERIM_INTERVAL: u32 = 85;
