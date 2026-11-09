@@ -126,6 +126,7 @@ pub struct SharedPresence {
 }
 
 impl SharedPresence {
+    #[cfg_attr(not(any(feature = "redis-backend", test)), allow(dead_code))]
     pub(crate) fn new(
         ops: Arc<dyn SharedSubscriptions>,
         freshness: Duration,
