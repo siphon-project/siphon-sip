@@ -34,6 +34,7 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- A Diameter server admits a peer under the most specific `allowed_ips` entry that contains its address, not the first one. The tenants are read from a map in no fixed order, so a test client's host address inside another tenant's network was admitted under either tenant depending on the process.
 - The local address of a P-CSCF's IPsec SAs is the address its protected ports listen on. It was the first UDP listener's, so a P-CSCF with a core-side listener ahead of Gm programmed SAs no protected packet matched (TS 33.203 clause 7.1).
 - **`forward_to` answers with the Hop-by-Hop Identifier the request came with when the next hop fails.** The 3002 or 3004 siphon makes for a backend that is gone, silent or answers what does not parse carried the identifier siphon had used towards the backend, so the peer that sent the request could not match the answer and waited for its own timer (RFC 6733 section 6.2).
 - **Route-Record names the peer a relayed request came from.** `forward_to` recorded this node's own identity; it now records the Origin-Host the previous peer gave in its CER or CEA (RFC 6733 section 6.1.9), so the next hop sees the whole path. The loop check still looks for this node, under its own identity and the one given as `identity=`. The identity is readable as `request.peer.host`.
