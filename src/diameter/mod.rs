@@ -652,6 +652,30 @@ impl DiameterManager {
     }
 }
 
+/// Process-wide `DiameterManager`, set once at server bootstrap so Rust addon
+/// code can reach the manager the Python `diameter` namespace uses. Mirrors
+/// [`crate::ipsec::global_manager`].
+static GLOBAL_MANAGER: std::sync::OnceLock<Arc<DiameterManager>> = std::sync::OnceLock::new();
+
+/// Register the process-wide `DiameterManager`. Idempotent: the first caller
+/// wins and later calls are ignored. Called once, where the manager is built
+/// during server startup, before any registered extension task runs.
+pub fn set_global_manager(manager: Arc<DiameterManager>) {
+    let _ = GLOBAL_MANAGER.set(manager);
+}
+
+/// The running `DiameterManager`, for Rust addon code (a
+/// [`register_task`](crate::SiphonServer::register_task) closure, or a task it
+/// spawns). `None` when no `diameter:` block is configured.
+///
+/// Pick the peer with [`DiameterManager::route_client`] so the configured
+/// `diameter.routes[]` decide, then send with the typed `DiameterClient`
+/// methods (`send_mar`, `send_zh_mar`, ...). The calls are async and Rust-only;
+/// they never touch the Python interpreter.
+pub fn global_manager() -> Option<Arc<DiameterManager>> {
+    GLOBAL_MANAGER.get().cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
