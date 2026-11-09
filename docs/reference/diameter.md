@@ -859,5 +859,33 @@ not dialled again by this node.
 
 A DPR from a peer is answered with a DPA, after which the connection closes
 and the dialling loop applies the cause: `REBOOTING` redials on the ordinary
-schedule, `BUSY` waits at least `reconnect_delay` seconds before the next try, and
+schedule, `BUSY` waits at least `reconnect_delay_max` seconds before the next try, and
 `DO_NOT_WANT_TO_TALK_TO_YOU` leaves the peer alone for five minutes.
+
+### Reconnecting, and the state of a peer
+
+A peer that is not reachable is dialled with exponential backoff: the first
+retry after `reconnect_delay` seconds (default `5`), then twice as long each
+time up to `reconnect_delay_max` (default `60`). Every wait is drawn from the
+upper 70 % of its nominal value, so nodes restarted together do not dial in
+step. A completed capabilities exchange starts the schedule over. `peers`,
+`servers` and `connect_to` entries each take `reconnect_delay`,
+`reconnect_delay_max` and `watchdog_interval`; `diameter.*` holds the defaults
+(`servers` and `connect_to` entries used to ignore them).
+
+The watchdog follows the state machine of RFC 3539 section 3.4.1. Every
+`watchdog_interval` seconds (default `30`) a connection that has had no
+message from its peer sends a Device-Watchdog-Request.
+
+| State | Meaning |
+|---|---|
+| `OKAY` | Takes requests. Any message from the peer proves it alive. |
+| `SUSPECT` | A watchdog went unanswered for an interval. The requests waiting on this peer fail at once, so the caller can send them to another peer (see "Retrying on another peer"), and no new request is sent to it. A watchdog answer brings it back to `OKAY`; another silent interval closes the connection. |
+| `REOPEN` | A connection that follows a failure. The peer must answer `reopen_watchdog_answers` watchdogs (default `3`, per peer or `diameter.reopen_watchdog_answers`; `0` skips it) before it is `OKAY` and takes requests. A missed one closes the connection. |
+| `DOWN` | The connection is closed. |
+
+A peer that goes away with a DPR, or that this node disconnected, comes back
+without REOPEN only when it said it was rebooting; one that just dropped, or
+stopped answering, is in REOPEN on its next connection. Detecting a dead peer
+takes two to three watchdog intervals, as the RFC has it; lower
+`watchdog_interval` for faster failover.

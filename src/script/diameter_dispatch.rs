@@ -23,7 +23,7 @@ use backend::spawn_backend_connection;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use pyo3::prelude::*;
 use tokio::sync::{mpsc, Semaphore};
@@ -33,7 +33,6 @@ use crate::config::DiameterConfig;
 use crate::diameter::auth::{AclMatch, OriginHostPolicy, SourceIpAcl};
 use crate::diameter::codec::{Avp, DiameterMsg};
 use crate::diameter::dictionary;
-use crate::diameter::lifecycle::ReconnectAdvice;
 use crate::diameter::peer::{self, DiameterPeer, IncomingRequest, PeerConfig};
 use crate::diameter::reauthorize::ServingConnection;
 use crate::diameter::server::{CerDecision, ServerHandshake, ServerIdentity, TenantApplications};
@@ -335,12 +334,16 @@ fn spawn_serving_connection(
         destination_realm: origin_realm.clone(),
         local_ip: std::net::Ipv4Addr::UNSPECIFIED,
         application_ids: vec![],
-        watchdog_interval: 30,
-        reconnect_delay: 5,
-        lifecycle: Default::default(),
+        watchdog_interval: entry.watchdog_interval.unwrap_or(30),
+        reconnect_delay: entry.reconnect_delay.unwrap_or(5),
+        lifecycle: entry.lifecycle(),
         product_name: product_name.to_string(),
         firmware_revision: peer::version_to_firmware_revision(product_version),
     };
+    let mut schedule = crate::diameter::backoff::ReconnectSchedule::new(
+        config.reconnect_delay,
+        config.lifecycle.reconnect_delay_max,
+    );
     let transport = entry.transport.clone();
     let peer_info = PyInboundPeer {
         name: entry.name.clone(),
@@ -353,11 +356,14 @@ fn spawn_serving_connection(
 
     tokio::spawn(async move {
         loop {
-            let mut delay = Duration::from_secs(5);
+            let delay;
             // Asked per attempt: the CER advertises what the script serves now.
             config.application_ids = applications(&tenant_name);
             match peer::connect_with_transport(config.clone(), &transport).await {
                 Ok((connected, incoming_rx)) => {
+                    if schedule.connected() {
+                        connected.enter_reopen().await;
+                    }
                     info!(
                         peer = %entry.name,
                         tenant = %tenant_name,
@@ -373,22 +379,20 @@ fn spawn_serving_connection(
                         (origin_host.clone(), origin_realm.clone()),
                     )
                     .await;
-                    match ended.reconnect_advice() {
-                        ReconnectAdvice::Stop => {
+                    match schedule.ended(&ended) {
+                        None => {
                             info!(peer = %entry.name, "Diameter server: outbound serving connection disconnected by this node, not reconnecting");
                             return;
                         }
-                        ReconnectAdvice::Hold(hold) => {
-                            warn!(peer = %entry.name, hold_secs = hold.as_secs(), "Diameter server: peer asked not to be redialled yet");
-                            delay = delay.max(hold);
-                        }
-                        ReconnectAdvice::Normal => {
-                            warn!(peer = %entry.name, "Diameter server: outbound serving connection dropped, reconnecting");
+                        Some(wait) => {
+                            warn!(peer = %entry.name, wait_secs = wait.as_secs(), "Diameter server: outbound serving connection dropped, reconnecting");
+                            delay = wait;
                         }
                     }
                 }
                 Err(error) => {
-                    warn!(peer = %entry.name, %error, "Diameter server: outbound serving connect failed, retrying in 5s");
+                    delay = schedule.failed();
+                    warn!(peer = %entry.name, %error, wait_secs = delay.as_secs(), "Diameter server: outbound serving connect failed, retrying");
                 }
             }
             tokio::time::sleep(delay).await;
@@ -2529,6 +2533,7 @@ mod s13_serving_tests {
 #[cfg(test)]
 mod awaiting_handler_tests {
     use super::*;
+    use std::time::Duration;
 
     /// The registry calls `@diameter.on_request` and friends make once
     /// `diameter:` is configured, which an embedded test script is not.
@@ -2685,6 +2690,7 @@ mod backend_connection_tests {
     use super::*;
     use crate::config::{DiameterServerEntry, DiameterTenant, DiameterTenantIdentity};
     use crate::diameter::codec::Avp;
+    use std::time::Duration;
 
     const SCRIPT: &str = concat!(
         "import _siphon_registry\n",
@@ -2836,6 +2842,7 @@ mod backend_connection_tests {
                     host: "127.0.0.1".to_string(),
                     port: hss_port,
                     transport: "tcp".to_string(),
+                    ..Default::default()
                 },
                 Arc::new(DiameterManager::new()),
                 Arc::clone(&engine),
@@ -2858,6 +2865,7 @@ mod backend_connection_tests {
                     host: "127.0.0.1".to_string(),
                     port: mme_port,
                     transport: "tcp".to_string(),
+                    ..Default::default()
                 },
                 Arc::clone(&engine),
                 Arc::clone(&semaphore),
@@ -2999,6 +3007,7 @@ mod backend_connection_tests {
                 host: "127.0.0.1".to_string(),
                 port,
                 transport: "tcp".to_string(),
+                ..Default::default()
             };
             let applications: TenantApplications = Arc::new(|_| vec![(10_415, S6A)]);
             spawn_backend_connection(

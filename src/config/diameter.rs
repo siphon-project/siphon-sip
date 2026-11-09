@@ -41,6 +41,12 @@ fn default_watchdog_interval() -> u64 {
 fn default_disconnect_timeout_ms() -> u64 {
     1000
 }
+fn default_reconnect_delay_max() -> u64 {
+    60
+}
+fn default_reopen_watchdog_answers() -> u32 {
+    3
+}
 fn default_reconnect_delay() -> u64 {
     5
 }
@@ -89,6 +95,18 @@ pub struct DiameterConfig {
     /// dead peer cannot hold the shutdown.
     #[serde(default = "default_disconnect_timeout_ms")]
     pub disconnect_timeout_ms: u64,
+    /// Default ceiling of the reconnect backoff in seconds: the wait between
+    /// attempts starts at `reconnect_delay` and doubles up to this.
+    #[serde(default = "default_reconnect_delay_max")]
+    pub reconnect_delay_max: u64,
+    /// Watchdogs a peer must answer after a reconnection before it takes
+    /// traffic again (RFC 3539 REOPEN). 0 skips REOPEN.
+    #[serde(default = "default_reopen_watchdog_answers")]
+    pub reopen_watchdog_answers: u32,
+    /// Watchdog interval in milliseconds, for a finer timer than
+    /// `watchdog_interval` allows.
+    #[serde(default)]
+    pub watchdog_interval_ms: Option<u64>,
     /// Named Diameter peers (HSS, OCS, PCRF, CDF, etc.).
     #[serde(default)]
     pub peers: Vec<DiameterPeerEntry>,
@@ -294,6 +312,29 @@ pub struct DiameterServerEntry {
     pub port: u16,
     #[serde(default = "default_diameter_transport")]
     pub transport: String,
+    /// Watchdog interval in seconds (default 30).
+    #[serde(default)]
+    pub watchdog_interval: Option<u64>,
+    /// First reconnect delay in seconds (default 5).
+    #[serde(default)]
+    pub reconnect_delay: Option<u64>,
+    /// Ceiling of the reconnect backoff in seconds (default 60).
+    #[serde(default)]
+    pub reconnect_delay_max: Option<u64>,
+}
+
+impl DiameterServerEntry {
+    /// The timers of this entry's connection, over the defaults of
+    /// [`PeerConfig`](crate::diameter::peer::PeerConfig).
+    pub fn lifecycle(&self) -> crate::diameter::lifecycle::PeerLifecycle {
+        let defaults = crate::diameter::lifecycle::PeerLifecycle::default();
+        crate::diameter::lifecycle::PeerLifecycle {
+            reconnect_delay_max: self
+                .reconnect_delay_max
+                .unwrap_or(defaults.reconnect_delay_max),
+            ..defaults
+        }
+    }
 }
 
 /// Generic batched event sink (Python-emitted signalling events).
@@ -339,6 +380,12 @@ pub struct DiameterPeerEntry {
     pub watchdog_interval: Option<u64>,
     /// Reconnect delay override in seconds.
     pub reconnect_delay: Option<u64>,
+    /// Reconnect backoff ceiling override in seconds.
+    #[serde(default)]
+    pub reconnect_delay_max: Option<u64>,
+    /// REOPEN watchdog answers override.
+    #[serde(default)]
+    pub reopen_watchdog_answers: Option<u32>,
 }
 
 /// Maps a Diameter application to one or more peers.
@@ -466,6 +513,11 @@ impl DiameterConfig {
             reconnect_delay: peer.reconnect_delay.unwrap_or(self.reconnect_delay),
             lifecycle: crate::diameter::lifecycle::PeerLifecycle {
                 disconnect_timeout_ms: self.disconnect_timeout_ms,
+                reconnect_delay_max: peer.reconnect_delay_max.unwrap_or(self.reconnect_delay_max),
+                reopen_watchdog_answers: peer
+                    .reopen_watchdog_answers
+                    .unwrap_or(self.reopen_watchdog_answers),
+                watchdog_interval_ms: self.watchdog_interval_ms,
                 ..Default::default()
             },
             product_name: self

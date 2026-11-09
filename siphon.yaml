@@ -2217,7 +2217,9 @@ auth:
 #   transport: tcp                       # tcp | sctp (default for all peers)
 #   watchdog_interval: 30                # DWR/DWA interval in seconds
 #   resolve_interval: 30                 # DNS group refresh in seconds
-#   reconnect_delay: 5                   # seconds between reconnect attempts
+#   reconnect_delay: 5                   # first reconnect wait in seconds; doubles per attempt
+#   reconnect_delay_max: 60              # ceiling of the reconnect backoff in seconds
+#   reopen_watchdog_answers: 3           # watchdogs a reconnected peer answers before it takes traffic
 #   disconnect_timeout_ms: 1000          # wait for the DPA when a connection is closed on purpose
 
 #   peers:

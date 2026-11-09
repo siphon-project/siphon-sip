@@ -58,6 +58,15 @@ pub struct PeerLifecycle {
     /// How long to leave a peer alone after it disconnected with
     /// DO_NOT_WANT_TO_TALK_TO_YOU, in seconds.
     pub refused_hold: u64,
+    /// The ceiling of the reconnect backoff, in seconds. The wait between
+    /// attempts starts at `reconnect_delay` and doubles up to this.
+    pub reconnect_delay_max: u64,
+    /// Watchdogs a peer must answer in REOPEN (RFC 3539) before it takes
+    /// traffic again after a reconnection. 0 skips REOPEN.
+    pub reopen_watchdog_answers: u32,
+    /// The watchdog timer in milliseconds, when it is to be finer than
+    /// `watchdog_interval` seconds.
+    pub watchdog_interval_ms: Option<u64>,
 }
 
 impl Default for PeerLifecycle {
@@ -65,6 +74,9 @@ impl Default for PeerLifecycle {
         Self {
             disconnect_timeout_ms: 1000,
             refused_hold: 300,
+            reconnect_delay_max: 60,
+            reopen_watchdog_answers: 3,
+            watchdog_interval_ms: None,
         }
     }
 }

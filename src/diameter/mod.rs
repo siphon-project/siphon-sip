@@ -11,6 +11,7 @@
 //! exchange and DWR/DWA watchdog keepalives.
 
 pub mod auth;
+pub mod backoff;
 pub(crate) mod client_connection;
 pub mod codec;
 pub mod cx;
@@ -45,6 +46,7 @@ pub mod sgd;
 pub mod sh;
 pub mod transport;
 pub mod unknown_avp;
+pub mod watchdog;
 
 use std::sync::Arc;
 

@@ -20,6 +20,7 @@ use crate::diameter::transport::DiameterStream;
 
 use crate::diameter::codec::{self, *};
 use crate::diameter::dictionary::{self, avp};
+use crate::diameter::watchdog::{Watchdog, WatchdogAction, WatchdogState};
 
 /// Configuration for a Diameter peer connection.
 #[derive(Debug, Clone)]
@@ -211,6 +212,9 @@ pub struct DiameterPeer {
     /// Set once this node has started to disconnect the connection with a
     /// Disconnect-Peer-Request: it takes no more requests and is not redialled.
     disconnecting: AtomicBool,
+    /// The RFC 3539 peer state machine and, for cheap reads, its state.
+    watchdog: std::sync::Mutex<Watchdog>,
+    watchdog_state: AtomicU8,
     /// Wakes the writer to flush what is queued and close (an answer to a
     /// Disconnect-Peer-Request has to leave before the socket does).
     flush_close: Arc<Notify>,
@@ -251,7 +255,84 @@ impl DiameterPeer {
 
     /// Whether the peer is `Open` and ready to carry requests.
     pub fn is_open(&self) -> bool {
-        self.state() == PeerState::Open && !self.disconnecting.load(Ordering::Acquire)
+        self.state() == PeerState::Open
+            && !self.disconnecting.load(Ordering::Acquire)
+            && self.watchdog_state() == WatchdogState::Okay
+    }
+
+    /// The state of the peer by the watchdog exchange (RFC 3539 section
+    /// 3.4.1). Only an OKAY peer takes new requests.
+    pub fn watchdog_state(&self) -> WatchdogState {
+        WatchdogState::from_u8(self.watchdog_state.load(Ordering::Acquire))
+    }
+
+    /// Run `event` on the watchdog machine and do what it asks.
+    async fn watchdog_event(&self, event: impl FnOnce(&mut Watchdog) -> WatchdogAction) {
+        let (action, before, after) = {
+            let Ok(mut machine) = self.watchdog.lock() else {
+                return;
+            };
+            let before = machine.state();
+            let action = event(&mut machine);
+            let after = machine.state();
+            self.watchdog_state.store(after.as_u8(), Ordering::Release);
+            (action, before, after)
+        };
+        if before != after {
+            info!(
+                peer = %self.config.host,
+                from = before.name(), to = after.name(),
+                "Diameter: peer watchdog state changed"
+            );
+        }
+        match action {
+            WatchdogAction::None => {}
+            WatchdogAction::SendWatchdog => {
+                let dwr = build_dwr(
+                    &self.config.origin_host,
+                    &self.config.origin_realm,
+                    self.next_hbh(),
+                    self.next_e2e(),
+                );
+                if self.write_tx.try_send(dwr).is_err() {
+                    warn!("Diameter: dropped DWR — peer outbound queue full or closed");
+                }
+            }
+            WatchdogAction::FailOver => {
+                // RFC 3539 failover: what waits on this peer goes elsewhere.
+                // The senders drop, so each caller sees the request fail now
+                // instead of at its timeout and can send it to another peer.
+                let failed = {
+                    let mut pending = self.pending.lock().await;
+                    let failed = pending.len();
+                    pending.clear();
+                    failed
+                };
+                warn!(
+                    peer = %self.config.host, failed,
+                    "Diameter: peer is SUSPECT, failing the requests waiting on it"
+                );
+            }
+            WatchdogAction::Close => {
+                warn!(peer = %self.config.host, "Diameter: peer did not answer the watchdog, closing the connection");
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.diameter_watchdog_failures_total.inc();
+                }
+                self.shutdown();
+            }
+        }
+    }
+
+    /// This connection follows a failure: RFC 3539 REOPEN. The peer takes no
+    /// traffic until it has answered the configured number of watchdogs.
+    pub async fn enter_reopen(&self) {
+        let required = self.config.lifecycle.reopen_watchdog_answers;
+        self.watchdog_event(|machine| {
+            let (reopened, action) = Watchdog::reopening(required);
+            *machine = reopened;
+            action
+        })
+        .await;
     }
 
     /// The Disconnect-Cause the other end gave when it disconnected, if it did.
@@ -269,11 +350,20 @@ impl DiameterPeer {
 
     /// What the loop that dialled this connection does now that it has ended.
     pub fn reconnect_advice(&self) -> crate::diameter::lifecycle::ReconnectAdvice {
+        self.reconnect_advice_with(Duration::from_secs(self.config.reconnect_delay.max(1)))
+    }
+
+    /// [`reconnect_advice`](Self::reconnect_advice) with `busy_hold` as the
+    /// wait for a peer that said BUSY.
+    pub fn reconnect_advice_with(
+        &self,
+        busy_hold: Duration,
+    ) -> crate::diameter::lifecycle::ReconnectAdvice {
         crate::diameter::lifecycle::reconnect_advice(
             self.remote_disconnect_cause(),
             self.disconnected_locally(),
             &self.config.lifecycle,
-            Duration::from_secs(self.config.reconnect_delay.max(1)),
+            busy_hold,
         )
     }
 
@@ -474,6 +564,7 @@ impl DiameterPeer {
     /// [`DiameterPeer::set_state_for_test`].
     #[cfg(test)]
     pub fn new_for_test(config: PeerConfig, write_tx: mpsc::Sender<Vec<u8>>) -> Self {
+        let reopen_watchdog_answers = config.lifecycle.reopen_watchdog_answers;
         Self {
             config,
             write_tx,
@@ -487,6 +578,8 @@ impl DiameterPeer {
             remote: OnceLock::new(),
             remote_disconnect_cause: Arc::new(AtomicU32::new(NO_DISCONNECT_CAUSE)),
             disconnecting: AtomicBool::new(false),
+            watchdog: std::sync::Mutex::new(Watchdog::new(reopen_watchdog_answers)),
+            watchdog_state: AtomicU8::new(WatchdogState::Okay.as_u8()),
             flush_close: Arc::new(Notify::new()),
         }
     }
@@ -684,6 +777,8 @@ where
         remote: OnceLock::new(),
         remote_disconnect_cause: Arc::new(AtomicU32::new(NO_DISCONNECT_CAUSE)),
         disconnecting: AtomicBool::new(false),
+        watchdog: std::sync::Mutex::new(Watchdog::new(config.lifecycle.reopen_watchdog_answers)),
+        watchdog_state: AtomicU8::new(WatchdogState::Okay.as_u8()),
         flush_close: Arc::new(Notify::new()),
     });
     crate::diameter::lifecycle::register(&peer);
@@ -749,6 +844,7 @@ where
     let write_tx_r = peer.write_tx.clone();
     let shutdown_r = shutdown.clone();
     let state_r = state.clone();
+    let peer_r = peer.clone();
     let remote_cause_r = peer.remote_disconnect_cause.clone();
     let flush_close_r = peer.flush_close.clone();
     tokio::spawn(async move {
@@ -766,6 +862,19 @@ where
                             };
 
                             let cmd = codec::command_name(decoded.command_code, decoded.is_request);
+                            let watchdog_answer = !decoded.is_request
+                                && decoded.command_code == dictionary::CMD_DEVICE_WATCHDOG;
+                            if watchdog_answer {
+                                peer_r.watchdog_event(Watchdog::on_answer).await;
+                            } else {
+                                // Anything else the peer sends proves it alive.
+                                peer_r
+                                    .watchdog_event(|machine| {
+                                        machine.on_message();
+                                        WatchdogAction::None
+                                    })
+                                    .await;
+                            }
 
                             if decoded.is_request {
                                 // This task is the only thing that correlates
@@ -822,7 +931,7 @@ where
                                 let mut map = pending_r.lock().await;
                                 if let Some(tx) = map.remove(&decoded.hop_by_hop) {
                                     let _ = tx.send(decoded);
-                                } else {
+                                } else if !watchdog_answer {
                                     warn!("Diameter: unexpected answer {} (hbh={})", cmd, decoded.hop_by_hop);
                                 }
                             }
@@ -843,6 +952,12 @@ where
         // Reader loop exited → the connection is no longer usable. Mark Closed
         // so the peer pool stops handing it out (state-as-truth).
         state_r.store(PeerState::Closed.as_u8(), Ordering::Release);
+        peer_r
+            .watchdog_event(|machine| {
+                machine.on_closed();
+                WatchdogAction::None
+            })
+            .await;
         // No answer can arrive any more: fail the requests still waiting now
         // (their senders dropped) rather than at their timeouts, so a caller
         // tells a lost connection from a peer that does not answer.
@@ -852,30 +967,24 @@ where
         }
     });
 
-    // Watchdog task — sends DWR via send_request() so DWA is correlated
-    // through the pending map. If DWA doesn't arrive within the request
-    // timeout, the peer is considered dead and we trigger shutdown
-    // (which causes reconnect in client mode per connect_with_retry).
+    // Watchdog task: the timer of the RFC 3539 state machine. It sends the
+    // DWR and, when the peer stays silent, moves it to SUSPECT (its pending
+    // requests fail over) and then closes the connection, which in client
+    // mode makes the reconnect loop dial again.
     let peer_w = peer.clone();
     let shutdown_dw = shutdown.clone();
-    let watchdog_interval = config.watchdog_interval;
+    let tick = config
+        .lifecycle
+        .watchdog_interval_ms
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(config.watchdog_interval));
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(watchdog_interval)) => {
-                    let hbh = peer_w.next_hbh();
-                    let e2e = peer_w.next_e2e();
-                    let dwr = build_dwr(&peer_w.config.origin_host, &peer_w.config.origin_realm, hbh, e2e);
-                    match peer_w.send_request(dwr).await {
-                        Ok(_) => {} // DWA received — peer is alive
-                        Err(error) => {
-                            warn!("Diameter: watchdog failed ({}), closing connection", error);
-                            if let Some(metrics) = crate::metrics::try_metrics() {
-                                metrics.diameter_watchdog_failures_total.inc();
-                            }
-                            peer_w.shutdown();
-                            break;
-                        }
+                _ = tokio::time::sleep(tick) => {
+                    peer_w.watchdog_event(Watchdog::on_timer).await;
+                    if peer_w.watchdog_state() == WatchdogState::Down {
+                        break;
                     }
                 }
                 _ = shutdown_dw.notified() => break,
@@ -2059,5 +2168,169 @@ mod tests {
             assert_eq!(peer.remote_disconnect_cause(), Some(cause));
             assert_eq!(peer.reconnect_advice(), expected, "cause {cause}");
         }
+    }
+
+    fn fast_watchdog_config(interval_ms: u64) -> PeerConfig {
+        let mut config = test_config();
+        config.lifecycle.watchdog_interval_ms = Some(interval_ms);
+        config
+    }
+
+    async fn wait_for(what: &str, condition: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[tokio::test]
+    async fn a_silent_peer_turns_suspect_and_its_pending_requests_fail_at_once() {
+        let (client_side, mut far_end) = tokio::io::duplex(8192);
+        let (incoming_tx, _incoming_rx) = mpsc::channel(8);
+        let peer = spawn_connection_tasks(fast_watchdog_config(100), client_side, incoming_tx);
+        assert_eq!(peer.watchdog_state(), WatchdogState::Okay);
+        assert!(peer.is_open());
+
+        // A request waits for an answer that never comes, with a long timeout:
+        // it must fail when the peer turns SUSPECT, not at its own timeout.
+        let waiting = {
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                let request = codec::encode_diameter_message(
+                    FLAG_REQUEST,
+                    dictionary::CMD_AUTHENTICATION_INFORMATION,
+                    dictionary::S6A_APP_ID,
+                    peer.next_hbh(),
+                    peer.next_e2e(),
+                    &[],
+                );
+                peer.send_request_timeout(request, Duration::from_secs(30))
+                    .await
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the request fails when the peer turns SUSPECT")
+            .unwrap();
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(peer.watchdog_state(), WatchdogState::Suspect);
+        assert!(!peer.is_open(), "a SUSPECT peer takes no new requests");
+
+        // The far end saw a watchdog request, and stays silent: the peer is
+        // closed on the next expiry.
+        let mut commands = Vec::new();
+        for _ in 0..2 {
+            let seen = codec::read_diameter_message(&mut far_end).await.unwrap();
+            commands.push(codec::decode_diameter(&seen).unwrap().command_code);
+        }
+        assert!(
+            commands.contains(&dictionary::CMD_DEVICE_WATCHDOG),
+            "the far end saw a watchdog request: {commands:?}"
+        );
+        wait_for("the connection to close", || {
+            peer.state() == PeerState::Closed
+        })
+        .await;
+        assert_eq!(peer.watchdog_state(), WatchdogState::Down);
+    }
+
+    #[tokio::test]
+    async fn a_suspect_peer_that_answers_the_watchdog_takes_traffic_again() {
+        let (client_side, mut far_end) = tokio::io::duplex(8192);
+        let (incoming_tx, _incoming_rx) = mpsc::channel(8);
+        let peer = spawn_connection_tasks(fast_watchdog_config(150), client_side, incoming_tx);
+
+        let dwr =
+            codec::decode_diameter(&codec::read_diameter_message(&mut far_end).await.unwrap())
+                .unwrap();
+        wait_for("SUSPECT", || {
+            peer.watchdog_state() == WatchdogState::Suspect
+        })
+        .await;
+        // The answer comes late.
+        let dwa = build_dwa(
+            "far.example.org",
+            "example.org",
+            dwr.hop_by_hop,
+            dwr.end_to_end,
+        );
+        far_end.write_all(&dwa).await.unwrap();
+        wait_for("OKAY", || peer.watchdog_state() == WatchdogState::Okay).await;
+        assert!(peer.is_open());
+    }
+
+    #[tokio::test]
+    async fn a_reopened_peer_takes_traffic_only_after_the_required_watchdog_answers() {
+        let (client_side, mut far_end) = tokio::io::duplex(8192);
+        let (incoming_tx, _incoming_rx) = mpsc::channel(8);
+        // A long timer: only the answers drive the exchange.
+        let peer = spawn_connection_tasks(fast_watchdog_config(60_000), client_side, incoming_tx);
+        peer.enter_reopen().await;
+        assert_eq!(peer.watchdog_state(), WatchdogState::Reopen);
+        assert!(!peer.is_open());
+
+        for answered in 1..=3u32 {
+            let dwr =
+                codec::decode_diameter(&codec::read_diameter_message(&mut far_end).await.unwrap())
+                    .unwrap();
+            assert_eq!(dwr.command_code, dictionary::CMD_DEVICE_WATCHDOG);
+            assert!(dwr.is_request);
+            let dwa = build_dwa(
+                "far.example.org",
+                "example.org",
+                dwr.hop_by_hop,
+                dwr.end_to_end,
+            );
+            far_end.write_all(&dwa).await.unwrap();
+            if answered < 3 {
+                // Not yet: the answer is read, then the next DWR comes.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(!peer.is_open(), "{answered} answers are not enough");
+            }
+        }
+        wait_for("OKAY after three answers", || peer.is_open()).await;
+        assert_eq!(peer.watchdog_state(), WatchdogState::Okay);
+    }
+
+    #[tokio::test]
+    async fn a_reopened_peer_that_stays_silent_is_closed() {
+        let (client_side, _far_end) = tokio::io::duplex(8192);
+        let (incoming_tx, _incoming_rx) = mpsc::channel(8);
+        let peer = spawn_connection_tasks(fast_watchdog_config(100), client_side, incoming_tx);
+        peer.enter_reopen().await;
+        wait_for("the silent peer to be closed", || {
+            peer.state() == PeerState::Closed
+        })
+        .await;
+        assert_eq!(peer.watchdog_state(), WatchdogState::Down);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_keeps_sending_is_never_suspect() {
+        let (client_side, mut far_end) = tokio::io::duplex(8192);
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(64);
+        let peer = spawn_connection_tasks(fast_watchdog_config(100), client_side, incoming_tx);
+        // Traffic, not watchdog answers, for well over two intervals.
+        for index in 0..12u32 {
+            let request = codec::encode_diameter_message(
+                FLAG_REQUEST,
+                dictionary::CMD_AUTHENTICATION_INFORMATION,
+                dictionary::S6A_APP_ID,
+                index,
+                index,
+                &[],
+            );
+            far_end.write_all(&request).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            while incoming_rx.try_recv().is_ok() {}
+        }
+        assert_eq!(peer.watchdog_state(), WatchdogState::Okay);
+        assert!(peer.is_open());
     }
 }
