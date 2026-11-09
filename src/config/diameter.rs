@@ -107,6 +107,10 @@ pub struct DiameterConfig {
     /// `watchdog_interval` allows.
     #[serde(default)]
     pub watchdog_interval_ms: Option<u64>,
+    /// Requests that may be sent once to another peer of their route when the
+    /// first peer could not serve them. Nothing is retried without an entry.
+    #[serde(default)]
+    pub retry: Vec<DiameterRetryEntry>,
     /// Overload control (RFC 7683 DOIC, loss algorithm), as a reacting node,
     /// a reporting node, or both. Absent: no OC-* AVP is sent or acted on;
     /// a relay passes the ones it is given through either way.
@@ -318,9 +322,42 @@ pub struct DiameterOverloadConfig {
     pub reporting: Option<DiameterReportingConfig>,
 }
 
+/// What a reacting node does with a request it abates.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DiameterAbatementAction {
+    /// Fail it with DIAMETER_TOO_BUSY (3004) here.
+    #[default]
+    Reject,
+    /// Send it to another peer of its route; fail it as above when none is
+    /// left.
+    Divert,
+}
+
 /// `diameter.overload.reacting`: its presence turns the reacting node on.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
-pub struct DiameterReactingConfig {}
+pub struct DiameterReactingConfig {
+    #[serde(default)]
+    pub action: DiameterAbatementAction,
+}
+
+/// One `diameter.retry` entry: the requests of an application that may be
+/// sent once to another peer of their route when the first could not serve
+/// them.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DiameterRetryEntry {
+    pub application: DiameterApplication,
+    /// The commands that may be repeated (`AIR`, `User-Authorization`, ...).
+    /// Left out, every command that is safe to repeat: not accounting or
+    /// credit-control records, re-auth, abort or termination, which are
+    /// retried only when listed.
+    #[serde(default)]
+    pub commands: Vec<String>,
+    /// The failures that trigger it: `too_busy` (3004), `unable_to_deliver`
+    /// (3002, or the connection lost), `timeout`. Left out, all three.
+    #[serde(default)]
+    pub on: Vec<String>,
+}
 
 /// `diameter.overload.reporting`.
 #[derive(Debug, Deserialize, Serialize, Clone)]

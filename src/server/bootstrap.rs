@@ -833,6 +833,9 @@ pub(super) fn init_diameter(config: &Config) -> Option<Arc<crate::diameter::Diam
     crate::diameter::overload::install(crate::diameter::overload::Overload::from_config(
         diameter_config.overload.as_ref(),
     ));
+    crate::diameter::retry::install(crate::diameter::retry::RetryPolicy::from_config(
+        diameter_config,
+    ));
 
     // Route by application, so a Cx request reaches the HSS rather than
     // whichever peer the map happened to yield first.

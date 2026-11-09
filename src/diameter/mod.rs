@@ -31,6 +31,7 @@ pub mod overload;
 pub mod peer;
 pub mod pool;
 pub(crate) mod reauthorize;
+pub mod retry;
 pub mod rf;
 pub mod rf_service;
 pub mod ro;
@@ -646,6 +647,22 @@ impl DiameterManager {
     /// Number of registered peers.
     pub fn peer_count(&self) -> usize {
         self.clients.len()
+    }
+
+    /// Every open peer of `diameter.peers` but `picked`, by name: where a
+    /// request goes when `picked` could not serve it.
+    pub fn alternates_to(&self, picked: &Arc<DiameterClient>) -> Vec<Arc<DiameterClient>> {
+        let mut names: Vec<String> = self
+            .clients
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        names.sort();
+        names
+            .iter()
+            .filter_map(|name| self.live_client(name))
+            .filter(|client| !Arc::ptr_eq(client.peer(), picked.peer()))
+            .collect()
     }
 
     /// Shutdown all peers.

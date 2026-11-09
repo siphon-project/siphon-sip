@@ -908,7 +908,8 @@ Nothing is sent or acted on unless `diameter.overload` is configured.
 ```yaml
 diameter:
   overload:
-    reacting: {}              # advertise DOIC and abate what reports ask
+    reacting:
+      action: divert          # reject (default) | divert
     reporting:
       validity: 30            # OC-Validity-Duration of a report, seconds
       pending_requests:       # optional built-in load source
@@ -927,7 +928,9 @@ reports match the peer the request is sent to and its Destination-Host, realm
 reports the Destination-Realm. A report ends when its validity runs out or a
 newer sequence number asks for 0 percent (or 0 seconds); an older or repeated
 sequence number is ignored. A request that is abated fails with
-DIAMETER_TOO_BUSY (3004) where it is made. A request this node
+DIAMETER_TOO_BUSY (3004) where it is made (`action: reject`), or is sent to
+another peer of its route and fails with 3004 only when there is none
+(`action: divert`, see "Retrying on another peer"). A request this node
 relays is never abated here and never gains OC-Supported-Features.
 
 **Reporting node.** An answer to a request that advertised the loss algorithm
@@ -957,3 +960,41 @@ reporting node, `reporting` for this node) and
 `siphon_diameter_overload_olr_total{direction}`.
 `scripts/validate_diameter_overload.sh` reads the encoding back with
 Wireshark's dissector.
+
+### Retrying on another peer
+
+A request that a peer could not serve may be sent once to another open peer of
+its route: when the answer is DIAMETER_TOO_BUSY (3004) or
+DIAMETER_UNABLE_TO_DELIVER (3002), when none comes in time, or when the
+connection is lost under it (including a peer that went SUSPECT, which fails
+what waits on it at once). One retry, never a loop: the outcome of the second
+peer is the outcome. Each attempt carries the Hop-by-Hop Identifier of the peer
+it goes to; the Session-Id and End-to-End Identifier stay.
+
+Repeating a request is safe only for some, so nothing is retried without an
+entry in `diameter.retry`:
+
+```yaml
+diameter:
+  retry:
+    - application: s6a                 # per application
+      commands: [AIR, ULR]             # optional: only these
+      on: [too_busy, unable_to_deliver, timeout]   # optional, default all three
+    - application: ro                  # no commands: every command that is safe to repeat
+```
+
+An entry that lists no commands leaves out the ones that change state at the
+peer: accounting (ACR), credit control (CCR), re-auth (RAR), abort (ASR) and
+session termination (STR); they are retried only when an entry names them. A
+timeout is the least safe trigger, because the first peer may have served the
+request: leave `timeout` out of `on` for anything that must not run twice.
+A request that overload control abated (`action: divert`) was never sent, so it
+is diverted whatever it is.
+
+Where it applies: `req.forward_to(peer)` retries to the other open members of
+the pool the peer was picked from (`diameter.peer_pool(...).pick_*`), and
+`diameter.send_request` without `peer=` retries to the other connected peers,
+unless the request names a Destination-Host. The typed helpers
+(`cx_*`, `sh_*`, `rf_*`, `ro_*` and the rest) do not retry: they keep the
+failover their own sessions have. `siphon_diameter_retries_total{reason}`
+counts the retries.

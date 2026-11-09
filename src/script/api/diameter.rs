@@ -2915,9 +2915,25 @@ impl PyDiameter {
 
         let command = command.to_string();
         let timeout = request_timeout(timeout_ms);
+        // Another peer takes it only when the script did not name one and the
+        // request is not addressed to a host.
+        let alternates = if peer.is_none() && config.destination_host.is_none() {
+            self.manager.alternates_to(&client)
+        } else {
+            Vec::new()
+        };
 
         crate::script::awaitable(python, async move {
-            let answer = client.peer().send_request_timeout(wire, timeout).await;
+            let policy = crate::diameter::retry::current();
+            let answer = crate::diameter::retry::send_routed(
+                &policy,
+                &client,
+                &alternates,
+                wire,
+                timeout,
+                crate::diameter::overload::Origin::Local,
+            )
+            .await;
             let message = match answer {
                 Ok(message) => message,
                 Err(error) => {

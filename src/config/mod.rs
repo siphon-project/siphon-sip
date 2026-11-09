@@ -49,11 +49,12 @@ pub use control::{
     ControlTlsConfig, DialogStateConfig,
 };
 pub use diameter::{
-    DiameterAdvertisedApplication, DiameterApplication, DiameterClientEntry, DiameterConfig,
-    DiameterCxConfig, DiameterListenConfig, DiameterOverloadConfig, DiameterPeerEntry,
-    DiameterPendingRequestsScale, DiameterReactingConfig, DiameterReportingConfig,
-    DiameterRouteEntry, DiameterServerEntry, DiameterTenant, DiameterTenantIdentity,
-    EventSinkConfig, EventSinkFileConfig,
+    DiameterAbatementAction, DiameterAdvertisedApplication, DiameterApplication,
+    DiameterClientEntry, DiameterConfig, DiameterCxConfig, DiameterListenConfig,
+    DiameterOverloadConfig, DiameterPeerEntry, DiameterPendingRequestsScale,
+    DiameterReactingConfig, DiameterReportingConfig, DiameterRetryEntry, DiameterRouteEntry,
+    DiameterServerEntry, DiameterTenant, DiameterTenantIdentity, EventSinkConfig,
+    EventSinkFileConfig,
 };
 pub use gateway::{
     GatewayAuthConfig, GatewayBackendType, GatewayConfig, GatewayDatabaseConfig, GatewayDestConfig,

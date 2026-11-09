@@ -461,7 +461,7 @@ impl DiameterPeer {
             .await
     }
 
-    async fn send_request_as(
+    pub(crate) async fn send_request_as(
         &self,
         msg: Vec<u8>,
         timeout: Duration,

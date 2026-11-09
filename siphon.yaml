@@ -2220,7 +2220,9 @@ auth:
 #   reconnect_delay: 5                   # first reconnect wait in seconds; doubles per attempt
 #   reconnect_delay_max: 60              # ceiling of the reconnect backoff in seconds
 #   overload:                            # DOIC, RFC 7683 (off unless set)
-#     reacting: {}                       # advertise DOIC, abate what reports ask
+#     reacting: {action: reject}         # advertise DOIC, abate what reports ask; reject | divert
+#   retry:                               # send once to another peer on 3004/3002/timeout
+#     - {application: s6a, commands: [AIR], on: [too_busy, unable_to_deliver]}
 #     reporting: {validity: 30, pending_requests: {start: 200, full: 1000, max_reduction: 80}}
 #   # peers/servers/connect_to entries also take source_address: 192.0.2.10 (bind before connect)
 #   reopen_watchdog_answers: 3           # watchdogs a reconnected peer answers before it takes traffic
