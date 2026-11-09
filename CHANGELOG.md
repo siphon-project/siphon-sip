@@ -15,6 +15,7 @@ entry, but a working config keeps working.
 
 ### Added
 
+- `sbi.bearer_token_header`: `proxy-authorization` sends the static bearer token in `Proxy-Authorization`, for a token that identifies the consumer to an SCP; the default stays `authorization`.
 - Diameter DNS address groups: opt-in `all_addresses` on client peers and relay backends maintains a connection per resolved address, refreshed by `resolve_interval` (30 seconds by default), with group routing, per-member metrics, and sticky backend affinity.
 - SBI notification listeners support TLS through `sbi.notif_tls`, with HTTP/2 ALPN, HTTP/1.1 fallback, and optional client certificate verification via `client_ca`. Empty certificate/key paths preserve plain HTTP; invalid configured TLS material fails startup.
 
