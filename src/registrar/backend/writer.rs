@@ -200,6 +200,21 @@ impl BackendWriter {
         self.queue.enqueue(key, aor, write, sequence);
     }
 
+    /// Whether a write for `aor` (its bindings or its auxiliary state) has not
+    /// been applied to the backend yet. A read of the backend taken while one
+    /// is pending would be older than the registrar's own memory.
+    pub(crate) fn has_pending(&self, aor: &str) -> bool {
+        [Keyspace::Bindings, Keyspace::State]
+            .into_iter()
+            .any(|keyspace| {
+                let key = WriteKey {
+                    keyspace,
+                    aor: aor.to_string(),
+                };
+                self.queue.is_unsettled(&key)
+            })
+    }
+
     /// Keys whose latest write has not been applied yet, waiting or in flight.
     #[cfg(test)]
     pub(crate) fn pending_writes(&self) -> usize {

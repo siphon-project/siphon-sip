@@ -109,6 +109,21 @@ impl RedisBackend {
         format!("{}index", self.config.key_prefix)
     }
 
+    /// The key naming the AoR an alias of its implicit set resolves to.
+    fn alias_key(&self, alias: &str) -> String {
+        format!("{}alias:{}", self.config.key_prefix, alias)
+    }
+
+    /// The prefix of every alias key, which the scripts append an alias to.
+    fn alias_prefix(&self) -> String {
+        format!("{}alias:", self.config.key_prefix)
+    }
+
+    /// The key an expiry claim lives under.
+    fn expiry_claim_key(&self, aor: &str, marker: &str) -> String {
+        format!("{}expired:{}:{}", self.config.key_prefix, marker, aor)
+    }
+
     /// The link of the shard holding `aor`.
     fn link_for(&self, aor: &str) -> &RedisLink {
         if self.links.len() == 1 {
@@ -136,6 +151,8 @@ impl RedisBackend {
         }
         let pattern = format!("{}*", self.config.key_prefix);
         let state_prefix = format!("{}state:", self.config.key_prefix);
+        let alias_prefix = format!("{}alias:", self.config.key_prefix);
+        let claim_prefix = format!("{}expired:", self.config.key_prefix);
         let prefix_len = self.config.key_prefix.len();
         let now = epoch_now();
         let mut indexed = 0usize;
@@ -151,7 +168,12 @@ impl RedisBackend {
                 .await
                 .map_err(|error| link.fail(&lease, error))?;
             for key in keys {
-                if key.starts_with(&state_prefix) || key == index_key || key.len() <= prefix_len {
+                if key.starts_with(&state_prefix)
+                    || key.starts_with(&alias_prefix)
+                    || key.starts_with(&claim_prefix)
+                    || key == index_key
+                    || key.len() <= prefix_len
+                {
                     continue;
                 }
                 let aor = &key[prefix_len..];
@@ -213,20 +235,64 @@ impl RedisBackend {
     }
 }
 
+/// How long an expiry claim is kept, seconds: far past the spread between the
+/// nodes' sweep ticks, so a late sweeper still loses the claim.
+const EXPIRY_CLAIM_TTL_SECS: u64 = 600;
+
 /// `SCAN` batch size for the walks that remain (boot-time only).
 const SCAN_COUNT: usize = 1000;
 
 /// Write an AoR's state with the TTL its binding hash has now, or with the
-/// no-binding lifetime when there is no hash to follow (or it has no TTL).
+/// no-binding lifetime when there is no hash to follow (or it has no TTL), and
+/// point each alias of its implicit set at the AoR with the same TTL.
 ///
-/// One script so the read of the hash's TTL and the write cannot straddle a
-/// save of the binding from another replica.
+/// One script so the read of the hash's TTL and the writes cannot straddle a
+/// save of the binding from another replica. KEYS: binding hash, state key.
+/// ARGV: the state JSON, the no-binding TTL in seconds, the key prefix of the
+/// alias keys, the AoR, then the normalised aliases.
 const SAVE_STATE_SCRIPT: &str = r#"
 local ttl = redis.call('PTTL', KEYS[1])
 if ttl > 0 then
-  return redis.call('SET', KEYS[2], ARGV[1], 'PX', ttl)
+  redis.call('SET', KEYS[2], ARGV[1], 'PX', ttl)
+else
+  ttl = tonumber(ARGV[2]) * 1000
+  redis.call('SET', KEYS[2], ARGV[1], 'PX', ttl)
 end
-return redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
+for i = 5, #ARGV do
+  redis.call('SET', ARGV[3] .. ARGV[i], ARGV[4], 'PX', ttl)
+end
+return ttl
+"#;
+
+/// Give the alias keys an AoR's state names the TTL its binding was just
+/// given, so a refresh that does not rewrite the state keeps them alive.
+/// KEYS: state key. ARGV: the key prefix of the alias keys, the TTL in
+/// seconds.
+const REFRESH_ALIASES_SCRIPT: &str = r#"
+local state = redis.call('GET', KEYS[1])
+if not state then return 0 end
+local aliases = cjson.decode(state).alias_keys
+if not aliases then return 0 end
+for _, alias in ipairs(aliases) do
+  redis.call('EXPIRE', ARGV[1] .. alias, ARGV[2])
+end
+return #aliases
+"#;
+
+/// Remove an AoR's state and the alias keys it names, those that still point
+/// at it. KEYS: state key. ARGV: the key prefix of the alias keys, the AoR.
+const REMOVE_STATE_SCRIPT: &str = r#"
+local state = redis.call('GET', KEYS[1])
+if state then
+  local aliases = cjson.decode(state).alias_keys
+  if aliases then
+    for _, alias in ipairs(aliases) do
+      local key = ARGV[1] .. alias
+      if redis.call('GET', key) == ARGV[2] then redis.call('DEL', key) end
+    end
+  end
+end
+return redis.call('DEL', KEYS[1])
 "#;
 
 fn epoch_now() -> u64 {
@@ -281,6 +347,15 @@ impl RegistrarBackend for RedisBackend {
             .ignore()
             .zadd(self.index_key(), aor, expiry)
             .ignore();
+        // EVAL, not EVALSHA: a pipeline cannot load a script that is missing.
+        let mut refresh = redis::cmd("EVAL");
+        refresh
+            .arg(REFRESH_ALIASES_SCRIPT)
+            .arg(1)
+            .arg(self.state_key(aor))
+            .arg(self.alias_prefix())
+            .arg(ttl_with_slack);
+        pipe.add_command(refresh).ignore();
         let link = self.link_for(aor);
         let mut lease = link.lease().await?;
         pipe.query_async::<()>(&mut lease.connection)
@@ -393,30 +468,45 @@ impl RegistrarBackend for RedisBackend {
     }
 
     async fn save_aor_state(&self, aor: &str, state: &StoredAorState) -> Result<(), BackendError> {
+        if state.is_empty() {
+            return self.remove_aor_state(aor).await;
+        }
         let key = self.state_key(aor);
         let link = self.link_for(aor);
         let mut lease = link.lease().await?;
 
-        if state.is_empty() {
-            let _: () = lease
-                .connection
-                .del(&key)
-                .await
-                .map_err(|error| link.fail(&lease, error))?;
-            return Ok(());
+        // The normalised aliases ride in the state's JSON (a reader of
+        // `StoredAorState` ignores the extra field), so a save of the binding
+        // and a removal of the state can find the alias keys again.
+        let aliases: Vec<String> = state
+            .associated_uris
+            .iter()
+            .map(|uri| super::super::normalize_aor(uri))
+            .collect();
+        let mut document = serde_json::to_value(state)
+            .map_err(|error| BackendError::Serialization(error.to_string()))?;
+        if let Some(object) = document.as_object_mut() {
+            object.insert("alias_keys".to_string(), serde_json::json!(aliases));
         }
-
-        let json = serde_json::to_string(state)
+        let json = serde_json::to_string(&document)
             .map_err(|error| BackendError::Serialization(error.to_string()))?;
         let without_binding = self
             .max_binding_lifetime_secs
             .saturating_add(self.config.ttl_slack_secs)
             .max(1);
-        let _: () = redis::Script::new(SAVE_STATE_SCRIPT)
+        let save_state = redis::Script::new(SAVE_STATE_SCRIPT);
+        let mut script = save_state.prepare_invoke();
+        script
             .key(self.key(aor))
             .key(&key)
             .arg(json)
             .arg(without_binding)
+            .arg(self.alias_prefix())
+            .arg(aor);
+        for alias in &aliases {
+            script.arg(alias);
+        }
+        let _state_ttl_ms: i64 = script
             .invoke_async(&mut lease.connection)
             .await
             .map_err(|error| link.fail(&lease, error))?;
@@ -442,13 +532,49 @@ impl RegistrarBackend for RedisBackend {
         }
     }
 
-    async fn remove_aor_state(&self, aor: &str) -> Result<(), BackendError> {
-        let key = self.state_key(aor);
+    async fn load_alias(&self, alias: &str) -> Result<Option<String>, BackendError> {
+        // The alias key lives on the shard of its primary, which the alias
+        // does not name: ask each shard.
+        let key = self.alias_key(&super::super::normalize_aor(alias));
+        for link in &self.links {
+            let mut lease = link.lease().await?;
+            let found: Option<String> = lease
+                .connection
+                .get(&key)
+                .await
+                .map_err(|error| link.fail(&lease, error))?;
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok(None)
+    }
+
+    async fn claim_expiry(&self, aor: &str, marker: &str) -> Result<bool, BackendError> {
         let link = self.link_for(aor);
         let mut lease = link.lease().await?;
-        let _: () = lease
-            .connection
-            .del(&key)
+        // SET NX is the atomic claim. The key outlives the longest
+        // disagreement between nodes' sweeps, then goes by itself.
+        let claimed: Option<String> = redis::cmd("SET")
+            .arg(self.expiry_claim_key(aor, marker))
+            .arg(1)
+            .arg("NX")
+            .arg("EX")
+            .arg(EXPIRY_CLAIM_TTL_SECS)
+            .query_async(&mut lease.connection)
+            .await
+            .map_err(|error| link.fail(&lease, error))?;
+        Ok(claimed.is_some())
+    }
+
+    async fn remove_aor_state(&self, aor: &str) -> Result<(), BackendError> {
+        let link = self.link_for(aor);
+        let mut lease = link.lease().await?;
+        let _: i64 = redis::Script::new(REMOVE_STATE_SCRIPT)
+            .key(self.state_key(aor))
+            .arg(self.alias_prefix())
+            .arg(aor)
+            .invoke_async(&mut lease.connection)
             .await
             .map_err(|error| link.fail(&lease, error))?;
         Ok(())
@@ -495,3 +621,7 @@ impl RegistrarBackend for RedisBackend {
 #[cfg(test)]
 #[path = "redis_store_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "redis_shared_tests.rs"]
+mod shared_tests;

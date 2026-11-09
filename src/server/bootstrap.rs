@@ -272,7 +272,16 @@ pub(super) async fn init_registrar_backend(config: &Config) {
                             error!(%err, "failed to restore contacts from Redis backend");
                         }
                     }
-                    registrar.set_backend_writer(backend::spawn_backend_writer(redis_backend));
+                    let redis_backend = std::sync::Arc::new(redis_backend);
+                    registrar.set_backend_writer(backend::spawn_backend_writer(
+                        std::sync::Arc::clone(&redis_backend),
+                    ));
+                    if redis_cfg.read_through_ttl_ms > 0 {
+                        registrar.set_shared_reader(crate::registrar::SharedReader::new(
+                            redis_backend,
+                            std::time::Duration::from_millis(redis_cfg.read_through_ttl_ms),
+                        ));
+                    }
 
                     // --- iFC profile persistence (shares the same Redis instance) ---
                     init_ifc_redis_backend(

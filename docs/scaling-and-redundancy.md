@@ -124,6 +124,8 @@ every one it has ever seen. In Redis, under `registrar.redis.key_prefix`:
 |---|---|---|
 | `{prefix}{aor}` | hash, contact URI to binding | longest contact's remaining lifetime + `ttl_slack_secs`, set on every save |
 | `{prefix}state:{aor}` | Service-Route, P-Asserted-Identity, P-Associated-URI | the binding hash's, refreshed on every save; written before the AoR has a binding, `max_expires` + `ttl_slack_secs` |
+| `{prefix}alias:{uri}` | the AoR whose implicit registration set lists `uri`, so a node that never saw the AoR still resolves the alias | the state key's, refreshed with it on every save |
+| `{prefix}expired:{marker}:{aor}` | an expiry claim (see below) | 10 minutes |
 | `{prefix}index` | sorted set of AoRs, scored by the epoch second the last contact expires | none; members whose score has passed are dropped on every read and once a minute |
 | `{isc.ifc_key_prefix}{aor}` | the iFC profile XML | `max_expires` + `ttl_slack_secs`, renewed by every `isc.store_profile()` |
 | `{registrar.redis.presence_key_prefix}{id}` | one presence subscription: its dialog (Call-ID, tags, route set, remote target, local and remote URI), the CSeq of its last NOTIFY, its next reginfo version, event, resource and expiry | the subscription's remaining lifetime + `ttl_slack_secs`, renewed by every change |
@@ -136,6 +138,44 @@ restarts and does not depend on keyspace expiry events. Boot is the one place
 siphon walks keys, by cursor `SCAN` (never `KEYS`): the iFC and auxiliary-state
 restore, the presence subscription restore, and building the index when a node
 finds none (a keyspace written by a version without it).
+
+### Several nodes over one Redis: read-through and single-owner expiry
+
+Each node keeps its bindings in memory and writes every change through to
+Redis. With `registrar.backend: redis` it also reads through: a lookup
+(`lookup`, `lookup_all`, `is_registered`, `registered_aor`, the implicit-set
+resolution, `service_route`, `associated_uris`) first re-reads the AoR from Redis
+when the node's copy is older than `registrar.redis.read_through_ttl_ms`
+(default 1000). So a binding another node wrote, refreshed or removed is seen
+here within **that window plus one Redis round trip**, once the write has reached
+Redis (milliseconds; longer only while Redis is unreachable). The window is the
+whole consistency contract: nothing is pushed, a node serving an AoR inside it
+may answer with what it had.
+
+- A node reads its own writes at once. While a write of its own for an AoR has
+  not reached Redis, or the AoR changed locally while the read was in flight,
+  the read does not overwrite the node's copy.
+- A read costs one blocking round trip (up to three for an alias a node has
+  never seen) on the thread that made the lookup, at most once per AoR per
+  window. The wait releases the interpreter if the thread is attached to it (and a tokio worker hands its core over). A node that
+  cannot reach Redis serves its own copy, logs the error, and tries again after
+  one window. A lookup on a current-thread runtime cannot block and serves the
+  local copy.
+- An alias of an implicit registration set resolves on a node that never saw
+  the primary, through the `alias:` key. It is checked against the primary's own
+  stored `associated_uris`, so a stale key is never followed.
+- Expiry has one owner. A node whose copy of a binding ran out re-reads Redis
+  first, because another node may have refreshed it, and drops its copy without
+  an event if so. Otherwise it claims the expiry with an atomic `SET NX`; only
+  the winner fires `@registrar.on_change` with `expired`, the others drop the
+  AoR silently. A node that never held the AoR announces nothing, so an AoR
+  whose only holder died is not announced until another node reads it.
+- `read_through_ttl_ms: 0` turns all of this off: lookups read only the node's
+  own memory, loaded at boot and written through, as before. A node on the
+  `postgres` backend never reads through (its store has no atomic claim).
+- Raising the window lowers Redis traffic and widens the staleness; lowering it
+  does the reverse. Under a second is cheap, a few hundred milliseconds is
+  what a P-CSCF in front of several S-CSCF nodes wants for TS 23.380 restoration.
 
 ### Presence subscriptions across a restart
 

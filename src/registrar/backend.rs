@@ -361,6 +361,37 @@ pub trait RegistrarBackend: Send + Sync + std::fmt::Debug {
         async { Ok(0) }
     }
 
+    /// The AoR whose implicit registration set lists `alias`, or `None`.
+    ///
+    /// What a node that has never seen the AoR asks when a lookup names an
+    /// alias (TS 23.228 implicit set): the caller checks the answer against
+    /// the primary's own stored `associated_uris`, so a stale answer is only
+    /// a wasted read. The default knows no aliases, which leaves an alias
+    /// lookup on another node a miss.
+    fn load_alias(
+        &self,
+        alias: &str,
+    ) -> impl std::future::Future<Output = Result<Option<String>, BackendError>> + Send {
+        let _ = alias;
+        async { Ok(None) }
+    }
+
+    /// Claim the expiry of the bindings of `aor` identified by `marker`, and
+    /// say whether this caller won it.
+    ///
+    /// Every node that cached the AoR sees its bindings run out, and only one
+    /// may tell the script (`RegistrationEvent::Expired`): the first claim of
+    /// a `(aor, marker)` pair wins, atomically, and later ones lose. The
+    /// default always wins, which is right for a backend one node owns.
+    fn claim_expiry(
+        &self,
+        aor: &str,
+        marker: &str,
+    ) -> impl std::future::Future<Output = Result<bool, BackendError>> + Send {
+        let _ = (aor, marker);
+        async { Ok(true) }
+    }
+
     /// Apply a batch of write-throughs for distinct keys, and return one
     /// result per write, in order. A write whose result is an error was not
     /// applied (or may not have been) and is retried; each is a full
@@ -373,6 +404,50 @@ pub trait RegistrarBackend: Send + Sync + std::fmt::Debug {
         writes: &[(&str, &BackendWrite)],
     ) -> impl std::future::Future<Output = Vec<Result<(), BackendError>>> + Send {
         futures_util::future::join_all(writes.iter().map(|(aor, write)| write.apply(self, aor)))
+    }
+}
+
+/// A backend shared by handle: the registrar's writer and its read-through
+/// reader hold the same one.
+impl<B: RegistrarBackend> RegistrarBackend for std::sync::Arc<B> {
+    async fn save(&self, aor: &str, contacts: &[StoredContact]) -> Result<(), BackendError> {
+        (**self).save(aor, contacts).await
+    }
+    async fn load(&self, aor: &str) -> Result<Vec<StoredContact>, BackendError> {
+        (**self).load(aor).await
+    }
+    async fn remove(&self, aor: &str) -> Result<(), BackendError> {
+        (**self).remove(aor).await
+    }
+    async fn exists(&self, aor: &str) -> Result<bool, BackendError> {
+        (**self).exists(aor).await
+    }
+    async fn all_aors(&self) -> Result<Vec<String>, BackendError> {
+        (**self).all_aors().await
+    }
+    async fn save_aor_state(&self, aor: &str, state: &StoredAorState) -> Result<(), BackendError> {
+        (**self).save_aor_state(aor, state).await
+    }
+    async fn load_aor_state(&self, aor: &str) -> Result<Option<StoredAorState>, BackendError> {
+        (**self).load_aor_state(aor).await
+    }
+    async fn remove_aor_state(&self, aor: &str) -> Result<(), BackendError> {
+        (**self).remove_aor_state(aor).await
+    }
+    async fn all_aor_state_aors(&self) -> Result<Vec<String>, BackendError> {
+        (**self).all_aor_state_aors().await
+    }
+    async fn count_aors(&self) -> Result<usize, BackendError> {
+        (**self).count_aors().await
+    }
+    async fn purge_expired(&self) -> Result<usize, BackendError> {
+        (**self).purge_expired().await
+    }
+    async fn load_alias(&self, alias: &str) -> Result<Option<String>, BackendError> {
+        (**self).load_alias(alias).await
+    }
+    async fn claim_expiry(&self, aor: &str, marker: &str) -> Result<bool, BackendError> {
+        (**self).claim_expiry(aor, marker).await
     }
 }
 
@@ -424,6 +499,8 @@ fn shard_index(aor: &str, shard_count: usize) -> usize {
 pub struct MemoryBackend {
     data: dashmap::DashMap<String, Vec<StoredContact>>,
     aor_state: dashmap::DashMap<String, StoredAorState>,
+    /// `(aor, marker)` expiries already claimed.
+    claimed: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
 }
 
 impl MemoryBackend {
@@ -431,6 +508,7 @@ impl MemoryBackend {
         Self {
             data: dashmap::DashMap::new(),
             aor_state: dashmap::DashMap::new(),
+            claimed: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 }
@@ -496,6 +574,25 @@ impl RegistrarBackend for MemoryBackend {
             .iter()
             .map(|entry| entry.key().clone())
             .collect())
+    }
+
+    async fn load_alias(&self, alias: &str) -> Result<Option<String>, BackendError> {
+        Ok(self.aor_state.iter().find_map(|entry| {
+            entry
+                .value()
+                .associated_uris
+                .iter()
+                .any(|uri| super::normalize_aor(uri) == alias)
+                .then(|| entry.key().clone())
+        }))
+    }
+
+    async fn claim_expiry(&self, aor: &str, marker: &str) -> Result<bool, BackendError> {
+        Ok(self
+            .claimed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((aor.to_string(), marker.to_string())))
     }
 }
 

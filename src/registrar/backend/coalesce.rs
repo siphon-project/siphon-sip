@@ -146,6 +146,11 @@ struct PendingWrites<K, W> {
     writes: HashMap<K, PendingWrite<W>>,
     /// The earliest `since` in `writes`, so the age gauge needs no scan.
     oldest: Option<Instant>,
+    /// The newest sequence enqueued for each key whose sink copy has not
+    /// caught up to it: waiting in `writes`, held by the drainer, or in
+    /// flight. A read of the sink taken while a key is here is older than
+    /// the memory it would be compared with.
+    unsettled: HashMap<K, u64>,
 }
 
 /// Code a test runs at the start of every enqueue, after the caller took its
@@ -217,6 +222,7 @@ pub(crate) fn queue<K, W: QueuedWrite>(kind: QueueKind) -> (QueueHandle<K, W>, D
         pending: Mutex::new(PendingWrites {
             writes: HashMap::new(),
             oldest: None,
+            unsettled: HashMap::new(),
         }),
         wake: Notify::new(),
         held: AtomicUsize::new(0),
@@ -244,7 +250,7 @@ pub(crate) fn queue<K, W: QueuedWrite>(kind: QueueKind) -> (QueueHandle<K, W>, D
     )
 }
 
-impl<K: Eq + Hash, W: QueuedWrite> QueueHandle<K, W> {
+impl<K: Eq + Hash + Clone, W: QueuedWrite> QueueHandle<K, W> {
     /// The next sequence: take it under the lock that orders the snapshot.
     pub(crate) fn sequence(&self) -> WriteSequence {
         WriteSequence(self.shared.sequence.fetch_add(1, Ordering::SeqCst) + 1)
@@ -284,6 +290,8 @@ impl<K: Eq + Hash, W: QueuedWrite> QueueHandle<K, W> {
         let now = Instant::now();
         let (depth, superseded) = {
             let mut pending = self.shared.pending();
+            let newest = pending.unsettled.entry(key.clone()).or_insert(0);
+            *newest = (*newest).max(sequence.0);
             let superseded = match pending.writes.entry(key) {
                 Entry::Occupied(mut entry) => {
                     let held = entry.get_mut();
@@ -324,6 +332,12 @@ impl<K: Eq + Hash, W: QueuedWrite> QueueHandle<K, W> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .map_or(Duration::ZERO, |since| since.elapsed())
+    }
+
+    /// Whether a write for `key` has been enqueued that the sink has not
+    /// applied yet: waiting, held for a retry, or in flight.
+    pub(crate) fn is_unsettled(&self, key: &K) -> bool {
+        self.shared.pending().unsettled.contains_key(key)
     }
 
     /// Keys whose latest write has not been applied yet, waiting or in flight.
@@ -513,11 +527,13 @@ where
                 match result {
                     Ok(()) => {
                         succeeded += 1;
+                        self.settle(&key, held.sequence);
                         self.applied.insert(key, (held.sequence, now));
                     }
                     // Retrying an encoding failure fails the same way forever.
                     Err(BackendError::Serialization(error)) => {
                         let label = held.write.label();
+                        self.settle(&key, held.sequence);
                         tracing::error!(
                             queue = self.shared.kind.name(),
                             key = %key,
@@ -554,6 +570,19 @@ where
         }
         self.shared.held.store(self.backlog.len(), Ordering::SeqCst);
         last_error.map_or(Ok(()), Err)
+    }
+
+    /// `key` is applied up to `sequence`: no longer unsettled unless a newer
+    /// write was enqueued meanwhile.
+    fn settle(&self, key: &K, sequence: u64) {
+        let mut pending = self.shared.pending();
+        if pending
+            .unsettled
+            .get(key)
+            .is_some_and(|newest| *newest <= sequence)
+        {
+            pending.unsettled.remove(key);
+        }
     }
 
     /// The pending count and the age of the oldest pending write.
@@ -593,7 +622,11 @@ impl<K, W: QueuedWrite> Drop for Drainer<K, W> {
     /// map nobody drains, and what was still pending is counted as lost.
     fn drop(&mut self) {
         self.shared.closed.store(true, Ordering::Release);
-        let left = std::mem::take(&mut self.shared.pending().writes);
+        let left = {
+            let mut pending = self.shared.pending();
+            pending.unsettled.clear();
+            std::mem::take(&mut pending.writes)
+        };
         let lost = left.len() + self.backlog.len();
         self.shared.held.store(0, Ordering::SeqCst);
         if lost == 0 {
