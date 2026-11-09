@@ -2218,6 +2218,7 @@ auth:
 #   watchdog_interval: 30                # DWR/DWA interval in seconds
 #   resolve_interval: 30                 # DNS group refresh in seconds
 #   reconnect_delay: 5                   # seconds between reconnect attempts
+#   disconnect_timeout_ms: 1000          # wait for the DPA when a connection is closed on purpose
 
 #   peers:
 #     # Optional DNS group (also supported on servers and tenants.<t>.servers):

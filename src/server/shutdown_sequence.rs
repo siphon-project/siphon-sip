@@ -76,6 +76,36 @@ pub(crate) async fn shut_down(
             );
         }
     }
+
+    // Last, once nothing above needs a Diameter peer any more: tell every
+    // peer why the connections go (RFC 6733 section 5.4), so none of them
+    // reads a silent close as a failure. Bounded by the configured DPA wait,
+    // so a dead peer does not hold the exit.
+    if let Some(diameter) = config.diameter.as_ref() {
+        disconnect_diameter_peers(diameter.disconnect_timeout_ms).await;
+    }
+}
+
+/// Send every open Diameter connection a Disconnect-Peer-Request with cause
+/// REBOOTING and wait, up to `disconnect_timeout_ms` (plus a little for the
+/// close), for the answers.
+async fn disconnect_diameter_peers(disconnect_timeout_ms: u64) {
+    let bound = std::time::Duration::from_millis(disconnect_timeout_ms.saturating_add(500));
+    match tokio::time::timeout(
+        bound,
+        crate::diameter::lifecycle::disconnect_all(
+            crate::diameter::lifecycle::DisconnectCause::Rebooting,
+        ),
+    )
+    .await
+    {
+        Ok(summary) => info!(
+            answered = summary.answered,
+            unanswered = summary.unanswered,
+            "disconnected the Diameter peers"
+        ),
+        Err(_) => warn!("the Diameter peers did not all disconnect within the bound"),
+    }
 }
 
 /// The drain: stop taking new work, wait (bounded by `server.drain_secs`) for

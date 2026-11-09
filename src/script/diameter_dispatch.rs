@@ -33,6 +33,7 @@ use crate::config::DiameterConfig;
 use crate::diameter::auth::{AclMatch, OriginHostPolicy, SourceIpAcl};
 use crate::diameter::codec::{Avp, DiameterMsg};
 use crate::diameter::dictionary;
+use crate::diameter::lifecycle::ReconnectAdvice;
 use crate::diameter::peer::{self, DiameterPeer, IncomingRequest, PeerConfig};
 use crate::diameter::reauthorize::ServingConnection;
 use crate::diameter::server::{CerDecision, ServerHandshake, ServerIdentity, TenantApplications};
@@ -336,6 +337,7 @@ fn spawn_serving_connection(
         application_ids: vec![],
         watchdog_interval: 30,
         reconnect_delay: 5,
+        lifecycle: Default::default(),
         product_name: product_name.to_string(),
         firmware_revision: peer::version_to_firmware_revision(product_version),
     };
@@ -351,6 +353,7 @@ fn spawn_serving_connection(
 
     tokio::spawn(async move {
         loop {
+            let mut delay = Duration::from_secs(5);
             // Asked per attempt: the CER advertises what the script serves now.
             config.application_ids = applications(&tenant_name);
             match peer::connect_with_transport(config.clone(), &transport).await {
@@ -360,6 +363,7 @@ fn spawn_serving_connection(
                         tenant = %tenant_name,
                         "Diameter server: outbound serving connection established (inbound requests → on_request)"
                     );
+                    let ended = Arc::clone(&connected);
                     serve_requests(
                         connected,
                         incoming_rx,
@@ -369,13 +373,25 @@ fn spawn_serving_connection(
                         (origin_host.clone(), origin_realm.clone()),
                     )
                     .await;
-                    warn!(peer = %entry.name, "Diameter server: outbound serving connection dropped, reconnecting");
+                    match ended.reconnect_advice() {
+                        ReconnectAdvice::Stop => {
+                            info!(peer = %entry.name, "Diameter server: outbound serving connection disconnected by this node, not reconnecting");
+                            return;
+                        }
+                        ReconnectAdvice::Hold(hold) => {
+                            warn!(peer = %entry.name, hold_secs = hold.as_secs(), "Diameter server: peer asked not to be redialled yet");
+                            delay = delay.max(hold);
+                        }
+                        ReconnectAdvice::Normal => {
+                            warn!(peer = %entry.name, "Diameter server: outbound serving connection dropped, reconnecting");
+                        }
+                    }
                 }
                 Err(error) => {
                     warn!(peer = %entry.name, %error, "Diameter server: outbound serving connect failed, retrying in 5s");
                 }
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(delay).await;
         }
     });
 }
@@ -2488,6 +2504,7 @@ mod s13_serving_tests {
             application_ids: vec![(dictionary::VENDOR_3GPP, dictionary::S13_APP_ID)],
             watchdog_interval: 3600,
             reconnect_delay: 5,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 1,
         };
@@ -2572,6 +2589,7 @@ mod awaiting_handler_tests {
             application_ids: vec![],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 100,
         }
@@ -2692,6 +2710,7 @@ mod backend_connection_tests {
             application_ids: vec![(10_415, S6A)],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            lifecycle: Default::default(),
             product_name: "far".to_string(),
             firmware_revision: 1,
         }

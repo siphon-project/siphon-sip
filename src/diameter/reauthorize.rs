@@ -242,6 +242,7 @@ pub(crate) mod tests {
                 application_ids: vec![(0, 4)],
                 watchdog_interval: 30,
                 reconnect_delay: 5,
+                lifecycle: Default::default(),
                 product_name: "test-peer".into(),
                 firmware_revision: 1,
             },

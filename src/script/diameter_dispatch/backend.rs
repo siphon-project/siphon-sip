@@ -30,6 +30,7 @@ pub(super) fn spawn_backend_connection(
         application_ids: vec![],
         watchdog_interval: 30,
         reconnect_delay: 5,
+        lifecycle: Default::default(),
         product_name: product_name.to_string(),
         firmware_revision: peer::version_to_firmware_revision(product_version),
     };
@@ -52,6 +53,7 @@ pub(super) fn spawn_backend_connection(
             crate::metrics::set_diameter_peer_up(&name, false);
         }
         loop {
+            let mut delay = Duration::from_secs(5);
             // Asked per attempt: the CER advertises what the script serves now.
             config.application_ids = applications(&tenant_name);
             match peer::connect_with_transport(config.clone(), &transport).await {
@@ -62,6 +64,7 @@ pub(super) fn spawn_backend_connection(
                         crate::metrics::set_diameter_peer_up(&name, true);
                     }
                     info!(peer = %name, tenant = %tenant_name, "Diameter server backend connected");
+                    let ended = Arc::clone(&connected);
                     serve_requests(
                         connected,
                         incoming_rx,
@@ -74,13 +77,25 @@ pub(super) fn spawn_backend_connection(
                     if grouped {
                         crate::metrics::set_diameter_peer_up(&name, false);
                     }
-                    warn!(peer = %name, "Diameter server backend disconnected, reconnecting");
+                    match ended.reconnect_advice() {
+                        ReconnectAdvice::Stop => {
+                            info!(peer = %name, "Diameter server backend disconnected by this node, not reconnecting");
+                            return;
+                        }
+                        ReconnectAdvice::Hold(hold) => {
+                            warn!(peer = %name, hold_secs = hold.as_secs(), "Diameter server backend asked not to be redialled yet");
+                            delay = delay.max(hold);
+                        }
+                        ReconnectAdvice::Normal => {
+                            warn!(peer = %name, "Diameter server backend disconnected, reconnecting");
+                        }
+                    }
                 }
                 Err(error) => {
                     warn!(peer = %name, %error, "Diameter server backend connect failed, retrying in 5s");
                 }
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(delay).await;
         }
     })
 }

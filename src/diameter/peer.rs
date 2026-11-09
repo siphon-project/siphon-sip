@@ -7,7 +7,7 @@
 //! server mode (accept inbound, respond to CER with CEA).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -38,6 +38,8 @@ pub struct PeerConfig {
     pub watchdog_interval: u64,
     /// Reconnect delay in seconds (client mode only)
     pub reconnect_delay: u64,
+    /// Disconnect and reconnect timers.
+    pub lifecycle: crate::diameter::lifecycle::PeerLifecycle,
     /// Product name advertised in CER/CEA
     pub product_name: String,
     /// Firmware revision advertised in CER/CEA
@@ -203,7 +205,19 @@ pub struct DiameterPeer {
     /// The other end's Origin-Host and Origin-Realm, from its CER (an
     /// accepted connection) or its CEA (a connection this node dialled).
     remote: OnceLock<(String, String)>,
+    /// The Disconnect-Cause of a Disconnect-Peer-Request the other end sent,
+    /// [`NO_DISCONNECT_CAUSE`] until one arrives.
+    remote_disconnect_cause: Arc<AtomicU32>,
+    /// Set once this node has started to disconnect the connection with a
+    /// Disconnect-Peer-Request: it takes no more requests and is not redialled.
+    disconnecting: AtomicBool,
+    /// Wakes the writer to flush what is queued and close (an answer to a
+    /// Disconnect-Peer-Request has to leave before the socket does).
+    flush_close: Arc<Notify>,
 }
+
+/// `remote_disconnect_cause` before a Disconnect-Peer-Request has arrived.
+const NO_DISCONNECT_CAUSE: u32 = u32::MAX;
 
 impl DiameterPeer {
     /// Allocate the next Hop-by-Hop identifier.
@@ -237,7 +251,74 @@ impl DiameterPeer {
 
     /// Whether the peer is `Open` and ready to carry requests.
     pub fn is_open(&self) -> bool {
-        self.state() == PeerState::Open
+        self.state() == PeerState::Open && !self.disconnecting.load(Ordering::Acquire)
+    }
+
+    /// The Disconnect-Cause the other end gave when it disconnected, if it did.
+    pub fn remote_disconnect_cause(&self) -> Option<u32> {
+        match self.remote_disconnect_cause.load(Ordering::Acquire) {
+            NO_DISCONNECT_CAUSE => None,
+            cause => Some(cause),
+        }
+    }
+
+    /// Whether this node disconnected the connection itself.
+    pub fn disconnected_locally(&self) -> bool {
+        self.disconnecting.load(Ordering::Acquire)
+    }
+
+    /// What the loop that dialled this connection does now that it has ended.
+    pub fn reconnect_advice(&self) -> crate::diameter::lifecycle::ReconnectAdvice {
+        crate::diameter::lifecycle::reconnect_advice(
+            self.remote_disconnect_cause(),
+            self.disconnected_locally(),
+            &self.config.lifecycle,
+            Duration::from_secs(self.config.reconnect_delay.max(1)),
+        )
+    }
+
+    /// Disconnect gracefully (RFC 6733 section 5.4): send a Disconnect-Peer-
+    /// Request carrying `cause`, wait up to `wait` for the answer, then close
+    /// the connection whether or not it came. The connection takes no further
+    /// requests from the moment this is called, and is not dialled again by
+    /// the loop that owns it.
+    pub async fn disconnect(
+        &self,
+        cause: crate::diameter::lifecycle::DisconnectCause,
+        wait: Duration,
+    ) -> crate::diameter::lifecycle::DisconnectOutcome {
+        use crate::diameter::lifecycle::DisconnectOutcome;
+        if self.disconnecting.swap(true, Ordering::AcqRel) {
+            return DisconnectOutcome::NotOpen;
+        }
+        if self.state() != PeerState::Open {
+            self.shutdown();
+            return DisconnectOutcome::NotOpen;
+        }
+        let dpr = build_dpr(
+            &self.config.origin_host,
+            &self.config.origin_realm,
+            cause.as_u32(),
+            self.next_hbh(),
+            self.next_e2e(),
+        );
+        info!(
+            peer = %self.config.host,
+            cause = cause.name(),
+            "Diameter: sending DPR before closing the connection"
+        );
+        let outcome = match self.send_request_timeout(dpr, wait).await {
+            Ok(_) => DisconnectOutcome::Answered,
+            Err(error) => {
+                warn!(
+                    peer = %self.config.host, %error,
+                    "Diameter: no DPA before the bound, closing the connection"
+                );
+                DisconnectOutcome::Unanswered
+            }
+        };
+        self.shutdown();
+        outcome
     }
 
     /// The Origin-Host the other end gave in the capabilities exchange.
@@ -404,6 +485,9 @@ impl DiameterPeer {
             state: Arc::new(AtomicU8::new(PeerState::Open.as_u8())),
             shutdown: Arc::new(Notify::new()),
             remote: OnceLock::new(),
+            remote_disconnect_cause: Arc::new(AtomicU32::new(NO_DISCONNECT_CAUSE)),
+            disconnecting: AtomicBool::new(false),
+            flush_close: Arc::new(Notify::new()),
         }
     }
 
@@ -598,7 +682,11 @@ where
         state: state.clone(),
         shutdown: shutdown.clone(),
         remote: OnceLock::new(),
+        remote_disconnect_cause: Arc::new(AtomicU32::new(NO_DISCONNECT_CAUSE)),
+        disconnecting: AtomicBool::new(false),
+        flush_close: Arc::new(Notify::new()),
     });
+    crate::diameter::lifecycle::register(&peer);
 
     if let Some(metrics) = crate::metrics::try_metrics() {
         metrics.diameter_peers_connected.inc();
@@ -606,9 +694,23 @@ where
 
     // Writer task
     let shutdown_w = shutdown.clone();
+    let flush_close_w = peer.flush_close.clone();
     tokio::spawn(async move {
         loop {
             tokio::select! {
+                _ = flush_close_w.notified() => {
+                    // Whatever is queued (the DPA that answers a DPR) leaves
+                    // before the socket closes.
+                    while let Ok(data) = write_rx.try_recv() {
+                        if tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(&data))
+                            .await
+                            .map_or(true, |written| written.is_err())
+                        {
+                            break;
+                        }
+                    }
+                    break;
+                }
                 msg = write_rx.recv() => {
                     match msg {
                         Some(data) => {
@@ -647,6 +749,8 @@ where
     let write_tx_r = peer.write_tx.clone();
     let shutdown_r = shutdown.clone();
     let state_r = state.clone();
+    let remote_cause_r = peer.remote_disconnect_cause.clone();
+    let flush_close_r = peer.flush_close.clone();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -681,11 +785,20 @@ where
                                 } else if decoded.command_code == dictionary::CMD_DISCONNECT_PEER {
                                     // RFC 6733 §5.4: acknowledge the DPR with a
                                     // DPA before tearing the connection down.
-                                    info!("Diameter: received DPR, sending DPA and closing");
+                                    let cause = codec::DiameterMsg::from_wire(&msg_bytes)
+                                        .ok()
+                                        .and_then(|tree| {
+                                            tree.find(avp::DISCONNECT_CAUSE, 0).and_then(|a| a.as_u32())
+                                        });
+                                    if let Some(cause) = cause {
+                                        remote_cause_r.store(cause, Ordering::Release);
+                                    }
+                                    info!(cause = ?cause, "Diameter: received DPR, sending DPA and closing");
                                     let dpa = build_dpa(&origin_host, &origin_realm, decoded.hop_by_hop, decoded.end_to_end);
                                     if write_tx_r.try_send(dpa).is_err() {
                                         warn!("Diameter: dropped DPA — peer outbound queue full or closed");
                                     }
+                                    flush_close_r.notify_one();
                                     break;
                                 } else {
                                     info!("Diameter: received {} from peer", cmd);
@@ -1028,6 +1141,7 @@ mod tests {
             application_ids: vec![(dictionary::VENDOR_3GPP, dictionary::CX_APP_ID)],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 100,
         };
@@ -1068,6 +1182,7 @@ mod tests {
             ],
             watchdog_interval: 3600,
             reconnect_delay: 5,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 1,
         };
@@ -1132,6 +1247,7 @@ mod tests {
             ],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 1,
         }
@@ -1193,6 +1309,7 @@ mod tests {
             application_ids: vec![(dictionary::VENDOR_3GPP, dictionary::CX_APP_ID)],
             watchdog_interval: 3600,
             reconnect_delay: 5,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 1,
         }
@@ -1602,6 +1719,7 @@ mod tests {
             application_ids: vec![(dictionary::VENDOR_3GPP, dictionary::CX_APP_ID)],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            lifecycle: Default::default(),
             product_name: "HSS".to_string(),
             firmware_revision: 200,
         };
@@ -1667,6 +1785,7 @@ mod tests {
             application_ids: vec![],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 100,
         }
@@ -1804,5 +1923,141 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(peer.state(), PeerState::Closed);
+    }
+
+    /// The far end of a duplex connection reads the message the peer sends,
+    /// as a decoded tree.
+    async fn read_tree(stream: &mut tokio::io::DuplexStream) -> codec::DiameterMsg {
+        let bytes = codec::read_diameter_message(stream).await.unwrap();
+        codec::DiameterMsg::from_wire(&bytes).unwrap()
+    }
+
+    fn disconnect_cause_of(tree: &codec::DiameterMsg) -> Option<u32> {
+        tree.find(dictionary::avp::DISCONNECT_CAUSE, 0)
+            .and_then(|a| a.as_u32())
+    }
+
+    #[tokio::test]
+    async fn disconnect_sends_a_dpr_with_the_cause_and_closes_once_answered() {
+        use crate::diameter::lifecycle::{DisconnectCause, DisconnectOutcome};
+        for cause in [
+            DisconnectCause::Rebooting,
+            DisconnectCause::DoNotWantToTalkToYou,
+        ] {
+            let (client_side, mut far_end) = tokio::io::duplex(8192);
+            let (incoming_tx, _incoming_rx) = mpsc::channel(8);
+            let peer = spawn_connection_tasks(test_config(), client_side, incoming_tx);
+
+            let task = {
+                let peer = peer.clone();
+                tokio::spawn(async move { peer.disconnect(cause, Duration::from_secs(5)).await })
+            };
+
+            let dpr = read_tree(&mut far_end).await;
+            assert!(dpr.is_request());
+            assert_eq!(dpr.command_code, dictionary::CMD_DISCONNECT_PEER);
+            assert_eq!(disconnect_cause_of(&dpr), Some(cause.as_u32()));
+            // Still open and not yet closed: it waits for the answer.
+            assert!(
+                !peer.is_open(),
+                "no new request rides a disconnecting connection"
+            );
+            let dpa = build_dpa(
+                "far.example.org",
+                "example.org",
+                dpr.hop_by_hop,
+                dpr.end_to_end,
+            );
+            far_end.write_all(&dpa).await.unwrap();
+
+            assert_eq!(task.await.unwrap(), DisconnectOutcome::Answered);
+            // The socket is closed after the answer: the far end reads EOF.
+            let eof = tokio::time::timeout(
+                Duration::from_secs(2),
+                codec::read_diameter_message(&mut far_end),
+            )
+            .await
+            .expect("the connection closes");
+            assert!(eof.is_err());
+            assert!(peer.disconnected_locally());
+            assert_eq!(
+                peer.reconnect_advice(),
+                crate::diameter::lifecycle::ReconnectAdvice::Stop
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_closes_anyway_when_the_dpa_does_not_come() {
+        use crate::diameter::lifecycle::{DisconnectCause, DisconnectOutcome};
+        let (client_side, mut far_end) = tokio::io::duplex(8192);
+        let (incoming_tx, _incoming_rx) = mpsc::channel(8);
+        let peer = spawn_connection_tasks(test_config(), client_side, incoming_tx);
+
+        let started = std::time::Instant::now();
+        let outcome = peer
+            .disconnect(DisconnectCause::Rebooting, Duration::from_millis(150))
+            .await;
+        assert_eq!(outcome, DisconnectOutcome::Unanswered);
+        assert!(started.elapsed() < Duration::from_secs(2), "bounded wait");
+        // The DPR did leave.
+        let dpr = read_tree(&mut far_end).await;
+        assert_eq!(dpr.command_code, dictionary::CMD_DISCONNECT_PEER);
+        for _ in 0..50 {
+            if peer.state() == PeerState::Closed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(peer.state(), PeerState::Closed);
+    }
+
+    #[tokio::test]
+    async fn a_second_disconnect_does_not_send_a_second_dpr() {
+        use crate::diameter::lifecycle::{DisconnectCause, DisconnectOutcome};
+        let (client_side, _far_end) = tokio::io::duplex(8192);
+        let (incoming_tx, _incoming_rx) = mpsc::channel(8);
+        let peer = spawn_connection_tasks(test_config(), client_side, incoming_tx);
+        let first = peer
+            .disconnect(DisconnectCause::Rebooting, Duration::from_millis(50))
+            .await;
+        assert_eq!(first, DisconnectOutcome::Unanswered);
+        let second = peer
+            .disconnect(DisconnectCause::Rebooting, Duration::from_millis(50))
+            .await;
+        assert_eq!(second, DisconnectOutcome::NotOpen);
+    }
+
+    #[tokio::test]
+    async fn an_incoming_dpr_records_its_cause_and_the_dpa_leaves_before_the_close() {
+        use crate::diameter::lifecycle::ReconnectAdvice;
+        for (cause, expected) in [
+            (0, ReconnectAdvice::Normal),
+            (1, ReconnectAdvice::Hold(Duration::from_secs(5))),
+            (2, ReconnectAdvice::Hold(Duration::from_secs(300))),
+        ] {
+            let (client_side, mut far_end) = tokio::io::duplex(8192);
+            let (incoming_tx, _incoming_rx) = mpsc::channel(8);
+            let peer = spawn_connection_tasks(test_config(), client_side, incoming_tx);
+            assert_eq!(peer.remote_disconnect_cause(), None);
+
+            far_end
+                .write_all(&build_dpr("far.example.org", "example.org", cause, 7, 8))
+                .await
+                .unwrap();
+            let dpa = read_tree(&mut far_end).await;
+            assert!(!dpa.is_request());
+            assert_eq!(dpa.hop_by_hop, 7);
+            // The connection is then closed from this side.
+            let eof = tokio::time::timeout(
+                Duration::from_secs(2),
+                codec::read_diameter_message(&mut far_end),
+            )
+            .await
+            .expect("the connection closes after the DPA");
+            assert!(eof.is_err());
+            assert_eq!(peer.remote_disconnect_cause(), Some(cause));
+            assert_eq!(peer.reconnect_advice(), expected, "cause {cause}");
+        }
     }
 }

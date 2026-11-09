@@ -38,6 +38,9 @@ fn default_diameter_transport() -> String {
 fn default_watchdog_interval() -> u64 {
     30
 }
+fn default_disconnect_timeout_ms() -> u64 {
+    1000
+}
 fn default_reconnect_delay() -> u64 {
     5
 }
@@ -80,6 +83,12 @@ pub struct DiameterConfig {
     /// Default reconnect delay in seconds after connection failure.
     #[serde(default = "default_reconnect_delay")]
     pub reconnect_delay: u64,
+    /// How long a Disconnect-Peer-Request waits for its answer, in
+    /// milliseconds, when a connection is closed at shutdown or because its
+    /// peer left a DNS group. The connection is closed when it passes, so a
+    /// dead peer cannot hold the shutdown.
+    #[serde(default = "default_disconnect_timeout_ms")]
+    pub disconnect_timeout_ms: u64,
     /// Named Diameter peers (HSS, OCS, PCRF, CDF, etc.).
     #[serde(default)]
     pub peers: Vec<DiameterPeerEntry>,
@@ -455,6 +464,10 @@ impl DiameterConfig {
             application_ids,
             watchdog_interval: peer.watchdog_interval.unwrap_or(self.watchdog_interval),
             reconnect_delay: peer.reconnect_delay.unwrap_or(self.reconnect_delay),
+            lifecycle: crate::diameter::lifecycle::PeerLifecycle {
+                disconnect_timeout_ms: self.disconnect_timeout_ms,
+                ..Default::default()
+            },
             product_name: self
                 .product_name
                 .clone()

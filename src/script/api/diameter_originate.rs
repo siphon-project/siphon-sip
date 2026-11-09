@@ -457,6 +457,7 @@ mod tests {
                 application_ids: Vec::new(),
                 watchdog_interval: 30,
                 reconnect_delay: 5,
+                lifecycle: Default::default(),
                 product_name: "test".into(),
                 firmware_revision: 1,
             },

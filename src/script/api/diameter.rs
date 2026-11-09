@@ -4176,6 +4176,7 @@ mod tests {
                 application_ids: vec![],
                 watchdog_interval: 30,
                 reconnect_delay: 5,
+                lifecycle: Default::default(),
                 product_name: "SIPhon".to_string(),
                 firmware_revision: 100,
             };
@@ -4540,6 +4541,7 @@ mod tests {
             application_ids: vec![],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 1,
         }

@@ -844,3 +844,20 @@ failover lists include every open member. Sticky pool picks bind the session
 to a specific member and select another when it goes down. Pool picks expose
 the member name. Backend members also serve inbound requests and remain
 available through `diameter.peer_for_host` using their advertised Origin-Host.
+
+### Disconnecting a connection
+
+siphon takes a connection down the way RFC 6733 section 5.4 describes: a
+Disconnect-Peer-Request, the answer, then the close. On SIGTERM it sends every
+open connection, of every kind (`peers`, `servers`, `connect_to` and the
+clients of the listener), a DPR with Disconnect-Cause `REBOOTING`, after the
+drain and the charging stops, and waits for the answers for up to
+`diameter.disconnect_timeout_ms` (default `1000`; all connections at once, so
+a dead peer costs one bound, not one each). When a DNS group drops a member the
+DPR carries `DO_NOT_WANT_TO_TALK_TO_YOU`. A connection that went this way is
+not dialled again by this node.
+
+A DPR from a peer is answered with a DPA, after which the connection closes
+and the dialling loop applies the cause: `REBOOTING` redials on the ordinary
+schedule, `BUSY` waits at least `reconnect_delay` seconds before the next try, and
+`DO_NOT_WANT_TO_TALK_TO_YOU` leaves the peer alone for five minutes.

@@ -562,6 +562,7 @@ mod tests {
             application_ids: vec![(dictionary::S6C_APP_ID, dictionary::VENDOR_3GPP)],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 100,
         }

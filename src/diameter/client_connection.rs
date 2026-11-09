@@ -1,5 +1,6 @@
 //! Client peer reconnect loop, shared by fixed peers and DNS members.
 use super::{
+    lifecycle::ReconnectAdvice,
     peer::{DiameterPeer, IncomingRequest, PeerConfig},
     DiameterManager,
 };
@@ -28,6 +29,7 @@ pub fn spawn(
     // and re-registers the client in the DiameterManager.
     tokio::spawn(async move {
         loop {
+            let mut delay = std::time::Duration::from_secs(reconnect_delay);
             match crate::diameter::peer::connect(peer_config.clone()).await {
                 Ok((peer, mut incoming_rx)) => {
                     let client = Arc::new(crate::diameter::DiameterClient::new(Arc::clone(&peer)));
@@ -66,7 +68,23 @@ pub fn spawn(
 
                     // incoming_rx closed — peer disconnected
                     crate::metrics::set_diameter_peer_up(&peer_name, false);
-                    warn!(peer = %peer_name, "Diameter peer disconnected, reconnecting");
+                    match peer.reconnect_advice() {
+                        ReconnectAdvice::Stop => {
+                            info!(peer = %peer_name, "Diameter peer disconnected by this node, not reconnecting");
+                            return;
+                        }
+                        ReconnectAdvice::Hold(hold) => {
+                            warn!(
+                                peer = %peer_name, hold_secs = hold.as_secs(),
+                                cause = ?peer.remote_disconnect_cause(),
+                                "Diameter peer disconnected and asked not to be redialled yet",
+                            );
+                            delay = delay.max(hold);
+                        }
+                        ReconnectAdvice::Normal => {
+                            warn!(peer = %peer_name, "Diameter peer disconnected, reconnecting");
+                        }
+                    }
                 }
                 Err(error) => {
                     crate::metrics::set_diameter_peer_up(&peer_name, false);
@@ -76,7 +94,7 @@ pub fn spawn(
                     );
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(reconnect_delay)).await;
+            tokio::time::sleep(delay).await;
         }
     })
 }
