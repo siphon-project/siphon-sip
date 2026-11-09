@@ -559,6 +559,8 @@ pub struct DrainState {
     pub is_draining: std::sync::atomic::AtomicBool,
     pub transaction_manager: std::sync::OnceLock<Arc<TransactionManager>>,
     pub call_actors: std::sync::OnceLock<Arc<CallActorStore>>,
+    /// Addon components taking part in readiness, drain and shutdown.
+    pub participants: crate::lifecycle::Participants,
 }
 
 impl DrainState {
@@ -567,6 +569,7 @@ impl DrainState {
             is_draining: std::sync::atomic::AtomicBool::new(false),
             transaction_manager: std::sync::OnceLock::new(),
             call_actors: std::sync::OnceLock::new(),
+            participants: crate::lifecycle::Participants::default(),
         }
     }
 

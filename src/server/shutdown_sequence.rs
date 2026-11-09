@@ -57,44 +57,7 @@ pub(crate) async fn shut_down(
     // or after this, whichever comes first (deleted below, before exit).
     let sa_answers_by = tokio::time::Instant::now() + crate::registrant::SHUTDOWN_ANSWER_WAIT;
 
-    let drain_secs = config.server.as_ref().map(|s| s.drain_secs).unwrap_or(30);
-
-    if drain_secs > 0 {
-        // Stop accepting new INVITEs; let in-flight transactions and B2BUA
-        // calls finish for up to drain_secs.
-        drain
-            .is_draining
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let (initial_tx, initial_calls) = drain.active_counts();
-        info!(
-            drain_secs,
-            active_transactions = initial_tx,
-            active_calls = initial_calls,
-            "draining — refusing new INVITEs while in-flight work completes"
-        );
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(drain_secs);
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
-        tick.tick().await; // burn the immediate first tick
-        loop {
-            let (txs, calls) = drain.active_counts();
-            if txs == 0 && calls == 0 {
-                info!("drain complete — all in-flight work finished");
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                warn!(
-                    active_transactions = txs,
-                    active_calls = calls,
-                    "drain timeout — ending the calls still up"
-                );
-                end_surviving_calls(config, drain).await;
-                break;
-            }
-            tick.tick().await;
-        }
-    } else {
-        info!("shutting down (drain disabled)");
-    }
+    drain_and_end(config, drain).await;
 
     // Before the dispatcher goes: it delivers the de-REGISTER answers that
     // release the IMS UE SA sets. Bounded, so it never holds the exit.
@@ -112,6 +75,61 @@ pub(crate) async fn shut_down(
                 "deleted the IMS UE security associations left at shutdown"
             );
         }
+    }
+}
+
+/// The drain: stop taking new work, wait (bounded by `server.drain_secs`) for
+/// transactions, calls and the lifecycle participants' outstanding work, then at
+/// the deadline end the calls still up and force the participants.
+///
+/// Participants hear `set_draining(true)` even when the drain is disabled
+/// (`drain_secs: 0`), and are forced at once in that case: there is no time to
+/// wait for them.
+pub(crate) async fn drain_and_end(config: &Config, drain: &Arc<crate::dispatcher::DrainState>) {
+    let drain_secs = config.server.as_ref().map(|s| s.drain_secs).unwrap_or(30);
+
+    if drain_secs > 0 {
+        // Stop accepting new INVITEs; let in-flight transactions and B2BUA
+        // calls finish for up to drain_secs.
+        drain
+            .is_draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        drain.participants.set_draining(true);
+        let (initial_tx, initial_calls) = drain.active_counts();
+        info!(
+            drain_secs,
+            active_transactions = initial_tx,
+            active_calls = initial_calls,
+            outstanding = drain.participants.outstanding(),
+            "draining — refusing new INVITEs while in-flight work completes"
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(drain_secs);
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+        tick.tick().await; // burn the immediate first tick
+        loop {
+            let (txs, calls) = drain.active_counts();
+            let outstanding = drain.participants.outstanding();
+            if txs == 0 && calls == 0 && outstanding == 0 {
+                info!("drain complete — all in-flight work finished");
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    active_transactions = txs,
+                    active_calls = calls,
+                    outstanding,
+                    "drain timeout — ending the calls still up"
+                );
+                end_surviving_calls(config, drain).await;
+                drain.participants.force();
+                break;
+            }
+            tick.tick().await;
+        }
+    } else {
+        info!("shutting down (drain disabled)");
+        drain.participants.set_draining(true);
+        drain.participants.force();
     }
 }
 
@@ -149,4 +167,99 @@ async fn end_surviving_calls(config: &Config, drain: &Arc<crate::dispatcher::Dra
         drained,
         "shutdown teardown complete"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lifecycle::test_support::FakeParticipant;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    fn config(drain_secs: u64) -> Config {
+        Config::from_str(&format!(
+            concat!(
+                "listen:\n  udp: [\"192.0.2.1:5060\"]\n",
+                "domain:\n  local: [\"example.com\"]\n",
+                "server:\n  drain_secs: {}\n  teardown_secs: 0\n",
+            ),
+            drain_secs
+        ))
+        .expect("a config")
+    }
+
+    /// No participant: the drain ends at once, as before.
+    #[tokio::test(start_paused = true)]
+    async fn drain_without_participants_ends_at_once() {
+        let drain = Arc::new(crate::dispatcher::DrainState::new());
+        let started = tokio::time::Instant::now();
+        drain_and_end(&config(30), &drain).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(drain.is_draining.load(Ordering::SeqCst));
+    }
+
+    /// Participants hear the drain, and the exit is held until their work is gone.
+    #[tokio::test(start_paused = true)]
+    async fn drain_waits_for_participant_outstanding() {
+        let drain = Arc::new(crate::dispatcher::DrainState::new());
+        let first = FakeParticipant::with_outstanding(2);
+        let second = FakeParticipant::with_outstanding(1);
+        drain.participants.register(first.clone());
+        drain.participants.register(second.clone());
+
+        let releaser = {
+            let first = first.clone();
+            let second = second.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                first.outstanding.store(0, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                second.outstanding.store(0, Ordering::SeqCst);
+            })
+        };
+        let started = tokio::time::Instant::now();
+        drain_and_end(&config(30), &drain).await;
+        let elapsed = started.elapsed();
+        releaser.await.expect("releaser");
+
+        assert!(elapsed >= Duration::from_secs(5), "left early: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(7), "overran: {elapsed:?}");
+        for participant in [&first, &second] {
+            assert_eq!(participant.draining_calls.load(Ordering::SeqCst), 1);
+            assert!(participant.draining.load(Ordering::SeqCst));
+            assert_eq!(participant.forced.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    /// Work that never ends is forced at the deadline, once per participant.
+    #[tokio::test(start_paused = true)]
+    async fn drain_forces_participants_at_the_deadline() {
+        let drain = Arc::new(crate::dispatcher::DrainState::new());
+        let stuck = FakeParticipant::with_outstanding(4);
+        let idle = FakeParticipant::with_outstanding(0);
+        drain.participants.register(stuck.clone());
+        drain.participants.register(idle.clone());
+
+        let started = tokio::time::Instant::now();
+        drain_and_end(&config(2), &drain).await;
+        let elapsed = started.elapsed();
+
+        assert!(elapsed >= Duration::from_secs(2), "left early: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "overran: {elapsed:?}");
+        assert_eq!(stuck.forced.load(Ordering::SeqCst), 1);
+        assert_eq!(idle.forced.load(Ordering::SeqCst), 1);
+    }
+
+    /// `drain_secs: 0` skips the wait: participants are told, then forced.
+    #[tokio::test(start_paused = true)]
+    async fn disabled_drain_still_informs_and_forces_participants() {
+        let drain = Arc::new(crate::dispatcher::DrainState::new());
+        let stuck = FakeParticipant::with_outstanding(4);
+        drain.participants.register(stuck.clone());
+        let started = tokio::time::Instant::now();
+        drain_and_end(&config(0), &drain).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(stuck.draining.load(Ordering::SeqCst));
+        assert_eq!(stuck.forced.load(Ordering::SeqCst), 1);
+    }
 }

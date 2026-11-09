@@ -379,6 +379,17 @@ fn register_task_records_in_order() {
 }
 
 #[test]
+fn register_lifecycle_records_every_participant() {
+    use crate::lifecycle::test_support::FakeParticipant;
+    let none = SiphonServer::builder();
+    assert_eq!(none.lifecycle_participant_count(), 0);
+    let server = SiphonServer::builder()
+        .register_lifecycle(FakeParticipant::with_outstanding(0))
+        .register_lifecycle(FakeParticipant::refusing("not bound"));
+    assert_eq!(server.lifecycle_participant_count(), 2);
+}
+
+#[test]
 fn register_task_empty_by_default() {
     let server = SiphonServer::builder();
     assert_eq!(server.extension_task_count(), 0);

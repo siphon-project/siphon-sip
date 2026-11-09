@@ -90,6 +90,7 @@ pub struct SiphonServer {
     module_extensions: Vec<(String, ModuleExtension)>,
     extension_tasks: Vec<ExtensionTask>,
     control_adapters: Vec<ControlAdapterHandle>,
+    lifecycle_participants: Vec<Arc<dyn crate::lifecycle::LifecycleParticipant>>,
 }
 
 impl SiphonServer {
@@ -107,6 +108,7 @@ impl SiphonServer {
             module_extensions: Vec::new(),
             extension_tasks: Vec::new(),
             control_adapters: Vec::new(),
+            lifecycle_participants: Vec::new(),
         }
     }
 
@@ -297,6 +299,41 @@ impl SiphonServer {
     {
         self.extension_tasks.push(Box::new(task));
         self
+    }
+
+    /// Register a component that takes part in readiness, drain and shutdown.
+    ///
+    /// For a Rust addon that owns long-lived state siphon cannot see (sessions
+    /// over its own protocol, its own sockets, an upstream peer). May be called
+    /// several times. See [`LifecycleParticipant`](crate::LifecycleParticipant)
+    /// for the contract: `/admin/ready` reports 503 with the participant's
+    /// reason while it is not ready, `/admin/drain` and SIGTERM call
+    /// `set_draining`, the shutdown waits while `outstanding()` is above zero,
+    /// and `force()` runs when `server.drain_secs` expires. With none
+    /// registered, behaviour is unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use siphon::SiphonServer;
+    ///
+    /// SiphonServer::builder()
+    ///     .config_path("siphon.yaml")
+    ///     .register_lifecycle(Arc::new(MySessions::new()))
+    ///     .run();
+    /// ```
+    pub fn register_lifecycle(
+        mut self,
+        participant: Arc<dyn crate::lifecycle::LifecycleParticipant>,
+    ) -> Self {
+        self.lifecycle_participants.push(participant);
+        self
+    }
+
+    /// Number of lifecycle participants currently registered on the builder.
+    pub fn lifecycle_participant_count(&self) -> usize {
+        self.lifecycle_participants.len()
     }
 
     /// Number of extension tasks currently registered on the builder.
@@ -2472,6 +2509,9 @@ impl SiphonServer {
 
         // --- Start dispatcher ---
         let drain = Arc::new(dispatcher::DrainState::new());
+        for participant in std::mem::take(&mut self.lifecycle_participants) {
+            drain.participants.register(participant);
+        }
 
         // --- HTTP admin API (health/readiness probes + registration inspection) ---
         let config_reloader = config_document.map(|(path, document)| {

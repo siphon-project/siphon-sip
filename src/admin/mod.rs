@@ -445,6 +445,7 @@ async fn drain_handler(State(state): State<AdminState>, method: Method) -> Respo
     drain
         .is_draining
         .store(draining, std::sync::atomic::Ordering::SeqCst);
+    drain.participants.set_draining(draining);
     let (transactions, calls) = drain.active_counts();
     if draining {
         info!(transactions, calls, "admin: node entering drain");
@@ -739,24 +740,27 @@ async fn health_handler(State(state): State<AdminState>) -> impl IntoResponse {
 
 /// `GET /admin/ready` — readiness probe. 200 normally; **503 while draining**
 /// (SIGTERM received) so a load balancer / orchestrator removes this node from
-/// rotation before it stops accepting new INVITEs. When no drain signal is wired
-/// it always reports ready.
+/// rotation before it stops accepting new INVITEs, and **503 with the reason**
+/// while a registered lifecycle participant is not ready. When no drain signal
+/// is wired it always reports ready.
 async fn ready_handler(State(state): State<AdminState>) -> impl IntoResponse {
-    let draining = state
-        .draining
-        .as_ref()
-        .map(|drain| drain.is_draining.load(std::sync::atomic::Ordering::SeqCst))
-        .unwrap_or(false);
+    let drain = state.draining.as_ref();
+    let draining = drain.is_some_and(|d| d.is_draining.load(std::sync::atomic::Ordering::SeqCst));
     if draining {
-        (
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "status": "draining" })),
-        )
-    } else {
-        (
+        );
+    }
+    match drain.and_then(|d| d.participants.not_ready_reason()) {
+        Some(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": "not_ready", "reason": reason })),
+        ),
+        None => (
             StatusCode::OK,
             Json(serde_json::json!({ "status": "ready" })),
-        )
+        ),
     }
 }
 
@@ -1831,6 +1835,98 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "draining");
+    }
+
+    fn state_with_participants(
+        participants: &[Arc<crate::lifecycle::test_support::FakeParticipant>],
+    ) -> (AdminState, Arc<DrainState>) {
+        let drain = Arc::new(DrainState::new());
+        for participant in participants {
+            drain.participants.register(participant.clone());
+        }
+        let mut state = test_state();
+        state.draining = Some(Arc::clone(&drain));
+        (state, drain)
+    }
+
+    async fn json_of(response: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ready_returns_503_with_the_first_participants_reason() {
+        use crate::lifecycle::test_support::FakeParticipant;
+        let (state, _drain) = state_with_participants(&[
+            FakeParticipant::with_outstanding(0),
+            FakeParticipant::refusing("no upstream peer up"),
+            FakeParticipant::refusing("second reason"),
+        ]);
+        let response = router(state, None, false)
+            .oneshot(Request::get("/admin/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json = json_of(response).await;
+        assert_eq!(json["status"], "not_ready");
+        assert_eq!(json["reason"], "no upstream peer up");
+    }
+
+    #[tokio::test]
+    async fn ready_is_200_when_every_participant_is_ready() {
+        use crate::lifecycle::test_support::FakeParticipant;
+        let (state, _drain) = state_with_participants(&[FakeParticipant::with_outstanding(0)]);
+        let response = router(state, None, false)
+            .oneshot(Request::get("/admin/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ready_reports_draining_ahead_of_a_participants_reason() {
+        use crate::lifecycle::test_support::FakeParticipant;
+        let (state, drain) = state_with_participants(&[FakeParticipant::refusing("x")]);
+        drain
+            .is_draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let response = router(state, None, false)
+            .oneshot(Request::get("/admin/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json_of(response).await["status"], "draining");
+    }
+
+    #[tokio::test]
+    async fn drain_post_and_delete_reach_every_participant() {
+        use crate::lifecycle::test_support::FakeParticipant;
+        use std::sync::atomic::Ordering;
+        let first = FakeParticipant::with_outstanding(0);
+        let second = FakeParticipant::with_outstanding(0);
+        let (state, _drain) = state_with_participants(&[first.clone(), second.clone()]);
+        let app = router(state, None, false);
+
+        let response = app
+            .clone()
+            .oneshot(Request::post("/admin/drain").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(first.draining.load(Ordering::SeqCst));
+        assert!(second.draining.load(Ordering::SeqCst));
+
+        let response = app
+            .oneshot(Request::delete("/admin/drain").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!first.draining.load(Ordering::SeqCst));
+        assert!(!second.draining.load(Ordering::SeqCst));
+        assert_eq!(first.draining_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(second.draining_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

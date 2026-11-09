@@ -28,6 +28,7 @@ pub mod ifc;
 pub mod ipsec;
 pub mod lcr;
 pub mod li;
+pub mod lifecycle;
 pub mod log_tail;
 pub mod media;
 pub mod metrics;
@@ -54,6 +55,7 @@ pub mod transport;
 pub mod uac;
 pub mod xml_text;
 
+pub use lifecycle::LifecycleParticipant;
 pub use server::SiphonServer;
 
 // Re-export the jemalloc allocator crate so the macro can name
