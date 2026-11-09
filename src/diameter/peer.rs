@@ -445,6 +445,39 @@ impl DiameterPeer {
         msg: Vec<u8>,
         timeout: Duration,
     ) -> Result<DiameterMessage, String> {
+        self.send_request_as(msg, timeout, crate::diameter::overload::Origin::Local)
+            .await
+    }
+
+    /// Relay a request received from another node and wait up to `timeout`
+    /// for the answer. The request is sent as it is: no DOIC is added and
+    /// none is abated (RFC 7683 section 5.2.3).
+    pub async fn send_relayed_timeout(
+        &self,
+        msg: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<DiameterMessage, String> {
+        self.send_request_as(msg, timeout, crate::diameter::overload::Origin::Relayed)
+            .await
+    }
+
+    async fn send_request_as(
+        &self,
+        msg: Vec<u8>,
+        timeout: Duration,
+        origin: crate::diameter::overload::Origin,
+    ) -> Result<DiameterMessage, String> {
+        // DOIC: advertise it in what this node originates, and abate what a
+        // report in force asks to.
+        let msg = match crate::diameter::overload::prepare_outbound(
+            msg,
+            origin,
+            self.remote_origin_host(),
+            self.remote_origin_realm(),
+        ) {
+            Ok(msg) => msg,
+            Err(_report) => return Err(crate::diameter::overload::ABATED.to_string()),
+        };
         // Extract HbH and command code from the message
         if msg.len() < 20 {
             return Err("message too short".into());
@@ -931,6 +964,7 @@ where
                                     }
                                 }
                             } else {
+                                crate::diameter::overload::note_answer(&msg_bytes);
                                 let mut map = pending_r.lock().await;
                                 if let Some(tx) = map.remove(&decoded.hop_by_hop) {
                                     let _ = tx.send(decoded);

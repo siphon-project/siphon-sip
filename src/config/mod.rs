@@ -50,9 +50,10 @@ pub use control::{
 };
 pub use diameter::{
     DiameterAdvertisedApplication, DiameterApplication, DiameterClientEntry, DiameterConfig,
-    DiameterCxConfig, DiameterListenConfig, DiameterPeerEntry, DiameterRouteEntry,
-    DiameterServerEntry, DiameterTenant, DiameterTenantIdentity, EventSinkConfig,
-    EventSinkFileConfig,
+    DiameterCxConfig, DiameterListenConfig, DiameterOverloadConfig, DiameterPeerEntry,
+    DiameterPendingRequestsScale, DiameterReactingConfig, DiameterReportingConfig,
+    DiameterRouteEntry, DiameterServerEntry, DiameterTenant, DiameterTenantIdentity,
+    EventSinkConfig, EventSinkFileConfig,
 };
 pub use gateway::{
     GatewayAuthConfig, GatewayBackendType, GatewayConfig, GatewayDatabaseConfig, GatewayDestConfig,

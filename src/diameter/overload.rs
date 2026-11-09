@@ -486,27 +486,36 @@ impl ReportingState {
 
 // ── Process-wide state ──────────────────────────────────────────────────────
 
-/// What a reacting node does with a request it abates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AbatementAction {
-    /// Fail it here with DIAMETER_TOO_BUSY (3004).
-    #[default]
-    Reject,
-    /// Send it to another peer of its route where one exists, and fail it
-    /// as above where none does.
-    Divert,
-}
-
 /// The installed overload behaviour of this node.
 #[derive(Debug)]
 pub struct Overload {
-    pub reacting: Option<AbatementAction>,
+    /// Whether this node is a reacting node.
+    pub reacting: bool,
     pub reporting: Option<ReportingState>,
     pub table: ReactingTable,
 }
 
 impl Overload {
-    pub fn new(reacting: Option<AbatementAction>, reporting: Option<ReportingState>) -> Self {
+    /// From `diameter.overload`.
+    pub fn from_config(config: Option<&crate::config::DiameterOverloadConfig>) -> Self {
+        let Some(config) = config else {
+            return Self::new(false, None);
+        };
+        let reacting = config.reacting.is_some();
+        let reporting = config.reporting.as_ref().map(|reporting| {
+            ReportingState::new(
+                reporting.validity,
+                reporting.pending_requests.as_ref().map(|scale| DepthScale {
+                    start: scale.start,
+                    full: scale.full,
+                    max_reduction: scale.max_reduction,
+                }),
+            )
+        });
+        Self::new(reacting, reporting)
+    }
+
+    pub fn new(reacting: bool, reporting: Option<ReportingState>) -> Self {
         Self {
             reacting,
             reporting,
@@ -516,7 +525,7 @@ impl Overload {
 }
 
 static CURRENT: LazyLock<RwLock<std::sync::Arc<Overload>>> =
-    LazyLock::new(|| RwLock::new(std::sync::Arc::new(Overload::new(None, None))));
+    LazyLock::new(|| RwLock::new(std::sync::Arc::new(Overload::new(false, None))));
 
 /// The overload behaviour in force. Disabled (every field None) until
 /// [`install`] is called.
@@ -533,6 +542,188 @@ pub fn install(overload: Overload) {
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *current = std::sync::Arc::new(overload);
+}
+
+// ── The node's own use of the above ─────────────────────────────────────────
+
+/// The error of a request abated at this node, for
+/// [`super::peer::DiameterPeer::send_request_timeout`] and what routes on it.
+pub const ABATED: &str = "overload abated";
+
+/// Whether `error` is [`ABATED`].
+pub fn is_abated(error: &str) -> bool {
+    error == ABATED
+}
+
+/// Where a request this node sends comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// Made by this node: it advertises DOIC in it and abates it.
+    Local,
+    /// Received from another node and relayed: left exactly as it is
+    /// (RFC 7683 section 5.2.3), abatement is the originator's business.
+    Relayed,
+}
+
+/// Requests this node is serving now: the pending-request depth the
+/// reporting node derives its load from.
+static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts a request being served until dropped.
+pub struct InflightGuard;
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A request is being served.
+pub fn track_inflight() -> InflightGuard {
+    INFLIGHT.fetch_add(1, Ordering::Relaxed);
+    InflightGuard
+}
+
+/// Requests being served now.
+pub fn inflight() -> usize {
+    INFLIGHT.load(Ordering::Relaxed)
+}
+
+/// The DOIC features the sender of the request in `raw` advertised; 0 when
+/// this node reports no overload (nothing is read then) or it advertised none.
+pub fn request_features(raw: &[u8]) -> u64 {
+    if current().reporting.is_none() {
+        return 0;
+    }
+    DiameterMsg::from_wire(raw)
+        .map(|message| advertised_features(&message))
+        .unwrap_or(0)
+}
+
+/// The answer `wire` with this node's overload report added for a request
+/// that advertised `request_features`. Unchanged when the node reports no
+/// overload or the requester did not advertise the loss algorithm.
+pub fn annotate_answer(request_features: u64, wire: Vec<u8>) -> Vec<u8> {
+    let overload = current();
+    let Some(reporting) = overload.reporting.as_ref() else {
+        return wire;
+    };
+    if request_features & FEATURE_LOSS == 0 {
+        return wire;
+    }
+    let Ok(mut answer) = DiameterMsg::from_wire(&wire) else {
+        return wire;
+    };
+    let now = Instant::now();
+    let pending = inflight();
+    let before = answer.avps.len();
+    let reported = reporting.annotate(&mut answer, request_features, pending, now);
+    if answer.avps.len() == before {
+        return wire;
+    }
+    if reported {
+        if let Some(metrics) = crate::metrics::try_metrics() {
+            metrics
+                .diameter_overload_olr_total
+                .with_label_values(&["sent"])
+                .inc();
+            metrics
+                .diameter_overload_reduction_percent
+                .with_label_values(&["reporting", "local"])
+                .set(i64::from(reporting.reduction(pending, now)));
+        }
+    }
+    answer.to_wire()
+}
+
+/// The request `wire` as it leaves this node for the peer that gave
+/// `peer_host` and `peer_realm`: a locally made request advertises DOIC, and
+/// is abated when a report in force says so. `Err` carries the report that
+/// abated it.
+pub fn prepare_outbound(
+    wire: Vec<u8>,
+    origin: Origin,
+    peer_host: Option<&str>,
+    peer_realm: Option<&str>,
+) -> Result<Vec<u8>, ReportKey> {
+    let overload = current();
+    if origin == Origin::Relayed || !overload.reacting {
+        return Ok(wire);
+    }
+    let Ok(mut request) = DiameterMsg::from_wire(&wire) else {
+        return Ok(wire);
+    };
+    // The base protocol (capabilities, watchdog, disconnect) has no
+    // application, and overload is reported per application.
+    if request.application_id == 0 || !request.is_request() {
+        return Ok(wire);
+    }
+    let application = request.application_id;
+    let mut keys = Vec::with_capacity(4);
+    let mut push = |report_type, identity: Option<String>| {
+        if let Some(identity) = identity.filter(|identity| !identity.is_empty()) {
+            keys.push(ReportKey::new(report_type, &identity, application));
+        }
+    };
+    push(ReportType::Host, peer_host.map(str::to_owned));
+    push(ReportType::Host, request.get_str(avp::DESTINATION_HOST));
+    push(ReportType::Realm, request.get_str(avp::DESTINATION_REALM));
+    push(ReportType::Realm, peer_realm.map(str::to_owned));
+    if let Some(key) = overload.table.abate(&keys, Instant::now(), random_unit()) {
+        if let Some(metrics) = crate::metrics::try_metrics() {
+            metrics
+                .diameter_overload_abated_total
+                .with_label_values(&[&key.identity])
+                .inc();
+        }
+        return Err(key);
+    }
+    if request.find(avp::OC_SUPPORTED_FEATURES, 0).is_some() {
+        return Ok(wire);
+    }
+    request.avps.push(supported_features_avp(FEATURE_LOSS));
+    Ok(request.to_wire())
+}
+
+/// Take in the OC-OLR of an answer received from the node that gave
+/// `origin_host` and `origin_realm`: it starts, replaces or ends the
+/// abatement towards it.
+pub fn note_answer(wire: &[u8]) {
+    let overload = current();
+    if !overload.reacting {
+        return;
+    }
+    let Ok(answer) = DiameterMsg::from_wire(wire) else {
+        return;
+    };
+    let Some(report) = parse_olr(&answer) else {
+        return;
+    };
+    let identity = match report.report_type {
+        ReportType::Host => answer.get_str(avp::ORIGIN_HOST),
+        ReportType::Realm => answer.get_str(avp::ORIGIN_REALM),
+    };
+    let Some(identity) = identity.filter(|identity| !identity.is_empty()) else {
+        return;
+    };
+    let key = ReportKey::new(report.report_type, &identity, answer.application_id);
+    let outcome = overload.table.update(key, &report, Instant::now());
+    if let Some(metrics) = crate::metrics::try_metrics() {
+        metrics
+            .diameter_overload_olr_total
+            .with_label_values(&["received"])
+            .inc();
+        if outcome != Update::Ignored {
+            metrics
+                .diameter_overload_reduction_percent
+                .with_label_values(&["reacting", &identity.to_ascii_lowercase()])
+                .set(i64::from(if outcome == Update::Ended {
+                    0
+                } else {
+                    report.reduction_percentage
+                }));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -942,6 +1133,26 @@ mod tests {
         let before = relayed.clone();
         assert!(!reporting.annotate(&mut relayed, FEATURE_LOSS, 0, now));
         assert_eq!(relayed, before);
+    }
+
+    #[test]
+    fn the_configuration_turns_the_two_roles_on_independently() {
+        let none = Overload::from_config(None);
+        assert!(!none.reacting && none.reporting.is_none());
+        let config: crate::config::DiameterConfig = serde_saphyr::from_str(
+            "overload:\n  reporting:\n    validity: 45\n    pending_requests: {start: 10, full: 20}\n",
+        )
+        .unwrap();
+        let reporting_only = Overload::from_config(config.overload.as_ref());
+        assert!(!reporting_only.reacting);
+        let reporting = reporting_only.reporting.expect("reporting configured");
+        // Full scale from `full` on, at the default max_reduction of 100.
+        assert_eq!(reporting.reduction(20, Instant::now()), 100);
+        assert_eq!(reporting.reduction(15, Instant::now()), 50);
+        let config: crate::config::DiameterConfig =
+            serde_saphyr::from_str("overload:\n  reacting: {}\n").unwrap();
+        let reacting_only = Overload::from_config(config.overload.as_ref());
+        assert!(reacting_only.reacting && reacting_only.reporting.is_none());
     }
 
     /// Emit the DOIC AVPs for `scripts/validate_diameter_overload.sh`, which

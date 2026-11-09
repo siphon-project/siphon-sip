@@ -1087,7 +1087,7 @@ impl PyDiameterRequest {
             let wire = tree.to_wire();
             tree.hop_by_hop = inbound_hbh;
 
-            match client.peer().send_request_timeout(wire, timeout).await {
+            match client.peer().send_relayed_timeout(wire, timeout).await {
                 Ok(answer_message) => {
                     // Rebuild the lossless tree from the answer's raw bytes and
                     // restore the inbound hbh/e2e so it correlates upstream.

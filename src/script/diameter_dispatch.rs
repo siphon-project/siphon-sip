@@ -685,8 +685,12 @@ pub(crate) async fn dispatch_request(
         return;
     }
     let start = Instant::now();
+    // Counted while it is served: the pending-request depth a reporting node
+    // derives its overload from.
+    let _serving = crate::diameter::overload::track_inflight();
     // Captured before `incoming` moves into the handler closure below.
     let command_code = incoming.command_code;
+    let request_features = crate::diameter::overload::request_features(&incoming.raw);
 
     // Build the answer (and keep the Py request/answer for the completed hook)
     // on the Python executor. An `async def` handler that awaits — at any of
@@ -770,7 +774,9 @@ pub(crate) async fn dispatch_request(
     // separately rather than a reason to lose the transaction.
     let result_label = emitted_answer_result_label(&outcome.wire);
 
-    if let Err(error) = inbound_peer.send_response(outcome.wire).await {
+    // The overload this node reports, to a requester that advertised DOIC.
+    let wire = crate::diameter::overload::annotate_answer(request_features, outcome.wire);
+    if let Err(error) = inbound_peer.send_response(wire).await {
         warn!(%error, "Diameter server: failed to send answer upstream");
     }
 

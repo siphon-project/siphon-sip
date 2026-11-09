@@ -898,3 +898,62 @@ the socket is bound to the address before it connects, over TCP and, in a
 build with the `sctp` feature, SCTP. Use it on a host with several addresses
 where the one the peer expects is not the default route's. The address must
 be of the family of the peer's. Unset, the kernel chooses as before.
+
+### Overload control (DOIC, RFC 7683)
+
+siphon implements the loss algorithm of the Diameter Overload Indication
+Conveyance as a reacting node, as a reporting node, and, always, as a relay.
+Nothing is sent or acted on unless `diameter.overload` is configured.
+
+```yaml
+diameter:
+  overload:
+    reacting: {}              # advertise DOIC and abate what reports ask
+    reporting:
+      validity: 30            # OC-Validity-Duration of a report, seconds
+      pending_requests:       # optional built-in load source
+        start: 200            # no reduction up to this many requests in service
+        full: 1000            # max_reduction from here
+        max_reduction: 80     # percent, default 100
+```
+
+**Reacting node.** Every request this node originates carries
+OC-Supported-Features with the loss algorithm (OLR_DEFAULT_ALGO). An answer
+with an OC-OLR (Sequence-Number, Report-Type host or realm,
+Reduction-Percentage, Validity-Duration) makes it abate that share of the
+requests it sends towards the reporting node, for that application: each
+request is abated with the probability of the reduction percentage. Host
+reports match the peer the request is sent to and its Destination-Host, realm
+reports the Destination-Realm. A report ends when its validity runs out or a
+newer sequence number asks for 0 percent (or 0 seconds); an older or repeated
+sequence number is ignored. A request that is abated fails with
+DIAMETER_TOO_BUSY (3004) where it is made. A request this node
+relays is never abated here and never gains OC-Supported-Features.
+
+**Reporting node.** An answer to a request that advertised the loss algorithm
+carries OC-Supported-Features, and, while there is overload to report, an
+OC-OLR with Report-Type host. The load comes from two sources and the larger
+counts: the application, with `diameter.set_overload(reduction_percentage,
+validity_secs=None)` (0 ends it; returns `False` when `reporting` is not
+configured), and, when `pending_requests` is configured, the number of
+inbound requests being served, scaled linearly from `start` to `full`. A
+change of reduction takes a new sequence number (seeded from the clock, so a
+restart does not repeat numbers); the same report repeats within its validity
+and is renewed when half of it is gone; the end of an overload is reported once
+with no reduction. A requester that did not advertise DOIC gets its answer
+unchanged.
+
+**Relay.** A relay passes OC-* AVPs through unchanged (RFC 7683 section
+5.2.3): the OC-Supported-Features of a request reach the node behind it, the
+OC-OLR of an answer reaches the requester, and `forward_to` neither adds,
+reads nor abates any of it. Acting on behalf of requesters that do not support
+DOIC, which the RFC makes optional, is not implemented: a relay in front of
+nodes that report overload leaves their clients that cannot hear it to be
+shed by the usual 3004 and 3002.
+
+Metrics: `siphon_diameter_overload_abated_total{node}`,
+`siphon_diameter_overload_reduction_percent{role,node}` (`reacting` per
+reporting node, `reporting` for this node) and
+`siphon_diameter_overload_olr_total{direction}`.
+`scripts/validate_diameter_overload.sh` reads the encoding back with
+Wireshark's dissector.

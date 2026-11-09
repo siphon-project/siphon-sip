@@ -107,6 +107,11 @@ pub struct DiameterConfig {
     /// `watchdog_interval` allows.
     #[serde(default)]
     pub watchdog_interval_ms: Option<u64>,
+    /// Overload control (RFC 7683 DOIC, loss algorithm), as a reacting node,
+    /// a reporting node, or both. Absent: no OC-* AVP is sent or acted on;
+    /// a relay passes the ones it is given through either way.
+    #[serde(default)]
+    pub overload: Option<DiameterOverloadConfig>,
     /// Named Diameter peers (HSS, OCS, PCRF, CDF, etc.).
     #[serde(default)]
     pub peers: Vec<DiameterPeerEntry>,
@@ -298,6 +303,53 @@ pub struct DiameterClientEntry {
     /// Optional asserted-Origin-Host validator (exact match).
     #[serde(default)]
     pub expected_origin_host: Option<String>,
+}
+
+/// `diameter.overload`: DOIC (RFC 7683).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DiameterOverloadConfig {
+    /// Advertise DOIC in the requests this node originates and abate what
+    /// overload reports ask for.
+    #[serde(default)]
+    pub reacting: Option<DiameterReactingConfig>,
+    /// Report this node's own overload in answers to requesters that
+    /// advertised DOIC.
+    #[serde(default)]
+    pub reporting: Option<DiameterReportingConfig>,
+}
+
+/// `diameter.overload.reacting`: its presence turns the reacting node on.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DiameterReactingConfig {}
+
+/// `diameter.overload.reporting`.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DiameterReportingConfig {
+    /// OC-Validity-Duration of a report, in seconds (default 30, at most
+    /// 86400).
+    #[serde(default = "default_overload_validity")]
+    pub validity: u32,
+    /// Derive the reduction from the requests being served: none up to
+    /// `start`, rising linearly to `max_reduction` at `full`. The application
+    /// sets its own with `diameter.set_overload`; the larger is reported.
+    #[serde(default)]
+    pub pending_requests: Option<DiameterPendingRequestsScale>,
+}
+
+/// `diameter.overload.reporting.pending_requests`.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DiameterPendingRequestsScale {
+    pub start: usize,
+    pub full: usize,
+    #[serde(default = "default_overload_max_reduction")]
+    pub max_reduction: u32,
+}
+
+fn default_overload_validity() -> u32 {
+    30
+}
+fn default_overload_max_reduction() -> u32 {
+    100
 }
 
 /// An outbound (server) peer the Diameter server relays to, using the tenant's identity.
