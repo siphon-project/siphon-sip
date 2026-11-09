@@ -979,6 +979,15 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
             "latency_by_command":
                 crate::metrics::histogram_vec_summary_by_label(&metrics.diameter_request_duration_seconds, "command"),
             "watchdog_failures": metrics.diameter_watchdog_failures_total.get(),
+            // Overload control (RFC 7683) and retries to another peer.
+            "overload_abated_by_node":
+                crate::metrics::int_counter_vec_by_label(&metrics.diameter_overload_abated_total, "node"),
+            "overload_reduction_percent":
+                crate::metrics::int_gauge_vec_by_two_labels(&metrics.diameter_overload_reduction_percent, "role", "node"),
+            "overload_olr_by_direction":
+                crate::metrics::int_counter_vec_by_label(&metrics.diameter_overload_olr_total, "direction"),
+            "retries_by_reason":
+                crate::metrics::int_counter_vec_by_label(&metrics.diameter_retries_total, "reason"),
             // The server-side half. Everything above is what siphon *sends* and
             // what came back; a node in a DRA or HSS role carried none of the
             // traffic it *serves* in any metric at all.

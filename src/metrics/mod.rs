@@ -1806,6 +1806,34 @@ pub fn int_counter_vec_by_label(
     out
 }
 
+/// Integer-gauge values keyed `first/second` over two labels, for a gauge
+/// whose rows are identified by both (overload reduction by role and node).
+pub fn int_gauge_vec_by_two_labels(
+    vector: &IntGaugeVec,
+    first: &str,
+    second: &str,
+) -> std::collections::BTreeMap<String, i64> {
+    use prometheus::core::Collector;
+    let mut out = std::collections::BTreeMap::new();
+    for family in vector.collect() {
+        for metric in family.get_metric() {
+            let label = |wanted: &str| {
+                metric
+                    .get_label()
+                    .iter()
+                    .find(|pair| pair.name() == wanted)
+                    .map(|pair| pair.value().to_owned())
+                    .unwrap_or_default()
+            };
+            out.insert(
+                format!("{}/{}", label(first), label(second)),
+                metric.get_gauge().value() as i64,
+            );
+        }
+    }
+    out
+}
+
 /// Float-counter totals as one row per label combination, in label order.
 ///
 /// The two-label twin of [`int_counter_vec_by_label`], for carrier spend: a

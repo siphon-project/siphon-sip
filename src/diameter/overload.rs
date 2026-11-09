@@ -95,7 +95,7 @@ pub fn olr_avp(olr: &Olr) -> Avp {
     )
 }
 
-fn child<'a>(children: &'a [Avp], code: u32) -> Option<&'a Avp> {
+fn child(children: &[Avp], code: u32) -> Option<&Avp> {
     children
         .iter()
         .find(|avp| avp.code == code && avp.vendor == 0)
