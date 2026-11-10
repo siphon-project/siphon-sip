@@ -366,6 +366,8 @@ mod tests {
             application_ids: vec![(10415, dictionary::S6A_APP_ID)],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: "test".into(),
             firmware_revision: 1,
         }

@@ -910,6 +910,11 @@
         "kind": "method_descriptor",
         "sig": "($self, command, application, peer=None, timeout_ms=10000, **avps)"
       },
+      "set_overload": {
+        "doc": "Report overload (RFC 7683): ask the nodes that send this one requests",
+        "kind": "method_descriptor",
+        "sig": "($self, reduction_percentage, validity_secs=None)"
+      },
       "sgd_tfr": {
         "doc": "Send an SGd MT-Forward-Short-Message request to the served node",
         "kind": "method_descriptor",

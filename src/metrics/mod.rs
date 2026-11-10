@@ -566,6 +566,17 @@ pub struct SiphonMetrics {
     pub diameter_request_errors_total: IntCounterVec,
     pub diameter_request_duration_seconds: HistogramVec,
     pub diameter_watchdog_failures_total: IntCounter,
+    /// Requests a reacting node abated on an overload report (RFC 7683),
+    /// by the reporting node.
+    pub diameter_overload_abated_total: IntCounterVec,
+    /// The reduction in force, in percent, by role (`reacting`: a report
+    /// received, `reporting`: this node's own) and node.
+    pub diameter_overload_reduction_percent: IntGaugeVec,
+    /// OC-OLR AVPs handled, by direction (`received`, `sent`).
+    pub diameter_overload_olr_total: IntCounterVec,
+    /// Requests sent again to another peer (`reason`: `too_busy`,
+    /// `unable_to_deliver`, `timeout`, `peer_failed`, `abated`).
+    pub diameter_retries_total: IntCounterVec,
 
     // --- Diameter, inbound (server / DRA role) ---
     //
@@ -1120,6 +1131,35 @@ impl SiphonMetrics {
             "Total Diameter watchdog (DWR/DWA) failures indicating dead peers",
         )?;
 
+        let diameter_overload_abated_total = IntCounterVec::new(
+            Opts::new(
+                "siphon_diameter_overload_abated_total",
+                "Diameter requests abated on an overload report (RFC 7683), by reporting node",
+            ),
+            &["node"],
+        )?;
+        let diameter_overload_reduction_percent = IntGaugeVec::new(
+            Opts::new(
+                "siphon_diameter_overload_reduction_percent",
+                "Diameter overload reduction in force, by role (reacting, reporting) and node",
+            ),
+            &["role", "node"],
+        )?;
+        let diameter_overload_olr_total = IntCounterVec::new(
+            Opts::new(
+                "siphon_diameter_overload_olr_total",
+                "Diameter OC-OLR AVPs handled, by direction (received, sent)",
+            ),
+            &["direction"],
+        )?;
+        let diameter_retries_total = IntCounterVec::new(
+            Opts::new(
+                "siphon_diameter_retries_total",
+                "Diameter requests sent again to another peer, by reason",
+            ),
+            &["reason"],
+        )?;
+
         let diameter_inbound_requests_total = IntCounterVec::new(
             Opts::new(
                 "siphon_diameter_inbound_requests_total",
@@ -1365,6 +1405,10 @@ impl SiphonMetrics {
         registry.register(Box::new(diameter_request_errors_total.clone()))?;
         registry.register(Box::new(diameter_request_duration_seconds.clone()))?;
         registry.register(Box::new(diameter_watchdog_failures_total.clone()))?;
+        registry.register(Box::new(diameter_overload_abated_total.clone()))?;
+        registry.register(Box::new(diameter_overload_reduction_percent.clone()))?;
+        registry.register(Box::new(diameter_overload_olr_total.clone()))?;
+        registry.register(Box::new(diameter_retries_total.clone()))?;
         registry.register(Box::new(diameter_inbound_requests_total.clone()))?;
         registry.register(Box::new(diameter_inbound_answers_total.clone()))?;
         registry.register(Box::new(diameter_inbound_duration_seconds.clone()))?;
@@ -1455,6 +1499,10 @@ impl SiphonMetrics {
             diameter_request_errors_total,
             diameter_request_duration_seconds,
             diameter_watchdog_failures_total,
+            diameter_overload_abated_total,
+            diameter_overload_reduction_percent,
+            diameter_overload_olr_total,
+            diameter_retries_total,
             diameter_inbound_requests_total,
             diameter_inbound_answers_total,
             diameter_inbound_duration_seconds,
@@ -1753,6 +1801,34 @@ pub fn int_counter_vec_by_label(
                 .map(|pair| pair.value().to_owned())
                 .unwrap_or_default();
             *out.entry(key).or_insert(0) += metric.get_counter().value() as u64;
+        }
+    }
+    out
+}
+
+/// Integer-gauge values keyed `first/second` over two labels, for a gauge
+/// whose rows are identified by both (overload reduction by role and node).
+pub fn int_gauge_vec_by_two_labels(
+    vector: &IntGaugeVec,
+    first: &str,
+    second: &str,
+) -> std::collections::BTreeMap<String, i64> {
+    use prometheus::core::Collector;
+    let mut out = std::collections::BTreeMap::new();
+    for family in vector.collect() {
+        for metric in family.get_metric() {
+            let label = |wanted: &str| {
+                metric
+                    .get_label()
+                    .iter()
+                    .find(|pair| pair.name() == wanted)
+                    .map(|pair| pair.value().to_owned())
+                    .unwrap_or_default()
+            };
+            out.insert(
+                format!("{}/{}", label(first), label(second)),
+                metric.get_gauge().value() as i64,
+            );
         }
     }
     out

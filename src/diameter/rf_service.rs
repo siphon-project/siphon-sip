@@ -1759,6 +1759,8 @@ mod tests {
             application_ids: vec![(0, crate::diameter::dictionary::RF_APP_ID)],
             watchdog_interval: 3600,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 1,
         }

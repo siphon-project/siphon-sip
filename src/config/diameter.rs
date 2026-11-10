@@ -38,6 +38,15 @@ fn default_diameter_transport() -> String {
 fn default_watchdog_interval() -> u64 {
     30
 }
+fn default_disconnect_timeout_ms() -> u64 {
+    1000
+}
+fn default_reconnect_delay_max() -> u64 {
+    60
+}
+fn default_reopen_watchdog_answers() -> u32 {
+    3
+}
 fn default_reconnect_delay() -> u64 {
     5
 }
@@ -80,6 +89,33 @@ pub struct DiameterConfig {
     /// Default reconnect delay in seconds after connection failure.
     #[serde(default = "default_reconnect_delay")]
     pub reconnect_delay: u64,
+    /// How long a Disconnect-Peer-Request waits for its answer, in
+    /// milliseconds, when a connection is closed at shutdown or because its
+    /// peer left a DNS group. The connection is closed when it passes, so a
+    /// dead peer cannot hold the shutdown.
+    #[serde(default = "default_disconnect_timeout_ms")]
+    pub disconnect_timeout_ms: u64,
+    /// Default ceiling of the reconnect backoff in seconds: the wait between
+    /// attempts starts at `reconnect_delay` and doubles up to this.
+    #[serde(default = "default_reconnect_delay_max")]
+    pub reconnect_delay_max: u64,
+    /// Watchdogs a peer must answer after a reconnection before it takes
+    /// traffic again (RFC 3539 REOPEN). 0 skips REOPEN.
+    #[serde(default = "default_reopen_watchdog_answers")]
+    pub reopen_watchdog_answers: u32,
+    /// Watchdog interval in milliseconds, for a finer timer than
+    /// `watchdog_interval` allows.
+    #[serde(default)]
+    pub watchdog_interval_ms: Option<u64>,
+    /// Requests that may be sent once to another peer of their route when the
+    /// first peer could not serve them. Nothing is retried without an entry.
+    #[serde(default)]
+    pub retry: Vec<DiameterRetryEntry>,
+    /// Overload control (RFC 7683 DOIC, loss algorithm), as a reacting node,
+    /// a reporting node, or both. Absent: no OC-* AVP is sent or acted on;
+    /// a relay passes the ones it is given through either way.
+    #[serde(default)]
+    pub overload: Option<DiameterOverloadConfig>,
     /// Named Diameter peers (HSS, OCS, PCRF, CDF, etc.).
     #[serde(default)]
     pub peers: Vec<DiameterPeerEntry>,
@@ -273,6 +309,86 @@ pub struct DiameterClientEntry {
     pub expected_origin_host: Option<String>,
 }
 
+/// `diameter.overload`: DOIC (RFC 7683).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DiameterOverloadConfig {
+    /// Advertise DOIC in the requests this node originates and abate what
+    /// overload reports ask for.
+    #[serde(default)]
+    pub reacting: Option<DiameterReactingConfig>,
+    /// Report this node's own overload in answers to requesters that
+    /// advertised DOIC.
+    #[serde(default)]
+    pub reporting: Option<DiameterReportingConfig>,
+}
+
+/// What a reacting node does with a request it abates.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DiameterAbatementAction {
+    /// Fail it with DIAMETER_TOO_BUSY (3004) here.
+    #[default]
+    Reject,
+    /// Send it to another peer of its route; fail it as above when none is
+    /// left.
+    Divert,
+}
+
+/// `diameter.overload.reacting`: its presence turns the reacting node on.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DiameterReactingConfig {
+    #[serde(default)]
+    pub action: DiameterAbatementAction,
+}
+
+/// One `diameter.retry` entry: the requests of an application that may be
+/// sent once to another peer of their route when the first could not serve
+/// them.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DiameterRetryEntry {
+    pub application: DiameterApplication,
+    /// The commands that may be repeated (`AIR`, `User-Authorization`, ...).
+    /// Left out, every command that is safe to repeat: not accounting or
+    /// credit-control records, re-auth, abort or termination, which are
+    /// retried only when listed.
+    #[serde(default)]
+    pub commands: Vec<String>,
+    /// The failures that trigger it: `too_busy` (3004), `unable_to_deliver`
+    /// (3002, or the connection lost), `timeout`. Left out, all three.
+    #[serde(default)]
+    pub on: Vec<String>,
+}
+
+/// `diameter.overload.reporting`.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DiameterReportingConfig {
+    /// OC-Validity-Duration of a report, in seconds (default 30, at most
+    /// 86400).
+    #[serde(default = "default_overload_validity")]
+    pub validity: u32,
+    /// Derive the reduction from the requests being served: none up to
+    /// `start`, rising linearly to `max_reduction` at `full`. The application
+    /// sets its own with `diameter.set_overload`; the larger is reported.
+    #[serde(default)]
+    pub pending_requests: Option<DiameterPendingRequestsScale>,
+}
+
+/// `diameter.overload.reporting.pending_requests`.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DiameterPendingRequestsScale {
+    pub start: usize,
+    pub full: usize,
+    #[serde(default = "default_overload_max_reduction")]
+    pub max_reduction: u32,
+}
+
+fn default_overload_validity() -> u32 {
+    30
+}
+fn default_overload_max_reduction() -> u32 {
+    100
+}
+
 /// An outbound (server) peer the Diameter server relays to, using the tenant's identity.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct DiameterServerEntry {
@@ -285,6 +401,34 @@ pub struct DiameterServerEntry {
     pub port: u16,
     #[serde(default = "default_diameter_transport")]
     pub transport: String,
+    /// Watchdog interval in seconds (default 30).
+    #[serde(default)]
+    pub watchdog_interval: Option<u64>,
+    /// First reconnect delay in seconds (default 5).
+    #[serde(default)]
+    pub reconnect_delay: Option<u64>,
+    /// Ceiling of the reconnect backoff in seconds (default 60).
+    #[serde(default)]
+    pub reconnect_delay_max: Option<u64>,
+    /// Local address to originate the connection from, for a host with
+    /// several. Bound before the connect, any port; unset leaves it to the
+    /// routing table.
+    #[serde(default)]
+    pub source_address: Option<std::net::IpAddr>,
+}
+
+impl DiameterServerEntry {
+    /// The timers of this entry's connection, over the defaults of
+    /// [`PeerConfig`](crate::diameter::peer::PeerConfig).
+    pub fn lifecycle(&self) -> crate::diameter::lifecycle::PeerLifecycle {
+        let defaults = crate::diameter::lifecycle::PeerLifecycle::default();
+        crate::diameter::lifecycle::PeerLifecycle {
+            reconnect_delay_max: self
+                .reconnect_delay_max
+                .unwrap_or(defaults.reconnect_delay_max),
+            ..defaults
+        }
+    }
 }
 
 /// Generic batched event sink (Python-emitted signalling events).
@@ -330,6 +474,17 @@ pub struct DiameterPeerEntry {
     pub watchdog_interval: Option<u64>,
     /// Reconnect delay override in seconds.
     pub reconnect_delay: Option<u64>,
+    /// Local address to originate the connection from, for a host with
+    /// several. Bound before the connect, any port; unset leaves it to the
+    /// routing table.
+    #[serde(default)]
+    pub source_address: Option<std::net::IpAddr>,
+    /// Reconnect backoff ceiling override in seconds.
+    #[serde(default)]
+    pub reconnect_delay_max: Option<u64>,
+    /// REOPEN watchdog answers override.
+    #[serde(default)]
+    pub reopen_watchdog_answers: Option<u32>,
 }
 
 /// Maps a Diameter application to one or more peers.
@@ -455,6 +610,16 @@ impl DiameterConfig {
             application_ids,
             watchdog_interval: peer.watchdog_interval.unwrap_or(self.watchdog_interval),
             reconnect_delay: peer.reconnect_delay.unwrap_or(self.reconnect_delay),
+            source_address: peer.source_address,
+            lifecycle: crate::diameter::lifecycle::PeerLifecycle {
+                disconnect_timeout_ms: self.disconnect_timeout_ms,
+                reconnect_delay_max: peer.reconnect_delay_max.unwrap_or(self.reconnect_delay_max),
+                reopen_watchdog_answers: peer
+                    .reopen_watchdog_answers
+                    .unwrap_or(self.reopen_watchdog_answers),
+                watchdog_interval_ms: self.watchdog_interval_ms,
+                ..Default::default()
+            },
             product_name: self
                 .product_name
                 .clone()

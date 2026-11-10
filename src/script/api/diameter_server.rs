@@ -212,6 +212,10 @@ pub struct PyPeer {
     pub(crate) client: Arc<DiameterClient>,
     name: String,
     tenant: String,
+    /// The other open peers of the pool this one was picked from: where
+    /// `forward_to` sends the request once when this one cannot serve it and
+    /// `diameter.retry` allows it.
+    alternates: Vec<Arc<DiameterClient>>,
 }
 
 impl PyPeer {
@@ -226,6 +230,7 @@ impl PyPeer {
             client: Arc::new(DiameterClient::new(peer)),
             name,
             tenant,
+            alternates: Vec::new(),
         }
     }
 }
@@ -264,29 +269,33 @@ impl PyPeerPool {
     }
 }
 
-fn peer_from_named(tenant: &str, named: Option<(String, Arc<DiameterClient>)>) -> Option<PyPeer> {
+fn peer_from_named(
+    pool: &PeerPool,
+    named: Option<(String, Arc<DiameterClient>)>,
+) -> Option<PyPeer> {
     named.map(|(name, client)| PyPeer {
+        alternates: pool.alternates_to(&client),
         client,
         name,
-        tenant: tenant.to_string(),
+        tenant: pool.tenant().to_string(),
     })
 }
 
 #[pymethods]
 impl PyPeerPool {
     fn pick_round_robin(&self) -> Option<PyPeer> {
-        peer_from_named(self.pool.tenant(), self.pool.pick_round_robin_named())
+        peer_from_named(&self.pool, self.pool.pick_round_robin_named())
     }
 
     #[pyo3(signature = (weights))]
     fn pick_weighted(&self, weights: HashMap<String, u32>) -> Option<PyPeer> {
-        peer_from_named(self.pool.tenant(), self.pool.pick_weighted_named(&weights))
+        peer_from_named(&self.pool, self.pool.pick_weighted_named(&weights))
     }
 
     #[pyo3(signature = (key, ttl_secs=300.0))]
     fn pick_sticky(&self, key: &str, ttl_secs: f64) -> Option<PyPeer> {
         let ttl = Duration::from_secs_f64(ttl_secs.max(0.0));
-        peer_from_named(self.pool.tenant(), self.pool.pick_sticky_named(key, ttl))
+        peer_from_named(&self.pool, self.pool.pick_sticky_named(key, ttl))
     }
 
     #[getter]
@@ -1048,6 +1057,7 @@ impl PyDiameterRequest {
         let inbound_e2e = self.inbound_e2e;
         let previous_hop = self.peer.host.clone();
         let client = Arc::clone(&peer.client);
+        let alternates = peer.alternates.clone();
         let timeout = Duration::from_secs_f64(timeout_secs.max(0.1));
 
         crate::script::awaitable(py, async move {
@@ -1087,7 +1097,17 @@ impl PyDiameterRequest {
             let wire = tree.to_wire();
             tree.hop_by_hop = inbound_hbh;
 
-            match client.peer().send_request_timeout(wire, timeout).await {
+            let policy = crate::diameter::retry::current();
+            let sent = crate::diameter::retry::send_routed(
+                &policy,
+                &client,
+                &alternates,
+                wire,
+                timeout,
+                crate::diameter::overload::Origin::Relayed,
+            )
+            .await;
+            match sent {
                 Ok(answer_message) => {
                     // Rebuild the lossless tree from the answer's raw bytes and
                     // restore the inbound hbh/e2e so it correlates upstream.

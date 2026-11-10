@@ -10696,6 +10696,8 @@ class MockDiameter:
         self._peers: dict[str, bool] = {}  # peer_name -> connected
         # (tenant, lower-case Origin-Host) -> configured peer name
         self._peer_hosts: dict[tuple[str, str], str] = {}
+        self.overload_reduction: int = 0
+        self.overload_validity: Optional[float] = None
         self._uar_responses: dict[str, dict] = {}  # public_identity -> response
         self._mar_responses: dict[str, dict] = {}
         self._zh_mar_responses: dict[str, dict] = {}
@@ -12182,6 +12184,21 @@ class MockDiameter:
         if name is None or not self._peers.get(name, False):
             return None
         return MockPeer(name, scope, host=host)
+
+    def set_overload(self, reduction_percentage: int,
+                     validity_secs: Optional[float] = None) -> bool:
+        """Report overload (RFC 7683): ask the nodes that send this one
+        requests to abate ``reduction_percentage`` percent (0 to 100) of
+        them, for ``validity_secs`` seconds or until set again. ``0`` ends
+        the overload. Returns ``False`` when ``diameter.overload.reporting``
+        is not configured; the mock reports it as configured, and records
+        the last value in :attr:`overload_reduction` for a test to assert.
+        """
+        if not 0 <= reduction_percentage <= 100:
+            raise ValueError("reduction_percentage is 0 to 100")
+        self.overload_reduction = reduction_percentage
+        self.overload_validity = validity_secs
+        return True
 
     @staticmethod
     def ip_in_cidr(addr: str, cidr: str) -> bool:

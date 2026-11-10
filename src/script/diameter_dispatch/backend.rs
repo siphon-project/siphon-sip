@@ -1,5 +1,6 @@
 //! Backend connection and DNS group bootstrap.
 use super::*;
+use crate::diameter::backoff::ReconnectSchedule;
 
 /// Connect one backend server as an outbound client, reconnecting on drop.
 /// Supports both TCP and SCTP transports. Requests the backend sends on the
@@ -28,8 +29,10 @@ pub(super) fn spawn_backend_connection(
         destination_realm: tenant.identity.origin_realm.clone(),
         local_ip: std::net::Ipv4Addr::UNSPECIFIED,
         application_ids: vec![],
-        watchdog_interval: 30,
-        reconnect_delay: 5,
+        watchdog_interval: server.watchdog_interval.unwrap_or(30),
+        reconnect_delay: server.reconnect_delay.unwrap_or(5),
+        source_address: server.source_address,
+        lifecycle: server.lifecycle(),
         product_name: product_name.to_string(),
         firmware_revision: peer::version_to_firmware_revision(product_version),
     };
@@ -47,21 +50,28 @@ pub(super) fn spawn_backend_connection(
         // The peer's CER/CEA identity, once connected (`serve_requests`).
         host: String::new(),
     };
+    let mut schedule =
+        ReconnectSchedule::new(config.reconnect_delay, config.lifecycle.reconnect_delay_max);
     tokio::spawn(async move {
         if grouped {
             crate::metrics::set_diameter_peer_up(&name, false);
         }
         loop {
+            let delay;
             // Asked per attempt: the CER advertises what the script serves now.
             config.application_ids = applications(&tenant_name);
             match peer::connect_with_transport(config.clone(), &transport).await {
                 Ok((connected, incoming_rx)) => {
+                    if schedule.connected() {
+                        connected.enter_reopen().await;
+                    }
                     let client = Arc::new(DiameterClient::new(Arc::clone(&connected)));
                     manager.register_backend(&tenant_name, &name, client);
                     if grouped {
                         crate::metrics::set_diameter_peer_up(&name, true);
                     }
                     info!(peer = %name, tenant = %tenant_name, "Diameter server backend connected");
+                    let ended = Arc::clone(&connected);
                     serve_requests(
                         connected,
                         incoming_rx,
@@ -74,13 +84,23 @@ pub(super) fn spawn_backend_connection(
                     if grouped {
                         crate::metrics::set_diameter_peer_up(&name, false);
                     }
-                    warn!(peer = %name, "Diameter server backend disconnected, reconnecting");
+                    match schedule.ended(&ended) {
+                        None => {
+                            info!(peer = %name, "Diameter server backend disconnected by this node, not reconnecting");
+                            return;
+                        }
+                        Some(wait) => {
+                            warn!(peer = %name, wait_secs = wait.as_secs(), "Diameter server backend disconnected, reconnecting");
+                            delay = wait;
+                        }
+                    }
                 }
                 Err(error) => {
-                    warn!(peer = %name, %error, "Diameter server backend connect failed, retrying in 5s");
+                    delay = schedule.failed();
+                    warn!(peer = %name, %error, wait_secs = delay.as_secs(), "Diameter server backend connect failed, retrying");
                 }
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(delay).await;
         }
     })
 }

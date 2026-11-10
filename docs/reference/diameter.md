@@ -844,3 +844,157 @@ failover lists include every open member. Sticky pool picks bind the session
 to a specific member and select another when it goes down. Pool picks expose
 the member name. Backend members also serve inbound requests and remain
 available through `diameter.peer_for_host` using their advertised Origin-Host.
+
+### Disconnecting a connection
+
+siphon takes a connection down the way RFC 6733 section 5.4 describes: a
+Disconnect-Peer-Request, the answer, then the close. On SIGTERM it sends every
+open connection, of every kind (`peers`, `servers`, `connect_to` and the
+clients of the listener), a DPR with Disconnect-Cause `REBOOTING`, after the
+drain and the charging stops, and waits for the answers for up to
+`diameter.disconnect_timeout_ms` (default `1000`; all connections at once, so
+a dead peer costs one bound, not one each). When a DNS group drops a member the
+DPR carries `DO_NOT_WANT_TO_TALK_TO_YOU`. A connection that went this way is
+not dialled again by this node.
+
+A DPR from a peer is answered with a DPA, after which the connection closes
+and the dialling loop applies the cause: `REBOOTING` redials on the ordinary
+schedule, `BUSY` waits at least `reconnect_delay_max` seconds before the next try, and
+`DO_NOT_WANT_TO_TALK_TO_YOU` leaves the peer alone for five minutes.
+
+### Reconnecting, and the state of a peer
+
+A peer that is not reachable is dialled with exponential backoff: the first
+retry after `reconnect_delay` seconds (default `5`), then twice as long each
+time up to `reconnect_delay_max` (default `60`). Every wait is drawn from the
+upper 70 % of its nominal value, so nodes restarted together do not dial in
+step. A completed capabilities exchange starts the schedule over. `peers`,
+`servers` and `connect_to` entries each take `reconnect_delay`,
+`reconnect_delay_max` and `watchdog_interval`; `diameter.*` holds the defaults
+(`servers` and `connect_to` entries used to ignore them).
+
+The watchdog follows the state machine of RFC 3539 section 3.4.1. Every
+`watchdog_interval` seconds (default `30`) a connection that has had no
+message from its peer sends a Device-Watchdog-Request.
+
+| State | Meaning |
+|---|---|
+| `OKAY` | Takes requests. Any message from the peer proves it alive. |
+| `SUSPECT` | A watchdog went unanswered for an interval. The requests waiting on this peer fail at once, so the caller can send them to another peer (see "Retrying on another peer"), and no new request is sent to it. A watchdog answer brings it back to `OKAY`; another silent interval closes the connection. |
+| `REOPEN` | A connection that follows a failure. The peer must answer `reopen_watchdog_answers` watchdogs (default `3`, per peer or `diameter.reopen_watchdog_answers`; `0` skips it) before it is `OKAY` and takes requests. A missed one closes the connection. |
+| `DOWN` | The connection is closed. |
+
+A peer that goes away with a DPR, or that this node disconnected, comes back
+without REOPEN only when it said it was rebooting; one that just dropped, or
+stopped answering, is in REOPEN on its next connection. Detecting a dead peer
+takes two to three watchdog intervals, as the RFC has it; lower
+`watchdog_interval` for faster failover.
+
+### Originating from a chosen address
+
+`source_address` on an entry of `diameter.peers`, `servers` or `connect_to`
+(an IP address, any port) makes the connection to that peer originate from it:
+the socket is bound to the address before it connects, over TCP and, in a
+build with the `sctp` feature, SCTP. Use it on a host with several addresses
+where the one the peer expects is not the default route's. The address must
+be of the family of the peer's. Unset, the kernel chooses as before.
+
+### Overload control (DOIC, RFC 7683)
+
+siphon implements the loss algorithm of the Diameter Overload Indication
+Conveyance as a reacting node, as a reporting node, and, always, as a relay.
+Nothing is sent or acted on unless `diameter.overload` is configured.
+
+```yaml
+diameter:
+  overload:
+    reacting:
+      action: divert          # reject (default) | divert
+    reporting:
+      validity: 30            # OC-Validity-Duration of a report, seconds
+      pending_requests:       # optional built-in load source
+        start: 200            # no reduction up to this many requests in service
+        full: 1000            # max_reduction from here
+        max_reduction: 80     # percent, default 100
+```
+
+**Reacting node.** Every request this node originates carries
+OC-Supported-Features with the loss algorithm (OLR_DEFAULT_ALGO). An answer
+with an OC-OLR (Sequence-Number, Report-Type host or realm,
+Reduction-Percentage, Validity-Duration) makes it abate that share of the
+requests it sends towards the reporting node, for that application: each
+request is abated with the probability of the reduction percentage. Host
+reports match the peer the request is sent to and its Destination-Host, realm
+reports the Destination-Realm. A report ends when its validity runs out or a
+newer sequence number asks for 0 percent (or 0 seconds); an older or repeated
+sequence number is ignored. A request that is abated fails with
+DIAMETER_TOO_BUSY (3004) where it is made (`action: reject`), or is sent to
+another peer of its route and fails with 3004 only when there is none
+(`action: divert`, see "Retrying on another peer"). A request this node
+relays is never abated here and never gains OC-Supported-Features.
+
+**Reporting node.** An answer to a request that advertised the loss algorithm
+carries OC-Supported-Features, and, while there is overload to report, an
+OC-OLR with Report-Type host. The load comes from two sources and the larger
+counts: the application, with `diameter.set_overload(reduction_percentage,
+validity_secs=None)` (0 ends it; returns `False` when `reporting` is not
+configured), and, when `pending_requests` is configured, the number of
+inbound requests being served, scaled linearly from `start` to `full`. A
+change of reduction takes a new sequence number (seeded from the clock, so a
+restart does not repeat numbers); the same report repeats within its validity
+and is renewed when half of it is gone; the end of an overload is reported once
+with no reduction. A requester that did not advertise DOIC gets its answer
+unchanged.
+
+**Relay.** A relay passes OC-* AVPs through unchanged (RFC 7683 section
+5.2.3): the OC-Supported-Features of a request reach the node behind it, the
+OC-OLR of an answer reaches the requester, and `forward_to` neither adds,
+reads nor abates any of it. Acting on behalf of requesters that do not support
+DOIC, which the RFC makes optional, is not implemented: a relay in front of
+nodes that report overload leaves their clients that cannot hear it to be
+shed by the usual 3004 and 3002.
+
+Metrics: `siphon_diameter_overload_abated_total{node}`,
+`siphon_diameter_overload_reduction_percent{role,node}` (`reacting` per
+reporting node, `reporting` for this node) and
+`siphon_diameter_overload_olr_total{direction}`.
+`scripts/validate_diameter_overload.sh` reads the encoding back with
+Wireshark's dissector.
+
+### Retrying on another peer
+
+A request that a peer could not serve may be sent once to another open peer of
+its route: when the answer is DIAMETER_TOO_BUSY (3004) or
+DIAMETER_UNABLE_TO_DELIVER (3002), when none comes in time, or when the
+connection is lost under it (including a peer that went SUSPECT, which fails
+what waits on it at once). One retry, never a loop: the outcome of the second
+peer is the outcome. Each attempt carries the Hop-by-Hop Identifier of the peer
+it goes to; the Session-Id and End-to-End Identifier stay.
+
+Repeating a request is safe only for some, so nothing is retried without an
+entry in `diameter.retry`:
+
+```yaml
+diameter:
+  retry:
+    - application: s6a                 # per application
+      commands: [AIR, ULR]             # optional: only these
+      on: [too_busy, unable_to_deliver, timeout]   # optional, default all three
+    - application: ro                  # no commands: every command that is safe to repeat
+```
+
+An entry that lists no commands leaves out the ones that change state at the
+peer: accounting (ACR), credit control (CCR), re-auth (RAR), abort (ASR) and
+session termination (STR); they are retried only when an entry names them. A
+timeout is the least safe trigger, because the first peer may have served the
+request: leave `timeout` out of `on` for anything that must not run twice.
+A request that overload control abated (`action: divert`) was never sent, so it
+is diverted whatever it is.
+
+Where it applies: `req.forward_to(peer)` retries to the other open members of
+the pool the peer was picked from (`diameter.peer_pool(...).pick_*`), and
+`diameter.send_request` without `peer=` retries to the other connected peers,
+unless the request names a Destination-Host. The typed helpers
+(`cx_*`, `sh_*`, `rf_*`, `ro_*` and the rest) do not retry: they keep the
+failover their own sessions have. `siphon_diameter_retries_total{reason}`
+counts the retries.

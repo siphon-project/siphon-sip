@@ -347,6 +347,8 @@ impl ServerHandshake {
             application_ids,
             watchdog_interval: self.identity.watchdog_interval,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: self.identity.product_name.clone(),
             firmware_revision: self.identity.firmware_revision,
         }
@@ -400,6 +402,8 @@ mod tests {
             application_ids,
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: "client".into(),
             firmware_revision: 1,
         };

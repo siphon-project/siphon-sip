@@ -15,6 +15,8 @@ fn register(manager: &DiameterManager, name: &str, tenant: Option<&str>) -> Arc<
         application_ids: vec![],
         watchdog_interval: 30,
         reconnect_delay: 5,
+        source_address: None,
+        lifecycle: Default::default(),
         product_name: "test".into(),
         firmware_revision: 1,
     };
@@ -253,6 +255,10 @@ async fn diameter_group_two_listeners_receive_requests_and_removal_closes_connec
     .await
     .unwrap();
     assert_eq!(manager.peer_count(), 1);
+    // The member that left the group was told why (RFC 6733 section 5.4.3:
+    // DO_NOT_WANT_TO_TALK_TO_YOU), not just dropped.
+    assert_eq!(remote_peers[0].remote_disconnect_cause(), Some(2));
+    assert_eq!(remote_peers[1].remote_disconnect_cause(), None);
 }
 
 #[test]

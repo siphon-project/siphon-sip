@@ -2,6 +2,8 @@
 
 import asyncio
 
+import pytest
+
 from siphon_sdk import mock_module
 
 
@@ -492,3 +494,17 @@ def test_peer_for_host_finds_a_connected_peer_by_origin_host():
     assert d.peer_for_host("mme-1.epc.example.org") is None  # another tenant
     assert d.peer_for_host("mme-2.epc.example.org", tenant="epc") is None  # closed
     assert d.peer_for_host("mme-9.epc.example.org", tenant="epc") is None
+
+
+def test_set_overload_records_the_reported_reduction_and_validates_the_range():
+    diameter = _fresh_diameter()
+
+    from siphon import diameter as d
+
+    assert d.set_overload(40, validity_secs=30) is True
+    assert diameter.overload_reduction == 40
+    assert diameter.overload_validity == 30
+    assert d.set_overload(0) is True
+    assert diameter.overload_reduction == 0
+    with pytest.raises(ValueError):
+        d.set_overload(101)

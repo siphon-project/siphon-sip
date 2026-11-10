@@ -61,6 +61,17 @@ impl PeerPool {
             .sum()
     }
 
+    /// Every open connection of the pool but `picked`, in configured order:
+    /// where a request goes when `picked` could not serve it.
+    pub fn alternates_to(&self, picked: &Arc<DiameterClient>) -> Vec<Arc<DiameterClient>> {
+        self.peers
+            .iter()
+            .flat_map(|name| self.manager.open_members(Some(&self.tenant), name))
+            .map(|(_, client)| client)
+            .filter(|client| !Arc::ptr_eq(client.peer(), picked.peer()))
+            .collect()
+    }
+
     /// Pick the next live peer in round-robin order, skipping dead ones.
     pub fn pick_round_robin(&self) -> Option<Arc<DiameterClient>> {
         self.pick_round_robin_named().map(|(_, client)| client)
@@ -175,6 +186,8 @@ mod tests {
             application_ids: vec![],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 1,
         }

@@ -829,6 +829,11 @@ pub(super) fn init_li(config: &Config) -> Option<LiState> {
 pub(super) fn init_diameter(config: &Config) -> Option<Arc<crate::diameter::DiameterManager>> {
     let diameter_config = config.diameter.as_ref()?;
 
+    use crate::diameter::overload::{self, Overload};
+    use crate::diameter::retry::{self, RetryPolicy};
+    overload::install(Overload::from_config(diameter_config.overload.as_ref()));
+    retry::install(RetryPolicy::from_config(diameter_config));
+
     // Route by application, so a Cx request reaches the HSS rather than
     // whichever peer the map happened to yield first.
     let manager = Arc::new(crate::diameter::DiameterManager::with_routes(

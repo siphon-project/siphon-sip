@@ -11,6 +11,7 @@
 //! exchange and DWR/DWA watchdog keepalives.
 
 pub mod auth;
+pub mod backoff;
 pub(crate) mod client_connection;
 pub mod codec;
 pub mod cx;
@@ -24,10 +25,13 @@ pub mod gba;
 #[cfg(test)]
 pub(crate) mod gba_test_vectors;
 pub mod group;
+pub mod lifecycle;
 pub(crate) mod originate;
+pub mod overload;
 pub mod peer;
 pub mod pool;
 pub(crate) mod reauthorize;
+pub mod retry;
 pub mod rf;
 pub mod rf_service;
 pub mod ro;
@@ -44,6 +48,7 @@ pub mod sgd;
 pub mod sh;
 pub mod transport;
 pub mod unknown_avp;
+pub mod watchdog;
 
 use std::sync::Arc;
 
@@ -644,6 +649,22 @@ impl DiameterManager {
         self.clients.len()
     }
 
+    /// Every open peer of `diameter.peers` but `picked`, by name: where a
+    /// request goes when `picked` could not serve it.
+    pub fn alternates_to(&self, picked: &Arc<DiameterClient>) -> Vec<Arc<DiameterClient>> {
+        let mut names: Vec<String> = self
+            .clients
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        names.sort();
+        names
+            .iter()
+            .filter_map(|name| self.live_client(name))
+            .filter(|client| !Arc::ptr_eq(client.peer(), picked.peer()))
+            .collect()
+    }
+
     /// Shutdown all peers.
     pub fn shutdown_all(&self) {
         for entry in self.clients.iter() {
@@ -693,6 +714,8 @@ mod tests {
             application_ids: vec![],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 100,
         }
@@ -905,6 +928,8 @@ mod tests {
             application_ids: vec![],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 100,
         };
@@ -951,6 +976,8 @@ mod tests {
                 application_ids: vec![],
                 watchdog_interval: 30,
                 reconnect_delay: 5,
+                source_address: None,
+                lifecycle: Default::default(),
                 product_name: "SIPhon".to_string(),
                 firmware_revision: 100,
             };

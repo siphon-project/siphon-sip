@@ -117,7 +117,19 @@ impl Supervisor {
                 task.abort();
                 // Wait until the loop cannot register another connection.
                 let _ = task.await;
-                self.remove(&name);
+                // The member left the group: say so (RFC 6733 section 5.4)
+                // before the connection closes, so the far end does not take
+                // it for a failure.
+                if let Some(client) = self.remove(&name) {
+                    let wait = client.peer().config().lifecycle.disconnect_timeout();
+                    client
+                        .peer()
+                        .disconnect(
+                            super::lifecycle::DisconnectCause::DoNotWantToTalkToYou,
+                            wait,
+                        )
+                        .await;
+                }
             }
         }
         for address in &addresses {
@@ -141,7 +153,7 @@ impl Supervisor {
             .set_group(self.tenant.as_deref(), &self.name, members);
     }
 
-    fn remove(&self, name: &str) {
+    fn remove(&self, name: &str) -> Option<Arc<super::DiameterClient>> {
         let client = match &self.tenant {
             Some(tenant) => self
                 .manager
@@ -150,10 +162,8 @@ impl Supervisor {
                 .map(|(_, client)| client),
             None => self.manager.deregister(name),
         };
-        if let Some(client) = client {
-            client.shutdown();
-        }
         crate::metrics::set_diameter_peer_up(name, false);
+        client
     }
 }
 
@@ -161,7 +171,23 @@ impl Drop for Supervisor {
     fn drop(&mut self) {
         for (name, task) in self.members.values() {
             task.abort();
-            self.remove(name);
+            let Some(client) = self.remove(name) else {
+                continue;
+            };
+            // Drop cannot wait: tell the peer from a task when there is a
+            // runtime to run it on, else just close.
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn(async move {
+                        let wait = client.peer().config().lifecycle.disconnect_timeout();
+                        client
+                            .peer()
+                            .disconnect(super::lifecycle::DisconnectCause::Rebooting, wait)
+                            .await;
+                    });
+                }
+                Err(_) => client.shutdown(),
+            }
         }
         self.manager
             .set_group(self.tenant.as_deref(), &self.name, vec![]);

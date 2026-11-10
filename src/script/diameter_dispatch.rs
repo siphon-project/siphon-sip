@@ -23,7 +23,7 @@ use backend::spawn_backend_connection;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use pyo3::prelude::*;
 use tokio::sync::{mpsc, Semaphore};
@@ -334,11 +334,17 @@ fn spawn_serving_connection(
         destination_realm: origin_realm.clone(),
         local_ip: std::net::Ipv4Addr::UNSPECIFIED,
         application_ids: vec![],
-        watchdog_interval: 30,
-        reconnect_delay: 5,
+        watchdog_interval: entry.watchdog_interval.unwrap_or(30),
+        reconnect_delay: entry.reconnect_delay.unwrap_or(5),
+        source_address: entry.source_address,
+        lifecycle: entry.lifecycle(),
         product_name: product_name.to_string(),
         firmware_revision: peer::version_to_firmware_revision(product_version),
     };
+    let mut schedule = crate::diameter::backoff::ReconnectSchedule::new(
+        config.reconnect_delay,
+        config.lifecycle.reconnect_delay_max,
+    );
     let transport = entry.transport.clone();
     let peer_info = PyInboundPeer {
         name: entry.name.clone(),
@@ -351,15 +357,20 @@ fn spawn_serving_connection(
 
     tokio::spawn(async move {
         loop {
+            let delay;
             // Asked per attempt: the CER advertises what the script serves now.
             config.application_ids = applications(&tenant_name);
             match peer::connect_with_transport(config.clone(), &transport).await {
                 Ok((connected, incoming_rx)) => {
+                    if schedule.connected() {
+                        connected.enter_reopen().await;
+                    }
                     info!(
                         peer = %entry.name,
                         tenant = %tenant_name,
                         "Diameter server: outbound serving connection established (inbound requests → on_request)"
                     );
+                    let ended = Arc::clone(&connected);
                     serve_requests(
                         connected,
                         incoming_rx,
@@ -369,13 +380,23 @@ fn spawn_serving_connection(
                         (origin_host.clone(), origin_realm.clone()),
                     )
                     .await;
-                    warn!(peer = %entry.name, "Diameter server: outbound serving connection dropped, reconnecting");
+                    match schedule.ended(&ended) {
+                        None => {
+                            info!(peer = %entry.name, "Diameter server: outbound serving connection disconnected by this node, not reconnecting");
+                            return;
+                        }
+                        Some(wait) => {
+                            warn!(peer = %entry.name, wait_secs = wait.as_secs(), "Diameter server: outbound serving connection dropped, reconnecting");
+                            delay = wait;
+                        }
+                    }
                 }
                 Err(error) => {
-                    warn!(peer = %entry.name, %error, "Diameter server: outbound serving connect failed, retrying in 5s");
+                    delay = schedule.failed();
+                    warn!(peer = %entry.name, %error, wait_secs = delay.as_secs(), "Diameter server: outbound serving connect failed, retrying");
                 }
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(delay).await;
         }
     });
 }
@@ -664,8 +685,12 @@ pub(crate) async fn dispatch_request(
         return;
     }
     let start = Instant::now();
+    // Counted while it is served: the pending-request depth a reporting node
+    // derives its overload from.
+    let _serving = crate::diameter::overload::track_inflight();
     // Captured before `incoming` moves into the handler closure below.
     let command_code = incoming.command_code;
+    let request_features = crate::diameter::overload::request_features(&incoming.raw);
 
     // Build the answer (and keep the Py request/answer for the completed hook)
     // on the Python executor. An `async def` handler that awaits — at any of
@@ -749,7 +774,9 @@ pub(crate) async fn dispatch_request(
     // separately rather than a reason to lose the transaction.
     let result_label = emitted_answer_result_label(&outcome.wire);
 
-    if let Err(error) = inbound_peer.send_response(outcome.wire).await {
+    // The overload this node reports, to a requester that advertised DOIC.
+    let wire = crate::diameter::overload::annotate_answer(request_features, outcome.wire);
+    if let Err(error) = inbound_peer.send_response(wire).await {
         warn!(%error, "Diameter server: failed to send answer upstream");
     }
 
@@ -2488,6 +2515,8 @@ mod s13_serving_tests {
             application_ids: vec![(dictionary::VENDOR_3GPP, dictionary::S13_APP_ID)],
             watchdog_interval: 3600,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 1,
         };
@@ -2512,6 +2541,7 @@ mod s13_serving_tests {
 #[cfg(test)]
 mod awaiting_handler_tests {
     use super::*;
+    use std::time::Duration;
 
     /// The registry calls `@diameter.on_request` and friends make once
     /// `diameter:` is configured, which an embedded test script is not.
@@ -2572,6 +2602,8 @@ mod awaiting_handler_tests {
             application_ids: vec![],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: "SIPhon".to_string(),
             firmware_revision: 100,
         }
@@ -2667,6 +2699,7 @@ mod backend_connection_tests {
     use super::*;
     use crate::config::{DiameterServerEntry, DiameterTenant, DiameterTenantIdentity};
     use crate::diameter::codec::Avp;
+    use std::time::Duration;
 
     const SCRIPT: &str = concat!(
         "import _siphon_registry\n",
@@ -2692,6 +2725,8 @@ mod backend_connection_tests {
             application_ids: vec![(10_415, S6A)],
             watchdog_interval: 30,
             reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
             product_name: "far".to_string(),
             firmware_revision: 1,
         }
@@ -2817,6 +2852,7 @@ mod backend_connection_tests {
                     host: "127.0.0.1".to_string(),
                     port: hss_port,
                     transport: "tcp".to_string(),
+                    ..Default::default()
                 },
                 Arc::new(DiameterManager::new()),
                 Arc::clone(&engine),
@@ -2839,6 +2875,7 @@ mod backend_connection_tests {
                     host: "127.0.0.1".to_string(),
                     port: mme_port,
                     transport: "tcp".to_string(),
+                    ..Default::default()
                 },
                 Arc::clone(&engine),
                 Arc::clone(&semaphore),
@@ -2980,6 +3017,7 @@ mod backend_connection_tests {
                 host: "127.0.0.1".to_string(),
                 port,
                 transport: "tcp".to_string(),
+                ..Default::default()
             };
             let applications: TenantApplications = Arc::new(|_| vec![(10_415, S6A)]);
             spawn_backend_connection(
