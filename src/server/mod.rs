@@ -678,6 +678,7 @@ impl SiphonServer {
 
         // Wire Diameter manager into PyAuth for IMS digest
         if let Some(ref manager) = diameter_manager {
+            crate::diameter::set_global_manager(Arc::clone(manager));
             pyo3::Python::attach(|python| {
                 crate::script::api::wire_auth_diameter_manager(python, Arc::clone(manager));
                 info!("Diameter manager wired into auth namespace for IMS digest");

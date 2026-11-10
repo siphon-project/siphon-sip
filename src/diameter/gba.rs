@@ -506,4 +506,45 @@ mod tests {
             Some(vectors::B_TID.as_bytes())
         );
     }
+
+    /// A Rust addon task reaches the running manager through
+    /// `diameter::global_manager()`, picks the peer the configured route names
+    /// and sends a Zh MAR through it.
+    #[tokio::test]
+    async fn an_addon_task_sends_a_zh_mar_through_the_global_manager() {
+        use crate::config::{DiameterApplication, DiameterRouteEntry};
+        use crate::diameter::{global_manager, set_global_manager, DiameterManager};
+
+        let (client, requests) = answering_peer(bsf_peer_config(), vectors::ZH_MAA).await;
+        let manager = std::sync::Arc::new(DiameterManager::with_routes(&[DiameterRouteEntry {
+            application: DiameterApplication::Zh,
+            realm: None,
+            peers: vec!["hss".to_string()],
+            algorithm: "failover".to_string(),
+        }]));
+        manager.register("hss".to_string(), client);
+        set_global_manager(manager);
+
+        // What a `register_task` closure spawns: it knows nothing but the accessor.
+        let answer = tokio::spawn(async move {
+            let manager = global_manager().expect("the manager is set");
+            let client = manager
+                .route_client(&DiameterApplication::Zh, None)
+                .expect("the Zh route names a live peer");
+            client
+                .send_zh_mar(&ZhMultimediaAuth {
+                    user_name: Some(vectors::IMPI),
+                    ..Default::default()
+                })
+                .await
+        })
+        .await
+        .expect("the task ran")
+        .expect("the HSS answers");
+
+        assert_eq!(answer.command_code, 303);
+        assert_eq!(answer.avps["Result-Code"], 2001);
+        let requests = requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+    }
 }
