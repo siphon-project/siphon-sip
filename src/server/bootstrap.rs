@@ -829,13 +829,10 @@ pub(super) fn init_li(config: &Config) -> Option<LiState> {
 pub(super) fn init_diameter(config: &Config) -> Option<Arc<crate::diameter::DiameterManager>> {
     let diameter_config = config.diameter.as_ref()?;
 
-    // DOIC (RFC 7683): advertise, abate and report, as configured.
-    crate::diameter::overload::install(crate::diameter::overload::Overload::from_config(
-        diameter_config.overload.as_ref(),
-    ));
-    crate::diameter::retry::install(crate::diameter::retry::RetryPolicy::from_config(
-        diameter_config,
-    ));
+    use crate::diameter::overload::{self, Overload};
+    use crate::diameter::retry::{self, RetryPolicy};
+    overload::install(Overload::from_config(diameter_config.overload.as_ref()));
+    retry::install(RetryPolicy::from_config(diameter_config));
 
     // Route by application, so a Cx request reaches the HSS rather than
     // whichever peer the map happened to yield first.
