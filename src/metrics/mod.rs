@@ -1678,6 +1678,19 @@ pub fn set_diameter_peer_up(peer: &str, up: bool) {
         .set(if up { 1 } else { 0 });
 }
 
+/// Drop a Diameter peer's `siphon_diameter_peer_up` series.
+///
+/// For a peer that left its group (DNS no longer lists it): a statically
+/// configured peer that goes down must keep reading 0 via
+/// [`set_diameter_peer_up`], but a vanished group member would otherwise stay
+/// exported at 0 until restart and keep any peer-down alert firing.
+pub fn remove_diameter_peer_up(peer: &str) {
+    let Some(metrics) = try_metrics() else {
+        return;
+    };
+    let _ = metrics.diameter_peer_up.remove_label_values(&[peer]);
+}
+
 /// Record one inbound Diameter transaction siphon served as a server.
 ///
 /// Takes the raw `command_code` and derives both names here rather than at the

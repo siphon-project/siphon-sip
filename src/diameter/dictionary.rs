@@ -2337,6 +2337,10 @@ const KNOWN_EXPERIMENTAL_RESULT_CODES: &[(u32, &str)] = &[
     (2002, "exp:2002"), // SUBSEQUENT_REGISTRATION
     (2003, "exp:2003"), // UNREGISTERED_SERVICE
     (2004, "exp:2004"), // SUCCESS_SERVER_NAME_NOT_STORED
+    (4100, "exp:4100"), // USER_DATA_NOT_AVAILABLE (Sh)
+    (4101, "exp:4101"), // PRIOR_UPDATE_IN_PROGRESS (Sh)
+    (4181, "exp:4181"), // AUTHENTICATION_DATA_UNAVAILABLE (S6a)
+    (4182, "exp:4182"), // ERROR_CAMEL_SUBSCRIPTION_PRESENT (S6a)
     (5001, "exp:5001"), // ERROR_USER_UNKNOWN
     (5002, "exp:5002"), // ERROR_IDENTITIES_DONT_MATCH
     (5003, "exp:5003"), // ERROR_IDENTITY_NOT_REGISTERED
@@ -2345,12 +2349,24 @@ const KNOWN_EXPERIMENTAL_RESULT_CODES: &[(u32, &str)] = &[
     (5006, "exp:5006"), // ERROR_AUTH_SCHEME_NOT_SUPPORTED
     (5007, "exp:5007"), // ERROR_IN_ASSIGNMENT_TYPE
     (5008, "exp:5008"), // ERROR_TOO_MUCH_DATA
+    (5100, "exp:5100"), // ERROR_USER_DATA_NOT_RECOGNIZED (Sh)
+    (5101, "exp:5101"), // ERROR_OPERATION_NOT_ALLOWED (Sh)
+    (5102, "exp:5102"), // ERROR_USER_DATA_CANNOT_BE_READ (Sh)
+    (5103, "exp:5103"), // ERROR_USER_DATA_CANNOT_BE_MODIFIED (Sh)
+    (5104, "exp:5104"), // ERROR_USER_DATA_CANNOT_BE_NOTIFIED (Sh)
+    (5105, "exp:5105"), // ERROR_TRANSPARENT_DATA_OUT_OF_SYNC (Sh)
+    (5106, "exp:5106"), // ERROR_SUBS_DATA_ABSENT (Sh)
+    (5107, "exp:5107"), // ERROR_NO_SUBSCRIPTION_TO_DATA (Sh)
+    (5108, "exp:5108"), // ERROR_DSAI_NOT_AVAILABLE (Sh)
     (5061, "exp:5061"), // INVALID_SERVICE_INFORMATION (Rx)
     (5063, "exp:5063"), // REQUESTED_SERVICE_NOT_AUTHORIZED (Rx)
     (5401, "exp:5401"), // ERROR_IDENTITY_UNKNOWN (Zh)
     (5402, "exp:5402"), // ERROR_NOT_AUTHORIZED (Zn)
     (5403, "exp:5403"), // ERROR_TRANSACTION_IDENTIFIER_INVALID (Zn)
-    (5422, "exp:5422"), // ERROR_EQUIPMENT_UNKNOWN (S13)
+    (5420, "exp:5420"), // ERROR_UNKNOWN_EPS_SUBSCRIPTION (S6a)
+    (5421, "exp:5421"), // ERROR_RAT_NOT_ALLOWED (S6a)
+    (5422, "exp:5422"), // ERROR_EQUIPMENT_UNKNOWN (S6a, S13)
+    (5423, "exp:5423"), // ERROR_UNKNOWN_SERVING_NODE (S6a)
 ];
 
 /// The class bucket an unlisted Result-Code falls into (RFC 6733 §7.1:
@@ -2595,6 +2611,23 @@ mod tests {
         assert_eq!(result_code_label(2001, true), "exp:2001");
         assert_eq!(result_code_label(5099, true), "exp:5xxx_other");
         assert_eq!(result_code_label(9999, true), "exp:other");
+    }
+
+    #[test]
+    fn sh_and_s6a_experimental_codes_have_their_own_label() {
+        for (code, label) in [
+            (4100, "exp:4100"),
+            (4101, "exp:4101"),
+            (5100, "exp:5100"),
+            (5104, "exp:5104"),
+            (5108, "exp:5108"),
+            (4181, "exp:4181"),
+            (5420, "exp:5420"),
+            (5421, "exp:5421"),
+            (5423, "exp:5423"),
+        ] {
+            assert_eq!(result_code_label(code, true), label);
+        }
     }
 
     #[test]

@@ -126,6 +126,52 @@ impl group::Resolver for Resolver {
     }
 }
 
+fn peer_up_series(peer: &str) -> bool {
+    crate::metrics::encode_metrics()
+        .lines()
+        .any(|line| line.starts_with("siphon_diameter_peer_up{") && line.contains(peer))
+}
+
+#[tokio::test]
+async fn diameter_group_removed_member_drops_peer_up_series() {
+    crate::metrics::init().ok();
+    let a = "192.0.2.77:3868".parse().unwrap();
+    let b = "192.0.2.78:3868".parse().unwrap();
+    let resolver = Resolver(std::sync::Mutex::new(std::collections::VecDeque::from([
+        Ok(vec![a, b]),
+        Ok(vec![b]),
+    ])));
+    let manager = Arc::new(DiameterManager::new());
+    let mut supervisor = group::Supervisor::new(manager.clone(), None, "seriesdra".into());
+    let spawn = |name: String, _address| {
+        register(&manager, &name, None);
+        crate::metrics::set_diameter_peer_up(&name, false);
+        tokio::spawn(std::future::pending())
+    };
+    supervisor
+        .refresh(&resolver, "example.net", 3868, &spawn)
+        .await;
+    assert!(peer_up_series("seriesdra@192.0.2.77"));
+    assert!(peer_up_series("seriesdra@192.0.2.78"));
+    supervisor
+        .refresh(&resolver, "example.net", 3868, &spawn)
+        .await;
+    assert!(!peer_up_series("seriesdra@192.0.2.77"));
+    assert!(peer_up_series("seriesdra@192.0.2.78"));
+}
+
+#[test]
+fn static_peer_going_down_still_exports_zero() {
+    crate::metrics::init().ok();
+    crate::metrics::set_diameter_peer_up("seriesstatic", true);
+    crate::metrics::set_diameter_peer_up("seriesstatic", false);
+    assert!(crate::metrics::encode_metrics()
+        .lines()
+        .any(|line| line.starts_with("siphon_diameter_peer_up{")
+            && line.contains("seriesstatic")
+            && line.ends_with(" 0")));
+}
+
 #[tokio::test]
 async fn diameter_group_reconciles_dns_and_preserves_members_on_error() {
     let a = "127.0.0.1:3868".parse().unwrap();

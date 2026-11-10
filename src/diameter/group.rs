@@ -162,7 +162,9 @@ impl Supervisor {
                 .map(|(_, client)| client),
             None => self.manager.deregister(name),
         };
-        crate::metrics::set_diameter_peer_up(name, false);
+        // Only group members are removed here; a static peer is never
+        // deregistered, so it keeps reading 0 rather than losing its series.
+        crate::metrics::remove_diameter_peer_up(name);
         client
     }
 }
