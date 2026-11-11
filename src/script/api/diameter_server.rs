@@ -216,6 +216,9 @@ pub struct PyPeer {
     /// `forward_to` sends the request once when this one cannot serve it and
     /// `diameter.retry` allows it.
     alternates: Vec<Arc<DiameterClient>>,
+    /// How many members that pool has, open or not (0 when unknown), which
+    /// the DOIC agent weighs the realm's capacity by.
+    configured: usize,
 }
 
 impl PyPeer {
@@ -231,6 +234,7 @@ impl PyPeer {
             name,
             tenant,
             alternates: Vec::new(),
+            configured: 0,
         }
     }
 }
@@ -275,6 +279,7 @@ fn peer_from_named(
 ) -> Option<PyPeer> {
     named.map(|(name, client)| PyPeer {
         alternates: pool.alternates_to(&client),
+        configured: pool.peer_names().len(),
         client,
         name,
         tenant: pool.tenant().to_string(),
@@ -1058,6 +1063,7 @@ impl PyDiameterRequest {
         let previous_hop = self.peer.host.clone();
         let client = Arc::clone(&peer.client);
         let alternates = peer.alternates.clone();
+        let configured = peer.configured;
         let timeout = Duration::from_secs_f64(timeout_secs.max(0.1));
 
         crate::script::awaitable(py, async move {
@@ -1093,58 +1099,22 @@ impl PyDiameterRequest {
             // Fresh outbound hop-by-hop; End-to-End is preserved. Every answer
             // this node makes from here on goes back with the inbound one
             // (RFC 6733 section 6.2).
-            tree.hop_by_hop = client.peer().next_hbh();
-            let wire = tree.to_wire();
             tree.hop_by_hop = inbound_hbh;
-
+            tree.end_to_end = inbound_e2e;
             let policy = crate::diameter::retry::current();
-            let sent = crate::diameter::retry::send_routed(
+            let answer = crate::diameter::overload_agent::relay(
                 &policy,
-                &client,
-                &alternates,
-                wire,
+                &mut tree,
+                crate::diameter::overload_agent::Target {
+                    first: &client,
+                    alternates: &alternates,
+                    configured,
+                },
                 timeout,
-                crate::diameter::overload::Origin::Relayed,
+                (&local_origin_host, &local_origin_realm),
             )
             .await;
-            match sent {
-                Ok(answer_message) => {
-                    // Rebuild the lossless tree from the answer's raw bytes and
-                    // restore the inbound hbh/e2e so it correlates upstream.
-                    match DiameterMsg::from_wire(&answer_message.raw) {
-                        Ok(mut answer_tree) => {
-                            answer_tree.hop_by_hop = inbound_hbh;
-                            answer_tree.end_to_end = inbound_e2e;
-                            Ok(PyDiameterAnswer::from_msg(answer_tree))
-                        }
-                        Err(_) => {
-                            let answer = forward::build_error_answer(
-                                &tree,
-                                &local_origin_host,
-                                &local_origin_realm,
-                                dictionary::DIAMETER_UNABLE_TO_DELIVER,
-                                "malformed answer from backend",
-                            );
-                            Ok(PyDiameterAnswer::from_msg(answer))
-                        }
-                    }
-                }
-                Err(reason) => {
-                    let result_code = if reason.contains("timed out") {
-                        dictionary::DIAMETER_TOO_BUSY
-                    } else {
-                        dictionary::DIAMETER_UNABLE_TO_DELIVER
-                    };
-                    let answer = forward::build_error_answer(
-                        &tree,
-                        &local_origin_host,
-                        &local_origin_realm,
-                        result_code,
-                        &reason,
-                    );
-                    Ok(PyDiameterAnswer::from_msg(answer))
-                }
-            }
+            Ok(PyDiameterAnswer::from_msg(answer))
         })
     }
 }

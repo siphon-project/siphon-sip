@@ -986,6 +986,7 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
                 crate::metrics::int_gauge_vec_by_two_labels(&metrics.diameter_overload_reduction_percent, "role", "node"),
             "overload_olr_by_direction":
                 crate::metrics::int_counter_vec_by_label(&metrics.diameter_overload_olr_total, "direction"),
+            "overload_shed": metrics.diameter_overload_shed_total.get(),
             "retries_by_reason":
                 crate::metrics::int_counter_vec_by_label(&metrics.diameter_retries_total, "reason"),
             // The server-side half. Everything above is what siphon *sends* and

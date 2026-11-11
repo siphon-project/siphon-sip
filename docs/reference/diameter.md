@@ -916,6 +916,8 @@ diameter:
         start: 200            # no reduction up to this many requests in service
         full: 1000            # max_reduction from here
         max_reduction: 80     # percent, default 100
+      admission_limit: 1200   # optional: answer 3004 without the script above this
+    agent: false              # DOIC agent for forward_to (see "Agent")
 ```
 
 **Reacting node.** Every request this node originates carries
@@ -931,7 +933,8 @@ sequence number is ignored. A request that is abated fails with
 DIAMETER_TOO_BUSY (3004) where it is made (`action: reject`), or is sent to
 another peer of its route and fails with 3004 only when there is none
 (`action: divert`, see "Retrying on another peer"). A request this node
-relays is never abated here and never gains OC-Supported-Features.
+relays is never abated here and never gains OC-Supported-Features, unless the
+node is an agent (below).
 
 **Reporting node.** An answer to a request that advertised the loss algorithm
 carries OC-Supported-Features, and, while there is overload to report, an
@@ -946,18 +949,54 @@ and is renewed when half of it is gone; the end of an overload is reported once
 with no reduction. A requester that did not advertise DOIC gets its answer
 unchanged.
 
-**Relay.** A relay passes OC-* AVPs through unchanged (RFC 7683 section
-5.2.3): the OC-Supported-Features of a request reach the node behind it, the
-OC-OLR of an answer reaches the requester, and `forward_to` neither adds,
-reads nor abates any of it. Acting on behalf of requesters that do not support
-DOIC, which the RFC makes optional, is not implemented: a relay in front of
-nodes that report overload leaves their clients that cannot hear it to be
-shed by the usual 3004 and 3002.
+**Admission limit.** `reporting.admission_limit` is a limit on the requests in
+service. A request that arrives while more than that many are in service (the
+new one counts) is answered DIAMETER_TOO_BUSY (3004) from the receive path: no
+job is queued on the Python executor and no handler runs, so shedding costs a
+parse and a write, not an executor slot. The answer carries OC-Supported-Features
+and the OC-OLR for a requester that advertised DOIC, like any other answer, so
+set `pending_requests.start` below the limit to have the requesters told before
+the first request is shed. `siphon_diameter_overload_shed_total` counts them.
+It needs `reporting` to be configured.
+
+**Agent.** With `diameter.overload.agent: true` a node that relays with
+`req.forward_to(peer)` is a DOIC agent (RFC 7683 section 5.3) for the realm
+behind it, instead of a transparent relay:
+
+- A relayed request towards a backend whose host report is in force is abated
+  with the probability of the reduction and sent to the open member of the pool
+  with the smallest reduction instead (the retry of "Retrying on another peer",
+  which an agent always applies to an abated request, whatever `diameter.retry`
+  and `reacting.action` say). When every backend abates it the client gets
+  DIAMETER_TOO_BUSY (3004).
+- The host reports of the backends stop here. The answer carries the agent's
+  own OC-OLR with Report-Type realm (REALM_REPORT, 1) for the Origin-Realm of
+  the answer, which is the key a client that sets Destination-Realm and has no
+  Destination-Host abates by. Its reduction is what the realm lacks of its
+  capacity: every member of the pool counts as one, a backend that reports `r`
+  percent offers `100 - r`, a member that is down offers nothing, and the
+  reduction is 100 minus the mean offer (three backends, one down and none
+  reporting: 33). The sequence number changes when the reduction does, is
+  repeated within the validity (`reporting.validity`, 30 s without it) and
+  renewed at half of it; the end is reported once with 0.
+- A request whose client did not advertise DOIC is sent to the backends with
+  OC-Supported-Features, so they report; the agent acts on it, and the client is
+  told nothing: its answer has no OC-* AVP.
+
+Capacity is not weighted: members count equally, whatever the pool's selection
+strategy. Reports are kept per application.
+
+**Relay.** Without `agent: true` a relay passes OC-* AVPs through unchanged
+(RFC 7683 section 5.2.3): the OC-Supported-Features of a request reach the node
+behind it, the OC-OLR of an answer reaches the requester, and `forward_to`
+neither adds, reads nor abates any of it. Clients that cannot hear a backend's
+report are then shed by the usual 3004 and 3002.
 
 Metrics: `siphon_diameter_overload_abated_total{node}`,
 `siphon_diameter_overload_reduction_percent{role,node}` (`reacting` per
-reporting node, `reporting` for this node) and
-`siphon_diameter_overload_olr_total{direction}`.
+reporting node, `reporting` for this node, `agent` per realm),
+`siphon_diameter_overload_olr_total{direction}` and
+`siphon_diameter_overload_shed_total`.
 `scripts/validate_diameter_overload.sh` reads the encoding back with
 Wireshark's dissector.
 

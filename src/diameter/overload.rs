@@ -12,13 +12,14 @@
 //! * A relay (RFC 7683 section 5.2.3) leaves every OC-* AVP alone: it passes
 //!   them through unchanged, so the reacting node and the reporting node
 //!   behind it talk to each other. Nothing in the relay path reads or writes
-//!   them.
+//!   them, unless `diameter.overload.agent` makes it a DOIC agent (section
+//!   5.3, see [`super::overload_agent`]).
 
 use super::codec::{Avp, AvpData, DiameterMsg};
 use super::dictionary::avp;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// OC-Feature-Vector bit of the default loss algorithm (RFC 7683 section 7.3,
@@ -348,6 +349,7 @@ struct Standing {
 /// reduction it sets) and from the pending-request depth; the larger counts.
 #[derive(Debug)]
 pub struct ReportingState {
+    report_type: ReportType,
     validity_secs: u32,
     depth_scale: Option<DepthScale>,
     set_by_application: AtomicU64,
@@ -358,7 +360,18 @@ pub struct ReportingState {
 
 impl ReportingState {
     pub fn new(validity_secs: u32, depth_scale: Option<DepthScale>) -> Self {
+        Self::of_type(ReportType::Host, validity_secs, depth_scale)
+    }
+
+    /// A node that reports about `report_type`: the host itself, or the
+    /// realm it serves (an agent speaking for the nodes behind it).
+    pub fn of_type(
+        report_type: ReportType,
+        validity_secs: u32,
+        depth_scale: Option<DepthScale>,
+    ) -> Self {
         Self {
+            report_type,
             validity_secs: validity_secs.clamp(1, MAX_VALIDITY_SECS),
             depth_scale,
             set_by_application: AtomicU64::new(0),
@@ -447,7 +460,7 @@ impl ReportingState {
     fn report(&self, sequence: u64, reduction: u32) -> Olr {
         Olr {
             sequence,
-            report_type: ReportType::Host,
+            report_type: self.report_type,
             validity_secs: self.validity_secs,
             reduction_percentage: reduction,
         }
@@ -493,6 +506,11 @@ pub struct Overload {
     pub reacting: bool,
     pub reporting: Option<ReportingState>,
     pub table: ReactingTable,
+    /// Requests in service above which one is answered 3004 without the
+    /// script (`reporting.admission_limit`).
+    pub admission_limit: Option<usize>,
+    /// The DOIC agent behaviour of a relay (`diameter.overload.agent`).
+    pub agent: Option<super::overload_agent::Agent>,
 }
 
 impl Overload {
@@ -512,7 +530,20 @@ impl Overload {
                 }),
             )
         });
-        Self::new(reacting, reporting)
+        let mut overload = Self::new(reacting, reporting);
+        overload.admission_limit = config
+            .reporting
+            .as_ref()
+            .and_then(|reporting| reporting.admission_limit);
+        if config.agent {
+            overload.agent = Some(super::overload_agent::Agent::new(
+                config
+                    .reporting
+                    .as_ref()
+                    .map_or(DEFAULT_VALIDITY_SECS, |reporting| reporting.validity),
+            ));
+        }
+        overload
     }
 
     pub fn new(reacting: bool, reporting: Option<ReportingState>) -> Self {
@@ -520,6 +551,8 @@ impl Overload {
             reacting,
             reporting,
             table: ReactingTable::default(),
+            admission_limit: None,
+            agent: None,
         }
     }
 }
@@ -584,9 +617,51 @@ pub fn track_inflight() -> InflightGuard {
     InflightGuard
 }
 
+/// The peer of `candidates` an agent should send a relayed request to: the
+/// one whose host report asks for the least. Without an agent, or without any
+/// report in force, the first. Candidates are in configured order.
+pub fn least_reduced<'a>(
+    candidates: impl Iterator<Item = &'a Arc<super::DiameterClient>>,
+    application: u32,
+    origin: Origin,
+) -> Option<&'a Arc<super::DiameterClient>> {
+    let overload = current();
+    if origin != Origin::Relayed || overload.agent.is_none() || overload.table.is_idle() {
+        return candidates.into_iter().next();
+    }
+    let now = Instant::now();
+    candidates.min_by_key(|client| {
+        client
+            .peer()
+            .remote_origin_host()
+            .and_then(|host| {
+                overload
+                    .table
+                    .reduction_for(&[ReportKey::new(ReportType::Host, host, application)], now)
+            })
+            .map_or(0, |found| found.0)
+    })
+}
+
 /// Requests being served now.
 pub fn inflight() -> usize {
     INFLIGHT.load(Ordering::Relaxed)
+}
+
+/// Whether more requests are in service than `reporting.admission_limit`
+/// allows, which makes the receive path answer 3004 itself. Counts the
+/// request being admitted, so a limit of N serves N at once.
+pub fn over_admission_limit() -> bool {
+    current()
+        .admission_limit
+        .is_some_and(|limit| inflight() > limit)
+}
+
+/// Count a request shed by the admission limit.
+pub fn count_shed() {
+    if let Some(metrics) = crate::metrics::try_metrics() {
+        metrics.diameter_overload_shed_total.inc();
+    }
 }
 
 /// The DOIC features the sender of the request in `raw` advertised; 0 when
@@ -647,8 +722,12 @@ pub fn prepare_outbound(
     peer_realm: Option<&str>,
 ) -> Result<Vec<u8>, ReportKey> {
     let overload = current();
-    if origin == Origin::Relayed || !overload.reacting {
-        return Ok(wire);
+    match origin {
+        // A relay abates only as an agent, and only once a report is in
+        // force: the common case parses nothing.
+        Origin::Relayed if overload.agent.is_none() || overload.table.is_idle() => return Ok(wire),
+        Origin::Local if !overload.reacting => return Ok(wire),
+        _ => {}
     }
     let Ok(mut request) = DiameterMsg::from_wire(&wire) else {
         return Ok(wire);
@@ -678,7 +757,9 @@ pub fn prepare_outbound(
         }
         return Err(key);
     }
-    if request.find(avp::OC_SUPPORTED_FEATURES, 0).is_some() {
+    // A relayed request carries what its originator and, for an agent,
+    // `overload_agent::prepare_request` put in it.
+    if origin == Origin::Relayed || request.find(avp::OC_SUPPORTED_FEATURES, 0).is_some() {
         return Ok(wire);
     }
     request.avps.push(supported_features_avp(FEATURE_LOSS));
@@ -690,7 +771,7 @@ pub fn prepare_outbound(
 /// abatement towards it.
 pub fn note_answer(wire: &[u8]) {
     let overload = current();
-    if !overload.reacting {
+    if !overload.reacting && overload.agent.is_none() {
         return;
     }
     let Ok(answer) = DiameterMsg::from_wire(wire) else {
@@ -1155,6 +1236,33 @@ mod tests {
         assert!(reacting_only.reacting && reacting_only.reporting.is_none());
     }
 
+    #[test]
+    fn the_agent_and_the_admission_limit_are_configured() {
+        let none = Overload::from_config(None);
+        assert!(none.agent.is_none() && none.admission_limit.is_none());
+        let config: crate::config::DiameterConfig = serde_saphyr::from_str(
+            "overload:\n  agent: true\n  reporting: {validity: 45, admission_limit: 500}\n",
+        )
+        .unwrap();
+        let configured = Overload::from_config(config.overload.as_ref());
+        assert!(configured.agent.is_some());
+        assert_eq!(configured.admission_limit, Some(500));
+        assert!(!configured.reacting);
+        let bare: crate::config::DiameterConfig =
+            serde_saphyr::from_str("overload:\n  agent: true\n").unwrap();
+        assert!(Overload::from_config(bare.overload.as_ref())
+            .agent
+            .is_some());
+    }
+
+    #[test]
+    fn an_agent_gives_every_relayed_request_somewhere_to_be_diverted_to() {
+        let config: crate::config::DiameterConfig =
+            serde_saphyr::from_str("overload:\n  agent: true\n").unwrap();
+        let policy = crate::diameter::retry::RetryPolicy::from_config(&config);
+        assert!(policy.divert_abated);
+    }
+
     /// Emit the DOIC AVPs for `scripts/validate_diameter_overload.sh`, which
     /// has Wireshark's dissector read them back.
     #[test]
@@ -1193,11 +1301,39 @@ mod tests {
             validity_secs: 86_400,
             reduction_percentage: 100,
         }));
+        // What a DOIC agent says: one backend of two reports 100 percent.
+        let table = ReactingTable::default();
+        let backend = |name: &str| super::super::overload_agent::Backend {
+            host: Some(name.to_string()),
+            realm: Some("example.org".to_string()),
+        };
+        table.update(
+            ReportKey::new(ReportType::Host, "a.example.org", 0),
+            &olr(1, 100, 30),
+            Instant::now(),
+        );
+        let mut agent_answer = forward::build_answer(
+            &capable_request,
+            "server.example.org",
+            "example.org",
+            2001,
+            None,
+        );
+        super::super::overload_agent::Agent::new(30).rewrite_answer(
+            &table,
+            &mut agent_answer,
+            "example.org",
+            true,
+            &[backend("a.example.org"), backend("b.example.org")],
+            2,
+            Instant::now(),
+        );
         let mut dump = String::new();
         for wire in [
             capable_request.to_wire(),
             answer.to_wire(),
             realm_report.to_wire(),
+            agent_answer.to_wire(),
         ] {
             for (offset, chunk) in wire.chunks(16).enumerate() {
                 dump.push_str(&format!("{:06x}", offset * 16));
