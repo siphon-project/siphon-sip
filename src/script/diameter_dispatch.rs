@@ -2994,7 +2994,9 @@ mod backend_connection_tests {
         "    peer = diameter.peer_for_host(request.dest_host, tenant=request.peer.tenant)\n",
         "    if peer is None:\n",
         "        return request.reject(3002)\n",
-        "    return await request.forward_to(peer, timeout_secs=1.0)\n",
+        "    # One subscriber's request is a retransmission of the script's own.\n",
+        "    again = request.extract_imsi() == '001010000000003'\n",
+        "    return await request.forward_to(peer, timeout_secs=1.0, retransmitted=again)\n",
     );
 
     fn peer_config(origin_host: &str) -> PeerConfig {
@@ -3114,7 +3116,7 @@ mod backend_connection_tests {
             let (hss_peer, _hss_incoming) = hss.await.expect("the HSS accepts");
             let (mme_peer, mut mme_incoming) = mme.await.expect("the MME accepts");
             let mme_answering = Arc::clone(&mme_peer);
-            let (route_records_tx, mut route_records) = mpsc::channel::<Vec<String>>(4);
+            let (route_records_tx, mut route_records) = mpsc::channel::<(Vec<String>, u8, u32)>(4);
             tokio::spawn(async move {
                 while let Some(incoming) = mme_incoming.recv().await {
                     let request = DiameterMsg::from_wire(&incoming.raw).expect("the CLR parses");
@@ -3122,7 +3124,9 @@ mod backend_connection_tests {
                         .find_all(dictionary::avp::ROUTE_RECORD, 0)
                         .filter_map(|record| record.as_str())
                         .collect();
-                    let _ = route_records_tx.send(records).await;
+                    let _ = route_records_tx
+                        .send((records, request.flags, request.end_to_end))
+                        .await;
                     // One subscriber's requests are never answered.
                     if request.get_str(dictionary::avp::USER_NAME).as_deref()
                         == Some("001010000000002")
@@ -3158,9 +3162,12 @@ mod backend_connection_tests {
             );
             // RFC 6733 section 6.1.9: the identity of the peer the request
             // was received from, which is the HSS, not the relay itself.
+            let (records, flags, _) = route_records.recv().await.expect("the MME saw the request");
+            assert_eq!(records, vec!["hss-1.epc.example.net".to_string()]);
             assert_eq!(
-                route_records.recv().await.expect("the MME saw the request"),
-                vec!["hss-1.epc.example.net".to_string()]
+                flags & crate::diameter::codec::FLAG_RETRANSMITTED,
+                0,
+                "a request forwarded as it came has no T flag"
             );
 
             // The MME stays silent. The relay's 3004 must carry the HSS's own
@@ -3186,6 +3193,34 @@ mod backend_connection_tests {
                 .recv()
                 .await
                 .expect("the MME saw the second request");
+
+            // A script that retransmits sets T (RFC 6733 section 5.5.4); the
+            // End-to-End Identifier stays, the Hop-by-Hop is the relay's.
+            let mut again =
+                DiameterMsg::from_wire(&cancel_location(0x7000_0000 + hss_peer.next_hbh()))
+                    .expect("the CLR parses");
+            again
+                .avps
+                .retain(|avp| avp.code != dictionary::avp::USER_NAME);
+            again
+                .avps
+                .push(Avp::utf8(dictionary::avp::USER_NAME, 0, "001010000000003"));
+            let answer = hss_peer
+                .send_request_timeout(again.to_wire(), Duration::from_secs(5))
+                .await
+                .expect("the relay answers");
+            let answer = DiameterMsg::from_wire(&answer.raw).expect("the answer parses");
+            assert_eq!(answer.answer_result_codes().0, Some(2001));
+            let (_, flags, end_to_end) = route_records
+                .recv()
+                .await
+                .expect("the MME saw the retransmission");
+            assert_ne!(
+                flags & crate::diameter::codec::FLAG_RETRANSMITTED,
+                0,
+                "retransmitted=True sets the T flag"
+            );
+            assert_eq!(end_to_end, 0x5151, "End-to-End Identifier preserved");
 
             // A host no connection has: the relay's own 3002.
             let mut unknown =

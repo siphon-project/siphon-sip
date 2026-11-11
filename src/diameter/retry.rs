@@ -178,10 +178,20 @@ fn with_hop_by_hop(wire: &[u8], peer: &super::peer::DiameterPeer) -> Vec<u8> {
     wire
 }
 
+/// `wire` with the T (potentially retransmitted) flag set, as RFC 6733
+/// sections 5.5.4 and 6.1.8 require of a request sent again after a failover.
+fn with_retransmitted_flag(mut wire: Vec<u8>) -> Vec<u8> {
+    if wire.len() >= 20 {
+        wire[4] |= super::codec::FLAG_RETRANSMITTED;
+    }
+    wire
+}
+
 /// Send `wire` to `first` and wait up to `timeout`. When that fails in a way
 /// `policy` allows for this request, send it once to the first open peer of
 /// `alternates` and return that outcome. `wire` carries the Hop-by-Hop
-/// Identifier of `first`; each attempt gets its own peer's.
+/// Identifier of `first`; each attempt gets its own peer's. The attempt at an
+/// alternate peer carries the T flag.
 pub async fn send_routed(
     policy: &RetryPolicy,
     first: &DiameterClient,
@@ -227,7 +237,7 @@ pub async fn send_routed(
         reason = failure.label(),
         "Diameter: request sent to another peer of its route"
     );
-    let again = with_hop_by_hop(&wire, next.peer());
+    let again = with_retransmitted_flag(with_hop_by_hop(&wire, next.peer()));
     next.peer().send_request_as(again, timeout, origin).await
 }
 
@@ -255,6 +265,80 @@ mod tests {
     const S6A: u32 = dictionary::S6A_APP_ID;
     const AIR: u32 = 318;
     const CCR: u32 = 272;
+
+    fn silent_peer(
+        origin_host: &str,
+    ) -> (Arc<DiameterClient>, tokio::sync::mpsc::Receiver<Vec<u8>>) {
+        let (write_tx, write_rx) = tokio::sync::mpsc::channel(8);
+        let config = super::super::peer::PeerConfig {
+            host: "192.0.2.10".to_string(),
+            port: 3868,
+            origin_host: origin_host.to_string(),
+            origin_realm: "epc.example.net".to_string(),
+            destination_host: None,
+            destination_realm: "epc.example.net".to_string(),
+            local_ip: "192.0.2.11".parse().unwrap(),
+            application_ids: Vec::new(),
+            watchdog_interval: 30,
+            reconnect_delay: 5,
+            source_address: None,
+            lifecycle: Default::default(),
+            product_name: "test".to_string(),
+            firmware_revision: 1,
+        };
+        let peer = Arc::new(super::super::peer::DiameterPeer::new_for_test(
+            config, write_tx,
+        ));
+        (Arc::new(DiameterClient::new(peer)), write_rx)
+    }
+
+    /// RFC 6733 sections 5.5.4 and 6.1.8: a request sent again to another
+    /// peer carries the T flag; the first send does not. End-to-End
+    /// Identifier unchanged, Hop-by-Hop fresh.
+    #[tokio::test]
+    async fn a_request_sent_to_an_alternate_peer_carries_the_t_flag() {
+        let (first, mut first_wire) = silent_peer("hss-1.epc.example.net");
+        let (alternate, mut alternate_wire) = silent_peer("hss-2.epc.example.net");
+        let request = super::super::codec::DiameterMsg {
+            flags: super::super::codec::FLAG_REQUEST | super::super::codec::FLAG_PROXIABLE,
+            command_code: AIR,
+            application_id: S6A,
+            hop_by_hop: first.peer().next_hbh(),
+            end_to_end: 0x5151,
+            avps: Vec::new(),
+        };
+        let policy = policy(vec![rule(S6A, &[])]);
+        let result = send_routed(
+            &policy,
+            &first,
+            &[Arc::clone(&alternate)],
+            request.to_wire(),
+            Duration::from_millis(100),
+            Origin::Local,
+        )
+        .await;
+        assert!(result.is_err(), "neither peer answers");
+
+        let sent_first = super::super::codec::DiameterMsg::from_wire(
+            &first_wire.try_recv().expect("the first peer got it"),
+        )
+        .unwrap();
+        let sent_again = super::super::codec::DiameterMsg::from_wire(
+            &alternate_wire.try_recv().expect("the alternate got it"),
+        )
+        .unwrap();
+        assert_eq!(
+            sent_first.flags & super::super::codec::FLAG_RETRANSMITTED,
+            0
+        );
+        assert_ne!(
+            sent_again.flags & super::super::codec::FLAG_RETRANSMITTED,
+            0,
+            "T flag on the request sent again"
+        );
+        assert_eq!(sent_first.end_to_end, sent_again.end_to_end);
+        assert_eq!(sent_first.command_code, sent_again.command_code);
+    }
 
     #[test]
     fn nothing_is_retried_by_default() {
