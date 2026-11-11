@@ -338,6 +338,33 @@ impl DepthScale {
     }
 }
 
+/// The reduction moves in multiples of this when the admission limit sheds.
+const SHED_STEP: u32 = 10;
+/// How long shedding must stay away before the reduction it caused drops by
+/// a step, and how long a reduction that did not stop the shedding holds
+/// before it is raised by one.
+const SHED_HOLD: Duration = Duration::from_secs(2);
+
+/// What the admission limit asks of the requesters.
+#[derive(Debug, Default)]
+struct Shed {
+    level: u32,
+    last_shed: Option<Instant>,
+    last_raised: Option<Instant>,
+}
+
+impl Shed {
+    /// The level at `now`: it leaves one step per `SHED_HOLD` without a shed.
+    fn at(&self, now: Instant) -> u32 {
+        let Some(last) = self.last_shed else {
+            return 0;
+        };
+        let quiet = now.saturating_duration_since(last).as_millis() / SHED_HOLD.as_millis();
+        self.level
+            .saturating_sub((quiet as u32).saturating_mul(SHED_STEP))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Standing {
     reduction: u32,
@@ -354,6 +381,7 @@ pub struct ReportingState {
     depth_scale: Option<DepthScale>,
     set_by_application: AtomicU64,
     set_until: Mutex<Option<Instant>>,
+    shed: Mutex<Shed>,
     sequence: AtomicU64,
     standing: Mutex<Option<Standing>>,
 }
@@ -376,6 +404,7 @@ impl ReportingState {
             depth_scale,
             set_by_application: AtomicU64::new(0),
             set_until: Mutex::new(None),
+            shed: Mutex::new(Shed::default()),
             // Seeded from the clock so a restart does not reuse numbers a
             // reacting node still holds (section 5.2.1: the sequence number
             // survives restarts or is a timestamp).
@@ -399,6 +428,40 @@ impl ReportingState {
         }
     }
 
+    /// A request was shed with `pending` in service and `limit` allowed: ask
+    /// for at least the share that brings the load back under the limit,
+    /// rounded up to a step, at once; if the reduction in force did not stop
+    /// the shedding, raise it one step, at most once per `SHED_HOLD`. It
+    /// leaves a step at a time once the shedding stops.
+    pub fn note_shed(&self, pending: usize, limit: usize, now: Instant) {
+        let excess = pending.saturating_sub(limit).max(1) as u128;
+        let share = (excess * 100).div_ceil(pending.max(1) as u128) as u32;
+        let wanted = share.div_ceil(SHED_STEP).max(1) * SHED_STEP;
+        let Ok(mut shed) = self.shed.lock() else {
+            return;
+        };
+        let current = shed.at(now);
+        let raise_due = shed
+            .last_raised
+            .is_none_or(|raised| now.saturating_duration_since(raised) >= SHED_HOLD);
+        let level = if wanted > current {
+            wanted
+        } else if raise_due {
+            current + SHED_STEP
+        } else {
+            current
+        };
+        if level != current || shed.last_raised.is_none() {
+            shed.last_raised = Some(now);
+        }
+        shed.level = level.min(100);
+        shed.last_shed = Some(now);
+    }
+
+    fn shed_reduction(&self, now: Instant) -> u32 {
+        self.shed.lock().map_or(0, |shed| shed.at(now))
+    }
+
     fn application_reduction(&self, now: Instant) -> u32 {
         let set = self.set_by_application.load(Ordering::Relaxed) as u32;
         if set == 0 {
@@ -413,7 +476,9 @@ impl ReportingState {
     /// The reduction this node reports now, given `pending` requests.
     pub fn reduction(&self, pending: usize, now: Instant) -> u32 {
         let by_depth = self.depth_scale.map_or(0, |scale| scale.reduction(pending));
-        self.application_reduction(now).max(by_depth)
+        self.application_reduction(now)
+            .max(by_depth)
+            .max(self.shed_reduction(now))
     }
 
     /// The OC-OLR to put in an answer now, None when there is nothing to
@@ -660,7 +725,17 @@ pub fn over_admission_limit() -> bool {
 /// Count a request shed by the admission limit.
 pub fn count_shed() {
     if let Some(metrics) = crate::metrics::try_metrics() {
-        metrics.diameter_overload_shed_total.inc();
+        metrics
+            .diameter_overload_abated_total
+            .with_label_values(&["admission_limit"])
+            .inc();
+    }
+    // A shed request is never left without a report: the reduction goes up
+    // now, and the answer that follows carries it.
+    let overload = current();
+    if let (Some(reporting), Some(limit)) = (overload.reporting.as_ref(), overload.admission_limit)
+    {
+        reporting.note_shed(inflight(), limit, Instant::now());
     }
 }
 
@@ -1234,6 +1309,49 @@ mod tests {
             serde_saphyr::from_str("overload:\n  reacting: {}\n").unwrap();
         let reacting_only = Overload::from_config(config.overload.as_ref());
         assert!(reacting_only.reacting && reacting_only.reporting.is_none());
+    }
+
+    #[test]
+    fn shedding_raises_the_report_at_once_and_it_leaves_a_step_at_a_time() {
+        let reporting = ReportingState::new(30, None);
+        let start = Instant::now();
+        assert_eq!(reporting.reduction(0, start), 0);
+        // 105 in service of 100 allowed: 5 percent over, one step.
+        reporting.note_shed(105, 100, start);
+        assert_eq!(reporting.reduction(0, start), 10);
+        let first = reporting.olr(0, start).unwrap();
+        assert_eq!(first.reduction_percentage, 10);
+        // 150 of 100: a third over, 40 at once.
+        reporting.note_shed(150, 100, start);
+        assert_eq!(reporting.reduction(0, start), 40);
+        reporting.note_shed(150, 100, start + Duration::from_secs(1));
+        assert_eq!(reporting.reduction(0, start + Duration::from_secs(1)), 40);
+        // Shedding goes on although 40 is in force: one step, once per hold.
+        let later = start + SHED_HOLD;
+        reporting.note_shed(150, 100, later);
+        assert_eq!(reporting.reduction(0, later), 50);
+        reporting.note_shed(150, 100, later);
+        assert_eq!(reporting.reduction(0, later), 50, "not twice in a hold");
+        // It leaves a step per hold without a shed, then ends once.
+        assert_eq!(reporting.reduction(0, later + SHED_HOLD), 40);
+        assert_eq!(reporting.reduction(0, later + SHED_HOLD * 3), 20);
+        let end = later + SHED_HOLD * 5;
+        assert_eq!(reporting.reduction(0, end), 0);
+        let held = reporting.olr(0, later).unwrap();
+        let ended = reporting.olr(0, end).unwrap();
+        assert_eq!(ended.reduction_percentage, 0);
+        assert!(ended.sequence > held.sequence);
+        assert!(reporting.olr(0, end + Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn a_limit_of_zero_asks_for_everything_and_never_overflows() {
+        let reporting = ReportingState::new(30, None);
+        let now = Instant::now();
+        reporting.note_shed(1, 0, now);
+        assert_eq!(reporting.reduction(0, now), 100);
+        reporting.note_shed(usize::MAX, 0, now);
+        assert_eq!(reporting.reduction(0, now + SHED_HOLD), 100 - SHED_STEP);
     }
 
     #[test]

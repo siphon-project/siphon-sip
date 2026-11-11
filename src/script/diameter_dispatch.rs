@@ -2846,6 +2846,28 @@ mod admission_limit_tests {
     }
 
     #[test]
+    fn a_shed_request_is_always_told_to_back_off_even_with_nothing_set() {
+        let _serial = crate::script::async_pool::pool_test_guard();
+        crate::script::async_pool::test_pools_runtime().block_on(async {
+            crate::script::async_pool::ensure_test_pools();
+            let engine =
+                Arc::new(ScriptEngine::new_embedded(SCRIPT).expect("the test script compiles"));
+            // No set_overload, no pending_requests: only the limit.
+            let config: crate::config::DiameterConfig =
+                serde_saphyr::from_str("overload:\n  reporting:\n    admission_limit: 0\n")
+                    .expect("the configuration parses");
+            overload::install(Overload::from_config(config.overload.as_ref()));
+            let answer = dispatch(&engine, true).await;
+            assert_eq!(answer.answer_result_codes().0, Some(3004));
+            let report = overload::parse_olr(&answer).expect("a 3004 comes with an OC-OLR");
+            assert!(report.reduction_percentage > 0);
+            assert_eq!(report.report_type, overload::ReportType::Host);
+            assert_eq!(calls(&engine), 0);
+            overload::install(Overload::new(false, None));
+        });
+    }
+
+    #[test]
     fn above_the_admission_limit_the_answer_is_3004_with_the_report_and_no_script_runs() {
         let _serial = crate::script::async_pool::pool_test_guard();
         crate::script::async_pool::test_pools_runtime().block_on(async {
@@ -2873,7 +2895,10 @@ mod admission_limit_tests {
             assert_eq!(answer.hop_by_hop, 0x41);
             assert_eq!(answer.end_to_end, 0x42);
             let report = overload::parse_olr(&answer).expect("the OC-OLR is there");
-            assert_eq!(report.reduction_percentage, 60);
+            assert!(
+                report.reduction_percentage >= 60,
+                "the larger of the set and the shed"
+            );
             assert_eq!(report.report_type, overload::ReportType::Host);
             assert!(overload::supports_loss(&answer));
 

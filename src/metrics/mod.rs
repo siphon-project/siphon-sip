@@ -574,8 +574,6 @@ pub struct SiphonMetrics {
     pub diameter_overload_reduction_percent: IntGaugeVec,
     /// OC-OLR AVPs handled, by direction (`received`, `sent`).
     pub diameter_overload_olr_total: IntCounterVec,
-    /// Requests answered 3004 by the admission limit, before the script.
-    pub diameter_overload_shed_total: IntCounter,
     /// Requests sent again to another peer (`reason`: `too_busy`,
     /// `unable_to_deliver`, `timeout`, `peer_failed`, `abated`).
     pub diameter_retries_total: IntCounterVec,
@@ -1154,10 +1152,6 @@ impl SiphonMetrics {
             ),
             &["direction"],
         )?;
-        let diameter_overload_shed_total = IntCounter::new(
-            "siphon_diameter_overload_shed_total",
-            "Diameter requests answered DIAMETER_TOO_BUSY by reporting.admission_limit",
-        )?;
         let diameter_retries_total = IntCounterVec::new(
             Opts::new(
                 "siphon_diameter_retries_total",
@@ -1414,7 +1408,6 @@ impl SiphonMetrics {
         registry.register(Box::new(diameter_overload_abated_total.clone()))?;
         registry.register(Box::new(diameter_overload_reduction_percent.clone()))?;
         registry.register(Box::new(diameter_overload_olr_total.clone()))?;
-        registry.register(Box::new(diameter_overload_shed_total.clone()))?;
         registry.register(Box::new(diameter_retries_total.clone()))?;
         registry.register(Box::new(diameter_inbound_requests_total.clone()))?;
         registry.register(Box::new(diameter_inbound_answers_total.clone()))?;
@@ -1509,7 +1502,6 @@ impl SiphonMetrics {
             diameter_overload_abated_total,
             diameter_overload_reduction_percent,
             diameter_overload_olr_total,
-            diameter_overload_shed_total,
             diameter_retries_total,
             diameter_inbound_requests_total,
             diameter_inbound_answers_total,

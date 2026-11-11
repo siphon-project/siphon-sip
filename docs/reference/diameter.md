@@ -954,10 +954,13 @@ service. A request that arrives while more than that many are in service (the
 new one counts) is answered DIAMETER_TOO_BUSY (3004) from the receive path: no
 job is queued on the Python executor and no handler runs, so shedding costs a
 parse and a write, not an executor slot. The answer carries OC-Supported-Features
-and the OC-OLR for a requester that advertised DOIC, like any other answer, so
-set `pending_requests.start` below the limit to have the requesters told before
-the first request is shed. `siphon_diameter_overload_shed_total` counts them.
-It needs `reporting` to be configured.
+and an OC-OLR for a requester that advertised DOIC, always: shedding raises the
+reported reduction at once to at least the share that brings the requests in
+service back under the limit (rounded up to 10 percent), raises it by one step
+when shedding goes on although it is in force (at most once per 2 s), and lets
+it fall a step per 2 s without a shed, after which the end is reported once.
+It combines with the other sources as the largest. `siphon_diameter_overload_abated_total{node="admission_limit"}` counts the shed
+requests. It needs `reporting` to be configured.
 
 **Agent.** With `diameter.overload.agent: true` a node that relays with
 `req.forward_to(peer)` is a DOIC agent (RFC 7683 section 5.3) for the realm
@@ -995,8 +998,8 @@ report are then shed by the usual 3004 and 3002.
 Metrics: `siphon_diameter_overload_abated_total{node}`,
 `siphon_diameter_overload_reduction_percent{role,node}` (`reacting` per
 reporting node, `reporting` for this node, `agent` per realm),
-`siphon_diameter_overload_olr_total{direction}` and
-`siphon_diameter_overload_shed_total`.
+and
+`siphon_diameter_overload_olr_total{direction}`.
 `scripts/validate_diameter_overload.sh` reads the encoding back with
 Wireshark's dissector.
 
