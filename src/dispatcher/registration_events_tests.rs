@@ -12,8 +12,11 @@ use crate::registrant::{RegistrantCredentials, RegistrantEntry};
 use crate::sip::uri::SipUri;
 use crate::transport::Transport;
 
-/// More than the registrar's broadcast holds (1024), so a consumer parked on
-/// its first event lags.
+/// The registrar's broadcast capacity in these tests.
+const CHANNEL: usize = 1024;
+
+/// More than the broadcast holds, so a consumer parked on its first event
+/// lags.
 const STORM: usize = 1100;
 
 fn save(registrar: &Registrar, user: &str) {
@@ -70,7 +73,7 @@ fn slow_sink<T: Clone + Send + 'static>(
 #[tokio::test]
 async fn a_registrar_lag_is_counted_snapshotted_and_survived() {
     crate::metrics::init().expect("the metrics build");
-    let registrar = Arc::new(Registrar::default());
+    let registrar = Arc::new(Registrar::default().with_event_capacity(CHANNEL));
     let seen = Arc::new(Mutex::new(Vec::<RegistrarChange>::new()));
     let gate = Arc::new(Notify::new());
     let task = tokio::spawn(drain_registrar_events(
@@ -92,25 +95,33 @@ async fn a_registrar_lag_is_counted_snapshotted_and_survived() {
     }
     gate.notify_one();
 
-    // Every AoR the registrar holds is re-told as a snapshot.
+    // Every AoR the registrar holds is re-told: as a snapshot, or by a live
+    // event still held in the channel, which takes it out of the snapshot.
     wait_for(&seen, |change: &RegistrarChange| {
-        change.is_snapshot() && change.aor == format!("sip:storm{}@example.com", STORM - 1)
+        change.is_snapshot() && change.aor == "sip:first@example.com"
     })
     .await;
-    let snapshot: std::collections::HashSet<String> = seen
+    // Nothing more arrives once the pending set is drained.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let delivered = seen
         .lock()
         .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let snapshot: Vec<&String> = delivered
         .iter()
         .filter(|change| change.is_snapshot())
-        .map(|change| change.aor.clone())
+        .map(|change| &change.aor)
         .collect();
-    assert_eq!(
-        snapshot.len(),
-        STORM + 1,
-        "one snapshot delivery per held AoR"
+    let unique: std::collections::HashSet<&&String> = snapshot.iter().collect();
+    assert_eq!(unique.len(), snapshot.len(), "one snapshot per AoR");
+    assert!(
+        snapshot.len() >= STORM + 1 - CHANNEL,
+        "every AoR whose live event was lost is re-told"
     );
+    let reported: std::collections::HashSet<&String> =
+        delivered.iter().map(|change| &change.aor).collect();
     for aor in registrar.registered_aors() {
-        assert!(snapshot.contains(&aor), "{aor} was not re-told");
+        assert!(reported.contains(&aor), "{aor} was not re-told");
     }
     assert!(
         lagged(LaggedConsumer::Registrar) > lagged_before,
@@ -141,7 +152,7 @@ async fn a_registrar_lag_is_counted_snapshotted_and_survived() {
 async fn a_registrar_snapshot_delivers_after_the_events_still_held() {
     // The events that survived the lag are still delivered after the
     // snapshot, so a removal among them still reaches the consumer.
-    let registrar = Arc::new(Registrar::default());
+    let registrar = Arc::new(Registrar::default().with_event_capacity(CHANNEL));
     let seen = Arc::new(Mutex::new(Vec::<RegistrarChange>::new()));
     let gate = Arc::new(Notify::new());
     let task = tokio::spawn(drain_registrar_events(
@@ -203,7 +214,7 @@ async fn the_registrar_loop_ends_only_when_the_channel_closes() {
     );
 }
 
-fn registrant_manager() -> RegistrantManager {
+pub(super) fn registrant_manager() -> RegistrantManager {
     RegistrantManager::new(
         3600,
         Duration::from_secs(60),
@@ -216,7 +227,7 @@ fn registrant_manager() -> RegistrantManager {
     )
 }
 
-fn registrant_entry(aor: &str) -> RegistrantEntry {
+pub(super) fn registrant_entry(aor: &str) -> RegistrantEntry {
     RegistrantEntry::new(
         aor.to_string(),
         "sip:registrar.example.net".to_string(),
@@ -255,10 +266,15 @@ async fn a_registrant_lag_is_counted_snapshotted_and_survived() {
         change.event == SNAPSHOT && change.aor == "sip:trunk-b@example.net"
     })
     .await;
-    wait_for(&seen, |change: &RegistrantChange| {
-        change.event == SNAPSHOT && change.aor == "sip:trunk-a@example.net"
-    })
-    .await;
+    // trunk-a's own live events are still held and delivered, which takes it
+    // out of the snapshot: it is re-told by those instead.
+    let refreshed_after_lag = seen
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .skip(1)
+        .any(|change| change.aor == "sip:trunk-a@example.net");
+    assert!(refreshed_after_lag, "trunk-a is re-told after the lag");
     assert!(lagged(LaggedConsumer::Registrant) > lagged_before);
 
     registrant.handle_failure("sip:trunk-b@example.net", 503, None);

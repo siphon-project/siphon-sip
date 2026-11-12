@@ -13,6 +13,8 @@ use std::sync::OnceLock;
 use prometheus::{IntCounterVec, Opts, Registry};
 
 static EVENT_LAG_METRICS: OnceLock<IntCounterVec> = OnceLock::new();
+static SNAPSHOT_RUNS: OnceLock<IntCounterVec> = OnceLock::new();
+static SNAPSHOT_AORS: OnceLock<IntCounterVec> = OnceLock::new();
 
 /// The consumers that read a state-change broadcast, as the `consumer` label.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,7 +58,66 @@ pub(super) fn init(registry: &Registry) -> Result<(), prometheus::Error> {
         lagged_total.with_label_values(&[consumer.as_str()]);
     }
     let _ = EVENT_LAG_METRICS.set(lagged_total);
+
+    let snapshots_total = IntCounterVec::new(
+        Opts::new(
+            "siphon_event_consumer_snapshots_total",
+            "Snapshot runs a consumer started after a broadcast lag, by consumer. A lag during a run replaces it with a fresh one",
+        ),
+        &["consumer"],
+    )?;
+    registry.register(Box::new(snapshots_total.clone()))?;
+    let snapshot_aors_total = IntCounterVec::new(
+        Opts::new(
+            "siphon_event_consumer_snapshot_aors_total",
+            "AoRs a consumer re-reported as a snapshot after a broadcast lag, by consumer",
+        ),
+        &["consumer"],
+    )?;
+    registry.register(Box::new(snapshot_aors_total.clone()))?;
+    for consumer in [LaggedConsumer::Registrar, LaggedConsumer::Registrant] {
+        snapshots_total.with_label_values(&[consumer.as_str()]);
+        snapshot_aors_total.with_label_values(&[consumer.as_str()]);
+    }
+    let _ = SNAPSHOT_RUNS.set(snapshots_total);
+    let _ = SNAPSHOT_AORS.set(snapshot_aors_total);
     Ok(())
+}
+
+/// Count one snapshot run `consumer` started.
+pub fn record_snapshot_started(consumer: LaggedConsumer) {
+    if let Some(snapshots_total) = SNAPSHOT_RUNS.get() {
+        snapshots_total
+            .with_label_values(&[consumer.as_str()])
+            .inc();
+    }
+}
+
+/// Count one AoR `consumer` re-reported as a snapshot.
+pub fn record_snapshot_aor(consumer: LaggedConsumer) {
+    if let Some(snapshot_aors_total) = SNAPSHOT_AORS.get() {
+        snapshot_aors_total
+            .with_label_values(&[consumer.as_str()])
+            .inc();
+    }
+}
+
+/// What the snapshot-run counter reads for `consumer`, `0` before the metrics
+/// are built.
+pub fn snapshots(consumer: LaggedConsumer) -> u64 {
+    SNAPSHOT_RUNS
+        .get()
+        .map(|counter| counter.with_label_values(&[consumer.as_str()]).get())
+        .unwrap_or(0)
+}
+
+/// What the re-reported-AoR counter reads for `consumer`, `0` before the
+/// metrics are built.
+pub fn snapshot_aors(consumer: LaggedConsumer) -> u64 {
+    SNAPSHOT_AORS
+        .get()
+        .map(|counter| counter.with_label_values(&[consumer.as_str()]).get())
+        .unwrap_or(0)
 }
 
 /// Count `skipped` events `consumer` lost to a broadcast lag.
@@ -89,6 +150,27 @@ mod tests {
         let exposition = crate::metrics::encode_metrics();
         assert!(exposition.contains("siphon_event_consumer_lagged_total{consumer=\"rf_register\"}"));
         assert!(exposition.contains("siphon_event_consumer_lagged_total{consumer=\"registrant\"}"));
+    }
+
+    #[test]
+    fn snapshot_runs_and_aors_are_counted_under_their_consumer() {
+        crate::metrics::init().expect("the metrics build");
+        let runs = snapshots(LaggedConsumer::Registrant);
+        let aors = snapshot_aors(LaggedConsumer::Registrant);
+        record_snapshot_started(LaggedConsumer::Registrant);
+        record_snapshot_aor(LaggedConsumer::Registrant);
+        record_snapshot_aor(LaggedConsumer::Registrant);
+        assert!(snapshots(LaggedConsumer::Registrant) > runs);
+        assert!(snapshot_aors(LaggedConsumer::Registrant) >= aors + 2);
+        let exposition = crate::metrics::encode_metrics();
+        for consumer in ["registrar", "registrant"] {
+            assert!(exposition.contains(&format!(
+                "siphon_event_consumer_snapshots_total{{consumer=\"{consumer}\"}}"
+            )));
+            assert!(exposition.contains(&format!(
+                "siphon_event_consumer_snapshot_aors_total{{consumer=\"{consumer}\"}}"
+            )));
+        }
     }
 
     #[test]
