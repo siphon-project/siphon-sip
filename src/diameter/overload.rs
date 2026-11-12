@@ -722,21 +722,41 @@ pub fn over_admission_limit() -> bool {
         .is_some_and(|limit| inflight() > limit)
 }
 
-/// Count a request shed by the admission limit.
-pub fn count_shed() {
+/// Count a request shed at `node` (`admission_limit`, `dispatch_queue`).
+pub fn count_shed(node: &str) {
     if let Some(metrics) = crate::metrics::try_metrics() {
         metrics
             .diameter_overload_abated_total
-            .with_label_values(&["admission_limit"])
+            .with_label_values(&[node])
             .inc();
     }
     // A shed request is never left without a report: the reduction goes up
-    // now, and the answer that follows carries it.
+    // now, and the answer that follows carries it. Without an admission
+    // limit the load in service is the limit the shed request exceeded.
     let overload = current();
-    if let (Some(reporting), Some(limit)) = (overload.reporting.as_ref(), overload.admission_limit)
-    {
-        reporting.note_shed(inflight(), limit, Instant::now());
+    if let Some(reporting) = overload.reporting.as_ref() {
+        let (pending, limit) = match overload.admission_limit {
+            Some(limit) => (inflight(), limit),
+            None => (inflight() + 1, inflight()),
+        };
+        reporting.note_shed(pending, limit, Instant::now());
     }
+}
+
+/// The DIAMETER_TOO_BUSY (3004) answer to the request `raw`, counted as shed
+/// at `node`, with the overload this node reports (RFC 7683) for a requester
+/// that advertised DOIC. None when `raw` does not parse.
+pub fn too_busy_answer(raw: &[u8], origin: (&str, &str), node: &str) -> Option<Vec<u8>> {
+    count_shed(node);
+    let request = DiameterMsg::from_wire(raw).ok()?;
+    let answer = super::forward::build_answer(
+        &request,
+        origin.0,
+        origin.1,
+        super::dictionary::DIAMETER_TOO_BUSY,
+        Some("overloaded"),
+    );
+    Some(annotate_answer(request_features(raw), answer.to_wire()))
 }
 
 /// The DOIC features the sender of the request in `raw` advertised; 0 when

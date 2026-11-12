@@ -962,6 +962,12 @@ it fall a step per 2 s without a shed, after which the end is reported once.
 It combines with the other sources as the largest. `siphon_diameter_overload_abated_total{node="admission_limit"}` counts the shed
 requests. It needs `reporting` to be configured.
 
+A request that arrives while the connection's queue towards the handlers is full
+(32 requests, or `admission_limit` when that is larger) is answered the same
+way, counted under `node="dispatch_queue"`, and one that arrives when nothing
+serves the connection any more is answered DIAMETER_UNABLE_TO_DELIVER (3002).
+No request is dropped without an answer.
+
 **Agent.** With `diameter.overload.agent: true` a node that relays with
 `req.forward_to(peer)` is a DOIC agent (RFC 7683 section 5.3) for the realm
 behind it, instead of a transparent relay:

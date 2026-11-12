@@ -698,7 +698,6 @@ pub(crate) async fn dispatch_request(
         shed_too_busy(
             &inbound_peer,
             &incoming,
-            request_features,
             (&local_origin_host, &local_origin_realm),
             start,
         )
@@ -981,23 +980,15 @@ fn emitted_answer_result_label(wire: &[u8]) -> &'static str {
 async fn shed_too_busy(
     inbound_peer: &DiameterPeer,
     incoming: &IncomingRequest,
-    request_features: u64,
     local_origin: (&str, &str),
     start: Instant,
 ) {
-    crate::diameter::overload::count_shed();
-    let Ok(request) = DiameterMsg::from_wire(&incoming.raw) else {
+    let Some(wire) =
+        crate::diameter::overload::too_busy_answer(&incoming.raw, local_origin, "admission_limit")
+    else {
         warn!("Diameter server: shed a request that does not parse, no answer sent");
         return;
     };
-    let answer = crate::diameter::forward::build_answer(
-        &request,
-        local_origin.0,
-        local_origin.1,
-        dictionary::DIAMETER_TOO_BUSY,
-        Some("overloaded"),
-    );
-    let wire = crate::diameter::overload::annotate_answer(request_features, answer.to_wire());
     if let Err(error) = inbound_peer.send_response(wire).await {
         warn!(%error, "Diameter server: failed to send the 3004 of the admission limit");
     }
