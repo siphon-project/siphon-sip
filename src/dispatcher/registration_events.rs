@@ -27,9 +27,10 @@
 //! while a snapshot is pending **replaces** the pending set with a fresh one; a
 //! second full snapshot is never queued behind the first.
 //!
-//! The loop remembers which AoRs it last reported as present (registered or
-//! refreshed, or a snapshot of one with bindings; dropped on deregistered or
-//! expired). The pending set is the AoRs held now plus those remembered AoRs
+//! The loop remembers which AoRs are present: everything the source holds when
+//! the loop starts (bindings restored from a backend never produced an event),
+//! then each one reported registered or refreshed, or as a snapshot with
+//! bindings; dropped on deregistered or expired. The pending set is the AoRs held now plus those remembered AoRs
 //! that are held no longer, so a deregistration or expiry lost inside the lag
 //! window is re-reported too, as a `snapshot` of an AoR with no bindings, which
 //! the handler reads exactly as it reads a live removal. The remembered set only
@@ -227,7 +228,13 @@ async fn drain_events<S, D, F>(
 {
     use broadcast::error::{RecvError, TryRecvError};
 
-    let mut recovery = Recovery::default();
+    // What the source already holds counts as present from the start, so a
+    // removal of a binding restored before the loop began (no event ever named
+    // it) is recovered after a lag too.
+    let mut recovery = Recovery {
+        known: source.held(),
+        ..Recovery::default()
+    };
     loop {
         let received = match receiver.try_recv() {
             Ok(event) => Ok(event),

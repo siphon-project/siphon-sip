@@ -343,6 +343,35 @@ async fn a_registrant_recovery_delivers_live_events_first_and_recovers_removals(
     task.abort();
 }
 
+#[tokio::test]
+async fn a_removal_of_an_aor_held_before_the_drain_started_is_recovered() {
+    // Restored from a backend: held, but no event was ever published for it.
+    let registrar = Arc::new(Registrar::default());
+    save(&registrar, "restored");
+    let (sender, receiver) = broadcast::channel(4);
+    let seen: Seen<RegistrarChange> = Arc::default();
+    let gate = Arc::new(Notify::new());
+    let task = tokio::spawn(drain_registrar_events(
+        receiver,
+        Arc::clone(&registrar),
+        paced_sink(
+            Arc::clone(&seen),
+            Duration::ZERO,
+            HashMap::from([(0, Arc::clone(&gate))]),
+        ),
+    ));
+    let _ = sender.send(expired("sip:first@example.com"));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    // Its removal happens inside the lag and never reaches this channel.
+    registrar.remove_all("sip:restored@example.com");
+    flood(&sender, 10);
+    gate.notify_one();
+
+    wait_until(|| snapshot_of(&seen).contains(&"sip:restored@example.com".to_string())).await;
+    assert!(registrar.lookup("sip:restored@example.com").is_empty());
+    task.abort();
+}
+
 #[test]
 fn the_remembered_set_drains_back_after_deregistrations() {
     let mut recovery = Recovery::default();
