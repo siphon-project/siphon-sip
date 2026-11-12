@@ -378,7 +378,10 @@ media:
 
 The URI supports `{call_id}`, `{from_tag}`, `{from_user}` and `{to_user}`,
 expanded per call. An unrecognised placeholder fails rather than passing through
-as a literal, so a typo cannot reach the engine as part of the URI path.
+as a literal, so a typo cannot reach the engine as part of the URI path. Each value arrives percent-encoded (every character outside
+`A-Z a-z 0-9 - . _ ~` as `%XX`), so a Call-ID carrying `+`, `/`, `&` or `%`
+cannot change the URI; read it back with the usual URI or query decoding
+(`parse_qs`, your framework's query params) and you get the exact Call-ID.
 
 When the endpoint depends on something only the script knows — a session token,
 a tenant lookup — pass it per call instead. It wins over the profile's own value,

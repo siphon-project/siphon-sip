@@ -38,7 +38,10 @@ with its config in `examples/voice_ai_b2bua.yaml`.
 `{call_id}` expands per call, so the AI can correlate the audio stream with the
 call without a side channel. `{from_tag}`, `{from_user}` and `{to_user}` expand
 too; an unknown placeholder is an error rather than a literal, so a typo cannot
-reach the engine as a URI path segment.
+reach the engine as a URI path segment. Each value arrives percent-encoded (every character outside
+`A-Z a-z 0-9 - . _ ~` as `%XX`), so a Call-ID carrying `+`, `/`, `&` or `%`
+cannot change the URI; read it back with the usual URI or query decoding
+(`parse_qs`, your framework's query params) and you get the exact Call-ID.
 
 ## Bridge, not tee
 

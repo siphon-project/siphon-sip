@@ -2406,7 +2406,7 @@ async fn answer_first_prepare_templates_ws_uri_on_siphon_rtp() {
     .expect("prepare must succeed on siphon-rtp with a ws_uri");
     assert_eq!(
         plan.flags.ws_uri.as_deref(),
-        Some("wss://ai.example/stream/call-abc@pc"),
+        Some("wss://ai.example/stream/call-abc%40pc"),
         "ws_uri must be #131-templated"
     );
     assert_eq!(plan.from_tag, "alice-tag");

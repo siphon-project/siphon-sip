@@ -13,6 +13,14 @@
 //! the call on and what every media event names. `{from_tag}` is the tag the
 //! engine keyed the leg on (the offerer's). `{from_user}` / `{to_user}` are
 //! the user parts of that dialog's From and To.
+//!
+//! Each value is **percent-encoded** as one URI component before it goes in
+//! (see [`push_percent_encoded`]): RFC 3261 §25.1 lets a Call-ID carry
+//! `+ % / ? " < > { }` and more, and a user part may carry `%`-escapes, `+`,
+//! `;` and `&`, each of which would change what the URI means. A receiver
+//! decodes the value as it decodes any URI (a query parser, a path router),
+//! and gets back the exact Call-ID / tag / user part. The template's own text
+//! is never touched.
 
 use crate::sip::headers::nameaddr::NameAddr;
 use crate::sip::message::SipMessage;
@@ -63,7 +71,8 @@ pub fn dialog_users(message: &SipMessage) -> (Option<String>, Option<String>) {
     )
 }
 
-/// Expand `{call_id}` / `{from_tag}` / `{from_user}` / `{to_user}` in a URI.
+/// Expand `{call_id}` / `{from_tag}` / `{from_user}` / `{to_user}` in a URI,
+/// each value percent-encoded (see the module docs).
 ///
 /// An unrecognised placeholder is an error, not a literal, and so is one with
 /// no value on this call (no From user part, say): an empty path segment is as
@@ -102,12 +111,34 @@ pub fn expand_ws_uri(template: &str, context: &WsUriContext<'_>) -> Result<Strin
                 name: name.to_string(),
             });
         };
-        expanded.push_str(value);
+        push_percent_encoded(&mut expanded, value);
         rest = &after_open[close + 1..];
     }
     expanded.push_str(rest);
 
     Ok(expanded)
+}
+
+/// Append `value` to `uri` as a single URI component: RFC 3986 §2.3
+/// unreserved characters (`A-Z a-z 0-9 - . _ ~`) as they are, every other
+/// byte of its UTF-8 as `%XX` with uppercase hex (RFC 3986 §2.1, §2.5).
+///
+/// Encoding everything outside the unreserved set is stricter than either a
+/// path segment or a query needs, which is the point: the same encoded value
+/// is safe in both, and no delimiter (`/ ? # & = +`) in a Call-ID can split a
+/// path or a query parameter. `+` in particular is encoded, since a form
+/// decoder (`application/x-www-form-urlencoded`) would read it as a space.
+fn push_percent_encoded(uri: &mut String, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            uri.push(char::from(byte));
+        } else {
+            uri.push('%');
+            uri.push(char::from(HEX[usize::from(byte >> 4)]));
+            uri.push(char::from(HEX[usize::from(byte & 0x0F)]));
+        }
+    }
 }
 
 /// Expand both WebSocket URIs a set of engine flags carries, the takeover
@@ -153,7 +184,7 @@ mod tests {
         .expect("expands");
         assert_eq!(
             expanded,
-            "wss://ai.invalid/abc123@example.invalid/tag-a?from=1001&to=2002"
+            "wss://ai.invalid/abc123%40example.invalid/tag-a?from=1001&to=2002"
         );
     }
 
@@ -163,7 +194,7 @@ mod tests {
             expand_ws_uri("wss://ai.invalid/{call_id}/{call_id}", &context()).expect("expands");
         assert_eq!(
             expanded,
-            "wss://ai.invalid/abc123@example.invalid/abc123@example.invalid"
+            "wss://ai.invalid/abc123%40example.invalid/abc123%40example.invalid"
         );
     }
 
@@ -213,11 +244,11 @@ mod tests {
         expand_flag_uris(&mut flags, &context()).expect("expands");
         assert_eq!(
             flags.ws_uri.as_deref(),
-            Some("wss://ai.invalid/abc123@example.invalid")
+            Some("wss://ai.invalid/abc123%40example.invalid")
         );
         assert_eq!(
             flags.ws_tee.as_deref(),
-            Some("wss://asr.invalid/abc123@example.invalid/tag-a")
+            Some("wss://asr.invalid/abc123%40example.invalid/tag-a")
         );
     }
 
@@ -239,6 +270,121 @@ mod tests {
             expand_flag_uris(&mut flags, &context()),
             Err(WsUriError::UnknownPlaceholder { .. })
         ));
+    }
+
+    fn call(call_id: &str) -> WsUriContext<'_> {
+        WsUriContext {
+            call_id,
+            ..context()
+        }
+    }
+
+    fn expand_call_id(call_id: &str) -> String {
+        expand_ws_uri("{call_id}", &call(call_id)).expect("expands")
+    }
+
+    #[test]
+    fn a_plus_and_an_at_sign_are_percent_encoded() {
+        assert_eq!(expand_call_id("a+b@h"), "a%2Bb%40h");
+    }
+
+    /// An escape already in the value is data, not an escape of the URI.
+    #[test]
+    fn a_percent_sign_is_itself_encoded() {
+        assert_eq!(expand_call_id("x%41y"), "x%2541y");
+    }
+
+    #[test]
+    fn a_slash_and_a_question_mark_cannot_change_the_route() {
+        assert_eq!(expand_call_id("p/q?r"), "p%2Fq%3Fr");
+    }
+
+    /// RFC 3261 §25.1 lets a Call-ID word carry `" < > { }`; none may reach a
+    /// URI raw, nor may a space or a non-ASCII character (encoded per UTF-8 byte).
+    #[test]
+    fn characters_a_uri_cannot_carry_are_encoded_as_utf8_bytes() {
+        assert_eq!(
+            expand_call_id("\"a<b>{c} d\u{e9}"),
+            "%22a%3Cb%3E%7Bc%7D%20d%C3%A9"
+        );
+    }
+
+    #[test]
+    fn query_delimiters_in_a_value_are_encoded() {
+        assert_eq!(expand_call_id("a&b=c#d;e"), "a%26b%3Dc%23d%3Be");
+    }
+
+    #[test]
+    fn an_all_unreserved_value_is_unchanged() {
+        let unreserved = "AZaz09-._~";
+        assert_eq!(expand_call_id(unreserved), unreserved);
+    }
+
+    #[test]
+    fn the_template_text_around_a_placeholder_is_untouched() {
+        let expanded = expand_ws_uri(
+            "wss://ai.example.com:8443/stream/{call_id}?call={call_id}&from={from_user}#x",
+            &WsUriContext {
+                call_id: "a b",
+                from_user: Some("+31"),
+                ..context()
+            },
+        )
+        .expect("expands");
+        assert_eq!(
+            expanded,
+            "wss://ai.example.com:8443/stream/a%20b?call=a%20b&from=%2B31#x"
+        );
+    }
+
+    /// The decoding a receiver does on a query string
+    /// (`application/x-www-form-urlencoded`, WHATWG URL §5.1: `+` is a space,
+    /// `%XX` a byte), written out here so the test does not lean on the encoder.
+    fn form_decode_query(query: &str) -> Vec<(String, String)> {
+        let decode = |text: &str| -> String {
+            let bytes = text.as_bytes();
+            let mut out = Vec::with_capacity(bytes.len());
+            let mut index = 0;
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'+' => out.push(b' '),
+                    b'%' if index + 2 < bytes.len() => {
+                        let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).expect("ascii");
+                        out.push(u8::from_str_radix(hex, 16).expect("hex escape"));
+                        index += 2;
+                    }
+                    other => out.push(other),
+                }
+                index += 1;
+            }
+            String::from_utf8(out).expect("utf-8")
+        };
+        query
+            .split('&')
+            .map(|pair| {
+                let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                (decode(name), decode(value))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_form_decoder_reads_back_the_exact_call_id() {
+        // Every character RFC 3261 §25.1 allows in a Call-ID word, plus `@`.
+        let call_id = "a-.!%*_+`'~()<>:\\\"/[]?{}@host";
+        let expanded = expand_ws_uri(
+            "wss://ai.example.com/s?call={call_id}&leg=1",
+            &call(call_id),
+        )
+        .expect("expands");
+        let (_, query) = expanded.split_once('?').expect("query");
+        assert_eq!(
+            form_decode_query(query),
+            vec![
+                ("call".to_string(), call_id.to_string()),
+                ("leg".to_string(), "1".to_string()),
+            ]
+        );
     }
 
     #[test]

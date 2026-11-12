@@ -92,11 +92,11 @@ async fn answer_first_templates_the_profile_tee_like_its_bridge() {
     .expect("the plan is made");
     assert_eq!(
         plan.flags.ws_uri.as_deref(),
-        Some("wss://ai.example.test/bridge/ws-uri-caller@example.test")
+        Some("wss://ai.example.test/bridge/ws-uri-caller%40example.test")
     );
     assert_eq!(
         plan.flags.ws_tee.as_deref(),
-        Some("wss://asr.example.test/tee/ws-uri-caller@example.test?leg=caller-tag")
+        Some("wss://asr.example.test/tee/ws-uri-caller%40example.test?leg=caller-tag")
     );
 }
 

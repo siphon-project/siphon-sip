@@ -446,7 +446,9 @@ same way every other verb does — never a hang:
   callee's To-tag on an `originate`. `{from_user}` / `{to_user}` are the user
   parts of the call's From and To. A placeholder siphon does not know, or one
   the call has no value for, is refused (`stream_start` answers `bad_request`)
-  rather than sent to the engine as written.
+  rather than sent to the engine as written. Each value is percent-encoded as
+  one URI component (everything outside `A-Z a-z 0-9 - . _ ~` becomes `%XX`),
+  so the receiver decodes it as it decodes any URI and gets the exact value.
 - A call with no anchored media session answers `not_found`; a backend that
   cannot perform the op answers `unsupported_verb`; any other backend failure
   answers `unavailable`.
