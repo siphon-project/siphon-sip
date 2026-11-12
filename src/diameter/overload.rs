@@ -12,13 +12,14 @@
 //! * A relay (RFC 7683 section 5.2.3) leaves every OC-* AVP alone: it passes
 //!   them through unchanged, so the reacting node and the reporting node
 //!   behind it talk to each other. Nothing in the relay path reads or writes
-//!   them.
+//!   them, unless `diameter.overload.agent` makes it a DOIC agent (section
+//!   5.3, see [`super::overload_agent`]).
 
 use super::codec::{Avp, AvpData, DiameterMsg};
 use super::dictionary::avp;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// OC-Feature-Vector bit of the default loss algorithm (RFC 7683 section 7.3,
@@ -337,6 +338,33 @@ impl DepthScale {
     }
 }
 
+/// The reduction moves in multiples of this when the admission limit sheds.
+const SHED_STEP: u32 = 10;
+/// How long shedding must stay away before the reduction it caused drops by
+/// a step, and how long a reduction that did not stop the shedding holds
+/// before it is raised by one.
+const SHED_HOLD: Duration = Duration::from_secs(2);
+
+/// What the admission limit asks of the requesters.
+#[derive(Debug, Default)]
+struct Shed {
+    level: u32,
+    last_shed: Option<Instant>,
+    last_raised: Option<Instant>,
+}
+
+impl Shed {
+    /// The level at `now`: it leaves one step per `SHED_HOLD` without a shed.
+    fn at(&self, now: Instant) -> u32 {
+        let Some(last) = self.last_shed else {
+            return 0;
+        };
+        let quiet = now.saturating_duration_since(last).as_millis() / SHED_HOLD.as_millis();
+        self.level
+            .saturating_sub((quiet as u32).saturating_mul(SHED_STEP))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Standing {
     reduction: u32,
@@ -348,21 +376,35 @@ struct Standing {
 /// reduction it sets) and from the pending-request depth; the larger counts.
 #[derive(Debug)]
 pub struct ReportingState {
+    report_type: ReportType,
     validity_secs: u32,
     depth_scale: Option<DepthScale>,
     set_by_application: AtomicU64,
     set_until: Mutex<Option<Instant>>,
+    shed: Mutex<Shed>,
     sequence: AtomicU64,
     standing: Mutex<Option<Standing>>,
 }
 
 impl ReportingState {
     pub fn new(validity_secs: u32, depth_scale: Option<DepthScale>) -> Self {
+        Self::of_type(ReportType::Host, validity_secs, depth_scale)
+    }
+
+    /// A node that reports about `report_type`: the host itself, or the
+    /// realm it serves (an agent speaking for the nodes behind it).
+    pub fn of_type(
+        report_type: ReportType,
+        validity_secs: u32,
+        depth_scale: Option<DepthScale>,
+    ) -> Self {
         Self {
+            report_type,
             validity_secs: validity_secs.clamp(1, MAX_VALIDITY_SECS),
             depth_scale,
             set_by_application: AtomicU64::new(0),
             set_until: Mutex::new(None),
+            shed: Mutex::new(Shed::default()),
             // Seeded from the clock so a restart does not reuse numbers a
             // reacting node still holds (section 5.2.1: the sequence number
             // survives restarts or is a timestamp).
@@ -386,6 +428,40 @@ impl ReportingState {
         }
     }
 
+    /// A request was shed with `pending` in service and `limit` allowed: ask
+    /// for at least the share that brings the load back under the limit,
+    /// rounded up to a step, at once; if the reduction in force did not stop
+    /// the shedding, raise it one step, at most once per `SHED_HOLD`. It
+    /// leaves a step at a time once the shedding stops.
+    pub fn note_shed(&self, pending: usize, limit: usize, now: Instant) {
+        let excess = pending.saturating_sub(limit).max(1) as u128;
+        let share = (excess * 100).div_ceil(pending.max(1) as u128) as u32;
+        let wanted = share.div_ceil(SHED_STEP).max(1) * SHED_STEP;
+        let Ok(mut shed) = self.shed.lock() else {
+            return;
+        };
+        let current = shed.at(now);
+        let raise_due = shed
+            .last_raised
+            .is_none_or(|raised| now.saturating_duration_since(raised) >= SHED_HOLD);
+        let level = if wanted > current {
+            wanted
+        } else if raise_due {
+            current + SHED_STEP
+        } else {
+            current
+        };
+        if level != current || shed.last_raised.is_none() {
+            shed.last_raised = Some(now);
+        }
+        shed.level = level.min(100);
+        shed.last_shed = Some(now);
+    }
+
+    fn shed_reduction(&self, now: Instant) -> u32 {
+        self.shed.lock().map_or(0, |shed| shed.at(now))
+    }
+
     fn application_reduction(&self, now: Instant) -> u32 {
         let set = self.set_by_application.load(Ordering::Relaxed) as u32;
         if set == 0 {
@@ -400,7 +476,9 @@ impl ReportingState {
     /// The reduction this node reports now, given `pending` requests.
     pub fn reduction(&self, pending: usize, now: Instant) -> u32 {
         let by_depth = self.depth_scale.map_or(0, |scale| scale.reduction(pending));
-        self.application_reduction(now).max(by_depth)
+        self.application_reduction(now)
+            .max(by_depth)
+            .max(self.shed_reduction(now))
     }
 
     /// The OC-OLR to put in an answer now, None when there is nothing to
@@ -447,7 +525,7 @@ impl ReportingState {
     fn report(&self, sequence: u64, reduction: u32) -> Olr {
         Olr {
             sequence,
-            report_type: ReportType::Host,
+            report_type: self.report_type,
             validity_secs: self.validity_secs,
             reduction_percentage: reduction,
         }
@@ -493,6 +571,11 @@ pub struct Overload {
     pub reacting: bool,
     pub reporting: Option<ReportingState>,
     pub table: ReactingTable,
+    /// Requests in service above which one is answered 3004 without the
+    /// script (`reporting.admission_limit`).
+    pub admission_limit: Option<usize>,
+    /// The DOIC agent behaviour of a relay (`diameter.overload.agent`).
+    pub agent: Option<super::overload_agent::Agent>,
 }
 
 impl Overload {
@@ -512,7 +595,20 @@ impl Overload {
                 }),
             )
         });
-        Self::new(reacting, reporting)
+        let mut overload = Self::new(reacting, reporting);
+        overload.admission_limit = config
+            .reporting
+            .as_ref()
+            .and_then(|reporting| reporting.admission_limit);
+        if config.agent {
+            overload.agent = Some(super::overload_agent::Agent::new(
+                config
+                    .reporting
+                    .as_ref()
+                    .map_or(DEFAULT_VALIDITY_SECS, |reporting| reporting.validity),
+            ));
+        }
+        overload
     }
 
     pub fn new(reacting: bool, reporting: Option<ReportingState>) -> Self {
@@ -520,6 +616,8 @@ impl Overload {
             reacting,
             reporting,
             table: ReactingTable::default(),
+            admission_limit: None,
+            agent: None,
         }
     }
 }
@@ -584,9 +682,61 @@ pub fn track_inflight() -> InflightGuard {
     InflightGuard
 }
 
+/// The peer of `candidates` an agent should send a relayed request to: the
+/// one whose host report asks for the least. Without an agent, or without any
+/// report in force, the first. Candidates are in configured order.
+pub fn least_reduced<'a>(
+    candidates: impl Iterator<Item = &'a Arc<super::DiameterClient>>,
+    application: u32,
+    origin: Origin,
+) -> Option<&'a Arc<super::DiameterClient>> {
+    let overload = current();
+    if origin != Origin::Relayed || overload.agent.is_none() || overload.table.is_idle() {
+        return candidates.into_iter().next();
+    }
+    let now = Instant::now();
+    candidates.min_by_key(|client| {
+        client
+            .peer()
+            .remote_origin_host()
+            .and_then(|host| {
+                overload
+                    .table
+                    .reduction_for(&[ReportKey::new(ReportType::Host, host, application)], now)
+            })
+            .map_or(0, |found| found.0)
+    })
+}
+
 /// Requests being served now.
 pub fn inflight() -> usize {
     INFLIGHT.load(Ordering::Relaxed)
+}
+
+/// Whether more requests are in service than `reporting.admission_limit`
+/// allows, which makes the receive path answer 3004 itself. Counts the
+/// request being admitted, so a limit of N serves N at once.
+pub fn over_admission_limit() -> bool {
+    current()
+        .admission_limit
+        .is_some_and(|limit| inflight() > limit)
+}
+
+/// Count a request shed by the admission limit.
+pub fn count_shed() {
+    if let Some(metrics) = crate::metrics::try_metrics() {
+        metrics
+            .diameter_overload_abated_total
+            .with_label_values(&["admission_limit"])
+            .inc();
+    }
+    // A shed request is never left without a report: the reduction goes up
+    // now, and the answer that follows carries it.
+    let overload = current();
+    if let (Some(reporting), Some(limit)) = (overload.reporting.as_ref(), overload.admission_limit)
+    {
+        reporting.note_shed(inflight(), limit, Instant::now());
+    }
 }
 
 /// The DOIC features the sender of the request in `raw` advertised; 0 when
@@ -647,8 +797,12 @@ pub fn prepare_outbound(
     peer_realm: Option<&str>,
 ) -> Result<Vec<u8>, ReportKey> {
     let overload = current();
-    if origin == Origin::Relayed || !overload.reacting {
-        return Ok(wire);
+    match origin {
+        // A relay abates only as an agent, and only once a report is in
+        // force: the common case parses nothing.
+        Origin::Relayed if overload.agent.is_none() || overload.table.is_idle() => return Ok(wire),
+        Origin::Local if !overload.reacting => return Ok(wire),
+        _ => {}
     }
     let Ok(mut request) = DiameterMsg::from_wire(&wire) else {
         return Ok(wire);
@@ -678,7 +832,9 @@ pub fn prepare_outbound(
         }
         return Err(key);
     }
-    if request.find(avp::OC_SUPPORTED_FEATURES, 0).is_some() {
+    // A relayed request carries what its originator and, for an agent,
+    // `overload_agent::prepare_request` put in it.
+    if origin == Origin::Relayed || request.find(avp::OC_SUPPORTED_FEATURES, 0).is_some() {
         return Ok(wire);
     }
     request.avps.push(supported_features_avp(FEATURE_LOSS));
@@ -690,7 +846,7 @@ pub fn prepare_outbound(
 /// abatement towards it.
 pub fn note_answer(wire: &[u8]) {
     let overload = current();
-    if !overload.reacting {
+    if !overload.reacting && overload.agent.is_none() {
         return;
     }
     let Ok(answer) = DiameterMsg::from_wire(wire) else {
@@ -1155,6 +1311,76 @@ mod tests {
         assert!(reacting_only.reacting && reacting_only.reporting.is_none());
     }
 
+    #[test]
+    fn shedding_raises_the_report_at_once_and_it_leaves_a_step_at_a_time() {
+        let reporting = ReportingState::new(30, None);
+        let start = Instant::now();
+        assert_eq!(reporting.reduction(0, start), 0);
+        // 105 in service of 100 allowed: 5 percent over, one step.
+        reporting.note_shed(105, 100, start);
+        assert_eq!(reporting.reduction(0, start), 10);
+        let first = reporting.olr(0, start).unwrap();
+        assert_eq!(first.reduction_percentage, 10);
+        // 150 of 100: a third over, 40 at once.
+        reporting.note_shed(150, 100, start);
+        assert_eq!(reporting.reduction(0, start), 40);
+        reporting.note_shed(150, 100, start + Duration::from_secs(1));
+        assert_eq!(reporting.reduction(0, start + Duration::from_secs(1)), 40);
+        // Shedding goes on although 40 is in force: one step, once per hold.
+        let later = start + SHED_HOLD;
+        reporting.note_shed(150, 100, later);
+        assert_eq!(reporting.reduction(0, later), 50);
+        reporting.note_shed(150, 100, later);
+        assert_eq!(reporting.reduction(0, later), 50, "not twice in a hold");
+        // It leaves a step per hold without a shed, then ends once.
+        assert_eq!(reporting.reduction(0, later + SHED_HOLD), 40);
+        assert_eq!(reporting.reduction(0, later + SHED_HOLD * 3), 20);
+        let end = later + SHED_HOLD * 5;
+        assert_eq!(reporting.reduction(0, end), 0);
+        let held = reporting.olr(0, later).unwrap();
+        let ended = reporting.olr(0, end).unwrap();
+        assert_eq!(ended.reduction_percentage, 0);
+        assert!(ended.sequence > held.sequence);
+        assert!(reporting.olr(0, end + Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn a_limit_of_zero_asks_for_everything_and_never_overflows() {
+        let reporting = ReportingState::new(30, None);
+        let now = Instant::now();
+        reporting.note_shed(1, 0, now);
+        assert_eq!(reporting.reduction(0, now), 100);
+        reporting.note_shed(usize::MAX, 0, now);
+        assert_eq!(reporting.reduction(0, now + SHED_HOLD), 100 - SHED_STEP);
+    }
+
+    #[test]
+    fn the_agent_and_the_admission_limit_are_configured() {
+        let none = Overload::from_config(None);
+        assert!(none.agent.is_none() && none.admission_limit.is_none());
+        let config: crate::config::DiameterConfig = serde_saphyr::from_str(
+            "overload:\n  agent: true\n  reporting: {validity: 45, admission_limit: 500}\n",
+        )
+        .unwrap();
+        let configured = Overload::from_config(config.overload.as_ref());
+        assert!(configured.agent.is_some());
+        assert_eq!(configured.admission_limit, Some(500));
+        assert!(!configured.reacting);
+        let bare: crate::config::DiameterConfig =
+            serde_saphyr::from_str("overload:\n  agent: true\n").unwrap();
+        assert!(Overload::from_config(bare.overload.as_ref())
+            .agent
+            .is_some());
+    }
+
+    #[test]
+    fn an_agent_gives_every_relayed_request_somewhere_to_be_diverted_to() {
+        let config: crate::config::DiameterConfig =
+            serde_saphyr::from_str("overload:\n  agent: true\n").unwrap();
+        let policy = crate::diameter::retry::RetryPolicy::from_config(&config);
+        assert!(policy.divert_abated);
+    }
+
     /// Emit the DOIC AVPs for `scripts/validate_diameter_overload.sh`, which
     /// has Wireshark's dissector read them back.
     #[test]
@@ -1193,11 +1419,39 @@ mod tests {
             validity_secs: 86_400,
             reduction_percentage: 100,
         }));
+        // What a DOIC agent says: one backend of two reports 100 percent.
+        let table = ReactingTable::default();
+        let backend = |name: &str| super::super::overload_agent::Backend {
+            host: Some(name.to_string()),
+            realm: Some("example.org".to_string()),
+        };
+        table.update(
+            ReportKey::new(ReportType::Host, "a.example.org", 0),
+            &olr(1, 100, 30),
+            Instant::now(),
+        );
+        let mut agent_answer = forward::build_answer(
+            &capable_request,
+            "server.example.org",
+            "example.org",
+            2001,
+            None,
+        );
+        super::super::overload_agent::Agent::new(30).rewrite_answer(
+            &table,
+            &mut agent_answer,
+            "example.org",
+            true,
+            &[backend("a.example.org"), backend("b.example.org")],
+            2,
+            Instant::now(),
+        );
         let mut dump = String::new();
         for wire in [
             capable_request.to_wire(),
             answer.to_wire(),
             realm_report.to_wire(),
+            agent_answer.to_wire(),
         ] {
             for (offset, chunk) in wire.chunks(16).enumerate() {
                 dump.push_str(&format!("{:06x}", offset * 16));

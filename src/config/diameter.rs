@@ -320,6 +320,12 @@ pub struct DiameterOverloadConfig {
     /// advertised DOIC.
     #[serde(default)]
     pub reporting: Option<DiameterReportingConfig>,
+    /// Act as a DOIC agent (RFC 7683 section 5.3) for the requests this node
+    /// relays with `forward_to`: abate them towards a backend that reported
+    /// overload, divert them to another backend, and report the realm's
+    /// aggregate overload to the clients instead of the backend's own.
+    #[serde(default)]
+    pub agent: bool,
 }
 
 /// What a reacting node does with a request it abates.
@@ -371,6 +377,10 @@ pub struct DiameterReportingConfig {
     /// sets its own with `diameter.set_overload`; the larger is reported.
     #[serde(default)]
     pub pending_requests: Option<DiameterPendingRequestsScale>,
+    /// Answer DIAMETER_TOO_BUSY (3004) from the receive path, without calling
+    /// the script, while more than this many requests are in service.
+    #[serde(default)]
+    pub admission_limit: Option<usize>,
 }
 
 /// `diameter.overload.reporting.pending_requests`.

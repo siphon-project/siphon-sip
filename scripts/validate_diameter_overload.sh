@@ -11,6 +11,8 @@
 #   frame 1  request (DWR-sized base command 280) with OC-Supported-Features
 #   frame 2  its answer with OC-Supported-Features and OC-OLR (30 %, host)
 #   frame 3  an answer with a realm report, 100 %, 86400 s, a 64-bit sequence
+#   frame 4  the answer of a DOIC agent: OC-Supported-Features and one realm
+#            report (REALM_REPORT, 50 %, 30 s)
 #
 # Needs tshark and text2pcap (wireshark-common).
 
@@ -72,6 +74,11 @@ expect 3 diameter.OC-Sequence-Number "72623859790382856"
 expect 3 diameter.OC-Report-Type "1"
 expect 3 diameter.OC-Reduction-Percentage "100"
 expect 3 diameter.OC-Validity-Duration "86400"
+expect 4 diameter.OC-Feature-Vector "1"
+[[ -n "$(field 4 diameter.OC-Sequence-Number)" ]] || { echo "  FAIL frame 4 has no OC-Sequence-Number" >&2; status=1; }
+expect 4 diameter.OC-Report-Type "1"
+expect 4 diameter.OC-Reduction-Percentage "50"
+expect 4 diameter.OC-Validity-Duration "30"
 
 # No M and no V bit on any OC AVP (RFC 7683 section 7.1).
 if tshark -r "$PCAP" -V -O diameter 2>/dev/null | awk '/AVP Code: 62[1-7] /{p=1;next} p&&/AVP Flags:/{print; p=0}' | grep -Eq 'Flags: 0x(4|8|c)'; then

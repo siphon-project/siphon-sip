@@ -96,7 +96,9 @@ impl RetryPolicy {
             .and_then(|overload| overload.reacting.as_ref())
             .is_some_and(|reacting| {
                 reacting.action == crate::config::DiameterAbatementAction::Divert
-            });
+            })
+            // An agent has nowhere else to put what it abates.
+            || config.overload.as_ref().is_some_and(|overload| overload.agent);
         Self {
             rules,
             divert_abated,
@@ -206,10 +208,13 @@ pub async fn send_routed(
     if !policy.allows(application_id, command_code, failure) {
         return result;
     }
-    let Some(next) = alternates
-        .iter()
-        .find(|client| client.peer().is_open() && !Arc::ptr_eq(client.peer(), first.peer()))
-    else {
+    let Some(next) = overload::least_reduced(
+        alternates
+            .iter()
+            .filter(|client| client.peer().is_open() && !Arc::ptr_eq(client.peer(), first.peer())),
+        application_id,
+        origin,
+    ) else {
         return result;
     };
     if let Some(metrics) = crate::metrics::try_metrics() {
