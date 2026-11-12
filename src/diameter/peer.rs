@@ -777,6 +777,31 @@ pub fn build_dwr(origin_host: &str, origin_realm: &str, hbh: u32, e2e: u32) -> V
     )
 }
 
+/// The capacity of the queue between a connection's reader and what serves
+/// its requests: 32, or `reporting.admission_limit` when that is larger, so
+/// that the admission limit, not the queue, is what normally sheds.
+pub(crate) fn dispatch_queue_capacity() -> usize {
+    crate::diameter::overload::current()
+        .admission_limit
+        .unwrap_or(0)
+        .max(32)
+}
+
+/// The answer `result_code` to the request `raw`, from this node.
+fn refusal_answer(raw: &[u8], origin: (&str, &str), result_code: u32) -> Option<Vec<u8>> {
+    let request = codec::DiameterMsg::from_wire(raw).ok()?;
+    Some(
+        crate::diameter::forward::build_answer(
+            &request,
+            origin.0,
+            origin.1,
+            result_code,
+            Some("unavailable"),
+        )
+        .to_wire(),
+    )
+}
+
 /// Spawn reader, writer, and watchdog tasks for an established connection.
 /// Returns the peer handle. Shared between client and server modes.
 pub(crate) fn spawn_connection_tasks<S>(
@@ -947,20 +972,51 @@ where
                                     break;
                                 } else {
                                     info!("Diameter: received {} from peer", cmd);
-                                    if incoming_tx.try_send(IncomingRequest {
+                                    if let Err(refused) = incoming_tx.try_send(IncomingRequest {
                                         command_code: decoded.command_code,
                                         application_id: decoded.application_id,
                                         hop_by_hop: decoded.hop_by_hop,
                                         end_to_end: decoded.end_to_end,
                                         avps: decoded.avps,
                                         raw: msg_bytes,
-                                    }).is_err() {
+                                    }) {
+                                        // Every request is answered. A full
+                                        // queue is overload: 3004 and the
+                                        // report. A closed one is a node going
+                                        // away: 3002, nothing here can serve it.
+                                        let (full, request) = match refused {
+                                            mpsc::error::TrySendError::Full(request) => (true, request),
+                                            mpsc::error::TrySendError::Closed(request) => (false, request),
+                                        };
                                         warn!(
-                                            command = cmd,
-                                            "Diameter: dropped inbound request — dispatch queue \
-                                             full or closed; the peer will time out and retry \
-                                             rather than this connection stalling"
+                                            command = cmd, full,
+                                            "Diameter: dispatch queue unavailable, answering the request instead"
                                         );
+                                        let answer = if full {
+                                            crate::diameter::overload::too_busy_answer(
+                                                &request.raw,
+                                                (&origin_host, &origin_realm),
+                                                "dispatch_queue",
+                                            )
+                                        } else {
+                                            refusal_answer(
+                                                &request.raw,
+                                                (&origin_host, &origin_realm),
+                                                dictionary::DIAMETER_UNABLE_TO_DELIVER,
+                                            )
+                                        };
+                                        if let Some(answer) = answer {
+                                            // Never park the reader: a full
+                                            // write queue is waited on aside.
+                                            if let Err(mpsc::error::TrySendError::Full(answer)) =
+                                                write_tx_r.try_send(answer)
+                                            {
+                                                let write_tx = write_tx_r.clone();
+                                                tokio::spawn(async move {
+                                                    let _ = write_tx.send_timeout(answer, ENQUEUE_TIMEOUT).await;
+                                                });
+                                            }
+                                        }
                                     }
                                 }
                             } else {
@@ -1107,7 +1163,7 @@ pub async fn connect_with_transport(
         addr, result_code
     );
 
-    let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingRequest>(32);
+    let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingRequest>(dispatch_queue_capacity());
     let peer = spawn_connection_tasks(config, stream, incoming_tx);
     peer.set_remote_identity(
         identity_avp(&cea.avps, "Origin-Host"),
@@ -1210,7 +1266,7 @@ pub async fn accept(
     }
     info!("Diameter: sent CEA to {} (result=2001)", peer_addr);
 
-    let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingRequest>(32);
+    let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingRequest>(dispatch_queue_capacity());
     let peer = spawn_connection_tasks(config, stream, incoming_tx);
     peer.set_remote_identity(
         identity_avp(&cer.avps, "Origin-Host"),

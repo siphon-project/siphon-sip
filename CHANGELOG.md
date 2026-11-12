@@ -47,6 +47,7 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **Diameter: a request that finds the connection's dispatch queue full is answered, not dropped.** The reader used to drop it with a log line and the peer timed out (44 of a 300-request burst on one connection). It now answers 3004 with the stepped OC-OLR for a DOIC requester, counted in `siphon_diameter_overload_abated_total{node="dispatch_queue"}`, and 3002 when the queue is closed. The queue holds 32 requests, or `reporting.admission_limit` when that is larger, so the admission gate is what normally sheds.
 - A Diameter server admits a peer under the most specific `allowed_ips` entry that contains its address, not the first one. The tenants are read from a map in no fixed order, so a test client's host address inside another tenant's network was admitted under either tenant depending on the process.
 - The local address of a P-CSCF's IPsec SAs is the address its protected ports listen on. It was the first UDP listener's, so a P-CSCF with a core-side listener ahead of Gm programmed SAs no protected packet matched (TS 33.203 clause 7.1).
 - **`forward_to` answers with the Hop-by-Hop Identifier the request came with when the next hop fails.** The 3002 or 3004 siphon makes for a backend that is gone, silent or answers what does not parse carried the identifier siphon had used towards the backend, so the peer that sent the request could not match the answer and waited for its own timer (RFC 6733 section 6.2).
