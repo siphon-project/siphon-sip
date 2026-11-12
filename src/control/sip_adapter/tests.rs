@@ -146,7 +146,7 @@ fn stream_start_expands_the_uri_for_the_channels_call() {
     .expect("expands");
     assert_eq!(
         uri,
-        "wss://asr.example.test/sipcid@host/caller-tag?from=1001"
+        "wss://asr.example.test/sipcid%40host/caller-tag?from=1001"
     );
     // No placeholder: passed through as written.
     assert_eq!(

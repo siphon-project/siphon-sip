@@ -7,6 +7,7 @@ the announcement, DTMF, and echo-test surface added for MMTEL / TAS-style script
 from __future__ import annotations
 
 import asyncio
+import urllib.parse
 
 import pytest
 
@@ -582,8 +583,24 @@ class TestWebSocketBridge:
         )
         assert harness.rtpengine.ws_uris[-1] == (
             "offer",
-            "wss://ai.example.com/abc123@example.invalid",
+            "wss://ai.example.com/abc123%40example.invalid",
         )
+
+    def test_placeholder_values_are_percent_encoded(self, harness):
+        call_id = 'a+b%41/c?d&e "x"'
+        asyncio.run(
+            harness.rtpengine.offer(
+                Call(call_id=call_id),
+                profile="voice_ai",
+                ws_uri="wss://ai.example.com/s?call={call_id}&leg=1",
+            )
+        )
+        expanded = harness.rtpengine.ws_uris[-1][1]
+        assert expanded == (
+            "wss://ai.example.com/s?call=a%2Bb%2541%2Fc%3Fd%26e%20%22x%22&leg=1"
+        )
+        query = urllib.parse.urlsplit(expanded).query
+        assert urllib.parse.parse_qsl(query) == [("call", call_id), ("leg", "1")]
 
     def test_user_placeholders_expand_from_uris(self, harness):
         call = Call(
@@ -730,7 +747,7 @@ class TestWebSocketTee:
             )
         )
         recorded = harness.rtpengine.media_calls[-1]
-        assert recorded["ws_uri"] == "wss://asr.example.com/call-6@example.invalid"
+        assert recorded["ws_uri"] == "wss://asr.example.com/call-6%40example.invalid"
 
     def test_attach_refuses_a_misspelt_placeholder(self, harness):
         with pytest.raises(ValueError, match="callid"):
@@ -747,7 +764,7 @@ class TestWebSocketTee:
             )
         )
         recorded = harness.rtpengine.media_calls[-1]
-        assert recorded["ws_uri"] == "wss://ai.example.com/call-8@example.invalid"
+        assert recorded["ws_uri"] == "wss://ai.example.com/call-8%40example.invalid"
 
     def test_tee_started_handler_receives_the_wire_shape(self, harness):
         # The wire shape is the payload's point: a consumer decodes the binary
