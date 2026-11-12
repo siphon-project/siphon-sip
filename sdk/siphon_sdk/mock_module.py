@@ -19,6 +19,7 @@ import inspect
 import re
 import sys
 import time
+import urllib.parse
 import uuid
 from types import ModuleType
 from typing import Any, Awaitable, Callable, Optional, Union
@@ -5517,7 +5518,9 @@ class MockRtpEngine:
         (the last two supply no user parts). An unknown placeholder, or one the
         call has no value for, raises ``ValueError`` rather than passing
         through as a literal — a typo'd ``{callid}`` would otherwise reach the
-        media engine as part of the URI path.
+        media engine as part of the URI path. Each value is percent-encoded as
+        one URI component (every byte outside RFC 3986 unreserved becomes
+        ``%XX``), so a Call-ID with ``+``, ``/`` or ``&`` arrives intact.
         """
         if "{" not in template:
             return template
@@ -5542,7 +5545,9 @@ class MockRtpEngine:
                 raise ValueError(
                     f"ws_uri placeholder {{{name}}} has no value on this call"
                 )
-            expanded = expanded.replace("{" + name + "}", str(values[name]))
+            expanded = expanded.replace(
+                "{" + name + "}", urllib.parse.quote(str(values[name]), safe="")
+            )
         return expanded
 
     def _forget_legs(self, call_id: Optional[str], scope: Optional[str]) -> None:
