@@ -1011,7 +1011,7 @@
       "forward_to": {
         "doc": "Relay this request to `peer` and await the answer. On loop detection,",
         "kind": "method_descriptor",
-        "sig": "($self, peer, identity=None, timeout_secs=10.0)"
+        "sig": "($self, peer, identity=None, timeout_secs=10.0, *, retransmitted=False)"
       },
       "get_avp": {
         "kind": "method_descriptor",
