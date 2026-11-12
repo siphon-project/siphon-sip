@@ -1039,4 +1039,10 @@ the pool the peer was picked from (`diameter.peer_pool(...).pick_*`), and
 unless the request names a Destination-Host. The typed helpers
 (`cx_*`, `sh_*`, `rf_*`, `ro_*` and the rest) do not retry: they keep the
 failover their own sessions have. `siphon_diameter_retries_total{reason}`
-counts the retries.
+counts the retries. A request sent to an alternate peer carries the T
+(potentially retransmitted) flag (RFC 6733 sections 5.5.4 and 6.1.8), with the
+End-to-End Identifier unchanged and a fresh Hop-by-Hop Identifier.
+
+A script that fails over by itself (for example a DRA that walks its own peer
+order per subscriber) sets the flag with `req.forward_to(peer,
+retransmitted=True)`; the default `False` sends the request as it came.
