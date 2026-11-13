@@ -13,6 +13,12 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.15.13] — 2026-11-13
+
+### Security
+
+- The `siphon` binary is built with hickory-net, hickory-proto and hickory-resolver 0.26.3 (RUSTSEC-2026-0506, -0507, -0508, -0513, -0514, -0515, -0516: DNSSEC validation and resolver retry bounds).
+
 ### Added
 
 - **`registrar.event_capacity` and snapshot metrics.** Sizes the buffer behind `@registrar.on_change` and `RegistrationChanged` (default 4096, floor 64; it was a fixed 1024). `siphon_event_consumer_snapshots_total{consumer}` counts recovery runs started after a lag and `siphon_event_consumer_snapshot_aors_total{consumer}` the AoRs they re-reported, for the registrar and registrant consumers.
