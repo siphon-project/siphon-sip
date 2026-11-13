@@ -335,6 +335,46 @@ pub(crate) async fn liveness_on_flow_close(
     }
 }
 
+/// Whether this instance accepted `contact`, so that its security
+/// associations are the ones in this instance's kernel. With a shared
+/// registrar an instance also holds bindings that other instances accepted,
+/// and a UE address is handed to another UE once its PDN connection ends: a
+/// pair here for that address says nothing about a binding accepted
+/// elsewhere. Without a configured identity there is only this instance.
+pub(super) fn accepted_here(
+    own: Option<&crate::registrar::InstanceIdentity>,
+    contact: &crate::registrar::Contact,
+) -> bool {
+    match own {
+        Some(own) => contact.instance_id() == Some(own.id.as_str()),
+        None => true,
+    }
+}
+
+/// The bindings the reaped pairs protected: accepted by this instance and
+/// registered from the pair's own UE address and client port. Another binding
+/// on the same address belongs to another pair (re-authentication moved the
+/// UE to new ports) or to another instance.
+pub(super) fn reaped_sa_bindings(
+    contacts: Vec<(crate::registrar::Aor, crate::registrar::Contact)>,
+    reaped: &[(std::net::IpAddr, u16)],
+    own: Option<&crate::registrar::InstanceIdentity>,
+) -> Vec<(crate::registrar::Aor, crate::registrar::Contact, u16)> {
+    contacts
+        .into_iter()
+        .filter_map(|(aor, contact)| {
+            let source = contact.source_addr?;
+            if !accepted_here(own, &contact) {
+                return None;
+            }
+            reaped
+                .iter()
+                .any(|(ip, port)| *ip == source.ip() && *port == source.port())
+                .then(|| (aor, contact, source.port()))
+        })
+        .collect()
+}
+
 /// Part B.4 — an abandoned UE's SA pair was just reaped from the kernel;
 /// remove the matching registrar binding(s) so the registration doesn't
 /// linger to its own `Expires`.  Runs synchronously in the sweep because the
@@ -349,25 +389,17 @@ pub(super) async fn liveness_dereg_reaped_sas(
         None => return,
     };
     let context = LivenessDeregCtx::from_state(state, registrar);
-    let reaped_ips: std::collections::HashSet<std::net::IpAddr> =
-        reaped.iter().map(|(ip, _)| *ip).collect();
-    let port_for: std::collections::HashMap<std::net::IpAddr, u16> =
-        reaped.iter().map(|(ip, port)| (*ip, *port)).collect();
-
-    for (aor, contact) in context.registrar.all_contacts() {
-        let ue_ip = match contact.source_addr {
-            Some(addr) => addr.ip(),
-            None => continue,
-        };
-        if !reaped_ips.contains(&ue_ip) {
-            continue;
-        }
-        let ue_port_c = port_for.get(&ue_ip).copied();
+    let victims = reaped_sa_bindings(
+        context.registrar.all_contacts(),
+        reaped,
+        context.registrar.instance_identity(),
+    );
+    for (aor, contact, ue_port_c) in victims {
         liveness_dereg_contact(
             &context,
             &aor,
             &contact,
-            ue_port_c,
+            Some(ue_port_c),
             "ipsec SA torn down (abandoned-SA sweep)",
         )
         .await;
@@ -432,8 +464,15 @@ pub(super) async fn sweep_registrar_liveness(state: &DispatcherState) {
     let mut ipsec_protected = 0usize;
     let mut suspects = 0usize;
 
+    let own = context.registrar.instance_identity().cloned();
     for (aor, contact) in context.registrar.all_contacts() {
         total += 1;
+        // Only this instance's own bindings are judged against its SAs; one
+        // accepted elsewhere may share a reassigned UE address with a stale
+        // pair here.
+        if !accepted_here(own.as_ref(), &contact) {
+            continue;
+        }
         let ue_addr = match contact.source_addr {
             Some(addr) => addr,
             None => continue,

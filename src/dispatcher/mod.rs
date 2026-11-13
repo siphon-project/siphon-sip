@@ -78,6 +78,8 @@ mod late_answer;
 mod liveness;
 #[cfg(test)]
 mod liveness_network_dereg_tests;
+#[cfg(test)]
+mod liveness_ownership_tests;
 mod media_init;
 mod proxy_dialog_state;
 mod proxy_release;

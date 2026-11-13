@@ -334,3 +334,55 @@ async fn a_challenge_to_a_protected_re_register_still_leaves_over_the_pair() {
     );
     assert!(!log.contains("TCP connect"), "{log}");
 }
+
+/// A retransmitted 2xx to an INVITE a protected UE sent, forwarded statelessly
+/// by its Via once the proxy holds nothing for it (RFC 3261 §16.7 step 9),
+/// goes over the UE's pair like the first copy: from the P-CSCF's protected
+/// client port to the UE's protected server port (TS 33.203 clause 7.1, UDP
+/// case), never in clear from the plain listener to a protected port.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_2xx_forwarded_statelessly_to_a_protected_ue_leaves_over_the_pair() {
+    let harness = p_cscf();
+    let ue: IpAddr = "198.51.100.160".parse().expect("an address");
+    install(&harness.manager, ue, UE_PORT_C).await;
+    let raw = format!(
+        concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP {plain};branch=z9hG4bK-0123456789abcdef0123456789abcdef\r\n",
+            "Via: SIP/2.0/UDP {ue}:{port_us};branch=z9hG4bKue160\r\n",
+            "From: <sip:001010000000160@ims.example.invalid>;tag=ue\r\n",
+            "To: <sip:+15550100@ims.example.invalid>;tag=callee\r\n",
+            "Call-ID: late-160\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Contact: <sip:callee@198.51.100.12:5060>\r\n",
+            "Content-Length: 0\r\n\r\n",
+        ),
+        plain = PLAIN,
+        ue = ue,
+        port_us = UE_PORT_S,
+    );
+    let response = parse_sip_message_bytes(raw.as_bytes()).expect("the 200 parses");
+
+    let taken = forward_2xx_statelessly(
+        &inbound(addr(REGISTRAR), addr(PLAIN), raw.as_bytes()),
+        &response,
+        200,
+        &harness.proxy.state,
+    );
+
+    assert!(taken, "the 2xx is forwarded");
+    let sent: Vec<_> = harness
+        .proxy
+        .udp
+        .try_iter()
+        .map(|outbound| (outbound.destination, outbound.source_local_addr))
+        .collect();
+    assert_eq!(
+        sent,
+        [(
+            SocketAddr::new(ue, UE_PORT_S),
+            Some(SocketAddr::new(PCSCF.parse().expect("an address"), PORT_PC)),
+        )],
+        "the 2xx goes from port_pc to port_us"
+    );
+}

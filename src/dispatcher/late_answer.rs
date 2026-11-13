@@ -365,12 +365,18 @@ pub(super) fn forward_2xx_statelessly(
             }
         }
     } else {
+        // A UE's protected port is reached only over its pair, from the
+        // P-CSCF port that pairs with it (TS 33.203 clause 7.1), as the first
+        // copy went; the Via names the UE's protected server port, which the
+        // UDP egress alone does not map.
+        let source =
+            protected_request(destination, transport, state).map(|protected| protected.source);
         send_outbound_from(
             data,
             transport,
             destination,
             ConnectionId::default(),
-            None,
+            source,
             state,
         );
     }
