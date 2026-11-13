@@ -1107,7 +1107,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3a8d85a582b3b8e788dd4c36a44974b40143bc45a87e7298a6eb3b96cff1a72"
 dependencies = [
  "inap",
- "rasn",
+ "rasn 0.29.0",
  "thiserror 2.0.21",
 ]
 
@@ -1118,7 +1118,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b756ee6565fd9c7823c15123b61b81fbadca469f64de4243a8d16f5620ba2995"
 dependencies = [
  "hex",
- "rasn",
+ "rasn 0.29.0",
  "sccp",
  "tcap",
  "thiserror 2.0.21",
@@ -1502,7 +1502,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "494431b43612e8109b96b938835a096383aed170fec271cc1a63e690d25321ec"
 dependencies = [
- "rasn",
+ "rasn 0.29.0",
  "thiserror 2.0.21",
 ]
 
@@ -2616,7 +2616,29 @@ dependencies = [
  "num-integer",
  "num-traits",
  "once_cell",
- "rasn-derive",
+ "rasn-derive 0.29.0",
+ "serde_json",
+ "snafu",
+ "xml-no-std",
+]
+
+[[package]]
+name = "rasn"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8099261c639cababe4b27ab20fb3f9c7cef5e014a12bc63a0fc09a1b90d7751b"
+dependencies = [
+ "bitvec",
+ "bytes",
+ "cfg-if",
+ "chrono",
+ "either",
+ "nom 7.1.3",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+ "once_cell",
+ "rasn-derive 0.30.0",
  "serde_json",
  "snafu",
  "xml-no-std",
@@ -2629,7 +2651,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "261556388c573dde262717e06ad2c9a9ed78405418f16f2789a0dd8004793fba"
 dependencies = [
  "proc-macro2",
- "rasn-derive-impl",
+ "rasn-derive-impl 0.29.0",
+ "syn 2.0.118",
+]
+
+[[package]]
+name = "rasn-derive"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffcc5d3631747eae0d97d3444c479135c037de13f0701a7ea60732a25eb7ac97"
+dependencies = [
+ "proc-macro2",
+ "rasn-derive-impl 0.30.0",
  "syn 2.0.118",
 ]
 
@@ -2638,6 +2671,20 @@ name = "rasn-derive-impl"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e17b9360b511cde533e75baa711dc652f6f613457afe02a66c748ccd6c31ef7"
+dependencies = [
+ "either",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+ "uuid",
+]
+
+[[package]]
+name = "rasn-derive-impl"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f55d80a38e4e6a8e435cf61e1144f62219fb7ea3c5bd682e216cb4c32c363114"
 dependencies = [
  "either",
  "itertools",
@@ -2660,9 +2707,11 @@ dependencies = [
  "combine",
  "futures-util",
  "itoa",
+ "log",
  "num-bigint",
  "percent-encoding",
  "pin-project-lite",
+ "rand 0.10.1",
  "ryu",
  "sha1_smol",
  "socket2 0.6.4",
@@ -3217,8 +3266,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sigtran"
-version = "5.1.1"
-source = "git+https://github.com/siphon-project/siphon-sigtran?tag=v5.1.1#905e6a7c6c51d1b27e6d2e78569292cb388f92dc"
+version = "7.0.0"
+source = "git+https://github.com/siphon-project/siphon-sigtran?tag=v7.0.0#30abe037c566680d9062391d30f48bd69fa9e4b4"
 dependencies = [
  "async-sctp",
  "gsm_cap",
@@ -3229,7 +3278,7 @@ dependencies = [
  "m3ua",
  "mtp3",
  "pyo3",
- "rasn",
+ "rasn 0.29.0",
  "sccp",
  "serde",
  "serde-saphyr",
@@ -3244,7 +3293,7 @@ dependencies = [
 [[package]]
 name = "siphon-sip"
 version = "1.15.12"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#3b5c8c64329dc30e0b3cc7c797c4b556501ca870"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#6f806b5a7c2fbe5078eb116be4c47a5b1e3bbe10"
 dependencies = [
  "aes",
  "arc-swap",
@@ -3276,8 +3325,8 @@ dependencies = [
  "pyo3",
  "pyo3-async-runtimes",
  "quick-xml",
- "rasn",
- "rasn-derive",
+ "rasn 0.30.0",
+ "rasn-derive 0.30.0",
  "redis",
  "regex",
  "reqwest",
@@ -3570,7 +3619,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c96f554e05c74b472c963b9a0e090682d1b70d6a4a39425291e0b5795cbb6819"
 dependencies = [
  "hex",
- "rasn",
+ "rasn 0.29.0",
  "thiserror 2.0.21",
 ]
 
