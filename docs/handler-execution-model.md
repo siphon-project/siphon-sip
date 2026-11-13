@@ -16,7 +16,7 @@ heap leak):
 | Pool | Runs | Size config | Default |
 |------|------|-------------|---------|
 | **Sync executor** (`PyExecutor`) | sync `@proxy.on_request`, `@proxy.on_reply`, `@registrar.on_change`, `@rtpengine.on_dtmf`, timers, … | `script.sync_pool_size` / `script.sync_pool_max` | core `max(8, 2×CPUs)`, max `max(32, 4×core)` |
-| **Async driver pool** (`AsyncPool`) | `async def` handlers that use asyncio itself + their `asyncio.create_task` work (a handler a host extension calls that awaits only siphon APIs stays on the sync executor, see [What an await costs](#what-an-await-costs)) | `script.async_pool_size` | CPUs |
+| **Async driver pool** (`AsyncPool`) | `async def` handlers that use asyncio itself + their `asyncio.create_task` work (one that awaits only siphon APIs stays on the sync executor, see [What an await costs](#what-an-await-costs)) | `script.async_pool_size` | CPUs |
 
 ### The sync pool is elastic
 
@@ -303,8 +303,7 @@ events) still hold their worker until the coroutine settles, so for them the
 
 ### What an await costs
 
-A handler a host extension calls through `ScriptHandle` (an HTTP route, a
-GTP-C message, a peer event) that awaits only siphon's own awaitable APIs
+A handler that awaits only siphon's own awaitable APIs
 (`await diameter.cx_uar(...)`, `await cache.fetch(...)`,
 `await proxy.send_request(...)`, an extension's awaitable built with
 `siphon::script::blocking::awaitable`) does not use asyncio at all. The worker that called the handler
@@ -370,10 +369,10 @@ go back to the direct path when the setting is removed. siphon also drives one
 handler through every step of the direct path at start-up and leaves the path
 off, with an error in the log, if the interpreter does not behave as expected.
 
-This applies to the handlers a host extension calls through `ScriptHandle`.
-`@proxy.on_request` and the Diameter server handlers give their worker back
-while they await but still run on a driver, as do the handler kinds that hold
-their worker until the coroutine settles (listed above).
+This applies to the handlers that give their worker back while they await:
+`@proxy.on_request`, the Diameter server handlers, and the handlers a host
+extension calls through `ScriptHandle`. The handler kinds that hold their
+worker until the coroutine settles (listed above) run on a driver as before.
 
 ### Where an awaitable API finishes
 

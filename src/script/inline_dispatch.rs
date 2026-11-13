@@ -283,26 +283,6 @@ pub(crate) fn start_coroutine(
     python: Python<'_>,
     coroutine: &Bound<'_, pyo3::PyAny>,
 ) -> PyResult<CoroutineStart> {
-    start(python, coroutine, false)
-}
-
-/// [`start_coroutine`] for a caller that has opted in to having the executor
-/// drive the coroutine itself while all it awaits is siphon's own awaitables
-/// ([`crate::script::direct`]), with a driver as the fallback the moment it
-/// uses asyncio. So far that is `ScriptHandle`; the request and Diameter
-/// dispatchers still start every suspending coroutine on a driver.
-pub(crate) fn start_coroutine_direct(
-    python: Python<'_>,
-    coroutine: &Bound<'_, pyo3::PyAny>,
-) -> PyResult<CoroutineStart> {
-    start(python, coroutine, true)
-}
-
-fn start(
-    python: Python<'_>,
-    coroutine: &Bound<'_, pyo3::PyAny>,
-    direct: bool,
-) -> PyResult<CoroutineStart> {
     if let Some(value) = run_coroutine_inline(python, coroutine)? {
         return Ok(CoroutineStart::Finished(value));
     }
@@ -311,20 +291,13 @@ fn start(
     {
         if let Some(pool) = crate::script::async_pool::AsyncPool::global() {
             use crate::script::direct::DirectStart;
-            if direct {
-                match crate::script::direct::start(&pool, python, coroutine) {
-                    Some(DirectStart::Finished(result)) => {
-                        return result.map(CoroutineStart::Finished)
-                    }
-                    Some(DirectStart::Pending(pending)) => {
-                        return Ok(CoroutineStart::Suspended(pending))
-                    }
-                    // Its handler uses asyncio: it starts on a driver.
-                    None => {}
-                }
-            }
-            return PendingCoroutine::submit(&pool, python, coroutine)
-                .map(CoroutineStart::Suspended);
+            return match crate::script::direct::start(&pool, python, coroutine) {
+                Some(DirectStart::Finished(result)) => result.map(CoroutineStart::Finished),
+                Some(DirectStart::Pending(pending)) => Ok(CoroutineStart::Suspended(pending)),
+                // Its handler uses asyncio: it starts on a driver.
+                None => PendingCoroutine::submit(&pool, python, coroutine)
+                    .map(CoroutineStart::Suspended),
+            };
         }
     }
     drive_suspending_coroutine(python, coroutine).map(CoroutineStart::Finished)
