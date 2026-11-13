@@ -146,3 +146,104 @@ async fn next_write_recovers_after_sentinel_failover() {
         assert_eq!(replica.get::<_, String>("before").await.unwrap(), "first");
     }).await.expect("Sentinel failover test exceeded 45 seconds");
 }
+
+/// A CA and a server certificate it signed for 127.0.0.1, as PEM.
+struct Pki {
+    ca: String,
+    certificate: String,
+    key: String,
+}
+fn pki() -> Pki {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType};
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca = CertificateParams::new(vec!["Redis Test CA".to_string()]).unwrap();
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_pem = ca.self_signed(&ca_key).unwrap().pem();
+    let key = KeyPair::generate().unwrap();
+    let mut leaf = CertificateParams::new(Vec::<String>::new()).unwrap();
+    leaf.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().unwrap())];
+    let certificate = leaf.signed_by(&key, &Issuer::new(ca, ca_key)).unwrap();
+    Pki {
+        ca: ca_pem,
+        certificate: certificate.pem(),
+        key: key.serialize_pem(),
+    }
+}
+
+async fn connected(target: &RedisTarget, processes: &mut Processes) -> Option<RedisConnection> {
+    for _ in 0..100 {
+        if let Ok(connection) = RedisConnection::connect(target.clone()).await {
+            return Some(connection);
+        }
+        // A redis-server built without TLS exits on the tls-port directive.
+        if processes
+            .children
+            .iter_mut()
+            .any(|child| matches!(child.try_wait(), Ok(Some(_))))
+        {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("no connection to {target:?} within the deadline");
+}
+
+#[tokio::test]
+async fn tls_with_a_private_ca_reaches_a_server_and_a_sentinel_set() {
+    if !Path::new("/usr/bin/redis-server").exists() {
+        eprintln!("SKIP tls_with_a_private_ca_reaches_a_server_and_a_sentinel_set: /usr/bin/redis-server absent");
+        return;
+    }
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let reservations: Vec<_> = (0..2).map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+        let ports: Vec<_> = reservations.iter().map(|listener| listener.local_addr().unwrap().port()).collect();
+        drop(reservations);
+        let mut processes = Processes { children: Vec::new(), directory: tempfile::tempdir().unwrap() };
+        let directory = processes.directory.path().to_path_buf();
+        let pki = pki();
+        for (name, pem) in [("ca.pem", &pki.ca), ("server.pem", &pki.certificate), ("server.key", &pki.key), ("other-ca.pem", &self::pki().ca)] {
+            std::fs::write(directory.join(name), pem).unwrap();
+        }
+        let ca = directory.join("ca.pem").display().to_string();
+        let other_ca = directory.join("other-ca.pem").display().to_string();
+        // TLS only: the plaintext port is closed, and a Sentinel dials the data nodes over TLS.
+        let tls = |port: u16| format!(
+            "port 0\ntls-port {port}\ntls-cert-file {0}/server.pem\ntls-key-file {0}/server.key\ntls-ca-cert-file {ca}\ntls-auth-clients no\ntls-replication yes",
+            directory.display()
+        );
+
+        processes.start(ports[0], &tls(ports[0]), false);
+        let direct = RedisTarget::from_url(format!("rediss://127.0.0.1:{}?ca_file={ca}", ports[0])).unwrap();
+        let Some(mut connection) = connected(&direct, &mut processes).await else {
+            eprintln!("SKIP tls_with_a_private_ca_reaches_a_server_and_a_sentinel_set: redis-server has no TLS");
+            return;
+        };
+        let _: () = connection.set("over-tls", "first").await.unwrap();
+        for refused in [
+            format!("rediss://127.0.0.1:{}?ca_file={other_ca}", ports[0]),
+            format!("rediss://127.0.0.1:{}", ports[0]),
+            format!("redis://127.0.0.1:{}", ports[0]),
+        ] {
+            let target = RedisTarget::from_url(refused.clone()).unwrap();
+            assert!(RedisConnection::connect(target).await.is_err(), "{refused}");
+        }
+
+        processes.start(ports[1], &format!("{}\nsentinel monitor primary 127.0.0.1 {} 1", tls(ports[1]), ports[0]), true);
+        let structured: RedisTarget = serde_saphyr::from_str(&format!(
+            "sentinel:\n  master: primary\n  addresses: [127.0.0.1:{}]\ntls:\n  ca_file: {ca}", ports[1]
+        )).unwrap();
+        let in_url = RedisTarget::from_url(format!("rediss+sentinel://127.0.0.1:{}/primary?ca_file={ca}", ports[1])).unwrap();
+        for target in [structured, in_url] {
+            let mut connection = connected(&target, &mut processes).await.expect("the Sentinel set over TLS");
+            assert_eq!(connection.get::<_, String>("over-tls").await.unwrap(), "first");
+        }
+        for refused in [
+            format!("rediss+sentinel://127.0.0.1:{}/primary?ca_file={other_ca}", ports[1]),
+            format!("rediss+sentinel://127.0.0.1:{}/primary", ports[1]),
+            format!("redis+sentinel://127.0.0.1:{}/primary", ports[1]),
+        ] {
+            let target = RedisTarget::from_url(refused.clone()).unwrap();
+            assert!(RedisConnection::connect(target).await.is_err(), "{refused}");
+        }
+    }).await.expect("TLS test exceeded 45 seconds");
+}

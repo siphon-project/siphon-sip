@@ -509,3 +509,70 @@ rediscovery.
 
 Cache `store` and `delete` return `false` when the Redis write fails, even if
 the local LRU was updated; they no longer report a failed write as successful.
+
+### Redis / Valkey over TLS
+
+A `rediss://` URL connects over TLS (rustls) and verifies the server
+certificate: its chain and its name, against the host in the URL. A
+certificate whose subjectAltName is an IP address verifies when the URL names
+that address. There is no setting that turns verification off.
+
+Without anything else the certificate must chain to the public web roots built
+into the binary (the Mozilla set), not to the host's trust store. A managed
+Redis or Valkey usually signs with a private CA; give that CA as a PEM bundle
+in `tls.ca_file`, beside `url`, and the server is verified against it alone:
+
+```yaml
+registrar:
+  backend: redis
+  redis:
+    url: "rediss://:${REDIS_PASSWORD}@192.0.2.10:6380/0"
+    tls:
+      ca_file: /etc/siphon/redis-ca.pem
+
+cache:
+  - name: routing
+    url: "rediss://valkey.example.net:6380/1"
+    tls:
+      ca_file: /etc/siphon/redis-ca.pem
+```
+
+The URL carries the same setting as a `ca_file` parameter, so a target written
+from the environment needs no other key, and a shard in `urls` takes it too:
+
+```yaml
+cache:
+  - name: routing
+    url: "${CACHE_URL:-redis://192.0.2.10:6379}"
+# CACHE_URL=rediss://192.0.2.10:6380/1?ca_file=/etc/siphon/redis-ca.pem
+```
+
+Percent-encode a path that holds anything but letters, digits and `/ - . _ ~`.
+Give the CA in one place, `tls.ca_file` or the URL, not both.
+
+A Sentinel set uses TLS when `tls:` stands beside `sentinel:` (an empty
+`tls: {}` verifies against the public roots), or when its URL starts with
+`rediss+sentinel://`, which takes the same `ca_file` parameter. TLS then covers
+the connections to the sentinels and to the data nodes, all verified against
+the one CA. Sentinels report data nodes by IP address unless they are set to
+announce hostnames, so the data nodes' certificates need those addresses as
+subjectAltNames.
+
+```yaml
+registrar:
+  backend: redis
+  redis:
+    sentinel:
+      addresses: ["192.0.2.10:26379", "192.0.2.11:26379", "192.0.2.12:26379"]
+      master: primary
+    tls:
+      ca_file: /etc/siphon/redis-ca.pem
+# or: url: "rediss+sentinel://192.0.2.10,192.0.2.11,192.0.2.12/primary?ca_file=/etc/siphon/redis-ca.pem"
+```
+
+The file is read and checked when the configuration loads: a `ca_file` that is
+missing, holds no certificate or holds one that is not a usable CA stops the
+start with an error, as does `tls:` or `ca_file` on a `redis://` or
+`redis+sentinel://` target. It is read again at each reconnect, so a replaced
+bundle is picked up without a restart; if it has become unreadable the
+reconnect fails and says so, it does not fall back to the public roots.

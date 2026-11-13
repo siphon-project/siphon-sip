@@ -143,7 +143,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Registrar persistence backends (optional, feature-flagged)
-redis = { version = "1", features = ["tokio-comp", "sentinel"], optional = true }
+redis = { version = "1", features = ["tokio-comp", "sentinel", "tokio-rustls-comp", "tls-rustls-webpki-roots"], optional = true }
 tokio-postgres = { version = "0.7", optional = true }
 prometheus = { version = "0.14", features = ["process"] }
 axum = { version = "0.8.8", features = ["tokio", "ws"] }

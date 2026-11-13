@@ -414,6 +414,11 @@ registrar:
   #   #   password: "${REDIS_PASSWORD}"             # optional, data nodes
   #   #   sentinel_password: "${SENTINEL_PASSWORD}" # optional, Sentinels
   #   #   db: 0                                     # optional, default 0
+  #   # TLS: a rediss:// (or rediss+sentinel://) URL. The server certificate is
+  #   # always verified; for a private CA give its PEM bundle here, or in the
+  #   # URL as ?ca_file=/etc/siphon/redis-ca.pem. See docs/deployment.md.
+  #   # tls:
+  #   #   ca_file: /etc/siphon/redis-ca.pem
   #   # Sharded: shard_count plus urls, each a URL string or a sentinel: mapping.
   #   key_prefix: "siphon:reg:"   # namespace prefix (default: "siphon:reg:")
   #   ttl_slack_secs: 30          # extra seconds beyond expires for race safety
@@ -1061,6 +1066,8 @@ auth:
 #   - name: "cnam"
 #     url: "redis://127.0.0.1:6379"
 #     # or sentinel: {addresses: [...], master: primary}, as for the registrar
+#     # TLS with a private CA, as for the registrar: a rediss:// url and
+#     # tls: {ca_file: /etc/siphon/redis-ca.pem}, or ?ca_file=... in the url
 #     local_ttl_secs: 60       # optional in-process LRU in front of Redis
 #     local_max_entries: 10000
 
