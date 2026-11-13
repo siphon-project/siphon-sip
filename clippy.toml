@@ -44,4 +44,10 @@ disallowed-methods = [
   { path = "tokio::sync::mpsc::Receiver::blocking_recv", reason = "parks the thread; await it, or wrap in blocking_released" },
   { path = "tokio::sync::mpsc::UnboundedReceiver::blocking_recv", reason = "parks the thread; await it, or wrap in blocking_released" },
   { path = "tokio::sync::oneshot::Receiver::blocking_recv", reason = "parks the thread; await it, or wrap in blocking_released" },
+  # Not a wait: siphon raises its RLIMIT_NOFILE soft limit to the hard limit at
+  # startup, and a child must get the original back (it may be a C program
+  # using select()). Every spawn goes through crate::fd_limit, whose one
+  # constructor is the allowed exception.
+  { path = "std::process::Command::new", reason = "use crate::fd_limit::command, which restores the original RLIMIT_NOFILE in the child" },
+  { path = "tokio::process::Command::new", reason = "use crate::fd_limit::tokio_command, which restores the original RLIMIT_NOFILE in the child" },
 ]

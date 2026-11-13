@@ -131,14 +131,23 @@ pub async fn listen(
     let sip_connection_map = channels.sip_connection_map;
     let websocket_connection_map = channels.websocket_connection_map;
 
+    let mut accept_backoff = crate::transport::accept_backoff::AcceptBackoff::new(
+        format!(
+            "{}+{}",
+            sip_transport.as_scheme(),
+            websocket_transport.as_scheme()
+        ),
+        bound,
+    );
     tokio::spawn(async move {
         loop {
             let (mut tcp_stream, remote_addr) = match listener.accept().await {
-                Ok(accepted) => accepted,
+                Ok(accepted) => {
+                    accept_backoff.on_success();
+                    accepted
+                }
                 Err(error) => {
-                    tracing::error!(
-                        "{sip_transport}+{websocket_transport} mux accept error: {error}"
-                    );
+                    accept_backoff.on_error(&error).await;
                     continue;
                 }
             };

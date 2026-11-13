@@ -9,6 +9,10 @@ released helpers in `src/script/blocking.rs` / `src/script/waits.rs`, or runs
 on a dedicated thread that never attaches, each allowed with its reason beside
 it. Without this the easy way past the lint is another `#[allow]`.
 
+One allow is not a wait: `Command::new` is disallowed so every child process
+is built by `crate::fd_limit::command`, which restores the original
+RLIMIT_NOFILE in the child; that constructor is the allowed site.
+
 Counts `src/` only: test, bench and example crates allow it at their root.
 
 Lower BUDGET whenever one goes.
@@ -20,7 +24,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-BUDGET = 16
+BUDGET = 17
 NEEDLE = "#[allow(clippy::disallowed_methods)]"
 
 

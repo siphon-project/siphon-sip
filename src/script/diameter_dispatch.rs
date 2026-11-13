@@ -440,26 +440,22 @@ fn spawn_listener(
         };
         info!(%addr, %transport, "Diameter server listening");
 
-        loop {
-            match listener.accept().await {
-                Ok((stream, peer_addr)) => {
-                    let handshake = Arc::clone(&handshake);
-                    let engine = Arc::clone(&engine);
-                    let semaphore = Arc::clone(&semaphore);
-                    let identities = Arc::clone(&identities);
-                    tokio::spawn(async move {
-                        serve_connection(
-                            stream, peer_addr, transport, handshake, engine, semaphore, identities,
-                        )
-                        .await;
-                    });
-                }
-                Err(error) => {
-                    warn!(%addr, %transport, %error, "Diameter server: accept error");
-                    return;
-                }
-            }
-        }
+        // An accept error used to end this task, so one EMFILE took the
+        // Diameter server down for good; `accept_forever` backs off instead.
+        listener
+            .accept_forever(&addr, |stream, peer_addr| {
+                let handshake = Arc::clone(&handshake);
+                let engine = Arc::clone(&engine);
+                let semaphore = Arc::clone(&semaphore);
+                let identities = Arc::clone(&identities);
+                tokio::spawn(async move {
+                    serve_connection(
+                        stream, peer_addr, transport, handshake, engine, semaphore, identities,
+                    )
+                    .await;
+                });
+            })
+            .await;
     });
 }
 

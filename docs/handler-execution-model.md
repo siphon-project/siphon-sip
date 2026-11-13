@@ -234,6 +234,12 @@ Design accordingly:
   ring with the control plane's `ring` verb and then connect it with an anchored
   `answer` (see [the control-plane reference](reference/control-plane.md)).
 
+- **Never `select.select()`.** siphon raises its file limit far above 1024 at
+  startup, so a socket a script opens can get a descriptor number past
+  `FD_SETSIZE`, and `select.select()` raises `ValueError: filedescriptor out of
+  range in select()` on it. Use `selectors.DefaultSelector` (epoll) or
+  `asyncio`.
+
 ### Blocking calls must release the interpreter (free-threaded GC safety)
 
 On free-threaded CPython (3.14t) the cyclic GC performs a **stop-the-world**:

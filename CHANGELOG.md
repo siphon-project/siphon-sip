@@ -168,6 +168,44 @@ entry, but a working config keeps working.
 - **P-CSCF: no TCP connection over a security association the UE no longer (or not yet) holds.** The RFC 3261 §18.1.1 over-MTU switch toward a protected UE opened a connection from the protected client port to the UE's protected server port whenever the destination matched any pair, including an old set kept only for its pending transactions after a de-registration and a pair a challenge just set up. A UE that had de-registered refused that connect, and the request went fragmented over UDP after it. The switch now takes only a pair in use for that exact flow (UE address and port) and not being retired; a pair kept for the NOTIFY of a network de-registration still qualifies (TS 24.229 clause 5.2.5.2). The ports of a pair already deleted get no TCP probe at all, protected or in clear. Responses never take this path: a response goes back over the transport and listener its request came in on, to its source (RFC 3261 §18.2.2, RFC 3581), so the challenge to an initial REGISTER sent unprotected is answered unprotected over UDP whatever its size, while the UE's previous pair is still being retired.
 - **Outbound registration: shutdown de-registers every binding and registers nothing again (TS 24.229 5.1.1.6, RFC 3261 §10.2.2).** On SIGTERM the de-REGISTERs removed every entry, and the next tick of the registration loop then closed every per-UE socket and TCP connection, so the answers to the de-REGISTERs were never received and their SA sets never released, a challenged de-REGISTER could not be answered, and a REGISTER in flight at the signal left its binding behind. With the entries gone, anything that re-adds them (a `registration.add` from a script timer, a `registrant.backend` source reconcile) gave each a fresh Call-ID and the dying process registered it again, set up a new SA pair and, through `@registration.on_change`, subscribed to its reg event. Shutdown now stops the registrant before the first de-REGISTER leaves: no entry is added, updated or moved (`registration.add` and `set_local_addr` raise `ValueError`, `registration.refresh` returns False), none is due for a refresh or a retry, the source reconcile stops, and nothing with `Expires > 0` is built. Every registered entry sends `Expires: 0` on its own Call-ID, over its SA set and from its own address; one whose REGISTER is in flight sends it once that is answered, without announcing the binding; a challenged de-REGISTER answers its challenge with `Expires: 0`. The entries and their sockets stay until the process exits. Shutdown waits up to 20 s from the signal for the de-registrations to end, then deletes the SA sets left (up to 5 s more); the drain no longer counts the registrant's own transactions.
 - **Outbound registration: REGISTERs are retransmitted over UDP (RFC 3261 §17.1.2.2).** The registrant sent each REGISTER once and only noticed a lost one 32 s later from its 5 s tick. Every REGISTER, de-REGISTER and challenge answer now goes under a non-INVITE client transaction: over UDP Timer E re-sends the same octets from T1 (500 ms) doubling to T2 (4 s), from the socket the first one left (the entry's own `local_addr`, or the UE protected client port and so through its SA), until a response arrives; over TCP nothing is retransmitted. Timer F (64·T1) fails the attempt as before. A repeated final response is absorbed by the transaction, so a 401 a registrar sends once per retransmission no longer starts a second authentication.
+### Changed
+
+- **The open file limit is raised to the hard limit at startup.** Docker,
+  containerd and systemd start services with a soft `RLIMIT_NOFILE` of 1024
+  and a hard limit of 524288; siphon only used the 1024, so one TCP or TLS
+  connection per client ran out of descriptors near 1000 clients. siphon now
+  raises its soft limit to the hard limit first thing in
+  `SiphonServer::run`, as Go programs have done since Go 1.19, and logs
+  `RLIMIT_NOFILE soft 1024 -> 524288 (hard 524288)`. A soft limit still below
+  65536 after that is warned about at startup. There is no config knob: a
+  lower ceiling is set by the hard limit (container `ulimits nofile`, systemd
+  `LimitNOFILE`). Child processes (`ip` for IPsec) start with the original
+  soft limit, in case they use `select()`. A script that calls
+  `select.select()` on a socket opened after siphon holds 1024 descriptors
+  gets `ValueError`; use `selectors.DefaultSelector` or `asyncio`.
+
+### Fixed
+
+- **A listener out of file descriptors no longer spins.** `accept()` failing
+  with `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM` leaves the connection in the
+  backlog, so every stream listener (TCP, TLS, WS, WSS, the shared SIP+WS
+  socket, SCTP, the per-UE TCP listeners, ETSI X1) went straight back to the
+  same error: all the CPU it could
+  get, an error line per attempt, and a metrics endpoint too starved to
+  answer. The loop now backs off, 5 ms doubling to 1 s, until an accept
+  succeeds. A peer that resets before the accept (`ECONNABORTED`, `EPROTO`,
+  `EPERM`, `EINTR`) is retried at once and logged at debug. The error line is
+  limited to one per listener per 10 s and says how many it stood for.
+- **The Diameter server listener survives running out of file descriptors.**
+  Its accept loop ended on any accept error, so a single `EMFILE` stopped it
+  accepting peers until restart. It now backs off the same way.
+
+### Added
+
+- `siphon_accept_errors_total{transport,listener,reason}`, `reason` one of
+  `emfile`, `enfile`, `enobufs`, `enomem`, `other`, counted on every accept
+  error. Alert on `process_open_fds / process_max_fds > 0.8` for the warning
+  before it.
 
 ## [1.15.4] — 2026-10-25
 

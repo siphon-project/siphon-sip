@@ -304,6 +304,8 @@ Scrape `/metrics`. The handful that matter operationally:
 | `siphon_proxy_dialog_sessions` | grows unbounded under flat completed-call load | Dialog state not draining — a leak signature. |
 | `siphon_gateway_source_last_success_timestamp_seconds` | `time() - <gauge> > 3 * refresh_secs`, or the gauge is `0` | The carriers this node routes over are stale — it kept the last set it read, correctly, and nothing else says the controller has been unreachable for hours. `0` means it has *never* been read, so a node that booted against a dead controller has no carriers from the source at all. |
 | `siphon_gateway_source_failures_total` | sustained `rate() > 0` | Reads are failing now. Pair with the timestamp above, which says for how long. |
+| `process_open_fds / process_max_fds` | `> 0.8` | Descriptors running out. Each TCP/TLS/WS client holds one. siphon raises its soft limit to the hard limit at startup, so the ceiling is whatever the container `ulimits nofile` or systemd `LimitNOFILE` hard limit says; a startup `WARN` names a limit below 65536. |
+| `siphon_accept_errors_total{reason="emfile"}` | any `increase() > 0` | A listener ran out of descriptors and is backing off its accepts (5 ms up to 1 s). New clients wait in the backlog until descriptors free up. |
 | `siphon_registrant_source_*` | same pair, same thresholds | Outbound trunk registrations, tracked separately: a node can route over stale carriers with current registrations, or the reverse. |
 | `siphon_presence_subscriptions_removed_total{reason}` | `rate()` jumps with no matching drop in registrations | Subscriptions the notifier dropped because their NOTIFY failed (RFC 6665 §4.2.2): `notify_rejected` for a 481 and the other codes §4.2.2 names, `notify_timeout` for no final response before Timer F or a 408. A burst after a subscriber-side restart is expected (those watchers re-SUBSCRIBE); a steady rate means NOTIFYs are being sent to dialogs the subscribers no longer hold, or not reaching them at all. |
 
@@ -363,6 +365,12 @@ and the blocking-handler contract that drives these.
   — if you set it on a node that matters, re-run your own throughput row first.
   A binary that embeds SIPhon as a library can bake the same string in via
   `siphon::install_allocator!("narenas:4,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0")`.
+- **File descriptors:** one per TCP, TLS or WebSocket client, plus a few
+  hundred for siphon itself. siphon raises its soft `RLIMIT_NOFILE` to the hard
+  limit at startup (logged as `RLIMIT_NOFILE soft 1024 -> 524288 (hard 524288)`),
+  so set the hard limit to what the node should hold: `ulimits: nofile:` in
+  compose, `LimitNOFILE=` in a systemd unit. Docker and systemd already default
+  the hard limit to 524288.
 - **Stability over heroics:** if a node is unstable under load, fix the instability —
   don't paper over it with more nodes. The liveness watchdogs
   (`script.handler_stall_abort_secs` for the handler pool,
