@@ -931,7 +931,10 @@ pub fn inject_python_singletons(config: &Config) {
         max_contacts: config.registrar.max_contacts.unwrap_or(10) as usize,
         enforce_auth_aor_match: config.registrar.enforce_auth_aor_match,
     };
-    let registrar = Arc::new(Registrar::new(registrar_config));
+    let registrar = Arc::new(
+        Registrar::new(registrar_config)
+            .with_event_capacity(config.registrar.effective_event_capacity()),
+    );
     let py_registrar = PyRegistrar::new(Arc::clone(&registrar));
 
     // Build PyAuth from config

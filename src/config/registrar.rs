@@ -23,6 +23,10 @@ pub struct RegistrarConfig {
     /// leave this off and authorize via the implicit registration set).
     #[serde(default)]
     pub enforce_auth_aor_match: bool,
+    /// How many state-change events (`@registrar.on_change`,
+    /// `RegistrationChanged`) may wait for a slow consumer before it lags and
+    /// is re-told every registered AoR as a snapshot. Default 4096, floor 64.
+    pub event_capacity: Option<usize>,
     pub redis: Option<RedisBackendConfig>,
     pub postgres: Option<PostgresBackendConfig>,
     /// Registration liveness — network-initiated deregistration when a UE
@@ -30,6 +34,16 @@ pub struct RegistrarConfig {
     /// IPsec SA on UDP).  Default off.
     #[serde(default)]
     pub liveness: RegistrarLivenessConfig,
+}
+
+impl RegistrarConfig {
+    /// The state-change channel capacity: `event_capacity`, else
+    /// [`crate::registrar::Registrar::DEFAULT_EVENT_CAPACITY`]. The registrar
+    /// raises anything below its floor.
+    pub fn effective_event_capacity(&self) -> usize {
+        self.event_capacity
+            .unwrap_or(crate::registrar::Registrar::DEFAULT_EVENT_CAPACITY)
+    }
 }
 
 impl Default for RegistrarConfig {
@@ -41,6 +55,7 @@ impl Default for RegistrarConfig {
             min_expires: None,
             max_contacts: None,
             enforce_auth_aor_match: false,
+            event_capacity: None,
             redis: None,
             postgres: None,
             liveness: RegistrarLivenessConfig::default(),
