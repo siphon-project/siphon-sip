@@ -2712,12 +2712,16 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "rand 0.10.1",
+ "rustls",
+ "rustls-native-certs",
  "ryu",
  "sha1_smol",
  "socket2 0.6.4",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "url",
+ "webpki-roots",
  "xxhash-rust",
 ]
 
@@ -2922,6 +2926,18 @@ dependencies = [
  "rustls-webpki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rustls-native-certs"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a073f5dc7469f984c52ad2752b63b0807745133b6de880b7b64c1ac4c48aec4"
+dependencies = [
+ "openssl-probe",
+ "rustls-pki-types",
+ "schannel",
+ "security-framework",
 ]
 
 [[package]]
@@ -3292,8 +3308,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sip"
-version = "1.15.12"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#82956b5fd49f94e99a2bd36eba128383e3b32fde"
+version = "1.15.13"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#fad93204afb9d45ec41909ee3ba80577bb3f8846"
 dependencies = [
  "aes",
  "arc-swap",
