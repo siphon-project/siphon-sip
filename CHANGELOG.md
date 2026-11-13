@@ -13,6 +13,10 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Changed
+
+- **An `async def` handler a host extension calls through `ScriptHandle`, and that awaits only siphon's own awaitable APIs, no longer goes through asyncio.** The executor runs the coroutine up to the await and resumes it when the Rust side finishes: no event-loop task, no async driver thread. In the dispatch-cost bench a handler with one await costs 27 µs of CPU per call instead of 147 µs at one caller and 70 µs instead of 222 µs at 1000 calls/s, and one with ten awaits 147 µs instead of 438 µs. A handler that uses asyncio itself (`asyncio.sleep`, `create_task`, `gather`, `wait_for`, `timeout`, `TaskGroup`, `to_thread`, a third-party asyncio client) is moved to a driver where it stands, as the same task with the same context variables, and starts on a driver from then on, so it costs what it did before. Applies to the handlers an extension registers under its own kind (HTTP routes, GTP-C messages, peer events); every other handler kind is unchanged. Two things a script can see: between awaits such a handler runs on sync-pool workers, and `asyncio.current_task()` and what an awaitable API returns are a `SiphonHandlerTask` and a `SiphonAwaitable`, which have the task and future interfaces but are not `asyncio.Task` / `asyncio.Future` instances. Handlers bound to a driver loop that has a task factory or is in asyncio debug mode start on the driver as before, and the direct path stays off altogether if its start-up self-test fails (both logged). The cost per handler shape is measured by `script::dispatch_cost_bench_tests::dispatch_cost` (an ignored test, run in a release build). See `docs/handler-execution-model.md`, "What an await costs".
+
 ## [1.15.14] — 2026-11-13
 
 ### Added

@@ -314,3 +314,148 @@ fn a_detach_inside_an_attach_releases_what_it_wraps() {
     assert!(inside(&attached, inner) && inside(&released, inner));
     assert!(inside(&attached, outer) && !inside(&released, outer));
 }
+
+/// Calls that run Python, or may. A thread that makes one while holding a
+/// Rust lock can park for a garbage collection's stop-the-world with the lock
+/// held; every attached thread then waiting on that lock never reaches a safe
+/// point, and the collection never ends. Taking and releasing references
+/// (`clone_ref`, moving a `Py`) is not in the list: it runs no Python.
+const PYTHON_WORK: [&str; 17] = [
+    ".call0(",
+    ".call1(",
+    ".call(",
+    "call_method",
+    ".getattr(",
+    ".setattr(",
+    ".import(",
+    ".extract",
+    ".str()",
+    "Py::new(",
+    "PyErr::from_value(",
+    "into_value(",
+    "into_pyobject(",
+    "cancelled_error(",
+    "invalid_state(",
+    "helpers(",
+    "demote(",
+];
+
+/// The lines of `source` that do Python work inside the scope of a guard
+/// taken with `locked(..)`: to the end of the enclosing block for a guard
+/// bound with `let`, to the end of the statement for a temporary.
+fn python_work_under_a_lock(source: &str) -> Vec<(usize, &'static str)> {
+    let masked = mask(source);
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(at) = find(&masked, from, b"locked(") {
+        from = at + 1;
+        let word_before =
+            at > 0 && (masked[at - 1].is_ascii_alphanumeric() || masked[at - 1] == b'_');
+        if word_before {
+            continue;
+        }
+        let call_end = closing(&masked, at + b"locked".len());
+        let after = masked[call_end + 1..]
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .map(|offset| call_end + 1 + offset);
+        let statement_start = masked[..at]
+            .iter()
+            .rposition(|&byte| matches!(byte, b';' | b'{' | b'}'))
+            .map_or(0, |index| index + 1);
+        let bound = after.is_some_and(|index| masked[index] == b';')
+            && String::from_utf8_lossy(&masked[statement_start..at]).contains("let ");
+        let scope_end = if bound {
+            // The block the binding lives in.
+            let mut depth = 0usize;
+            let mut open = None;
+            for index in (0..at).rev() {
+                match masked[index] {
+                    b'}' => depth += 1,
+                    b'{' if depth == 0 => {
+                        open = Some(index);
+                        break;
+                    }
+                    b'{' => depth -= 1,
+                    _ => {}
+                }
+            }
+            open.map_or(masked.len(), |open| closing(&masked, open))
+        } else {
+            // The statement: a temporary lives to its end, a block that
+            // follows on the way (`if let .. = locked(..) { .. }`) included.
+            let mut index = call_end + 1;
+            loop {
+                match masked.get(index) {
+                    None | Some(b';' | b')' | b']' | b'}' | b',') => break index,
+                    Some(b'{') => break closing(&masked, index),
+                    Some(b'(' | b'[') => index = closing(&masked, index) + 1,
+                    Some(_) => index += 1,
+                }
+            }
+        };
+        let scope = String::from_utf8_lossy(&masked[call_end..scope_end.min(masked.len())]);
+        for needle in PYTHON_WORK {
+            for (offset, _) in scope.match_indices(needle) {
+                found.push((line_of(source.as_bytes(), call_end + offset), needle));
+            }
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// Direct dispatch keeps its state behind plain mutexes that attached threads
+/// take. None of them is held across Python.
+#[test]
+fn direct_dispatch_runs_no_python_under_its_locks() {
+    let mut offenders = Vec::new();
+    for (path, source) in production_sources() {
+        if !path.starts_with("src/script/direct/") {
+            continue;
+        }
+        for (line, needle) in python_work_under_a_lock(&source) {
+            offenders.push(format!("{path}:{line} {needle}"));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "Python work while a direct-dispatch lock is held; copy what is needed \
+         out, release the lock, then make the Python object: {offenders:?}"
+    );
+}
+
+/// The scan sees the shape it is there for (an exception built while a bound
+/// guard is alive, and under a temporary guard), and passes the fix.
+#[test]
+fn the_lock_scan_tells_python_work_under_a_guard_from_work_after_it() {
+    let held = "fn read(&self, python: Python<'_>) -> PyResult<Py<PyAny>> {\n\
+                    let inner = locked(&self.inner);\n\
+                    match &inner.state {\n\
+                        State::Done(value) => Ok(value.clone_ref(python)),\n\
+                        State::Cancelled => Err(cancelled_error(python)),\n\
+                    }\n\
+                }\n";
+    assert_eq!(
+        python_work_under_a_lock(held),
+        vec![(5, "cancelled_error(")]
+    );
+    let temporary = "fn name(&self, python: Python<'_>) -> PyResult<()> {\n\
+                         if let Some(name) = locked(&self.name).as_ref() {\n\
+                             name.bind(python).call0()?;\n\
+                         }\n\
+                         Ok(())\n\
+                     }\n";
+    assert_eq!(python_work_under_a_lock(temporary), vec![(3, ".call0(")]);
+    let released = "fn read(&self, python: Python<'_>) -> PyResult<Py<PyAny>> {\n\
+                        let read = {\n\
+                            let inner = locked(&self.inner);\n\
+                            inner.cancelled\n\
+                        };\n\
+                        let taken = locked(&self.slot).take();\n\
+                        if read { return Err(cancelled_error(python)); }\n\
+                        taken.ok_or_else(|| invalid_state(python))\n\
+                    }\n";
+    assert!(python_work_under_a_lock(released).is_empty());
+}
