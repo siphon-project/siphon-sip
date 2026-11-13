@@ -58,6 +58,7 @@ pub(crate) struct Leaf {
 
 impl Leaf {
     /// A TLS acceptor serving this certificate, asking for no client one.
+    #[cfg(feature = "redis-backend")]
     pub(crate) fn acceptor(&self) -> tokio_rustls::TlsAcceptor {
         ensure_crypto_provider();
         let config = tokio_rustls::rustls::ServerConfig::builder()
