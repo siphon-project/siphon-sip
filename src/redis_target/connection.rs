@@ -122,7 +122,40 @@ fn recoverable(error: &RedisError) -> bool {
                 .any(|(_, error)| matches!(error.code(), "READONLY" | "MASTERDOWN"))
         })
 }
-async fn open(source: &Source) -> RedisResult<MultiplexedConnection> {
+fn invalid(message: String) -> RedisError {
+    RedisError::from((redis::ErrorKind::InvalidClientConfig, "Redis TLS", message))
+}
+/// The CA bundle of a target, read again at every connect so that a replaced
+/// file is picked up. One that cannot be used fails the connect: verifying
+/// against anything else would not be what the configuration asked for.
+async fn certificates(ca_file: Option<String>) -> RedisResult<Option<redis::TlsCertificates>> {
+    let Some(path) = ca_file else {
+        return Ok(None);
+    };
+    let root_cert = tokio::task::spawn_blocking(move || super::load_ca(&path))
+        .await
+        .map_err(|error| invalid(format!("reading the CA bundle: {error}")))?
+        .map_err(invalid)?;
+    Ok(Some(redis::TlsCertificates {
+        client_tls: None,
+        root_cert: Some(root_cert),
+    }))
+}
+/// rustls takes its provider from the process, and panics without one when
+/// more than one is compiled in. The server installs it at start; a library
+/// user or a test that connects first gets the same one here.
+fn ensure_crypto_provider() {
+    use tokio_rustls::rustls::crypto::{ring, CryptoProvider};
+    if CryptoProvider::get_default().is_none() {
+        let _ = ring::default_provider().install_default();
+    }
+}
+// Boxed: with the TLS streams inside, this future is deep enough that
+// embedding it in every caller's future overflows the compiler's layout depth.
+fn open(source: &Source) -> redis::RedisFuture<'_, MultiplexedConnection> {
+    Box::pin(open_unboxed(source))
+}
+async fn open_unboxed(source: &Source) -> RedisResult<MultiplexedConnection> {
     let attempt = async {
         let client = match source {
             #[cfg(test)]
@@ -139,42 +172,63 @@ async fn open(source: &Source) -> RedisResult<MultiplexedConnection> {
                     "connection has no discovery target",
                 )))
             }
-            Source::Target(RedisTarget::Url(url)) => redis::Client::open(url.as_str())?,
+            Source::Target(RedisTarget::Url(url)) => {
+                ensure_crypto_provider();
+                let (url, ca_file) = super::split_ca_file(url).map_err(invalid)?;
+                match certificates(ca_file).await? {
+                    Some(certificates) => redis::Client::build_with_tls(url, certificates)?,
+                    None => redis::Client::open(url)?,
+                }
+            }
             Source::Target(RedisTarget::Sentinel(config)) => {
                 use redis::{
-                    sentinel::{Sentinel, SentinelNodeConnectionInfo},
-                    IntoConnectionInfo, RedisConnectionInfo,
+                    sentinel::{SentinelClientBuilder, SentinelServerType},
+                    IntoConnectionInfo, TlsMode,
+                };
+                ensure_crypto_provider();
+                // One CA for the sentinels and for the data nodes they name.
+                let (scheme, certificates) = match &config.tls {
+                    Some(tls) => ("rediss", certificates(tls.ca_file.clone()).await?),
+                    None => ("redis", None),
                 };
                 let addresses = config
                     .addresses
                     .iter()
                     .map(|address| {
-                        let info = format!("redis://{address}").into_connection_info()?;
-                        let settings = match &config.sentinel_password {
-                            Some(password) => RedisConnectionInfo::default().set_password(password),
-                            None => RedisConnectionInfo::default(),
-                        };
-                        Ok(info.set_redis_settings(settings))
+                        let info = format!("{scheme}://{address}").into_connection_info()?;
+                        Ok(info.addr().clone())
                     })
                     .collect::<RedisResult<Vec<_>>>()?;
-                let mut settings = RedisConnectionInfo::default().set_db(i64::from(config.db));
-                if let Some(password) = &config.password {
-                    settings = settings.set_password(password);
-                }
-                let node =
-                    SentinelNodeConnectionInfo::default().set_redis_connection_info(settings);
                 let mut last_error = RedisError::from((
                     redis::ErrorKind::MasterNameNotFoundBySentinel,
                     "no Sentinel provided a reachable primary",
                 ));
                 let mut discovered = None;
                 for address in addresses {
-                    let mut sentinel = Sentinel::build(vec![address])?;
-                    match tokio::time::timeout(
-                        RESPONSE_TIMEOUT,
-                        sentinel.async_master_for(&config.master, Some(&node)),
-                    )
-                    .await
+                    let mut builder = SentinelClientBuilder::new(
+                        [address],
+                        &config.master,
+                        SentinelServerType::Master,
+                    )?
+                    .set_client_to_redis_db(i64::from(config.db));
+                    if let Some(password) = &config.password {
+                        builder = builder.set_client_to_redis_password(password);
+                    }
+                    if let Some(password) = &config.sentinel_password {
+                        builder = builder.set_client_to_sentinel_password(password);
+                    }
+                    if config.tls.is_some() {
+                        builder = builder
+                            .set_client_to_redis_tls_mode(TlsMode::Secure)
+                            .set_client_to_sentinel_tls_mode(TlsMode::Secure);
+                    }
+                    if let Some(certificates) = &certificates {
+                        builder = builder
+                            .set_client_to_redis_certificates(certificates.clone())
+                            .set_client_to_sentinel_certificates(certificates.clone());
+                    }
+                    let mut sentinel = builder.build()?;
+                    match tokio::time::timeout(RESPONSE_TIMEOUT, sentinel.async_get_client()).await
                     {
                         Ok(Ok(client)) => {
                             discovered = Some(client);
@@ -296,6 +350,10 @@ impl ConnectionLike for RedisConnection {
 }
 
 #[cfg(test)]
+#[path = "tls_tests.rs"]
+mod tls_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -372,6 +430,40 @@ mod tests {
         }
     }
 
+    /// Answers each command on `stream` with `+OK`, a SET with `reply`, until
+    /// the peer closes or `reply` is empty.
+    pub(super) async fn serve(
+        stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        reply: &'static str,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let mut stream = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                break;
+            }
+            let count: usize = line.trim().strip_prefix('*').unwrap().parse().unwrap();
+            let mut arguments = Vec::new();
+            for _ in 0..count {
+                line.clear();
+                stream.read_line(&mut line).await.unwrap();
+                let length: usize = line.trim().strip_prefix('$').unwrap().parse().unwrap();
+                let mut value = vec![0; length + 2];
+                stream.read_exact(&mut value).await.unwrap();
+                arguments.push(String::from_utf8(value[..length].to_vec()).unwrap());
+            }
+            let response = if arguments[0] == "SET" {
+                reply
+            } else {
+                "+OK\r\n"
+            };
+            if response.is_empty() || stream.write_all(response.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+    }
+
     // Real redis protocol over in-memory Tokio streams: deterministic failure
     // tests require neither ports nor external processes.
     async fn mock_connection(
@@ -381,35 +473,8 @@ mod tests {
         tokio::task::JoinHandle<()>,
         tokio::task::JoinHandle<()>,
     ) {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         let (client, server) = tokio::io::duplex(4096);
-        let server = tokio::spawn(async move {
-            let mut stream = BufReader::new(server);
-            loop {
-                let mut line = String::new();
-                if stream.read_line(&mut line).await.unwrap() == 0 {
-                    break;
-                }
-                let count: usize = line.trim().strip_prefix('*').unwrap().parse().unwrap();
-                let mut arguments = Vec::new();
-                for _ in 0..count {
-                    line.clear();
-                    stream.read_line(&mut line).await.unwrap();
-                    let length: usize = line.trim().strip_prefix('$').unwrap().parse().unwrap();
-                    let mut value = vec![0; length + 2];
-                    stream.read_exact(&mut value).await.unwrap();
-                    arguments.push(String::from_utf8(value[..length].to_vec()).unwrap());
-                }
-                let response = if arguments[0] == "SET" {
-                    reply
-                } else {
-                    "+OK\r\n"
-                };
-                if response.is_empty() || stream.write_all(response.as_bytes()).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let server = tokio::spawn(serve(server, reply));
         let (connection, driver) = MultiplexedConnection::new_with_config(
             &redis::RedisConnectionInfo::default(),
             client,

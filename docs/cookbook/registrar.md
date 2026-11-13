@@ -192,4 +192,5 @@ curl http://127.0.0.1:9091/admin/registrations/sip:alice@example.com
 Redis targets also support a `sentinel` block in place of `url`; see
 [Redis / Valkey Sentinel](../deployment.md#redis--valkey-sentinel) for the shared
 registrar/cache form, credentials, sharding, and recovery behavior. iFC persistence
-inherits the registrar target.
+inherits the registrar target. For `rediss://` and a private CA (`tls.ca_file`)
+see [Redis / Valkey over TLS](../deployment.md#redis--valkey-over-tls).

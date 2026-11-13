@@ -27,6 +27,13 @@ pub(crate) struct TestCa {
     pem: String,
 }
 
+impl TestCa {
+    /// The CA certificate, as a PEM bundle a trust store loads.
+    pub(crate) fn pem(&self) -> &str {
+        &self.pem
+    }
+}
+
 pub(crate) fn test_ca(name: &str) -> TestCa {
     let key = KeyPair::generate().expect("ca keygen");
     let mut params = CertificateParams::new(vec![name.to_string()]).expect("ca params");
@@ -47,6 +54,19 @@ pub(crate) fn test_ca(name: &str) -> TestCa {
 pub(crate) struct Leaf {
     der: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
+}
+
+impl Leaf {
+    /// A TLS acceptor serving this certificate, asking for no client one.
+    #[cfg(feature = "redis-backend")]
+    pub(crate) fn acceptor(&self) -> tokio_rustls::TlsAcceptor {
+        ensure_crypto_provider();
+        let config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![self.der.clone()], self.key.clone_key())
+            .expect("server config");
+        tokio_rustls::TlsAcceptor::from(Arc::new(config))
+    }
 }
 
 pub(crate) fn leaf(ca: &TestCa, names: Vec<SanType>) -> Leaf {
