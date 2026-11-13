@@ -11,6 +11,10 @@ pub(crate) mod blocking_metrics;
 pub(crate) mod completions;
 pub mod deferred;
 pub mod diameter_dispatch;
+#[cfg(test)]
+mod direct_tests;
+#[cfg(test)]
+mod dispatch_cost_bench_tests;
 pub mod engine;
 pub mod error_report;
 pub mod handle;
