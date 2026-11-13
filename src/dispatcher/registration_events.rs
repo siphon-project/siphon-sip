@@ -10,26 +10,45 @@
 //! handler, does.
 //!
 //! So a lag is counted (`siphon_event_consumer_lagged_total`), logged, and
-//! answered with a **snapshot**: one delivery per AoR the source holds, tagged
-//! `snapshot` rather than a change, each reading the AoR's current state the way
-//! every live event already does. A consumer that keeps its own copy is whole
-//! again for every AoR still held. An AoR whose bindings went away inside the
-//! lost window is not in the snapshot; the events still held after the lag are
-//! delivered once the snapshot is done and may name it, but if its removal was
-//! among the `n` lost, only a consumer that reconciles against the full set
-//! (the control plane's `registrations` verb, which a controller asks for when
-//! it sees the gap the lost events leave in `seq`) learns it is gone.
+//! answered with a **snapshot**: one delivery per AoR, tagged `snapshot` rather
+//! than a change, each reading the AoR's current state the way every live event
+//! already does. A consumer that keeps its own copy is whole again for every
+//! AoR.
+//!
+//! The snapshot is not a walk that blocks the channel. Re-reporting thousands
+//! of AoRs one handler call at a time takes longer than a channel of a few
+//! thousand events absorbs a live stream, so a loop that finished the walk
+//! before it read the channel again lagged again, started another walk, and
+//! never recovered, losing every live event meanwhile. Instead a lag turns the
+//! snapshot into a *pending set*, and the loop interleaves: it delivers every
+//! live event that is ready first, delivers one pending AoR only when none is,
+//! and waits on the channel when nothing is pending. A live event for a pending
+//! AoR drops it from the set (it was just reported with current state). A lag
+//! while a snapshot is pending **replaces** the pending set with a fresh one; a
+//! second full snapshot is never queued behind the first.
+//!
+//! The loop remembers which AoRs are present: everything the source holds when
+//! the loop starts (bindings restored from a backend never produced an event),
+//! then each one reported registered or refreshed, or as a snapshot with
+//! bindings; dropped on deregistered or expired. The pending set is the AoRs held now plus those remembered AoRs
+//! that are held no longer, so a deregistration or expiry lost inside the lag
+//! window is re-reported too, as a `snapshot` of an AoR with no bindings, which
+//! the handler reads exactly as it reads a live removal. The remembered set only
+//! ever holds present AoRs, so it is bounded by what the source holds.
 //!
 //! Only the end of the channel (`RecvError::Closed`, the source dropped) ends
 //! a loop.
 
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-use crate::metrics::event_lag::{record_lag, LaggedConsumer};
+use crate::metrics::event_lag::{
+    record_lag, record_snapshot_aor, record_snapshot_started, LaggedConsumer,
+};
 use crate::registrant::{RegistrantEvent, RegistrantManager};
 use crate::registrar::{RegisterExchange, Registrar, RegistrationEvent};
 
@@ -98,118 +117,303 @@ impl RegistrantChange {
     }
 }
 
-/// What one `recv()` on a state-change broadcast came back with.
-enum Received<T> {
-    Event(T),
-    Lagged(u64),
-    Closed,
+/// What a delivered change says about whether its AoR is still held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Presence {
+    Present,
+    Absent,
 }
 
-async fn receive<T: Clone>(receiver: &mut broadcast::Receiver<T>) -> Received<T> {
-    match receiver.recv().await {
-        Ok(event) => Received::Event(event),
-        Err(broadcast::error::RecvError::Lagged(skipped)) => Received::Lagged(skipped),
-        Err(broadcast::error::RecvError::Closed) => Received::Closed,
+/// What differs between the registrar and the registrant consumer; the drain
+/// loop is the same.
+trait EventSource {
+    type Event: Clone;
+    type Change;
+    const CONSUMER: LaggedConsumer;
+
+    fn change(&self, event: Self::Event) -> Self::Change;
+    fn aor<'a>(&self, change: &'a Self::Change) -> &'a str;
+    fn presence(&self, change: &Self::Change) -> Presence;
+    fn snapshot(&self, aor: String) -> Self::Change;
+    /// Every AoR the source holds now.
+    fn held(&self) -> HashSet<String>;
+    /// Number the lost events, so a controller sees the gap in `seq`.
+    fn skip(&self, skipped: u64);
+    fn log_lag(&self, skipped: u64, pending: usize);
+}
+
+/// The AoRs the loop last reported as present, and the snapshot still to be
+/// delivered.
+#[derive(Default)]
+struct Recovery {
+    known: HashSet<String>,
+    /// AoRs to re-report, with whether each was held when the lag was seen.
+    queue: VecDeque<(String, bool)>,
+    /// The members of `queue` not yet delivered or superseded by a live event.
+    pending: HashSet<String>,
+}
+
+impl Recovery {
+    /// Note what a delivered change says about its AoR. A live event for a
+    /// pending AoR takes it out of the snapshot.
+    fn track(&mut self, aor: &str, presence: Presence) {
+        match presence {
+            Presence::Present => {
+                if !self.known.contains(aor) {
+                    self.known.insert(aor.to_string());
+                }
+            }
+            Presence::Absent => {
+                self.known.remove(aor);
+            }
+        }
+        if !self.pending.is_empty() {
+            self.pending.remove(aor);
+        }
+    }
+
+    /// Start a snapshot of `held` plus every remembered AoR that is not held
+    /// now, dropping whatever an earlier one still had pending.
+    fn begin_snapshot(&mut self, held: HashSet<String>) -> usize {
+        self.queue.clear();
+        self.pending.clear();
+        let gone: Vec<String> = self
+            .known
+            .iter()
+            .filter(|aor| !held.contains(*aor))
+            .cloned()
+            .collect();
+        for aor in held {
+            self.pending.insert(aor.clone());
+            self.queue.push_back((aor, true));
+        }
+        for aor in gone {
+            self.pending.insert(aor.clone());
+            self.queue.push_back((aor, false));
+        }
+        self.pending.len()
+    }
+
+    /// The next AoR to re-report, skipping those a live event has covered.
+    /// Reporting it settles what is remembered about it.
+    fn next_pending(&mut self) -> Option<String> {
+        while let Some((aor, held)) = self.queue.pop_front() {
+            if !self.pending.remove(&aor) {
+                continue;
+            }
+            if held {
+                if !self.known.contains(&aor) {
+                    self.known.insert(aor.clone());
+                }
+            } else {
+                self.known.remove(&aor);
+            }
+            return Some(aor);
+        }
+        None
+    }
+}
+
+/// Feed every event to `deliver`, one at a time, until the channel closes.
+/// Live events go first; a lag starts a snapshot that is delivered one AoR at a
+/// time while no live event is waiting.
+async fn drain_events<S, D, F>(
+    mut receiver: broadcast::Receiver<S::Event>,
+    source: S,
+    mut deliver: D,
+) where
+    S: EventSource,
+    D: FnMut(S::Change) -> F,
+    F: Future<Output = ()>,
+{
+    use broadcast::error::{RecvError, TryRecvError};
+
+    // What the source already holds counts as present from the start, so a
+    // removal of a binding restored before the loop began (no event ever named
+    // it) is recovered after a lag too.
+    let mut recovery = Recovery {
+        known: source.held(),
+        ..Recovery::default()
+    };
+    loop {
+        let received = match receiver.try_recv() {
+            Ok(event) => Ok(event),
+            Err(TryRecvError::Lagged(skipped)) => Err(RecvError::Lagged(skipped)),
+            Err(TryRecvError::Closed) => Err(RecvError::Closed),
+            Err(TryRecvError::Empty) => {
+                if let Some(aor) = recovery.next_pending() {
+                    record_snapshot_aor(S::CONSUMER);
+                    deliver(source.snapshot(aor)).await;
+                    continue;
+                }
+                receiver.recv().await
+            }
+        };
+        match received {
+            Ok(event) => {
+                let change = source.change(event);
+                recovery.track(source.aor(&change), source.presence(&change));
+                deliver(change).await;
+            }
+            Err(RecvError::Lagged(skipped)) => {
+                record_lag(S::CONSUMER, skipped);
+                source.skip(skipped);
+                record_snapshot_started(S::CONSUMER);
+                let pending = recovery.begin_snapshot(source.held());
+                source.log_lag(skipped, pending);
+            }
+            Err(RecvError::Closed) => {
+                info!(
+                    consumer = S::CONSUMER.as_str(),
+                    "state-change events: the event channel closed, the event task ends"
+                );
+                break;
+            }
+        }
+    }
+}
+
+struct RegistrarSource {
+    registrar: Arc<Registrar>,
+}
+
+impl EventSource for RegistrarSource {
+    type Event = RegistrationEvent;
+    type Change = RegistrarChange;
+    const CONSUMER: LaggedConsumer = LaggedConsumer::Registrar;
+
+    fn change(&self, event: RegistrationEvent) -> RegistrarChange {
+        RegistrarChange::from_event(event)
+    }
+
+    fn aor<'a>(&self, change: &'a RegistrarChange) -> &'a str {
+        &change.aor
+    }
+
+    fn presence(&self, change: &RegistrarChange) -> Presence {
+        match change.event {
+            "deregistered" | "expired" => Presence::Absent,
+            _ => Presence::Present,
+        }
+    }
+
+    fn snapshot(&self, aor: String) -> RegistrarChange {
+        RegistrarChange {
+            aor,
+            event: SNAPSHOT,
+            exchange: None,
+        }
+    }
+
+    fn held(&self) -> HashSet<String> {
+        self.registrar.registered_aors().into_iter().collect()
+    }
+
+    fn skip(&self, skipped: u64) {
+        crate::control::registration::skip_registration_events(skipped);
+    }
+
+    fn log_lag(&self, skipped: u64, pending: usize) {
+        warn!(
+            skipped,
+            pending,
+            "registrar events: @registrar.on_change and RegistrationChanged fell behind the \
+             registrar and lost events; re-reporting the current state of every registered AoR, \
+             and of every AoR last reported present that is gone, as a snapshot between live \
+             events. Counted in siphon_event_consumer_lagged_total{{consumer=\"registrar\"}}; \
+             raise registrar.event_capacity if it repeats"
+        );
+    }
+}
+
+struct RegistrantSource {
+    registrant: Arc<RegistrantManager>,
+}
+
+impl EventSource for RegistrantSource {
+    type Event = RegistrantEvent;
+    type Change = RegistrantChange;
+    const CONSUMER: LaggedConsumer = LaggedConsumer::Registrant;
+
+    fn change(&self, event: RegistrantEvent) -> RegistrantChange {
+        RegistrantChange::from_event(event)
+    }
+
+    fn aor<'a>(&self, change: &'a RegistrantChange) -> &'a str {
+        &change.aor
+    }
+
+    fn presence(&self, change: &RegistrantChange) -> Presence {
+        match change.event {
+            "deregistered" => Presence::Absent,
+            _ => Presence::Present,
+        }
+    }
+
+    fn snapshot(&self, aor: String) -> RegistrantChange {
+        RegistrantChange {
+            aor,
+            event: SNAPSHOT,
+            status_code: None,
+        }
+    }
+
+    fn held(&self) -> HashSet<String> {
+        self.registrant
+            .list()
+            .into_iter()
+            .map(|(aor, _, _)| aor)
+            .collect()
+    }
+
+    fn skip(&self, skipped: u64) {
+        crate::control::registration::skip_registrant_events(skipped);
+    }
+
+    fn log_lag(&self, skipped: u64, pending: usize) {
+        warn!(
+            skipped,
+            pending,
+            "registrant events: @registration.on_change fell behind the outbound registrations \
+             and lost events; re-reporting the current state of every outbound registration, \
+             and of every one last reported present that is gone, as a snapshot between live \
+             events. Counted in siphon_event_consumer_lagged_total{{consumer=\"registrant\"}}"
+        );
     }
 }
 
 /// Feed every registrar event to `deliver`, one at a time, until the channel
-/// closes. A lag is counted and answered with one [`SNAPSHOT`] delivery per
-/// registered AoR before the loop carries on with the events still held.
+/// closes. A lag is counted and answered with a [`SNAPSHOT`] delivery per AoR,
+/// interleaved with the live events (see the module documentation).
 pub(crate) async fn drain_registrar_events<D, F>(
-    mut receiver: broadcast::Receiver<RegistrationEvent>,
+    receiver: broadcast::Receiver<RegistrationEvent>,
     registrar: Arc<Registrar>,
-    mut deliver: D,
+    deliver: D,
 ) where
     D: FnMut(RegistrarChange) -> F,
     F: Future<Output = ()>,
 {
-    loop {
-        match receive(&mut receiver).await {
-            Received::Event(event) => deliver(RegistrarChange::from_event(event)).await,
-            Received::Lagged(skipped) => {
-                record_lag(LaggedConsumer::Registrar, skipped);
-                // The lost changes are numbered too, so a controller sees the
-                // gap in `seq` and can ask for the full set.
-                crate::control::registration::skip_registration_events(skipped);
-                let aors = registrar.registered_aors();
-                warn!(
-                    skipped,
-                    republished = aors.len(),
-                    "registrar events: @registrar.on_change and RegistrationChanged fell behind \
-                     the registrar and lost events; re-publishing the current state of every \
-                     registered AoR as a snapshot. A removal among the lost events reaches only \
-                     a consumer that reconciles against the full set. Counted in \
-                     siphon_event_consumer_lagged_total{{consumer=\"registrar\"}}"
-                );
-                for aor in aors {
-                    deliver(RegistrarChange {
-                        aor,
-                        event: SNAPSHOT,
-                        exchange: None,
-                    })
-                    .await;
-                }
-            }
-            Received::Closed => {
-                info!(
-                    "registrar events: the registrar's event channel closed, the event task ends"
-                );
-                break;
-            }
-        }
-    }
+    drain_events(receiver, RegistrarSource { registrar }, deliver).await;
 }
 
 /// Feed every registrant event to `deliver`, one at a time, until the channel
-/// closes. A lag is counted and answered with one [`SNAPSHOT`] delivery per
-/// outbound registration before the loop carries on.
+/// closes. A lag is counted and answered with a [`SNAPSHOT`] delivery per
+/// outbound registration, interleaved with the live events.
 pub(crate) async fn drain_registrant_events<D, F>(
-    mut receiver: broadcast::Receiver<RegistrantEvent>,
+    receiver: broadcast::Receiver<RegistrantEvent>,
     registrant: Arc<RegistrantManager>,
-    mut deliver: D,
+    deliver: D,
 ) where
     D: FnMut(RegistrantChange) -> F,
     F: Future<Output = ()>,
 {
-    loop {
-        match receive(&mut receiver).await {
-            Received::Event(event) => deliver(RegistrantChange::from_event(event)).await,
-            Received::Lagged(skipped) => {
-                record_lag(LaggedConsumer::Registrant, skipped);
-                crate::control::registration::skip_registrant_events(skipped);
-                let aors: Vec<String> = registrant
-                    .list()
-                    .into_iter()
-                    .map(|(aor, _, _)| aor)
-                    .collect();
-                warn!(
-                    skipped,
-                    republished = aors.len(),
-                    "registrant events: @registration.on_change fell behind the outbound \
-                     registrations and lost events; re-publishing the current state of every \
-                     outbound registration as a snapshot. Counted in \
-                     siphon_event_consumer_lagged_total{{consumer=\"registrant\"}}"
-                );
-                for aor in aors {
-                    deliver(RegistrantChange {
-                        aor,
-                        event: SNAPSHOT,
-                        status_code: None,
-                    })
-                    .await;
-                }
-            }
-            Received::Closed => {
-                info!(
-                    "registrant events: the registrant's event channel closed, the event task ends"
-                );
-                break;
-            }
-        }
-    }
+    drain_events(receiver, RegistrantSource { registrant }, deliver).await;
 }
 
 #[cfg(test)]
 #[path = "registration_events_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "registration_events_recovery_tests.rs"]
+mod recovery_tests;

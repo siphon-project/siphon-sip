@@ -396,6 +396,10 @@ registrar:
   #   AoR (call hijack) or deregister B. Default false. Leave OFF for IMS
   #   deployments where the public identity (AoR) differs from the private auth
   #   identity — those authorize via the implicit registration set instead.
+  # event_capacity: 4096   # state-change events (@registrar.on_change,
+  #   RegistrationChanged) that may wait for a slow consumer before it lags and
+  #   is re-told every registered AoR as a "snapshot". Default 4096, floor 64.
+  #   Size it above a registration burst (a restart re-registering every UE).
 
   # Redis persistence (backend: redis)
   # Survives restarts; required when RTPEngine or dialog state also uses Redis.

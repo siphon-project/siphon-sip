@@ -1024,6 +1024,30 @@ registrar:
 }
 
 #[test]
+fn registrar_event_capacity_defaults_and_overrides() {
+    let base = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+registrar:
+  backend: memory
+"#;
+    let config = Config::from_str(base).unwrap();
+    assert_eq!(config.registrar.event_capacity, None);
+    assert_eq!(config.registrar.effective_event_capacity(), 4096);
+
+    let raised = format!("{base}  event_capacity: 20000\n");
+    let config = Config::from_str(&raised).unwrap();
+    assert_eq!(config.registrar.event_capacity, Some(20000));
+    assert_eq!(config.registrar.effective_event_capacity(), 20000);
+}
+
+#[test]
 fn parses_registrant_config() {
     let yaml = r#"
 listen:

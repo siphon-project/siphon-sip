@@ -565,8 +565,14 @@ impl std::fmt::Debug for Registrar {
 }
 
 impl Registrar {
+    /// The state-change channel capacity when none is configured.
+    pub const DEFAULT_EVENT_CAPACITY: usize = 4096;
+
+    /// The smallest state-change channel `with_event_capacity` builds.
+    pub const MIN_EVENT_CAPACITY: usize = 64;
+
     pub fn new(config: RegistrarConfig) -> Self {
-        let (event_sender, _) = broadcast::channel(1024);
+        let (event_sender, _) = broadcast::channel(Self::DEFAULT_EVENT_CAPACITY);
         Self {
             bindings: DashMap::new(),
             service_routes: DashMap::new(),
@@ -583,6 +589,15 @@ impl Registrar {
             shared_fetched: DashMap::new(),
             instance_identity: OnceLock::new(),
         }
+    }
+
+    /// Hold up to `capacity` undelivered state-change events (at least
+    /// [`MIN_EVENT_CAPACITY`](Self::MIN_EVENT_CAPACITY)) before a slow consumer
+    /// lags. Call before anything subscribes.
+    pub fn with_event_capacity(mut self, capacity: usize) -> Self {
+        let (event_sender, _) = broadcast::channel(capacity.max(Self::MIN_EVENT_CAPACITY));
+        self.event_sender = event_sender;
+        self
     }
 
     /// Set the backend writer for write-through persistence.
@@ -2241,6 +2256,40 @@ mod tests {
 
     fn contact_uri(user: &str, host: &str) -> SipUri {
         SipUri::new(host.to_string()).with_user(user.to_string())
+    }
+
+    #[test]
+    fn the_event_channel_holds_the_configured_capacity_and_never_less_than_the_floor() {
+        // What a receiver that never read sees when `count` events pile up.
+        let publish = |registrar: &Registrar, count: usize| {
+            for index in 0..count {
+                registrar.emit_event(RegistrationEvent::Expired {
+                    aor: format!("sip:fill{index}@example.com"),
+                });
+            }
+        };
+        let default = Registrar::default();
+        let mut receiver = default.subscribe_events();
+        publish(&default, 4096);
+        assert!(receiver.try_recv().is_ok(), "the default holds 4096");
+        publish(&default, 4096 + 10);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+
+        // 74 events overrun the floor (64) by 10, and fit a channel raised to 100.
+        let registrar = Registrar::default().with_event_capacity(2);
+        let mut receiver = registrar.subscribe_events();
+        publish(&registrar, 74);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(10))
+        ));
+        let registrar = Registrar::default().with_event_capacity(100);
+        let mut receiver = registrar.subscribe_events();
+        publish(&registrar, 74);
+        assert!(receiver.try_recv().is_ok(), "100 holds 74 events");
     }
 
     #[test]
