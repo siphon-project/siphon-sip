@@ -283,6 +283,16 @@ pub(crate) fn start_coroutine(
     python: Python<'_>,
     coroutine: &Bound<'_, pyo3::PyAny>,
 ) -> PyResult<CoroutineStart> {
+    start_coroutine_keyed(python, coroutine, None)
+}
+
+/// [`start_coroutine`] with the object that names the unit to remember as
+/// using asyncio, for a host whose coroutines share one code object.
+pub(crate) fn start_coroutine_keyed(
+    python: Python<'_>,
+    coroutine: &Bound<'_, pyo3::PyAny>,
+    demotion_key: Option<&Bound<'_, pyo3::PyAny>>,
+) -> PyResult<CoroutineStart> {
     if let Some(value) = run_coroutine_inline(python, coroutine)? {
         return Ok(CoroutineStart::Finished(value));
     }
@@ -291,7 +301,8 @@ pub(crate) fn start_coroutine(
     {
         if let Some(pool) = crate::script::async_pool::AsyncPool::global() {
             use crate::script::direct::DirectStart;
-            return match crate::script::direct::start(&pool, python, coroutine) {
+            return match crate::script::direct::start_keyed(&pool, python, coroutine, demotion_key)
+            {
                 Some(DirectStart::Finished(result)) => result.map(CoroutineStart::Finished),
                 Some(DirectStart::Pending(pending)) => Ok(CoroutineStart::Suspended(pending)),
                 // Its handler uses asyncio: it starts on a driver.

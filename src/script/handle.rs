@@ -64,7 +64,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
 use crate::script::engine::{HandlerEntry, HandlerKind, ScriptState};
-use crate::script::inline_dispatch::{start_coroutine, CoroutineStart};
+use crate::script::inline_dispatch::{start_coroutine_keyed, CoroutineStart};
 
 /// Owned, opaque reference to a script-registered handler. Returned by
 /// [`ScriptHandle::handlers_for`].
@@ -266,6 +266,7 @@ impl ScriptHandle {
                 callable.bind(py).call1(arg_tuple)
             },
             is_async,
+            None,
             finish,
         )
         .await
@@ -289,16 +290,30 @@ impl ScriptHandle {
     /// expiry it is cancelled, nothing of it stays pending, and `finish`
     /// receives the `TimeoutError`.
     ///
+    /// `demotion_key` names the unit siphon learns about: a coroutine that
+    /// uses asyncio makes later calls with the same key start on a driver
+    /// instead of the direct path. `None` keys on the coroutine's code object,
+    /// as for a handler, which is right unless many handlers run through one
+    /// shared wrapper function (then they share a code object, and one that
+    /// uses asyncio would send them all to a driver). Pass any object whose
+    /// identity names the handler, such as its function; it is held for as
+    /// long as the verdict is, and forgotten on script reload.
+    ///
     /// `Err` means the coroutine never started or its job was lost (the
     /// executor shed it or is shutting down, or a closure panicked); a failure
     /// of `build` itself reaches `finish`.
-    pub async fn start_coroutine<B, F, R>(&self, build: B, finish: F) -> PyResult<R>
+    pub async fn start_coroutine<B, F, R>(
+        &self,
+        demotion_key: Option<Py<PyAny>>,
+        build: B,
+        finish: F,
+    ) -> PyResult<R>
     where
         B: for<'py> FnOnce(Python<'py>) -> PyResult<Bound<'py, PyAny>> + Send + 'static,
         F: for<'py> FnOnce(Python<'py>, PyResult<Bound<'py, PyAny>>) -> R + Send + 'static,
         R: Send + 'static,
     {
-        dispatch(build, true, finish).await
+        dispatch(build, true, demotion_key, finish).await
     }
 }
 
@@ -319,7 +334,12 @@ enum Started<R> {
 /// Run `produce` in an executor job and, when `is_async`, start what it
 /// returns as a coroutine: the one path `call_handler_with` and
 /// `start_coroutine` share.
-async fn dispatch<P, F, R>(produce: P, is_async: bool, finish: F) -> PyResult<R>
+async fn dispatch<P, F, R>(
+    produce: P,
+    is_async: bool,
+    demotion_key: Option<Py<PyAny>>,
+    finish: F,
+) -> PyResult<R>
 where
     P: for<'py> FnOnce(Python<'py>) -> PyResult<Bound<'py, PyAny>> + Send + 'static,
     F: for<'py> FnOnce(Python<'py>, PyResult<Bound<'py, PyAny>>) -> R + Send + 'static,
@@ -329,7 +349,11 @@ where
         crate::script::attach::attach(|py| -> Started<R> {
             let returned = produce(py);
             let returned = match returned {
-                Ok(returned) if is_async => match start_coroutine(py, &returned) {
+                Ok(returned) if is_async => match start_coroutine_keyed(
+                    py,
+                    &returned,
+                    demotion_key.as_ref().map(|key| key.bind(py)),
+                ) {
                     Ok(CoroutineStart::Finished(value)) => Ok(value.into_bound(py)),
                     Ok(CoroutineStart::Suspended(pending)) if pending.is_direct() => {
                         let (sender, receiver) = tokio::sync::oneshot::channel();

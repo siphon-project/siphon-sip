@@ -75,6 +75,18 @@ async def raises(x):
     await probe.ready(x)
     raise KeyError('after the await')
 
+async def wrapper(route, x):
+    return await route(x)
+
+async def route_asyncio(x):
+    started_on_driver = on_driver()
+    await asyncio.sleep(0.01)
+    return f'{started_on_driver}'
+
+async def route_siphon(x):
+    value = await probe.ready(x)
+    return f'{on_driver()}'
+
 async def wedged(x):
     try:
         await probe.never()
@@ -103,7 +115,8 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 /// engine; the tests share one process and run one at a time.
 struct Rig {
     handle: ScriptHandle,
-    _engine: ScriptEngine,
+    engine: ScriptEngine,
+    _script: tempfile::NamedTempFile,
     _serial: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -166,7 +179,8 @@ fn rig() -> Rig {
     .expect("engine");
     Rig {
         handle: ScriptHandle::for_engine(&engine, runtime().handle().clone()),
-        _engine: engine,
+        engine,
+        _script: file,
         _serial: serial,
     }
 }
@@ -180,6 +194,7 @@ async fn run(
 ) -> Result<String, String> {
     handle
         .start_coroutine(
+            None,
             move |python| {
                 let module = PyModule::import(python, "start_coroutine_probe")?;
                 module.getattr(function)?.call1((argument,))
@@ -231,6 +246,7 @@ fn a_raising_coroutine_surfaces_its_exception() {
     assert!(error.contains("after the await"), "{error}");
     // A coroutine the extension fails to build reaches `finish` too.
     let built_wrong = within(rig.handle.start_coroutine(
+        None,
         |_python| Err(PyValueError::new_err("no such handler")),
         |_python, outcome| outcome.map(|_| ()).map_err(|error| error.to_string()),
     ))
@@ -337,4 +353,82 @@ fn a_forced_collection_during_coroutines_does_not_hang() {
         };
         assert_eq!(answer, Ok(expected));
     }
+}
+
+/// Run `wrapper(route, 0)`, the one coroutine function every route of a host
+/// goes through, and say whether it started on an asyncio driver. `keyed`
+/// names the route as the demotion unit; otherwise the wrapper's code object
+/// is what siphon learns about.
+async fn run_route(handle: &ScriptHandle, route: &'static str, keyed: bool) -> String {
+    let key = keyed.then(|| {
+        Python::attach(|python| {
+            PyModule::import(python, "start_coroutine_probe")
+                .and_then(|module| module.getattr(route))
+                .expect("route exists")
+                .unbind()
+        })
+    });
+    handle
+        .start_coroutine(
+            key,
+            move |python| {
+                let module = PyModule::import(python, "start_coroutine_probe")?;
+                module
+                    .getattr("wrapper")?
+                    .call1((module.getattr(route)?, 0))
+            },
+            |_python, outcome| {
+                outcome
+                    .and_then(|value| value.str()?.extract::<String>())
+                    .unwrap_or_else(|error| error.to_string())
+            },
+        )
+        .await
+        .expect("the coroutine was started")
+}
+
+/// Two routes through one shared wrapper coroutine. The wrapper has one code
+/// object, so without a key a route that uses asyncio sends every route to a
+/// driver; with the route as the key only that route goes.
+#[test]
+fn a_demotion_key_keeps_routes_sharing_one_wrapper_apart() {
+    let rig = rig();
+    rig.engine
+        .reload()
+        .expect("reload forgets earlier verdicts");
+
+    // No key: route A demotes the wrapper's code object, so B starts on a driver.
+    assert_eq!(
+        within(run_route(&rig.handle, "route_asyncio", false)),
+        "False"
+    );
+    assert_eq!(
+        within(run_route(&rig.handle, "route_siphon", false)),
+        "True"
+    );
+
+    rig.engine.reload().expect("reload");
+
+    // Keyed per route: A is demoted, B is not.
+    assert_eq!(
+        within(run_route(&rig.handle, "route_asyncio", true)),
+        "False"
+    );
+    assert_eq!(
+        within(run_route(&rig.handle, "route_asyncio", true)),
+        "True",
+        "the route that used asyncio starts on a driver from now on"
+    );
+    assert_eq!(
+        within(run_route(&rig.handle, "route_siphon", true)),
+        "False",
+        "the other route still runs on the executor"
+    );
+
+    // A reload forgets the keyed verdict: A starts directly again.
+    rig.engine.reload().expect("reload");
+    assert_eq!(
+        within(run_route(&rig.handle, "route_asyncio", true)),
+        "False"
+    );
 }

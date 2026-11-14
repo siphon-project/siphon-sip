@@ -976,3 +976,40 @@ fn a_direct_coroutine_resumes_its_caller_on_the_executor() {
         );
     });
 }
+
+/// A demotion key names one verdict: the same key repeated stays one entry,
+/// different keys on one shared coroutine function are separate ones, and a
+/// reload's `clear_demoted` forgets them all.
+#[test]
+fn demotion_keys_are_one_entry_each_and_cleared_on_reload() {
+    let _serial = pool_test_guard();
+    Python::initialize();
+    Python::attach(|python| {
+        use crate::script::direct::{clear_demoted, demote_for_test, demoted_len};
+        clear_demoted();
+        let module = PyModule::from_code(
+            python,
+            c"async def shared(x):\n    return x\n\ndef route_a(): pass\ndef route_b(): pass\n",
+            c"demotion_key_probe.py",
+            c"demotion_key_probe",
+        )
+        .unwrap();
+        let route_a = module.getattr("route_a").unwrap();
+        let route_b = module.getattr("route_b").unwrap();
+        let shared = module.getattr("shared").unwrap();
+        for _ in 0..50 {
+            let coroutine = shared.call1((1,)).unwrap();
+            demote_for_test(&coroutine, Some(&route_a));
+            coroutine.call_method0("close").unwrap();
+        }
+        assert_eq!(demoted_len(), 1, "the same key repeated is one entry");
+        let coroutine = shared.call1((1,)).unwrap();
+        demote_for_test(&coroutine, Some(&route_b));
+        assert_eq!(demoted_len(), 2);
+        demote_for_test(&coroutine, None);
+        assert_eq!(demoted_len(), 3, "no key falls back to the code object");
+        coroutine.call_method0("close").unwrap();
+        clear_demoted();
+        assert_eq!(demoted_len(), 0);
+    });
+}
