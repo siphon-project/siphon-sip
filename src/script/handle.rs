@@ -157,6 +157,16 @@ impl ScriptHandle {
         Self { state, runtime }
     }
 
+    /// A handle onto an engine an embedding host built itself, for an
+    /// extension's own tests: the same handle `register_task` hands out,
+    /// without starting a server.
+    pub fn for_engine(
+        engine: &crate::script::engine::ScriptEngine,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self::new(engine.state_arc(), runtime)
+    }
+
     /// Tokio runtime handle for spawning extension-owned background work
     /// (HTTP listeners, side-channel clients, periodic sweeps).
     pub fn tokio_handle(&self) -> &tokio::runtime::Handle {
@@ -247,96 +257,144 @@ impl ScriptHandle {
     {
         let callable = Arc::clone(&handler.callable);
         let is_async = handler.is_async;
+        dispatch(
+            move |py| {
+                let args = args(py)?;
+                let bound_args: Vec<Bound<'_, PyAny>> =
+                    args.into_iter().map(|a| a.into_bound(py)).collect();
+                let arg_tuple = PyTuple::new(py, bound_args)?;
+                callable.bind(py).call1(arg_tuple)
+            },
+            is_async,
+            finish,
+        )
+        .await
+    }
 
-        type Finish<R> =
-            Box<dyn for<'py> FnOnce(Python<'py>, PyResult<Bound<'py, PyAny>>) -> R + Send>;
-        enum Started<R> {
-            Done(R),
-            Suspended(crate::script::async_pool::PendingCoroutine, Finish<R>),
-            /// The executor drives the coroutine: `finish` runs in the job
-            /// that finishes it and its value arrives here.
-            Resuming(
-                tokio::sync::oneshot::Receiver<R>,
-                Option<crate::script::direct::Deadline>,
-            ),
-        }
+    /// Start a coroutine the caller builds, on the same path a script's
+    /// `async def` handler takes, and finish it the way
+    /// [`Self::call_handler_with`] does.
+    ///
+    /// For an extension that wraps the script's handler in a coroutine of its
+    /// own (middleware, an adapter) and so cannot hand the handler itself to
+    /// `call_handler_with`. `build` runs attached in an executor job and
+    /// returns the coroutine object (call the `async def`, do not await it).
+    /// `finish` turns its outcome (the return value, or the exception it
+    /// raised, a `TimeoutError` included) into what the extension needs, as for
+    /// `call_handler_with`.
+    ///
+    /// A coroutine that awaits only siphon's awaitables is resumed by the
+    /// executor with no asyncio task; one that uses asyncio goes to an asyncio
+    /// driver intact. Either way it is bounded by the coroutine timeout: on
+    /// expiry it is cancelled, nothing of it stays pending, and `finish`
+    /// receives the `TimeoutError`.
+    ///
+    /// `Err` means the coroutine never started or its job was lost (the
+    /// executor shed it or is shutting down, or a closure panicked); a failure
+    /// of `build` itself reaches `finish`.
+    pub async fn start_coroutine<B, F, R>(&self, build: B, finish: F) -> PyResult<R>
+    where
+        B: for<'py> FnOnce(Python<'py>) -> PyResult<Bound<'py, PyAny>> + Send + 'static,
+        F: for<'py> FnOnce(Python<'py>, PyResult<Bound<'py, PyAny>>) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        dispatch(build, true, finish).await
+    }
+}
 
-        let join = crate::script::py_executor::try_run(move || {
-            crate::script::attach::attach(|py| -> Started<R> {
-                let returned = args(py).and_then(|args| {
-                    let bound_args: Vec<Bound<'_, PyAny>> =
-                        args.into_iter().map(|a| a.into_bound(py)).collect();
-                    let arg_tuple = PyTuple::new(py, bound_args)?;
-                    callable.bind(py).call1(arg_tuple)
-                });
-                let returned = match returned {
-                    Ok(returned) if is_async => match start_coroutine(py, &returned) {
-                        Ok(CoroutineStart::Finished(value)) => Ok(value.into_bound(py)),
-                        Ok(CoroutineStart::Suspended(pending)) if pending.is_direct() => {
-                            let (sender, receiver) = tokio::sync::oneshot::channel();
-                            let deadline = pending.resume_on_executor_watched(move |settled| {
-                                let value = crate::script::attach::attach(|py| {
-                                    finish(py, settled.map(|value| value.into_bound(py)))
-                                });
-                                // The caller may have stopped waiting.
-                                let _ = sender.send(value);
+/// The outcome handler of a dispatch.
+type Finish<R> = Box<dyn for<'py> FnOnce(Python<'py>, PyResult<Bound<'py, PyAny>>) -> R + Send>;
+
+enum Started<R> {
+    Done(R),
+    Suspended(crate::script::async_pool::PendingCoroutine, Finish<R>),
+    /// The executor drives the coroutine: `finish` runs in the job
+    /// that finishes it and its value arrives here.
+    Resuming(
+        tokio::sync::oneshot::Receiver<R>,
+        Option<crate::script::direct::Deadline>,
+    ),
+}
+
+/// Run `produce` in an executor job and, when `is_async`, start what it
+/// returns as a coroutine: the one path `call_handler_with` and
+/// `start_coroutine` share.
+async fn dispatch<P, F, R>(produce: P, is_async: bool, finish: F) -> PyResult<R>
+where
+    P: for<'py> FnOnce(Python<'py>) -> PyResult<Bound<'py, PyAny>> + Send + 'static,
+    F: for<'py> FnOnce(Python<'py>, PyResult<Bound<'py, PyAny>>) -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let join = crate::script::py_executor::try_run(move || {
+        crate::script::attach::attach(|py| -> Started<R> {
+            let returned = produce(py);
+            let returned = match returned {
+                Ok(returned) if is_async => match start_coroutine(py, &returned) {
+                    Ok(CoroutineStart::Finished(value)) => Ok(value.into_bound(py)),
+                    Ok(CoroutineStart::Suspended(pending)) if pending.is_direct() => {
+                        let (sender, receiver) = tokio::sync::oneshot::channel();
+                        let deadline = pending.resume_on_executor_watched(move |settled| {
+                            let value = crate::script::attach::attach(|py| {
+                                finish(py, settled.map(|value| value.into_bound(py)))
                             });
-                            return Started::Resuming(receiver, deadline);
-                        }
-                        Ok(CoroutineStart::Suspended(pending)) => {
-                            return Started::Suspended(pending, Box::new(finish));
-                        }
-                        Err(error) => Err(error),
-                    },
-                    other => other,
-                };
-                Started::Done(finish(py, returned))
-            })
+                            // The caller may have stopped waiting.
+                            let _ = sender.send(value);
+                        });
+                        return Started::Resuming(receiver, deadline);
+                    }
+                    Ok(CoroutineStart::Suspended(pending)) => {
+                        return Started::Suspended(pending, Box::new(finish));
+                    }
+                    Err(error) => Err(error),
+                },
+                other => other,
+            };
+            Started::Done(finish(py, returned))
         })
-        .await;
+    })
+    .await;
 
-        match join {
-            Ok(Started::Done(value)) => Ok(value),
-            Ok(Started::Suspended(pending, finish)) => {
-                let settled = pending.wait().await;
-                crate::script::py_executor::run_queued(move || {
-                    crate::script::attach::attach(|py| {
-                        finish(py, settled.map(|value| value.into_bound(py)))
-                    })
+    match join {
+        Ok(Started::Done(value)) => Ok(value),
+        Ok(Started::Suspended(pending, finish)) => {
+            let settled = pending.wait().await;
+            crate::script::py_executor::run_queued(move || {
+                crate::script::attach::attach(|py| {
+                    finish(py, settled.map(|value| value.into_bound(py)))
                 })
-                .await
-                .map_err(|_| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                        "script handler continuation did not run".to_string(),
-                    )
-                })
-            }
-            Ok(Started::Resuming(mut receiver, deadline)) => {
-                // This task is awake for the result anyway, so it bounds the
-                // wait: when the coroutine timeout runs out the handler is
-                // cancelled and `finish` gets the `TimeoutError`.
-                let settled = match deadline {
-                    Some(deadline) => {
-                        match tokio::time::timeout(deadline.left(), &mut receiver).await {
-                            Ok(settled) => settled,
-                            Err(_elapsed) => {
-                                deadline.expire();
-                                receiver.await
-                            }
+            })
+            .await
+            .map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "script handler continuation did not run".to_string(),
+                )
+            })
+        }
+        Ok(Started::Resuming(mut receiver, deadline)) => {
+            // This task is awake for the result anyway, so it bounds the
+            // wait: when the coroutine timeout runs out the handler is
+            // cancelled and `finish` gets the `TimeoutError`.
+            let settled = match deadline {
+                Some(deadline) => {
+                    match tokio::time::timeout(deadline.left(), &mut receiver).await {
+                        Ok(settled) => settled,
+                        Err(_elapsed) => {
+                            deadline.expire();
+                            receiver.await
                         }
                     }
-                    None => receiver.await,
-                };
-                settled.map_err(|_| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                        "script handler continuation did not run".to_string(),
-                    )
-                })
-            }
-            Err(_panic) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "script handler dispatch panicked".to_string(),
-            )),
+                }
+                None => receiver.await,
+            };
+            settled.map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "script handler continuation did not run".to_string(),
+                )
+            })
         }
+        Err(_panic) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "script handler dispatch panicked".to_string(),
+        )),
     }
 }
 

@@ -380,6 +380,12 @@ This applies to the handlers that give their worker back while they await:
 extension calls through `ScriptHandle`. The handler kinds that hold their
 worker until the coroutine settles (listed above) run on a driver as before.
 
+An extension that wraps the script's handler in a coroutine of its own
+(middleware) starts it with `ScriptHandle::start_coroutine`, which takes the
+same path: executor-driven while it awaits only siphon's awaitables, on a
+driver if it uses asyncio, and bounded by the same coroutine timeout. See
+`docs/extensions.md`, "Rust addons: wrapping a handler in your own coroutine".
+
 ### Where an awaitable API finishes
 
 An awaitable siphon API (`await diameter.cx_uar(...)`, `await cache.fetch(...)`,
