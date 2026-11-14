@@ -28,6 +28,11 @@ free-threaded-CPython attach from leaking (reaping a persistently-attached
 thread orphans ~2 MB of heap). Growth-on-demand restores the burst headroom that
 blocking handlers need; never-reaping keeps the no-leak property.
 
+The ceiling is never below the core. A `sync_pool_max` smaller than the core is
+raised to it and logged as a startup warning: on a 6-CPU node the core is 12, so
+`sync_pool_max: 8` alone still runs 12 workers. To cap the pool at 8, set
+`sync_pool_size: 8` and `sync_pool_max: 8`.
+
 > Why elastic: an earlier change moved inbound dispatch off tokio's elastic
 > `spawn_blocking` pool (which grew threads on demand) onto a **fixed** pool to
 > stop the heap leak — but that removed the burst valve. A blocking handler pins
