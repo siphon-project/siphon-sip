@@ -17,10 +17,12 @@
 //!   neither parked nor has parked again for the whole window is stuck inside
 //!   one poll; more than half of them stuck trips, before the last one goes.
 //! * **interpreter**: a dedicated thread attaching to the interpreter and
-//!   detaching again. It completes unless a stop-the-world never ends. How long
-//!   each attach waited is published (`siphon_interpreter_attach_wait_ms`), so a
-//!   stop-the-world held open for a second, too short to abort over, still
-//!   shows.
+//!   detaching again, every 10 ms. It completes unless a stop-the-world never
+//!   ends. How long each attach waited is published
+//!   (`siphon_interpreter_attach_wait_seconds`, and the longest of the last
+//!   second as `siphon_interpreter_attach_wait_ms`), so a stop-the-world held
+//!   open for milliseconds, far too short to abort over, still shows. This
+//!   thread runs with the watchdog off as well.
 //! * **critical loops**: tasks that must keep turning (the timer sweep, which
 //!   drives every SIP transaction timer) stamp each turn. One that stops trips
 //!   even when the rest of the runtime is fine.
@@ -362,16 +364,22 @@ pub(crate) fn run_interpreter_probe(
     beat: Arc<Beat>,
     interval: Duration,
     shutdown: Arc<AtomicBool>,
+    wait: Option<&AttachWait>,
     probe: impl Fn(),
 ) {
+    let mut window = LongestWait::default();
     while !shutdown.load(Ordering::Relaxed) {
         beat.begin();
         let started = Instant::now();
         probe();
         let waited = started.elapsed();
         beat.end();
-        if let Some(gauge) = attach_wait_gauge() {
-            gauge.set(i64::try_from(waited.as_millis()).unwrap_or(i64::MAX));
+        if let Some(wait) = wait {
+            wait.seconds.observe(waited.as_secs_f64());
+            if let Some(longest) = window.sample(waited, Instant::now()) {
+                wait.last_ms
+                    .set(i64::try_from(longest.as_millis()).unwrap_or(i64::MAX));
+            }
         }
         if waited >= Duration::from_secs(1) {
             // Off the probe's attach: this thread holds nothing here.
@@ -385,41 +393,137 @@ pub(crate) fn run_interpreter_probe(
     }
 }
 
-/// `siphon_interpreter_attach_wait_ms`, registered on first use once the
-/// metrics registry exists.
-fn attach_wait_gauge() -> Option<&'static prometheus::IntGauge> {
-    static GAUGE: OnceLock<prometheus::IntGauge> = OnceLock::new();
-    if let Some(gauge) = GAUGE.get() {
-        return Some(gauge);
-    }
-    let metrics = crate::metrics::try_metrics()?;
-    let gauge = prometheus::IntGauge::new(
-        "siphon_interpreter_attach_wait_ms",
-        "How long the liveness probe's last attach to the Python interpreter waited (ms)",
-    )
-    .ok()?;
-    if GAUGE.set(gauge.clone()).is_ok() {
-        let _ = metrics.registry.register(Box::new(gauge));
-    }
-    GAUGE.get()
+/// How often the probe attaches. One uncontended attach and detach on a thread
+/// that keeps its thread state costs well under a microsecond, so 100 a second
+/// is no load, and a stop-the-world of 10 ms or more is always sampled.
+const PROBE_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How often `siphon_interpreter_attach_wait_ms` is refreshed, with the longest
+/// wait since the last refresh. The probe once attached at this rate and set
+/// the gauge each time; a gauge set every [`PROBE_INTERVAL`] would hide a stall
+/// from any scrape that did not land within 10 ms of it.
+const GAUGE_WINDOW: Duration = Duration::from_secs(1);
+
+/// The longest attach wait over the current [`GAUGE_WINDOW`].
+#[derive(Default)]
+struct LongestWait {
+    since: Option<Instant>,
+    longest: Duration,
 }
 
-/// Start the process liveness watchdog for the current tokio runtime, unless
-/// `script.process_stall_abort_secs` is 0.
+impl LongestWait {
+    /// One sample at `now`. Returns the window's longest wait when the window
+    /// closes, and starts the next.
+    fn sample(&mut self, waited: Duration, now: Instant) -> Option<Duration> {
+        self.longest = self.longest.max(waited);
+        let since = *self.since.get_or_insert(now);
+        if now.duration_since(since) < GAUGE_WINDOW {
+            return None;
+        }
+        self.since = Some(now);
+        Some(std::mem::take(&mut self.longest))
+    }
+}
+
+/// The collectors the probe publishes its attach waits through.
+pub(crate) struct AttachWait {
+    seconds: prometheus::Histogram,
+    last_ms: prometheus::IntGauge,
+}
+
+impl AttachWait {
+    pub(crate) fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            seconds: prometheus::Histogram::with_opts(
+                prometheus::HistogramOpts::new(
+                    "siphon_interpreter_attach_wait_seconds",
+                    "How long each attach of the liveness probe to the Python interpreter \
+                     waited. The probe attaches every 10 ms from its own thread, so a \
+                     stop-the-world (a garbage collection or any other) or a held GIL shows \
+                     as one observation about as long as what was left of it; read the upper \
+                     buckets, not a quantile over the many idle samples",
+                )
+                // 100 us to 3.3 s.
+                .buckets(prometheus::exponential_buckets(0.0001, 2.0, 16)?),
+            )?,
+            last_ms: prometheus::IntGauge::new(
+                "siphon_interpreter_attach_wait_ms",
+                "The longest the liveness probe's attaches to the Python interpreter waited \
+                 in the last completed one-second window (ms)",
+            )?,
+        })
+    }
+
+    /// How many attaches were observed.
+    #[cfg(test)]
+    pub(crate) fn samples(&self) -> u64 {
+        self.seconds.get_sample_count()
+    }
+}
+
+/// The process-wide collectors, built on first use. `None` only if the
+/// hardcoded names were rejected, which would be a bug; the probe still beats.
+fn attach_wait() -> Option<&'static AttachWait> {
+    static ATTACH_WAIT: OnceLock<Option<AttachWait>> = OnceLock::new();
+    ATTACH_WAIT.get_or_init(|| AttachWait::new().ok()).as_ref()
+}
+
+/// Add the attach-wait collectors to the metrics registry. Called from
+/// `metrics::init`; the registry holds the same collectors the probe writes.
+pub(crate) fn register(registry: &prometheus::Registry) -> Result<(), prometheus::Error> {
+    if let Some(wait) = attach_wait() {
+        registry.register(Box::new(wait.seconds.clone()))?;
+        registry.register(Box::new(wait.last_ms.clone()))?;
+    }
+    Ok(())
+}
+
+/// The probe's attach, for the thread that runs [`run_interpreter_probe`].
+///
+/// A thread with no Python thread state gets one made and destroyed around
+/// every attach, which on a free-threaded interpreter means a heap set up and
+/// torn down each time (about 180 us an attach measured on 3.14t in a debug
+/// build, against about 0.1 us pinned) and a wait that measures that as well
+/// as the interpreter. So once an attach has
+/// succeeded, which also proves the interpreter is initialised, the thread
+/// state is pinned and every later attach only resumes it.
+pub(crate) fn pinned_attach_probe() -> impl Fn() {
+    let pinned = std::cell::Cell::new(false);
+    move || {
+        // `try_attach` never initialises the interpreter.
+        let attached = pyo3::Python::try_attach(|_| ()).is_some();
+        if attached && !pinned.get() {
+            // SAFETY: the attach above returned, so the interpreter is
+            // initialised and this thread is detached again. `PyEval_SaveThread`
+            // detaches once more while the thread state stays cached against
+            // this OS thread, so each later attach is a resume. Never released:
+            // the probe thread lives until the process exits.
+            unsafe {
+                pyo3::ffi::PyGILState_Ensure();
+                pyo3::ffi::PyEval_SaveThread();
+            }
+            pinned.set(true);
+        }
+    }
+}
+
+/// Start the interpreter probe, and the process liveness watchdog for the
+/// current tokio runtime unless `script.process_stall_abort_secs` is 0. The
+/// probe runs either way: its attach waits are a metric, not only a reason to
+/// abort.
 pub(crate) fn start_from_config(config: &crate::config::ScriptConfig) {
-    if config.process_stall_abort_secs > 0 {
-        start(
-            TokioHandle::current(),
-            Duration::from_secs(config.process_stall_abort_secs),
-        );
-    }
+    let stall = match config.process_stall_abort_secs {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    };
+    start(TokioHandle::current(), stall);
 }
 
-/// Start the watchdog and the interpreter probe for `runtime`, aborting the
-/// process after `stall`. Neither thread is joined on shutdown: a wedged
-/// process must not also wedge its own exit.
+/// Start the interpreter probe, and with `stall` the watchdog for `runtime`
+/// that aborts the process after it. Neither thread is joined on shutdown: a
+/// wedged process must not also wedge its own exit.
 #[allow(clippy::disallowed_methods)] // dedicated watchdog thread, never attaches
-pub(crate) fn start(runtime: TokioHandle, stall: Duration) {
+pub(crate) fn start(runtime: TokioHandle, stall: Option<Duration>) {
     const INTERVAL: Duration = Duration::from_secs(1);
     let shutdown = Arc::new(AtomicBool::new(false));
     let interpreter = Arc::new(Beat::default());
@@ -429,27 +533,34 @@ pub(crate) fn start(runtime: TokioHandle, stall: Duration) {
         std::thread::Builder::new()
             .name("siphon-attach-probe".to_string())
             .spawn(move || {
-                run_interpreter_probe(interpreter, INTERVAL, shutdown, || {
-                    // `try_attach` never initialises the interpreter.
-                    let _ = pyo3::Python::try_attach(|_| ());
-                })
+                run_interpreter_probe(
+                    interpreter,
+                    PROBE_INTERVAL,
+                    shutdown,
+                    attach_wait(),
+                    pinned_attach_probe(),
+                )
             })
     };
-    let watchdog = std::thread::Builder::new()
-        .name("siphon-liveness".to_string())
-        .spawn(move || {
-            let stall_samples = u32::try_from(stall.as_secs().max(1)).unwrap_or(u32::MAX);
-            run_liveness_watchdog(
-                runtime,
-                interpreter,
-                &LOOPS,
-                stall_samples,
-                INTERVAL,
-                shutdown,
-                |which| abort_on_stall(which, stall),
-                || std::thread::sleep(INTERVAL),
-            )
-        });
+    let watchdog = match stall {
+        None => Ok(None),
+        Some(stall) => std::thread::Builder::new()
+            .name("siphon-liveness".to_string())
+            .spawn(move || {
+                let stall_samples = u32::try_from(stall.as_secs().max(1)).unwrap_or(u32::MAX);
+                run_liveness_watchdog(
+                    runtime,
+                    interpreter,
+                    &LOOPS,
+                    stall_samples,
+                    INTERVAL,
+                    shutdown,
+                    |which| abort_on_stall(which, stall),
+                    || std::thread::sleep(INTERVAL),
+                )
+            })
+            .map(Some),
+    };
     if let Err(error) = probe.and(watchdog) {
         // Not fatal: the node serves without it, but a whole-process wedge
         // then goes unnoticed until someone looks.
@@ -636,9 +747,15 @@ mod tests {
             let interpreter = Arc::clone(&interpreter);
             let shutdown = Arc::clone(&shutdown);
             std::thread::spawn(move || {
-                run_interpreter_probe(interpreter, Duration::from_millis(5), shutdown, || {
-                    let _ = blocked.lock().unwrap().recv();
-                })
+                run_interpreter_probe(
+                    interpreter,
+                    Duration::from_millis(5),
+                    shutdown,
+                    None,
+                    || {
+                        let _ = blocked.lock().unwrap().recv();
+                    },
+                )
             })
         };
         let fired = first_stall(runtime.handle().clone(), Arc::clone(&interpreter), 5, 40);
@@ -723,5 +840,228 @@ mod tests {
         let _ = turner.join();
         let result = *fired.lock().unwrap();
         assert_eq!(result, None, "the suspension was judged a stall");
+    }
+
+    /// Observations in `histogram` above `seconds`.
+    fn observed_above(wait: &AttachWait, seconds: f64) -> u64 {
+        use prometheus::core::Collector;
+        let families = wait.seconds.collect();
+        let histogram = families[0].get_metric()[0].get_histogram();
+        let within = histogram
+            .get_bucket()
+            .iter()
+            .filter(|bucket| bucket.upper_bound() <= seconds)
+            .map(|bucket| bucket.cumulative_count())
+            .max()
+            .unwrap_or(0);
+        histogram.get_sample_count() - within
+    }
+
+    /// Run the probe with `probe` as its attach until `done` says so.
+    fn probe_until(wait: &Arc<AttachWait>, probe: impl Fn() + Send + 'static, done: impl Fn()) {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let wait = Arc::clone(wait);
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || {
+                run_interpreter_probe(
+                    Arc::new(Beat::default()),
+                    Duration::from_millis(1),
+                    shutdown,
+                    Some(&wait),
+                    probe,
+                )
+            })
+        };
+        done();
+        shutdown.store(true, Ordering::Relaxed);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn every_attach_is_observed_with_how_long_it_waited() {
+        let wait = Arc::new(AttachWait::new().unwrap());
+        let calls = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&calls);
+        probe_until(
+            &wait,
+            move || {
+                // The third attach waits; the rest return at once.
+                if counted.fetch_add(1, Ordering::Relaxed) == 2 {
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+            },
+            || {
+                while calls.load(Ordering::Relaxed) < 10 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            },
+        );
+        assert!(wait.samples() >= 10);
+        assert_eq!(wait.samples(), calls.load(Ordering::Relaxed));
+        assert!(observed_above(&wait, 0.02) >= 1, "the one slow attach");
+        assert!(wait.seconds.get_sample_sum() >= 0.030);
+    }
+
+    #[test]
+    fn the_gauge_reads_the_longest_wait_of_each_window() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let ms = Duration::from_millis;
+        let mut window = LongestWait::default();
+        assert_eq!(window.sample(ms(1), at(0)), None);
+        assert_eq!(window.sample(ms(400), at(10)), None);
+        assert_eq!(window.sample(ms(2), at(500)), None);
+        // The stall of 400 ms is still what the window reports when it closes.
+        assert_eq!(window.sample(ms(1), at(1000)), Some(ms(400)));
+        // The next window starts empty.
+        assert_eq!(window.sample(ms(3), at(1500)), None);
+        assert_eq!(window.sample(ms(1), at(2000)), Some(ms(3)));
+        // One attach that outlasts the window reports itself.
+        assert_eq!(window.sample(ms(5000), at(7000)), Some(ms(5000)));
+    }
+
+    #[test]
+    fn the_gauge_is_set_when_its_window_closes() {
+        let wait = Arc::new(AttachWait::new().unwrap());
+        let read = Arc::clone(&wait);
+        probe_until(
+            &wait,
+            // Every attach waits, so every window's longest is at least this
+            // and a slow reader cannot miss the one window that held it.
+            || std::thread::sleep(Duration::from_millis(40)),
+            || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while read.last_ms.get() == 0 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            },
+        );
+        assert!(
+            wait.last_ms.get() >= 40,
+            "the gauge reads the window's longest attach, got {} ms",
+            wait.last_ms.get()
+        );
+    }
+
+    /// The pinned probe leaves the thread detached with its thread state kept.
+    #[test]
+    fn the_pinned_probe_keeps_its_thread_state_and_stays_detached() {
+        pyo3::Python::initialize();
+        let (before, state_kept, attached_after) = std::thread::spawn(|| {
+            // SAFETY: both read only this thread's own thread state.
+            let this_thread_state = || unsafe { pyo3::ffi::PyGILState_GetThisThreadState() };
+            let before = this_thread_state().is_null();
+            let probe = pinned_attach_probe();
+            probe();
+            let state = this_thread_state();
+            for _ in 0..100 {
+                probe();
+            }
+            let attached = unsafe { pyo3::ffi::PyGILState_Check() };
+            (
+                before,
+                !state.is_null() && state == this_thread_state(),
+                attached,
+            )
+        })
+        .join()
+        .unwrap();
+        assert!(before, "a fresh thread has no thread state");
+        assert!(state_kept, "the probe pins one thread state for good");
+        assert_eq!(attached_after, 0, "and leaves the thread detached");
+    }
+
+    /// The real stall: a thread blocked while attached holds a collection's
+    /// stop-the-world open (or the GIL), and the probe's next attach waits
+    /// behind it. That wait lands in the histogram.
+    #[test]
+    fn a_stall_behind_an_attached_thread_shows_in_the_histogram() {
+        use crate::script::stop_the_world_tests::in_child;
+        use pyo3::types::PyAnyMethods;
+        if !in_child(
+            concat!(
+                module_path!(),
+                "::a_stall_behind_an_attached_thread_shows_in_the_histogram"
+            ),
+            Duration::from_secs(60),
+        ) {
+            return;
+        }
+        pyo3::Python::initialize();
+        const DEADLINE: Duration = Duration::from_secs(20);
+        // Samples unchanged for this long means one attach has waited this
+        // long: the probe takes one every millisecond otherwise.
+        const STUCK: Duration = Duration::from_millis(200);
+        let wait = Arc::new(AttachWait::new().unwrap());
+        let seen = Arc::clone(&wait);
+        probe_until(&wait, pinned_attach_probe(), move || {
+            // The probe pins itself and takes idle samples first.
+            let started = Instant::now();
+            while seen.samples() < 10 && started.elapsed() < DEADLINE {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Blocked while attached until released: the fault itself.
+            let (attached_tx, attached) = std::sync::mpsc::channel();
+            let (release, blocked) = std::sync::mpsc::channel::<()>();
+            let blocker = std::thread::spawn(move || {
+                pyo3::Python::attach(|_| {
+                    let _ = attached_tx.send(());
+                    let _ = blocked.recv();
+                })
+            });
+            attached.recv().unwrap();
+            let collector = std::thread::spawn(|| {
+                pyo3::Python::attach(|python| {
+                    let _ = python
+                        .import("gc")
+                        .and_then(|gc| gc.call_method0("collect"));
+                })
+            });
+            // Hold the blocker until the probe has been stuck behind it.
+            let started = Instant::now();
+            loop {
+                let before = seen.samples();
+                std::thread::sleep(STUCK);
+                if seen.samples() == before || started.elapsed() > DEADLINE {
+                    break;
+                }
+            }
+            drop(release);
+            blocker.join().unwrap();
+            collector.join().unwrap();
+        });
+        assert!(wait.samples() > 10, "the probe sampled before and after");
+        assert!(
+            observed_above(&wait, 0.11) >= 1,
+            "no attach waited behind the attached thread: {} samples, {:.3} s in all",
+            wait.samples(),
+            wait.seconds.get_sample_sum()
+        );
+    }
+
+    /// With the watchdog off the probe still runs and publishes.
+    #[test]
+    fn the_probe_runs_without_the_watchdog() {
+        use crate::script::stop_the_world_tests::in_child;
+        if !in_child(
+            concat!(module_path!(), "::the_probe_runs_without_the_watchdog"),
+            Duration::from_secs(60),
+        ) {
+            return;
+        }
+        pyo3::Python::initialize();
+        crate::metrics::init().unwrap();
+        let runtime = runtime(1);
+        let before = attach_wait().expect("collectors build").samples();
+        start(runtime.handle().clone(), None);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while attach_wait().unwrap().samples() < before + 20 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(attach_wait().unwrap().samples() >= before + 20);
+        let output = crate::metrics::encode_metrics();
+        assert!(output.contains("siphon_interpreter_attach_wait_seconds_bucket"));
+        assert!(output.contains("siphon_interpreter_attach_wait_ms"));
     }
 }

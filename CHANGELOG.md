@@ -51,6 +51,19 @@ entry, but a working config keeps working.
   `emfile`, `enfile`, `enobufs`, `enomem`, `other`, counted on every accept
   error. Alert on `process_open_fds / process_max_fds > 0.8` for the warning
   before it.
+- Histograms for interpreter stalls, where there were only last-value gauges.
+  `siphon_interpreter_attach_wait_seconds`: the attach probe now samples
+  every 10 ms instead of every second, and runs with
+  `script.process_stall_abort_secs: 0` too (the abort stays tied to that key).
+  `siphon_interpreter_attach_wait_ms` is kept and now reads the longest wait
+  of the last second, where it read the one sample taken that second.
+  `siphon_python_gc_pause_seconds{generation}` and
+  `siphon_python_gc_collections_total{generation}`, from a `gc.callbacks`
+  hook: the time is the whole collection, so an upper bound on the pause, and
+  a stop-the-world that is not a collection only shows in the attach wait.
+  `siphon_pyexec_queue_wait_seconds`: every executor job's wait in the queue,
+  next to the `siphon_pyexec_queue_wait_ms` gauge; also in
+  `/admin/metrics.json` as `pyexec.queue_wait`.
 
 ## [1.15.14] — 2026-11-13
 

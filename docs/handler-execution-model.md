@@ -397,7 +397,7 @@ handler degrades gracefully instead of taking the node down silently:
      I/O driver all turn;
    - tokio's per-worker park counters: more than half of the workers stuck in
      one poll trips, before the last one goes;
-   - a thread that attaches to the interpreter and detaches every second, which
+   - a thread that attaches to the interpreter and detaches every 10 ms, which
      cannot complete while a garbage collection's stop-the-world never ends;
    - the timer sweep, which drives every SIP transaction timer, stamping each
      turn of its Rust part (which never waits for the executor, so a deep
@@ -405,9 +405,12 @@ handler degrades gracefully instead of taking the node down silently:
 
    Any of them owed for `script.process_stall_abort_secs` (default 30 s; `0`
    disables it, independently of `handler_stall_abort_secs`) writes one line
-   to stderr and aborts. The probe's attach wait is published as
-   `siphon_interpreter_attach_wait_ms`, so a stop-the-world held open for a
-   second or two, far too short to abort over, still shows.
+   to stderr and aborts. The probe's attach waits are published as the
+   `siphon_interpreter_attach_wait_seconds` histogram (and the longest of the
+   last second as `siphon_interpreter_attach_wait_ms`), so a stop-the-world
+   held open for milliseconds, far too short to abort over, still shows. The
+   probe runs with `process_stall_abort_secs: 0` as well; only the abort is
+   off then.
 
 ### Never block while attached
 
@@ -439,7 +442,8 @@ siphon keeps every such wait detached:
   that can reach a script run as one executor job at a time.
 - `siphon_pyexec_queue_wait_ms` reads how long the job a worker last took had
   waited in the queue: under a backlog, the age of the oldest job. Past 5 s it
-  is logged as overload.
+  is logged as overload. `siphon_pyexec_queue_wait_seconds` is the same wait
+  for every job, as a histogram.
 - The request's action runs on a copy of the request, not under its lock, so a
   script task still holding the request never waits for that lock attached.
 - The proxy session's relay callbacks are shared, so the response path copies
@@ -457,10 +461,35 @@ siphon keeps every such wait detached:
 | `siphon_pyexec_jobs_shed_total` | jobs dropped because the queue was full |
 | `siphon_pyexec_stale_requests_shed_total{method}` | initial requests answered 503 without the script because they queued past the 8 s budget |
 | `siphon_async_coroutines_pending` | `async def` handler coroutines on a driver, not yet settled |
-| `siphon_interpreter_attach_wait_ms` | how long the liveness probe's last attach to the interpreter waited |
+| `siphon_pyexec_queue_wait_ms` | how long the job a worker last took had waited in the queue; 0 with the queue empty |
+| `siphon_pyexec_queue_wait_seconds` | histogram: how long each job waited in the queue before a worker took it (buckets 100 µs to 13 s) |
+| `siphon_interpreter_attach_wait_seconds` | histogram: how long each attach of the liveness probe waited; one sample every 10 ms (buckets 100 µs to 3.3 s) |
+| `siphon_interpreter_attach_wait_ms` | the longest of those waits in the last completed one-second window |
+| `siphon_python_gc_pause_seconds{generation}` | histogram: wall time of each Python garbage collection (buckets 100 µs to 3.3 s) |
+| `siphon_python_gc_collections_total{generation}` | Python garbage collections completed |
 | `siphon_blocking_waits_in_flight` | threads parked right now in a blocking wait through siphon's released helpers; stuck high means a slow backend or a hang |
 | `siphon_blocking_waits_total` | blocking waits started through those helpers |
 | `siphon_auth_ha1_cache_hits_total` | HTTP-auth lookups served from cache |
+
+Reading the interpreter metrics:
+
+- **Attach wait** is what every thread that wants the interpreter waits: a
+  stop-the-world of any kind on a free-threaded build, the GIL on a GIL build.
+  The probe takes one sample every 10 ms, so a stall shows as a single
+  observation about as long as what was left of it, among a hundred idle
+  samples a second. Read the upper buckets
+  (`siphon_interpreter_attach_wait_seconds_bucket{le="0.0512"}` against
+  `_count`), not a quantile. A stall shorter than 10 ms can fall between two
+  samples.
+- **GC pause** is timed from the collector's `start` callback to its `stop`
+  callback on the collecting thread. That is the whole collection: the
+  stop-the-world phases, then finalizers and the freeing of the garbage, which
+  run with the other threads resumed. It is an upper bound on the pause, not
+  the pause. A stop-the-world that is not a collection is not in it; the
+  attach wait is where that shows.
+- **`generation`** is the generation the collection was asked for. A
+  free-threaded interpreter scans the whole heap every time: its automatic
+  collections report `0`, `gc.collect()` reports `2`.
 
 **Alert on**: a sustained `rate(siphon_pyexec_jobs_shed_total)` > 0, or
 `siphon_pyexec_pool_size == siphon_pyexec_pool_max` with

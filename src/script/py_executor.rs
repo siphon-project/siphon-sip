@@ -940,9 +940,10 @@ thread_local! {
 
 /// `job`, recording on pickup how long it waited in the queue.
 ///
-/// The one clock read on pickup feeds both the backlog gauge and the job's own
-/// age ([`spawn_with_queue_wait`]), so knowing a job's age costs the hot path
-/// nothing beyond a thread-local store.
+/// The one clock read on pickup feeds the backlog gauge, the queue-wait
+/// histogram and the job's own age ([`spawn_with_queue_wait`]), so knowing a
+/// job's age costs the hot path a thread-local store and the histogram's few
+/// atomic adds, on a worker that is not attached yet.
 fn stamped(job: Job) -> Job {
     let enqueued = std::time::Instant::now();
     Box::new(move || {
@@ -951,9 +952,43 @@ fn stamped(job: Job) -> Job {
             u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+        if let Some(histogram) = queue_wait_seconds() {
+            histogram.observe(waited.as_secs_f64());
+        }
         JOB_QUEUE_WAIT.with(|cell| cell.set(waited));
         job();
     })
+}
+
+/// `siphon_pyexec_queue_wait_seconds`: how long each job waited in the queue
+/// before a worker took it. Built on first use; `None` only if the hardcoded
+/// name were rejected, which would be a bug.
+pub(crate) fn queue_wait_seconds() -> Option<&'static prometheus::Histogram> {
+    static HISTOGRAM: OnceLock<Option<prometheus::Histogram>> = OnceLock::new();
+    HISTOGRAM
+        .get_or_init(|| {
+            prometheus::Histogram::with_opts(
+                prometheus::HistogramOpts::new(
+                    "siphon_pyexec_queue_wait_seconds",
+                    "How long each Python executor job waited in the queue before a worker \
+                     took it",
+                )
+                // 100 us to 13 s: past the 8 s at which a queued request is shed.
+                .buckets(prometheus::exponential_buckets(0.0001, 2.0, 18).ok()?),
+            )
+            .ok()
+        })
+        .as_ref()
+}
+
+/// Add the queue-wait histogram to the metrics registry. Called from
+/// `metrics::init`; jobs observed before that keep their counts, because the
+/// registry holds the same collector.
+pub(crate) fn register(registry: &prometheus::Registry) -> Result<(), prometheus::Error> {
+    if let Some(histogram) = queue_wait_seconds() {
+        registry.register(Box::new(histogram.clone()))?;
+    }
+    Ok(())
 }
 
 /// Fire-and-forget like [`spawn`], handing `f` how long it waited in the queue
@@ -1704,6 +1739,62 @@ mod tests {
             stale >= Duration::from_millis(200),
             "the job queued behind the blocker waited for it: {stale:?}"
         );
+    }
+
+    /// Every job a worker takes is observed in the queue-wait histogram with
+    /// how long it queued. The histogram is the process's, and other tests
+    /// run jobs beside this one, so the counts are lower bounds.
+    #[test]
+    fn every_job_is_observed_in_the_queue_wait_histogram() {
+        pyo3::Python::initialize();
+        let histogram = queue_wait_seconds().expect("the histogram builds");
+        let pool = test_pool(test_runtime().handle().clone(), 1);
+        let count_before = histogram.get_sample_count();
+        let sum_before = histogram.get_sample_sum();
+
+        const JOBS: u64 = 20;
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        spawn_on(&pool, move || {
+            let _ = started_tx.send(());
+            let _ = unblock_rx.recv();
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the blocker ran");
+        for _ in 0..JOBS {
+            let done = done_tx.clone();
+            spawn_on(&pool, move || {
+                let _ = done.send(());
+            });
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = unblock_tx.send(());
+        for _ in 0..JOBS {
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a queued job ran");
+        }
+        drop(pool);
+
+        assert!(
+            histogram.get_sample_count() > count_before + JOBS,
+            "the blocker and each queued job were observed"
+        );
+        // Each of the queued jobs waited out the blocker's 100 ms.
+        assert!(
+            histogram.get_sample_sum() - sum_before >= 0.1 * JOBS as f64,
+            "the waits were observed in seconds: {} s",
+            histogram.get_sample_sum() - sum_before
+        );
+    }
+
+    #[test]
+    fn the_queue_wait_histogram_is_exported_once_registered() {
+        crate::metrics::init().unwrap();
+        let output = crate::metrics::encode_metrics();
+        assert!(output.contains("siphon_pyexec_queue_wait_seconds_bucket"));
     }
 
     /// A job the pool sheds is reported as shed, not as the panic `try_run`

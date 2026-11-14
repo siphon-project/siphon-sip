@@ -344,6 +344,14 @@ pub struct ScriptState {
 // Script engine
 // ---------------------------------------------------------------------------
 
+/// Initialise the interpreter and what siphon installs in it once for the life
+/// of the process. A no-op once done, so every engine calls it and a reload,
+/// which builds no engine, never does.
+fn initialize_interpreter() {
+    Python::initialize();
+    super::gc_metrics::install();
+}
+
 /// The script engine manages Python initialisation, script compilation,
 /// hot-reload watching, and the handler registry.
 pub struct ScriptEngine {
@@ -380,7 +388,7 @@ impl ScriptEngine {
         }
 
         // Initialise the free-threaded Python interpreter (no-op if already done).
-        Python::initialize();
+        initialize_interpreter();
 
         let include_paths: Vec<PathBuf> = config.include_paths.iter().map(PathBuf::from).collect();
 
@@ -411,7 +419,7 @@ impl ScriptEngine {
         let script_path = PathBuf::from(EMBEDDED_SCRIPT_PATH);
 
         // Initialise the free-threaded Python interpreter (no-op if already done).
-        Python::initialize();
+        initialize_interpreter();
 
         let state = Self::compile_source_standalone(&script_path, source)?;
 
@@ -435,7 +443,7 @@ impl ScriptEngine {
     pub fn new_from_bytecode(pyc: &[u8]) -> Result<Self> {
         let script_path = PathBuf::from(EMBEDDED_SCRIPT_PATH);
 
-        Python::initialize();
+        initialize_interpreter();
 
         let state = Self::load_bytecode(&script_path, pyc)?;
 
