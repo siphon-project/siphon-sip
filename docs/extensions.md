@@ -372,13 +372,15 @@ pending (`finish` receives the `TimeoutError`).
 the `async def`, do not await it); `finish` reads the outcome the same way. The
 calling task never attaches.
 
-The first argument, `demotion_key: Option<Py<PyAny>>`, matters when every route
+The first argument, `demotion_key: Option<Arc<Py<PyAny>>>`, matters when every route
 goes through one wrapper coroutine. siphon remembers which coroutines use
 asyncio so they start on a driver from then on, keyed by code object, and a
 shared wrapper has one code object for all routes: one route that uses asyncio
 would move them all. Pass the route's handler function (any object whose
 identity names the route) and each route is learned separately; the key is held
-until the script reloads. `None` keys on the code object, as for a handler.
+until the script reloads. It is an `Arc` because the caller is a tokio worker
+that must not attach: keep the key on the route as an `Arc<Py<PyAny>>` and clone
+the `Arc` per call (`Py::clone` needs an attach), the job reads it attached. `None` keys on the code object, as for a handler.
 
 ```rust,ignore
 use pyo3::prelude::*;
@@ -386,7 +388,7 @@ use pyo3::prelude::*;
 async fn run_wrapped(handle: &ScriptHandle, path: String) -> Option<String> {
     handle
         .start_coroutine(
-            None, // or Some(route_handler) when routes share a wrapper
+            None, // or Some(Arc::clone(&route.key)) when routes share a wrapper
             move |py| {
                 // Your middleware coroutine, which awaits the user's handler.
                 let middleware = py.import("my_addon.middleware")?.getattr("run")?;

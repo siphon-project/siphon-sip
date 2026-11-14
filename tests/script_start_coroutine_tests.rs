@@ -355,19 +355,28 @@ fn a_forced_collection_during_coroutines_does_not_hang() {
     }
 }
 
+/// The route's handler function as a key, made once with the route as an
+/// extension would at registration.
+fn route_key(route: &str) -> Arc<Py<PyAny>> {
+    Python::attach(|python| {
+        Arc::new(
+            PyModule::import(python, "start_coroutine_probe")
+                .and_then(|module| module.getattr(route))
+                .expect("route exists")
+                .unbind(),
+        )
+    })
+}
+
 /// Run `wrapper(route, 0)`, the one coroutine function every route of a host
 /// goes through, and say whether it started on an asyncio driver. `keyed`
 /// names the route as the demotion unit; otherwise the wrapper's code object
 /// is what siphon learns about.
-async fn run_route(handle: &ScriptHandle, route: &'static str, keyed: bool) -> String {
-    let key = keyed.then(|| {
-        Python::attach(|python| {
-            PyModule::import(python, "start_coroutine_probe")
-                .and_then(|module| module.getattr(route))
-                .expect("route exists")
-                .unbind()
-        })
-    });
+async fn run_route(
+    handle: &ScriptHandle,
+    route: &'static str,
+    key: Option<Arc<Py<PyAny>>>,
+) -> String {
     handle
         .start_coroutine(
             key,
@@ -393,34 +402,33 @@ async fn run_route(handle: &ScriptHandle, route: &'static str, keyed: bool) -> S
 #[test]
 fn a_demotion_key_keeps_routes_sharing_one_wrapper_apart() {
     let rig = rig();
+    let key_a = route_key("route_asyncio");
+    let key_b = route_key("route_siphon");
     rig.engine
         .reload()
         .expect("reload forgets earlier verdicts");
 
     // No key: route A demotes the wrapper's code object, so B starts on a driver.
     assert_eq!(
-        within(run_route(&rig.handle, "route_asyncio", false)),
+        within(run_route(&rig.handle, "route_asyncio", None)),
         "False"
     );
-    assert_eq!(
-        within(run_route(&rig.handle, "route_siphon", false)),
-        "True"
-    );
+    assert_eq!(within(run_route(&rig.handle, "route_siphon", None)), "True");
 
     rig.engine.reload().expect("reload");
 
     // Keyed per route: A is demoted, B is not.
     assert_eq!(
-        within(run_route(&rig.handle, "route_asyncio", true)),
+        within(run_route(&rig.handle, "route_asyncio", Some(key_a.clone()))),
         "False"
     );
     assert_eq!(
-        within(run_route(&rig.handle, "route_asyncio", true)),
+        within(run_route(&rig.handle, "route_asyncio", Some(key_a.clone()))),
         "True",
         "the route that used asyncio starts on a driver from now on"
     );
     assert_eq!(
-        within(run_route(&rig.handle, "route_siphon", true)),
+        within(run_route(&rig.handle, "route_siphon", Some(key_b.clone()))),
         "False",
         "the other route still runs on the executor"
     );
@@ -428,7 +436,40 @@ fn a_demotion_key_keeps_routes_sharing_one_wrapper_apart() {
     // A reload forgets the keyed verdict: A starts directly again.
     rig.engine.reload().expect("reload");
     assert_eq!(
-        within(run_route(&rig.handle, "route_asyncio", true)),
+        within(run_route(&rig.handle, "route_asyncio", Some(key_a.clone()))),
         "False"
     );
+}
+
+/// A caller on a tokio worker never attaches: it holds the key as an
+/// `Arc<Py<..>>` and clones the `Arc` per call (`Py::clone` would need an
+/// attach, and panics without one under `py-clone`). Many calls with one
+/// shared key from plain tasks, none of them attached before or after.
+#[test]
+fn a_caller_on_a_tokio_worker_passes_a_shared_key_without_attaching() {
+    let rig = rig();
+    let key = route_key("route_siphon");
+    rig.engine.reload().expect("reload");
+    let results = within(async {
+        let mut joins = Vec::new();
+        for _ in 0..200 {
+            let handle = rig.handle.clone();
+            let key = Arc::clone(&key);
+            joins.push(tokio::spawn(async move {
+                let attached = || unsafe { pyo3::ffi::PyGILState_Check() } != 0;
+                let before = attached();
+                let answer = run_route(&handle, "route_siphon", Some(key)).await;
+                (before, attached(), answer)
+            }));
+        }
+        let mut results = Vec::new();
+        for join in joins {
+            results.push(join.await.expect("joined"));
+        }
+        results
+    });
+    for (before, after, answer) in results {
+        assert!(!before && !after, "the caller attached");
+        assert_eq!(answer, "False", "still on the executor");
+    }
 }

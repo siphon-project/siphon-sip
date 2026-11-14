@@ -297,14 +297,17 @@ impl ScriptHandle {
     /// shared wrapper function (then they share a code object, and one that
     /// uses asyncio would send them all to a driver). Pass any object whose
     /// identity names the handler, such as its function; it is held for as
-    /// long as the verdict is, and forgotten on script reload.
+    /// long as the verdict is, and forgotten on script reload. It is an
+    /// `Arc` so a caller on a tokio worker, which must not attach, can hand
+    /// one in per call by cloning the `Arc` (`Py::clone` needs an attach);
+    /// the job reads it attached.
     ///
     /// `Err` means the coroutine never started or its job was lost (the
     /// executor shed it or is shutting down, or a closure panicked); a failure
     /// of `build` itself reaches `finish`.
     pub async fn start_coroutine<B, F, R>(
         &self,
-        demotion_key: Option<Py<PyAny>>,
+        demotion_key: Option<Arc<Py<PyAny>>>,
         build: B,
         finish: F,
     ) -> PyResult<R>
@@ -337,7 +340,7 @@ enum Started<R> {
 async fn dispatch<P, F, R>(
     produce: P,
     is_async: bool,
-    demotion_key: Option<Py<PyAny>>,
+    demotion_key: Option<Arc<Py<PyAny>>>,
     finish: F,
 ) -> PyResult<R>
 where
