@@ -1494,6 +1494,49 @@ mod tests {
         assert_advertises_gx(&build_cer(&gx_and_ro_config(), 1, 1));
     }
 
+    /// The Vendor-Specific-Application-Id advertising Sy, written out from
+    /// RFC 6733 section 6.11 and TS 29.219 clause 5.1.5: Vendor-Id 10415
+    /// (0x28AF) and Auth-Application-Id 16777302 (0x01000056).
+    const SY_VENDOR_SPECIFIC_APPLICATION_ID: [u8; 32] = [
+        0x00, 0x00, 0x01, 0x04, 0x40, 0x00, 0x00, 0x20, // 260, M, length 32
+        0x00, 0x00, 0x01, 0x0a, 0x40, 0x00, 0x00, 0x0c, // 266 Vendor-Id, M, 12
+        0x00, 0x00, 0x28, 0xaf, // 10415
+        0x00, 0x00, 0x01, 0x02, 0x40, 0x00, 0x00, 0x0c, // 258 Auth-Application-Id
+        0x01, 0x00, 0x00, 0x56, // 16777302
+    ];
+
+    fn assert_advertises_sy(wire: &[u8]) {
+        assert!(
+            wire.windows(SY_VENDOR_SPECIFIC_APPLICATION_ID.len())
+                .any(|window| window == SY_VENDOR_SPECIFIC_APPLICATION_ID),
+            "no Vendor-Specific-Application-Id for Sy in {}",
+            hex::encode(wire)
+        );
+        let tree = codec::DiameterMsg::from_wire(wire).expect("decode capabilities exchange");
+        let vendors: Vec<u32> = tree
+            .find_all(avp::SUPPORTED_VENDOR_ID, 0)
+            .filter_map(|a| a.as_u32())
+            .collect();
+        assert!(
+            vendors.contains(&dictionary::VENDOR_3GPP),
+            "got {vendors:?}"
+        );
+        assert_eq!(tree.find_all(avp::ACCT_APPLICATION_ID, 0).count(), 0);
+    }
+
+    fn sy_config() -> PeerConfig {
+        PeerConfig {
+            application_ids: vec![(dictionary::VENDOR_3GPP, dictionary::SY_APP_ID)],
+            ..gx_and_ro_config()
+        }
+    }
+
+    #[test]
+    fn cer_and_cea_advertise_sy_as_a_3gpp_auth_application() {
+        assert_advertises_sy(&build_cer(&sy_config(), 1, 1));
+        assert_advertises_sy(&build_cea(&sy_config(), dictionary::DIAMETER_SUCCESS, 1, 1));
+    }
+
     #[test]
     fn cea_advertises_gx_as_a_3gpp_auth_application() {
         let cea = build_cea(&gx_and_ro_config(), dictionary::DIAMETER_SUCCESS, 1, 1);

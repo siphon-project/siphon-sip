@@ -1,7 +1,7 @@
-//! The policy and charging control AVPs: every AVP TS 29.212 (Gx) and TS
-//! 29.214 (Rx) define, in their tables 5.3.0.1 (Rel-18), and the 3GPP-*
-//! attributes of TS 29.061 their re-used tables take over. All of them are
-//! 3GPP vendor-specific (10415).
+//! The policy and charging control AVPs: every AVP TS 29.212 (Gx), TS
+//! 29.214 (Rx) and TS 29.219 (Sy) define, in their tables 5.3.0.1 (Rel-18),
+//! and the 3GPP-* attributes of TS 29.061 their re-used tables take over. All
+//! of them are 3GPP vendor-specific (10415).
 //!
 //! Each entry carries its M bit as the table gives it: `MANDATORY` where M is
 //! under "Must", `NOT_MANDATORY` where it is under "Must not" or under no
@@ -446,6 +446,20 @@ pub(super) static POLICY_AVPS: &[PolicyAvp] = &[
         Unsigned32,
         NOT_MANDATORY,
     ),
+    // TS 29.219 table 5.3.0.1, Sy. SN-Request-Type is V under "Must" and M
+    // under "Must not", for the ASR feature; the rest are M,V.
+    policy_avp(2901, "Policy-Counter-Identifier", UTF8String, MANDATORY),
+    policy_avp(2902, "Policy-Counter-Status", UTF8String, MANDATORY),
+    policy_avp(2903, "Policy-Counter-Status-Report", Grouped, MANDATORY),
+    policy_avp(2904, "SL-Request-Type", Enumerated, MANDATORY),
+    policy_avp(
+        2905,
+        "Pending-Policy-Counter-Information",
+        Grouped,
+        MANDATORY,
+    ),
+    policy_avp(2906, "Pending-Policy-Counter-Change-Time", Time, MANDATORY),
+    policy_avp(2907, "SN-Request-Type", Unsigned32, NOT_MANDATORY),
 ];
 
 /// The entry for `code`, all of them being 3GPP vendor-specific.
