@@ -50,10 +50,8 @@
 //! }
 //! ```
 //!
-//! An `async def` handler that awaits only siphon's own awaitables is resumed
-//! by the executor and the conversion runs in the job that finishes it; one
-//! that uses asyncio runs on an asyncio driver and the conversion runs in a
-//! follow-up job once it finishes. Blocking Rust an
+//! An `async def` handler's coroutine runs on an asyncio driver and the
+//! conversion runs in a follow-up job once it finishes. Blocking Rust an
 //! extension cannot avoid goes through [`crate::script::blocking`]
 //! (`released`, `blocking_released`, `block_on_released`, `detach_block_on`).
 
@@ -181,10 +179,9 @@ impl ScriptHandle {
     ///
     /// Both kinds are called on the Python executor. A sync handler's value
     /// comes back from that job. An async handler's coroutine runs inline when
-    /// it cannot suspend; otherwise the job returns at its first await (having
-    /// handed it to an asyncio driver if it uses asyncio), and this future
-    /// awaits its result with no executor worker held and no interpreter
-    /// attached. So the number of async handlers in flight
+    /// it cannot suspend; otherwise the job hands it to an asyncio driver and
+    /// returns, and this future awaits its result with no executor worker held
+    /// and no interpreter attached. So the number of async handlers in flight
     /// is not bounded by the executor's size; each is still bounded by the
     /// coroutine timeout, on which it is cancelled and fails with
     /// `TimeoutError`.
@@ -220,10 +217,8 @@ impl ScriptHandle {
     /// the handler. `finish` turns the handler's outcome (its return value, or
     /// the exception it raised) into whatever the extension needs, attached:
     /// in the same job for a sync handler or a coroutine that finished inline,
-    /// in the job that resumes a coroutine suspended on siphon's own
-    /// awaitables, in a follow-up job once a coroutine on an asyncio driver
-    /// has finished. The caller awaits all of it without holding the
-    /// interpreter.
+    /// in a follow-up job once a suspended coroutine has finished. The caller
+    /// awaits all of it without holding the interpreter.
     ///
     /// Use it for per-event dispatch on a tokio worker (an HTTP request, an
     /// SMPP PDU): an attach there parks the worker through every garbage
@@ -253,12 +248,6 @@ impl ScriptHandle {
         enum Started<R> {
             Done(R),
             Suspended(crate::script::async_pool::PendingCoroutine, Finish<R>),
-            /// The executor drives the coroutine: `finish` runs in the job
-            /// that finishes it and its value arrives here.
-            Resuming(
-                tokio::sync::oneshot::Receiver<R>,
-                Option<crate::script::direct::Deadline>,
-            ),
         }
 
         let join = crate::script::py_executor::try_run(move || {
@@ -272,17 +261,6 @@ impl ScriptHandle {
                 let returned = match returned {
                     Ok(returned) if is_async => match start_coroutine(py, &returned) {
                         Ok(CoroutineStart::Finished(value)) => Ok(value.into_bound(py)),
-                        Ok(CoroutineStart::Suspended(pending)) if pending.is_direct() => {
-                            let (sender, receiver) = tokio::sync::oneshot::channel();
-                            let deadline = pending.resume_on_executor_watched(move |settled| {
-                                let value = crate::script::attach::attach(|py| {
-                                    finish(py, settled.map(|value| value.into_bound(py)))
-                                });
-                                // The caller may have stopped waiting.
-                                let _ = sender.send(value);
-                            });
-                            return Started::Resuming(receiver, deadline);
-                        }
                         Ok(CoroutineStart::Suspended(pending)) => {
                             return Started::Suspended(pending, Box::new(finish));
                         }
@@ -306,28 +284,6 @@ impl ScriptHandle {
                 })
                 .await
                 .map_err(|_| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                        "script handler continuation did not run".to_string(),
-                    )
-                })
-            }
-            Ok(Started::Resuming(mut receiver, deadline)) => {
-                // This task is awake for the result anyway, so it bounds the
-                // wait: when the coroutine timeout runs out the handler is
-                // cancelled and `finish` gets the `TimeoutError`.
-                let settled = match deadline {
-                    Some(deadline) => {
-                        match tokio::time::timeout(deadline.left(), &mut receiver).await {
-                            Ok(settled) => settled,
-                            Err(_elapsed) => {
-                                deadline.expire();
-                                receiver.await
-                            }
-                        }
-                    }
-                    None => receiver.await,
-                };
-                settled.map_err(|_| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                         "script handler continuation did not run".to_string(),
                     )

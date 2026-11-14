@@ -16,7 +16,7 @@ heap leak):
 | Pool | Runs | Size config | Default |
 |------|------|-------------|---------|
 | **Sync executor** (`PyExecutor`) | sync `@proxy.on_request`, `@proxy.on_reply`, `@registrar.on_change`, `@rtpengine.on_dtmf`, timers, … | `script.sync_pool_size` / `script.sync_pool_max` | core `max(8, 2×CPUs)`, max `max(32, 4×core)` |
-| **Async driver pool** (`AsyncPool`) | `async def` handlers that use asyncio itself + their `asyncio.create_task` work (one that awaits only siphon APIs stays on the sync executor, see [What an await costs](#what-an-await-costs)) | `script.async_pool_size` | CPUs |
+| **Async driver pool** (`AsyncPool`) | `async def` handlers + their `asyncio.create_task` work | `script.async_pool_size` | CPUs |
 
 ### The sync pool is elastic
 
@@ -307,79 +307,6 @@ handlers, `@diameter.on_inbound_cer`, built-in timers, SBI callbacks, RTPEngine
 events) still hold their worker until the coroutine settles, so for them the
 `max_rate` formula above applies to the await as well.
 
-### What an await costs
-
-A handler that awaits only siphon's own awaitable APIs
-(`await diameter.cx_uar(...)`, `await cache.fetch(...)`,
-`await proxy.send_request(...)`, an extension's awaitable built with
-`siphon::script::blocking::awaitable`) does not use asyncio at all. The worker that called the handler
-runs it up to the await and takes the next job; when the Rust side of the call
-finishes, a worker resumes the coroutine where it stopped. No event-loop task
-is created and no async driver thread runs, so such an await costs a small
-multiple of a synchronous call rather than an asyncio round trip: in the
-dispatch-cost bench a handler with one await takes about 27 µs of CPU per call
-where it took 147 µs, and one with ten awaits 147 µs where it took 438 µs
-(`script::dispatch_cost_bench_tests`, one caller).
-
-Everything asyncio offers still works, and still goes through an async driver:
-`asyncio.sleep`, `asyncio.create_task`, `asyncio.gather`, `asyncio.wait_for`
-and `asyncio.timeout`, `TaskGroup`, `asyncio.to_thread`, a third-party asyncio
-client. The first time a handler uses one of them it is moved to a driver
-where it stands, as the same task with the same context variables, and carries
-on there; what it scheduled on the loop runs after the step that scheduled it,
-as it always did. siphon remembers the handler and starts it on a driver from
-then on (until the script is reloaded), so such a handler costs what it did
-before, never more.
-
-What that means when writing a handler:
-
-- Awaiting siphon APIs one after another is the cheap shape.
-- To overlap two siphon calls, start both and await each, instead of
-  `asyncio.gather`: the Rust side starts when the awaitable is created, not
-  when it is awaited.
-
-  ```python
-  first = cache.fetch("profiles", caller)     # both in flight from here
-  second = cache.fetch("profiles", callee)
-  caller_profile, callee_profile = await first, await second
-  ```
-
-- To bound one call, prefer the API's own timeout argument to
-  `asyncio.wait_for`.
-- `asyncio.create_task` for fire-and-forget work is as correct as before; the
-  handler that calls it runs on a driver.
-
-Three things differ on the direct path, none of which a handler normally
-notices:
-
-- Between awaits the handler runs on sync-pool workers, not on a driver, and
-  not necessarily on the same worker twice. A blocking call in such a handler
-  holds one worker instead of stopping every coroutine on a driver loop.
-- `asyncio.current_task()` is a `SiphonHandlerTask`: it has the task interface
-  (name, `cancel()`, `cancelling()`, done callbacks) and stays the handler's
-  current task if it is moved to a driver, but it is not an `asyncio.Task`
-  instance, and `asyncio.all_tasks()` lists the handler only once it is on a
-  driver.
-- What an awaitable API returns is a `SiphonAwaitable`: it has the future
-  interface (`done()`, `result()`, `cancel()`, `add_done_callback()`, and
-  cancelling it drops the Rust call) and can be passed to `asyncio.gather`,
-  `asyncio.wait` or `asyncio.wait_for`, but it is not an `asyncio.Future`
-  instance.
-
-Two loop settings keep handlers off the direct path, because neither can be
-honoured from an executor thread: a task factory set on a driver loop
-(`loop.set_task_factory(...)`, `asyncio.eager_task_factory` included) and
-asyncio's debug mode (`PYTHONASYNCIODEBUG=1`, `loop.set_debug(True)`). Handlers
-bound to such a loop start on the driver, which is logged once per loop, and
-go back to the direct path when the setting is removed. siphon also drives one
-handler through every step of the direct path at start-up and leaves the path
-off, with an error in the log, if the interpreter does not behave as expected.
-
-This applies to the handlers that give their worker back while they await:
-`@proxy.on_request`, the Diameter server handlers, and the handlers a host
-extension calls through `ScriptHandle`. The handler kinds that hold their
-worker until the coroutine settles (listed above) run on a driver as before.
-
 ### Where an awaitable API finishes
 
 An awaitable siphon API (`await diameter.cx_uar(...)`, `await cache.fetch(...)`,
@@ -388,8 +315,7 @@ interpreter once, to build its Python result and wake the coroutine. That last
 step runs on two fixed threads named `siphon-await-0` and `siphon-await-1`,
 which hold their Python thread state for the life of the process. It is
 microseconds of work per call, so two threads carry far more than any
-signalling load. A handler on the direct path above needs neither thread: the
-worker that resumes it builds the result.
+signalling load.
 
 tokio's own blocking pool never runs Python. It grows a thread per concurrent
 blocking wait (a peer that stops answering parks one per in-flight request, up

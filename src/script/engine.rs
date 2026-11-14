@@ -479,7 +479,6 @@ impl ScriptEngine {
                 self.state.store(Arc::new(new_state));
                 // The verdicts describe code objects this reload replaced.
                 inline_dispatch::clear_inline_verdicts();
-                crate::script::direct::clear_demoted();
                 self.restart_timers();
                 Ok(())
             }

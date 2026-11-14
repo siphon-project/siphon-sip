@@ -1,6 +1,5 @@
-//! Running a script coroutine: inline where it provably cannot suspend, from
-//! the executor while all it awaits is siphon's own awaitables
-//! ([`crate::script::direct`]), on the asyncio driver pool otherwise.
+//! Running a script coroutine: inline where that is provably safe, on the
+//! asyncio driver pool otherwise.
 //!
 //! An asyncio task per SIP message is expensive out of all proportion to the
 //! work it wraps. Profiling the 40k proxy row moved **+23.85 % of total CPU into
@@ -17,10 +16,7 @@
 //! completion. That is the only case taken here, because a coroutine that *does*
 //! suspend cannot be recovered: probing it consumes the future the event loop
 //! needed, and handing it on afterwards fails with `RuntimeError: await wasn't
-//! used with future`. A coroutine that may suspend is therefore never probed:
-//! it is either driven from the executor with everything asyncio needs in
-//! place from its first step, so that it can be handed to a driver whole
-//! ([`crate::script::direct`]), or started on a driver.
+//! used with future`. There is no general fast path, only this one.
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -265,8 +261,7 @@ pub(crate) fn run_coroutine_value(
 pub(crate) enum CoroutineStart {
     /// It ran to the end here; this is its value.
     Finished(Py<PyAny>),
-    /// It is suspended: on one of siphon's awaitables, to be resumed by the
-    /// executor, or on an asyncio driver. The caller waits for it with
+    /// It is running on an asyncio driver. The caller waits for it with
     /// [`PendingCoroutine::resume_on_executor`] and continues from there.
     Suspended(PendingCoroutine),
 }
@@ -290,14 +285,8 @@ pub(crate) fn start_coroutine(
         && tokio::runtime::Handle::try_current().is_ok()
     {
         if let Some(pool) = crate::script::async_pool::AsyncPool::global() {
-            use crate::script::direct::DirectStart;
-            return match crate::script::direct::start(&pool, python, coroutine) {
-                Some(DirectStart::Finished(result)) => result.map(CoroutineStart::Finished),
-                Some(DirectStart::Pending(pending)) => Ok(CoroutineStart::Suspended(pending)),
-                // Its handler uses asyncio: it starts on a driver.
-                None => PendingCoroutine::submit(&pool, python, coroutine)
-                    .map(CoroutineStart::Suspended),
-            };
+            return PendingCoroutine::submit(&pool, python, coroutine)
+                .map(CoroutineStart::Suspended);
         }
     }
     drive_suspending_coroutine(python, coroutine).map(CoroutineStart::Finished)

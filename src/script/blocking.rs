@@ -67,23 +67,11 @@ where
 /// threads come and go). Called from a synchronous
 /// handler (no running event loop) it fails with an error that says to make
 /// the handler `async def`.
-///
-/// In a handler the executor drives itself ([`super::direct`]) the result is
-/// not an asyncio future but an awaitable that resumes the coroutine straight
-/// from the executor: awaiting it there involves no event loop, and the
-/// conversion runs on the worker that resumes. To anything else it still is a
-/// future, on demand. Either way `future` starts now, not when it is awaited,
-/// and cancelling what is returned drops it.
 pub fn awaitable<'py, F, T>(python: Python<'py>, future: F) -> PyResult<Bound<'py, PyAny>>
 where
     F: Future<Output = PyResult<T>> + Send + 'static,
     T: for<'a> IntoPyObject<'a> + Send + 'static,
 {
-    // In a handler step the executor is driving, the coroutine is resumed by
-    // the executor too, with no asyncio future in between.
-    if super::direct::in_direct_step() {
-        return super::direct::awaitable_in_step(python, future);
-    }
     pyo3_async_runtimes::generic::future_into_py::<super::completions::AwaitableRuntime, _, _>(
         python, future,
     )
