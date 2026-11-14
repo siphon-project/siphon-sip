@@ -49,6 +49,8 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`tasks` namespace: background work and wait-for-the-first-answer without asyncio.** `tasks.spawn(coroutine)` runs a coroutine as tracked background work, driven by the executor like a handler (moved to an async driver, intact, the moment it uses asyncio itself) and returning a handle that can be awaited and cancelled; an exception nothing is awaiting is logged at error level, `siphon_script_background_tasks` counts the running ones, a graceful shutdown waits for them and cancels what the drain deadline finds still running. `tasks.wait_first(awaitables, timeout=..., cancel_losers=False)` finishes with a `FirstResult` (winner index, value or exception, or `timed_out`), and `tasks.event()` is a settable awaitable for the cases that used an `asyncio.Event`. A handler that used `asyncio.ensure_future` and `asyncio.wait(..., return_when=FIRST_COMPLETED)` for these no longer has to leave the direct path. The awaitables siphon APIs return gain native `cancel()`, `done()`, `cancelled()`, `result()` and `exception()`, so using them no longer schedules on the loop. In the dispatch-cost bench, spawn plus `wait_first` costs 68 µs of CPU per call where `ensure_future` plus `asyncio.wait` costs 306 µs. See `docs/handler-execution-model.md`, "Background work and waiting for the first answer".
+
 - `siphon_accept_errors_total{transport,listener,reason}`, `reason` one of
   `emfile`, `enfile`, `enobufs`, `enomem`, `other`, counted on every accept
   error. Alert on `process_open_fds / process_max_fds > 0.8` for the warning

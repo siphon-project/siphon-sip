@@ -94,14 +94,20 @@ use crate::script::async_pool::{AsyncPool, PendingCoroutine};
 mod awaitable;
 mod baton;
 mod python;
+mod spawn;
 mod task;
 #[cfg(test)]
 pub(crate) mod test_hooks;
+mod wait;
 
 pub(crate) use awaitable::awaitable_in_step;
 #[cfg(test)]
 pub(crate) use awaitable::SiphonAwaitable as TestAwaitable;
 pub(crate) use python::{new_driver_loop, DriverLoop};
+#[cfg(test)]
+pub(crate) use spawn::outstanding as background_outstanding;
+pub(crate) use spawn::{cancel_all_and_wait, spawn as spawn_background, BackgroundTasks};
+pub(crate) use wait::{wait_first, EventCore, FirstOutcome};
 
 use awaitable::{Registered, SiphonAwaitable};
 use baton::{Baton, LoopCommand, LoopPark};
@@ -265,6 +271,13 @@ pub(crate) fn clear_demoted() {
     if let Some(map) = DEMOTED.get() {
         map.clear();
     }
+}
+
+/// How many handlers are known to use asyncio, for tests asserting that one
+/// never did.
+#[cfg(test)]
+pub(crate) fn demoted_count() -> usize {
+    DEMOTED.get().map_or(0, DashMap::len)
 }
 
 /// Whether this coroutine's handler used asyncio on an earlier call. Such a

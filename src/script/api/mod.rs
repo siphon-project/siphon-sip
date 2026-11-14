@@ -57,6 +57,7 @@ pub mod subscribe_state;
 /// silently. Test-only.
 #[cfg(test)]
 mod surface_snapshot;
+pub mod tasks;
 pub mod timer;
 mod uac_flow;
 #[cfg(test)]
@@ -85,6 +86,7 @@ pub const BUILT_IN_NAMESPACE_NAMES: &[&str] = &[
     "numbers",
     "sdp",
     "timer",
+    "tasks",
     "isc",
     "b2bua",
     "rtpengine",
@@ -971,6 +973,14 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
             .setattr("timer", timer_py.bind(python))
             .map_err(|error| SiphonError::Script(format!("setattr timer: {error}")))?;
     }
+
+    // Inject the tasks namespace (always available, stateless: background
+    // work and waits are tracked process-wide, not per namespace object).
+    let tasks_py = Py::new(python, tasks::PyTasksNamespace::new())
+        .map_err(|error| SiphonError::Script(format!("Py::new(tasks): {error}")))?;
+    module
+        .setattr("tasks", tasks_py)
+        .map_err(|error| SiphonError::Script(format!("setattr tasks: {error}")))?;
 
     // Inject ISC singleton (always available — iFC store).
     if let Some(isc_py) = ISC_SINGLETON.get() {

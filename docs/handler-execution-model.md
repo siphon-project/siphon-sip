@@ -347,7 +347,8 @@ What that means when writing a handler:
 - To bound one call, prefer the API's own timeout argument to
   `asyncio.wait_for`.
 - `asyncio.create_task` for fire-and-forget work is as correct as before; the
-  handler that calls it runs on a driver.
+  handler that calls it runs on a driver. `tasks.spawn` (below) does the same
+  job and keeps the handler on the direct path.
 
 Three things differ on the direct path, none of which a handler normally
 notices:
@@ -379,6 +380,87 @@ This applies to the handlers that give their worker back while they await:
 `@proxy.on_request`, the Diameter server handlers, and the handlers a host
 extension calls through `ScriptHandle`. The handler kinds that hold their
 worker until the coroutine settles (listed above) run on a driver as before.
+
+### Background work and waiting for the first answer (`tasks`)
+
+Two things scripts reached for asyncio to do, and so lost the direct path for
+the whole handler: fire-and-forget work (`asyncio.ensure_future`) and waiting
+for the first of several awaitables with a timeout (`asyncio.wait(...,
+return_when=FIRST_COMPLETED)` with an `asyncio.Event`). The `tasks` namespace
+does both without asyncio:
+
+```python
+from siphon import tasks
+
+async def delete_session(session):
+    release = tasks.spawn(release_resources(session), name="release")
+    answered = tasks.event()                  # set by another handler
+    first = await tasks.wait_first([release, answered.wait()], timeout=2.0)
+    if first.timed_out:
+        log.warning("release still running, answering anyway")
+    return "deleted"
+```
+
+- `tasks.spawn(coroutine, *, name=None)` starts the coroutine and returns a
+  handle. It is started the way a handler is: on the calling worker, with no
+  asyncio task, for as long as it awaits only siphon's own awaitables; the
+  moment it uses asyncio for anything else it is moved to an async driver, as
+  the same coroutine, exactly as a handler would be (and the coroutine's code
+  is remembered, so later spawns start on a driver). Its first step runs
+  inside the `spawn()` call. Spawned from a thread that already runs an event
+  loop (a handler on a driver) it starts on a driver.
+- The handle is awaitable (its value, or its exception), can be passed to
+  `wait_first`, and has `cancel()`, `done()`, `cancelled()`, `result()` and
+  `exception()`. `cancel()` cancels the coroutine behind it as
+  `Task.cancel()` does. It is native, not the asyncio future's: the future's
+  `cancel()` schedules on the loop, which takes the handler off the direct
+  path.
+- Background work is bounded by `script.handler_timeout_secs` like a handler:
+  a coroutine that outlives it is cancelled and its entry released. An
+  exception that ends it while nothing awaits the handle (or watches it
+  through `wait_first`) is logged at error level with the task name, the
+  exception and its traceback; awaiting the handle later still raises it.
+  Cancellation is not logged.
+- It is tracked. `siphon_script_background_tasks` counts the running ones, a
+  graceful shutdown waits for them (they count towards the drain), and the
+  ones still running when `server.drain_secs` runs out are cancelled and given
+  a moment to unwind, so a `finally` block that releases something runs.
+- `tasks.wait_first(awaitables, *, timeout=None, cancel_losers=False)`
+  returns an awaitable that finishes with a `FirstResult` as soon as the first
+  of `awaitables` finishes (value, exception or cancellation), or with
+  `timed_out` after `timeout` seconds. `first.index` is the winner's position
+  (`None` on a timeout), `first.awaitable` the winner, `first.result()` its
+  value or its exception (`TimeoutError` after a timeout), `first.exception`
+  the exception or `None`. An awaitable that is already finished wins at once;
+  of several, the lowest position.
+- `cancel_losers` defaults to `False`, as for `asyncio.wait`: a loser is
+  usually a request already sent (a release, a Diameter answer) that still has
+  to finish after the caller stopped waiting, and cancelling it mid-flight
+  would lose the answer. Pass `True` to cancel every awaitable that did not win
+  (all of them after a timeout); a cancelled `spawn` handle cancels its
+  coroutine. A cancelled wait (its waiter cancelled) leaves the awaitables
+  running and withdraws what it registered on them.
+- `tasks.event()` returns an `Event` with `set()`, `clear()`, `is_set()` and
+  `wait()`. `wait()` is a siphon awaitable that finishes with `True` once the
+  event is set (at once if it already is), so it goes into `wait_first` like
+  any other. It is what replaces the `asyncio.Event` of a wait that other code
+  wakes. Store the event where the other handler can reach it (the `cache`
+  namespace, an object kept alongside the session), as before.
+
+In the dispatch-cost bench, a handler that spawns one coroutine awaiting one
+siphon call and waits for it with `wait_first(timeout=...)` costs 68 µs of CPU
+per call at one caller (60 µs at sixteen); the same shape with
+`asyncio.ensure_future` and `asyncio.wait` costs 306 µs (334 µs)
+(`spawn_wait` and `asyncio_spawn_wait` in
+`script::dispatch_cost_bench_tests::dispatch_cost`).
+
+`wait_first` takes the awaitables siphon returned: `spawn` handles,
+`Event.wait()` and the awaitables of siphon APIs called in a handler siphon
+drives itself. An asyncio future or task is a `TypeError`; a handler that
+already uses asyncio can keep using `asyncio.wait` for those. Awaitables made
+in a handler that is already on a driver (see above) are asyncio futures and
+are not accepted either, so the shape pays off in a handler that has no other
+asyncio in it.
 
 ### Where an awaitable API finishes
 

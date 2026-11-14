@@ -952,6 +952,7 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
             "async_drivers_stalled": metrics.async_drivers_stalled.get(),
             // Async handlers awaiting: these hold a coroutine, not a worker.
             "async_coroutines_pending": metrics.async_coroutines_pending.get(),
+            "background_tasks": metrics.script_background_tasks.get(),
             // Part of `inflight` that is never coming back.
             "jobs_abandoned": metrics.pyexec_jobs_abandoned_total.get(),
         },

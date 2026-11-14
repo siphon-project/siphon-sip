@@ -15,6 +15,8 @@ pub(crate) mod direct;
 #[cfg(test)]
 mod direct_edge_tests;
 #[cfg(test)]
+mod direct_spawn_tests;
+#[cfg(test)]
 mod direct_tests;
 #[cfg(test)]
 mod dispatch_cost_bench_tests;

@@ -33,6 +33,7 @@
     "sbi",
     "sdp",
     "srs",
+    "tasks",
     "timer"
   ],
   "types": {
@@ -1086,6 +1087,28 @@
         "kind": "getset_descriptor"
       }
     },
+    "Event": {
+      "clear": {
+        "doc": "Unset the event.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "is_set": {
+        "doc": "Whether the event is set.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "set": {
+        "doc": "Set the event: everything awaiting `wait()` finishes, and later calls",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "wait": {
+        "doc": "An awaitable that finishes with `True` once the event is set.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      }
+    },
     "FailureResponse": {
       "body": {
         "doc": "The response body as ``bytes``, or ``None`` when it has none.",
@@ -1111,6 +1134,29 @@
       },
       "status_code": {
         "doc": "The leg's own status code, e.g. ``503`` where the caller is sent ``500``.",
+        "kind": "getset_descriptor"
+      }
+    },
+    "FirstResult": {
+      "awaitable": {
+        "doc": "The awaitable that finished first; `None` on a timeout.",
+        "kind": "getset_descriptor"
+      },
+      "exception": {
+        "doc": "The exception the winner ended with, or `None`.",
+        "kind": "getset_descriptor"
+      },
+      "index": {
+        "doc": "Position, in the list given to `wait_first`, of the awaitable that",
+        "kind": "getset_descriptor"
+      },
+      "result": {
+        "doc": "The winner's value; raises its exception, or `TimeoutError` if the",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "timed_out": {
+        "doc": "Whether the timeout ended the wait.",
         "kind": "getset_descriptor"
       }
     },
@@ -3293,6 +3339,23 @@
         "doc": "Originate an outbound SUBSCRIBE and capture the resulting dialog.",
         "kind": "method_descriptor",
         "sig": "($self, ruri, event, expires, accept=None, target_uri=None, headers=None, timeout_ms=2000, flow=None, route=..., body=None, content_type=None)"
+      }
+    },
+    "TasksNamespace": {
+      "event": {
+        "doc": "A new, unset `Event`.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "spawn": {
+        "doc": "Start `coroutine` as background work and return a handle for it.",
+        "kind": "method_descriptor",
+        "sig": "($self, coroutine, *, name=None)"
+      },
+      "wait_first": {
+        "doc": "An awaitable that finishes with a `FirstResult` as soon as the first of",
+        "kind": "method_descriptor",
+        "sig": "($self, awaitables, *, timeout=None, cancel_losers=False)"
       }
     },
     "TimerHandle": {

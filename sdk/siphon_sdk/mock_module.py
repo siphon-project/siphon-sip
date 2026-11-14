@@ -15145,6 +15145,15 @@ _numbers = MockNumbersNamespace()
 
 
 # ---------------------------------------------------------------------------
+# tasks namespace — background work and wait-for-the-first-answer
+# ---------------------------------------------------------------------------
+
+from siphon_sdk.tasks import MockTasksNamespace
+
+_tasks = MockTasksNamespace()
+
+
+# ---------------------------------------------------------------------------
 # config namespace: operator-supplied script configuration (script_config:)
 # ---------------------------------------------------------------------------
 
@@ -15636,6 +15645,7 @@ def install() -> ModuleType:
     mod.stir = _stir  # type: ignore[attr-defined]
     mod.sdp = _sdp  # type: ignore[attr-defined]
     mod.numbers = _numbers  # type: ignore[attr-defined]
+    mod.tasks = _tasks  # type: ignore[attr-defined]
     mod.qos = _qos  # type: ignore[attr-defined]
     mod.config = _script_config  # type: ignore[attr-defined]
     # LCR namespace (B2BUA-only) + the Route / LcrDecision types (mirrors the
@@ -15699,6 +15709,7 @@ def reset() -> None:
     _ipsec.clear()
     _stir.clear()
     _numbers.clear()
+    _tasks.clear()
     _script_config.clear()
     _smpp.clear()
     _http.clear()
@@ -15755,6 +15766,19 @@ def b2bua_claims_invite(request_uri: str, in_dialog: bool = False) -> bool:
     if in_dialog:
         return False
     return any(re.search(pattern, request_uri) for pattern in patterns)
+
+
+def get_tasks() -> MockTasksNamespace:
+    """Access the mock tasks namespace singleton (test helper).
+
+    ``outstanding`` counts the spawned coroutines still running, ``drain()``
+    waits for them, and ``unawaited_failures`` lists the failures siphon would
+    have logged at error level::
+
+        await mock_module.get_tasks().drain()
+        assert mock_module.get_tasks().outstanding == 0
+    """
+    return _tasks
 
 
 def get_numbers() -> MockNumbersNamespace:

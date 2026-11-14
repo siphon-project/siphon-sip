@@ -45,11 +45,23 @@ struct Bridge {
     future: Py<PyAny>,
 }
 
+/// Told, from whichever thread finishes or cancels the awaitable, that it
+/// has. Touches no Python object: it only wakes something.
+pub(super) type Watcher = Box<dyn FnOnce() + Send>;
+
+/// What cancelling the awaitable also cancels (the background work behind a
+/// spawn handle), run attached once the awaitable is cancelled.
+pub(super) type OnCancel = Box<dyn for<'py> FnOnce(Python<'py>) + Send>;
+
 struct AwaitableInner {
     state: AwaitableState,
     /// The directly driven coroutine suspended on this awaitable.
     waiter: Option<Arc<Drive>>,
     bridges: Vec<Bridge>,
+    /// `tasks.wait_first` calls watching for this awaitable to finish, by the
+    /// token each took out. Empty once it has finished.
+    watchers: Vec<(u64, Watcher)>,
+    on_cancel: Option<OnCancel>,
 }
 
 pub(super) struct AwaitableShared {
@@ -86,15 +98,25 @@ impl AwaitableShared {
     /// The Rust future finished. Runs on a tokio worker: touches no Python
     /// object beyond moving references.
     async fn complete(self: Arc<Self>, build: BuildValue) {
-        let (waiter, bridged) = {
+        let (waiter, bridged, watchers, on_cancel) = {
             let mut inner = locked(&self.inner);
             if !matches!(inner.state, AwaitableState::Pending) {
                 // Cancelled while the future was finishing.
                 return;
             }
             inner.state = AwaitableState::Ready(build);
-            (inner.waiter.take(), !inner.bridges.is_empty())
+            (
+                inner.waiter.take(),
+                !inner.bridges.is_empty(),
+                std::mem::take(&mut inner.watchers),
+                inner.on_cancel.take(),
+            )
         };
+        // Finished: there is nothing left to cancel.
+        drop(on_cancel);
+        for (_token, watcher) in watchers {
+            watcher();
+        }
         if bridged {
             // The asyncio futures are settled attached, off the workers, on
             // the pinned completion threads.
@@ -109,7 +131,7 @@ impl AwaitableShared {
     }
 
     /// The awaitable's result, converting it on first use.
-    fn result(&self, python: Python<'_>) -> PyResult<Py<PyAny>> {
+    pub(super) fn result(&self, python: Python<'_>) -> PyResult<Py<PyAny>> {
         loop {
             let read = {
                 let mut inner = locked(&self.inner);
@@ -216,14 +238,62 @@ impl AwaitableShared {
         drop(released);
     }
 
-    fn finished(&self) -> bool {
+    pub(super) fn finished(&self) -> bool {
         !matches!(locked(&self.inner).state, AwaitableState::Pending)
+    }
+
+    /// Call `watcher` once this awaitable has finished or been cancelled.
+    /// `false`, with `watcher` dropped uncalled, if it already has: the caller
+    /// acts on that itself.
+    pub(super) fn watch(&self, token: u64, watcher: Watcher) -> bool {
+        let mut inner = locked(&self.inner);
+        if !matches!(inner.state, AwaitableState::Pending) {
+            return false;
+        }
+        inner.watchers.push((token, watcher));
+        true
+    }
+
+    /// Withdraw the watcher `token` took out, if it has not been called.
+    pub(super) fn unwatch(&self, token: u64) {
+        let removed = {
+            let mut inner = locked(&self.inner);
+            inner
+                .watchers
+                .iter()
+                .position(|(held, _)| *held == token)
+                .map(|index| inner.watchers.remove(index))
+        };
+        drop(removed);
+    }
+
+    /// Whether anything is waiting to be told how this awaitable ended: a
+    /// coroutine awaiting it, an asyncio future standing in for it, or a
+    /// watcher.
+    pub(super) fn observed(&self) -> bool {
+        let inner = locked(&self.inner);
+        inner.waiter.is_some() || !inner.bridges.is_empty() || !inner.watchers.is_empty()
+    }
+
+    /// Have cancelling this awaitable also run `on_cancel`. Ignored if it has
+    /// finished already.
+    pub(super) fn set_on_cancel(&self, on_cancel: OnCancel) {
+        let mut inner = locked(&self.inner);
+        if matches!(inner.state, AwaitableState::Pending) {
+            inner.on_cancel = Some(on_cancel);
+        }
+    }
+
+    /// Watchers still registered, for the leak tests.
+    #[cfg(test)]
+    pub(super) fn watcher_count(&self) -> usize {
+        locked(&self.inner).watchers.len()
     }
 
     /// Cancel the awaitable: its Rust future is dropped and whatever waits on
     /// it is woken with `CancelledError`. `false` if it had finished.
     pub(super) fn cancel(&self, python: Python<'_>) -> bool {
-        let (waiter, futures) = {
+        let (waiter, futures, watchers, on_cancel) = {
             let mut inner = locked(&self.inner);
             if !matches!(inner.state, AwaitableState::Pending) {
                 return false;
@@ -237,10 +307,21 @@ impl AwaitableShared {
                     future: bridge.future.clone_ref(python),
                 })
                 .collect();
-            (inner.waiter.take(), futures)
+            (
+                inner.waiter.take(),
+                futures,
+                std::mem::take(&mut inner.watchers),
+                inner.on_cancel.take(),
+            )
         };
         if let Some(abort) = self.abort.get() {
             abort.abort();
+        }
+        if let Some(on_cancel) = on_cancel {
+            on_cancel(python);
+        }
+        for (_token, watcher) in watchers {
+            watcher();
         }
         for bridge in futures {
             let cancel = bridge
@@ -415,6 +496,12 @@ impl SiphonAwaitable {
         self.shared.cancel(python)
     }
 
+    /// Watchers still registered on this awaitable.
+    #[cfg(test)]
+    pub(crate) fn watcher_count_for_test(&self) -> usize {
+        self.shared.watcher_count()
+    }
+
     /// The asyncio future for the loop running on this thread.
     fn future_here<'py>(&self, python: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let helpers = helpers(python)
@@ -455,9 +542,50 @@ impl SiphonAwaitable {
         Err(PyRuntimeError::new_err("await wasn't used with future"))
     }
 
+    /// Cancel the awaitable (and, for a `tasks.spawn` handle, the background
+    /// coroutine behind it). `False` if it had finished. Native, because the
+    /// asyncio future's `cancel` schedules its callbacks on the loop and so
+    /// takes the handler off the executor.
+    #[pyo3(signature = (msg=None))]
+    fn cancel(&self, python: Python<'_>, msg: Option<Py<PyAny>>) -> bool {
+        let _ = msg;
+        self.shared.cancel(python)
+    }
+
+    /// Whether the awaitable has finished, failed or been cancelled.
+    fn done(&self) -> bool {
+        self.shared.finished()
+    }
+
+    /// Whether the awaitable was cancelled.
+    fn cancelled(&self) -> bool {
+        matches!(locked(&self.shared.inner).state, AwaitableState::Cancelled)
+    }
+
+    /// The value, or raise the exception it ended with
+    /// (`asyncio.InvalidStateError` while it is still running).
+    fn result(&self, python: Python<'_>) -> PyResult<Py<PyAny>> {
+        if !self.shared.finished() {
+            return Err(invalid_state(python));
+        }
+        self.shared.result(python)
+    }
+
+    /// The exception it ended with, or `None`
+    /// (`asyncio.InvalidStateError` while it is still running).
+    fn exception(&self, python: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        if !self.shared.finished() {
+            return Err(invalid_state(python));
+        }
+        match self.shared.result(python) {
+            Ok(_) => Ok(None),
+            Err(error) if self.cancelled() => Err(error),
+            Err(error) => Ok(Some(error.into_value(python).into_any())),
+        }
+    }
+
     /// Everything else a script may do with what an awaitable API returned
-    /// (`add_done_callback`, `cancel`, `done`, `result`, ...) is the asyncio
-    /// future's.
+    /// (`add_done_callback`, ...) is the asyncio future's.
     fn __getattr__<'py>(slf: &Bound<'py, Self>, name: &str) -> PyResult<Bound<'py, PyAny>> {
         // Protocol probes must not conjure a future: dunder lookups, and the
         // generator protocol, which the interpreter looks up on whatever a
@@ -503,6 +631,8 @@ where
             state: AwaitableState::Pending,
             waiter: None,
             bridges: Vec::new(),
+            watchers: Vec::new(),
+            on_cancel: None,
         }),
         converted: Condvar::new(),
         abort: OnceLock::new(),

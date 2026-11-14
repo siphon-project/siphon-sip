@@ -866,6 +866,15 @@ impl PendingCoroutine {
         self.settle().await.into_result()
     }
 
+    /// What cancels this coroutine, usable after the pending entry itself has
+    /// been consumed by a wait.
+    pub(crate) fn canceller(&self, python: Python<'_>) -> Canceller {
+        match &self.waiting {
+            Waiting::Driver { future, .. } => Canceller::Driver(future.clone_ref(python)),
+            Waiting::Direct(drive) => Canceller::Direct(Arc::clone(drive)),
+        }
+    }
+
     /// Whether the executor drives this coroutine itself, so that
     /// [`resume_on_executor`](Self::resume_on_executor) runs `resume` in the
     /// job that finishes it rather than in a job of its own.
@@ -961,6 +970,29 @@ impl PendingCoroutine {
                 );
             }
         });
+    }
+}
+
+/// Cancels a coroutine that is running somewhere: on the executor, or as a
+/// task on a driver.
+pub(crate) enum Canceller {
+    Direct(Arc<crate::script::direct::Drive>),
+    /// Anything with a `cancel()` that is safe from any thread.
+    Driver(Py<PyAny>),
+}
+
+impl Canceller {
+    /// Cancel the coroutine as `asyncio.Task.cancel` would. `false` if it had
+    /// finished.
+    pub(crate) fn cancel(&self, python: Python<'_>) -> bool {
+        match self {
+            Self::Direct(drive) => drive.cancel(python),
+            Self::Driver(future) => future
+                .bind(python)
+                .call_method0("cancel")
+                .and_then(|cancelled| cancelled.extract::<bool>())
+                .unwrap_or(false),
+        }
     }
 }
 
