@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::CrlfPongTracker;
@@ -73,10 +73,12 @@ pub async fn listen(
     // Route header pointed at a destination with no live inbound connection.
     spawn_outbound_distributor(outbound_rx, connection_map.clone(), Transport::Tcp, pool);
 
+    let mut accept_backoff = crate::transport::accept_backoff::AcceptBackoff::new("tcp", bound);
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((socket, remote_addr)) => {
+                    accept_backoff.on_success();
                     if !acl.is_allowed(remote_addr.ip()) {
                         debug!("TCP rejected {} by ACL", remote_addr);
                         continue;
@@ -223,9 +225,7 @@ pub async fn listen(
                         .await;
                     });
                 }
-                Err(error) => {
-                    error!("TCP accept error: {}", error);
-                }
+                Err(error) => accept_backoff.on_error(&error).await,
             }
         }
     });

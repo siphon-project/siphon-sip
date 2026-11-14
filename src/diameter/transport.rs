@@ -325,6 +325,28 @@ impl DiameterListener {
         }
     }
 
+    /// Accept connections forever, handing each to `serve`. An accept error
+    /// never ends the loop: running out of descriptors backs off (see
+    /// [`crate::transport::accept_backoff`]) and the loop keeps accepting.
+    /// `listener` labels the log lines and `siphon_accept_errors_total`.
+    pub async fn accept_forever(
+        &self,
+        listener: impl std::fmt::Display,
+        mut serve: impl FnMut(DiameterStream, SocketAddr),
+    ) {
+        let mut accept_backoff =
+            crate::transport::accept_backoff::AcceptBackoff::new("diameter", listener);
+        loop {
+            match self.accept().await {
+                Ok((stream, peer_addr)) => {
+                    accept_backoff.on_success();
+                    serve(stream, peer_addr);
+                }
+                Err(error) => accept_backoff.on_error(&error).await,
+            }
+        }
+    }
+
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         match self {
             DiameterListener::Tcp(l) => l.local_addr(),

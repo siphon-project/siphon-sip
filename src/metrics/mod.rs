@@ -4,6 +4,7 @@
 //! registrations, dialogs, and transport connections. Metrics are collected
 //! inline (at the call site) and scraped via the HTTP admin API `/metrics`.
 
+pub mod accept;
 pub mod admission;
 pub mod custom;
 pub mod enum_servers;

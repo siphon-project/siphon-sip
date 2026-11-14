@@ -77,10 +77,12 @@ pub async fn listen(
         }
     });
 
+    let mut accept_backoff = crate::transport::accept_backoff::AcceptBackoff::new("sctp", bound);
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((sctp_stream, remote_addr)) => {
+                    accept_backoff.on_success();
                     if !acl.is_allowed(remote_addr.ip()) {
                         continue;
                     }
@@ -230,9 +232,7 @@ pub async fn listen(
                         info!("SCTP connection {:?} cleaned up", connection_id);
                     });
                 }
-                Err(error) => {
-                    error!("SCTP accept error: {}", error);
-                }
+                Err(error) => accept_backoff.on_error(&error).await,
             }
         }
     });
