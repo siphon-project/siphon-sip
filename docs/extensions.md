@@ -357,6 +357,54 @@ SiphonServer::builder()
 calls on `DiameterClient` are async and Rust-only; they never attach to the
 Python interpreter.
 
+## Rust addons: wrapping a handler in your own coroutine
+
+`ScriptHandle::call_handler_with` calls a registered handler. An addon that
+wraps the handler in middleware of its own (auth, tracing, a request context)
+has a coroutine of its own to run, and starts it with
+`ScriptHandle::start_coroutine`. It takes the same path as a handler: a
+coroutine that awaits only siphon's awaitables (`blocking::awaitable`) is
+resumed by the executor with no asyncio task, one that uses asyncio moves to an
+asyncio driver intact, and the coroutine timeout cancels it and leaves nothing
+pending (`finish` receives the `TimeoutError`).
+
+`build` runs attached in an executor job and returns the coroutine object (call
+the `async def`, do not await it); `finish` reads the outcome the same way. The
+calling task never attaches.
+
+The first argument, `demotion_key: Option<Arc<Py<PyAny>>>`, matters when every route
+goes through one wrapper coroutine. siphon remembers which coroutines use
+asyncio so they start on a driver from then on, keyed by code object, and a
+shared wrapper has one code object for all routes: one route that uses asyncio
+would move them all. Pass the route's handler function (any object whose
+identity names the route) and each route is learned separately; the key is held
+until the script reloads. It is an `Arc` because the caller is a tokio worker
+that must not attach: keep the key on the route as an `Arc<Py<PyAny>>` and clone
+the `Arc` per call (`Py::clone` needs an attach), the job reads it attached. `None` keys on the code object, as for a handler.
+
+```rust,ignore
+use pyo3::prelude::*;
+
+async fn run_wrapped(handle: &ScriptHandle, path: String) -> Option<String> {
+    handle
+        .start_coroutine(
+            None, // or Some(Arc::clone(&route.key)) when routes share a wrapper
+            move |py| {
+                // Your middleware coroutine, which awaits the user's handler.
+                let middleware = py.import("my_addon.middleware")?.getattr("run")?;
+                middleware.call1((path,))
+            },
+            |_py, outcome| outcome.and_then(|value| value.extract::<String>()).ok(),
+        )
+        .await
+        .ok()
+        .flatten()
+}
+```
+
+An extension's own tests can build a handle onto an engine without a server
+with `ScriptHandle::for_engine(&engine, runtime_handle)`.
+
 ## Testing extension scripts
 
 The [`siphon-sip` SDK](https://pypi.org/project/siphon-sip/) (`pip install

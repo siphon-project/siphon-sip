@@ -380,6 +380,29 @@ This applies to the handlers that give their worker back while they await:
 extension calls through `ScriptHandle`. The handler kinds that hold their
 worker until the coroutine settles (listed above) run on a driver as before.
 
+An extension that wraps the script's handler in a coroutine of its own
+(middleware) starts it with `ScriptHandle::start_coroutine`, which takes the
+same path: executor-driven while it awaits only siphon's awaitables, on a
+driver if it uses asyncio, and bounded by the same coroutine timeout. See
+`docs/extensions.md`, "Rust addons: wrapping a handler in your own coroutine".
+
+#### What siphon learns per coroutine code object
+
+A handler that uses asyncio is moved to a driver the first time, and siphon
+remembers that it did, so its later calls start on a driver without paying the
+hand-over again. What is remembered is the coroutine's **code object**, cleared
+on script reload. That is exactly one handler, unless several handlers share a
+code object:
+
+- A script's own `async def` decorator wrapper (`def traced(fn): async def
+  inner(*args): return await fn(*args)`) has one code object for every handler
+  it wraps. The first wrapped handler that uses asyncio sends all of them to a
+  driver. Keep the wrapper out of the hot handlers, or accept the driver cost.
+- An extension host that runs every route through one wrapper coroutine has the
+  same trap. It passes `demotion_key` to `ScriptHandle::start_coroutine`: any
+  object whose identity names the route (its handler function), so each route
+  is learned on its own. With `None` the wrapper's code object is the key.
+
 ### Where an awaitable API finishes
 
 An awaitable siphon API (`await diameter.cx_uar(...)`, `await cache.fetch(...)`,

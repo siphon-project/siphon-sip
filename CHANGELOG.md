@@ -49,6 +49,7 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`ScriptHandle::start_coroutine(demotion_key, build, finish)` (`demotion_key: Option<Arc<Py<PyAny>>>`, so a tokio worker passes it per call without attaching) for extensions that wrap a handler in their own coroutine.** `call_handler_with` builds the coroutine from a registered handler, so middleware around a handler could not use it. `start_coroutine` takes a closure that builds the coroutine (attached, in an executor job) and a `finish` closure like `call_handler_with`'s, and runs it on the same path: executor-driven while it awaits only siphon's awaitables, moved to an asyncio driver intact if it uses asyncio, bounded by the coroutine timeout (cancelled, nothing left pending, `finish` gets `TimeoutError`). siphon remembers per coroutine code object which coroutines use asyncio; `demotion_key` names the unit instead (a route's handler function), so routes that share one wrapper coroutine are not all moved to a driver when one of them uses asyncio. The docs now say that the same trap applies to a script's own `async def` decorator wrapper. `ScriptHandle::for_engine` builds a handle onto an engine without a server, for an extension's own tests. See `docs/extensions.md`.
 - `siphon_accept_errors_total{transport,listener,reason}`, `reason` one of
   `emfile`, `enfile`, `enobufs`, `enomem`, `other`, counted on every accept
   error. Alert on `process_open_fds / process_max_fds > 0.8` for the warning

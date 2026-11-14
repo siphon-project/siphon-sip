@@ -223,7 +223,7 @@ fn run_self_test(pool: &Arc<AsyncPool>, python: Python<'_>) -> Result<(), String
         .call1((&helpers.self_test_awaitable, report))
         .map_err(text)?;
     // Held until the verdict is in: dropping it is not what ends the test.
-    let started = match start_unchecked(pool, python, &coroutine) {
+    let started = match start_unchecked(pool, python, &coroutine, None) {
         Some(DirectStart::Pending(pending)) => pending,
         Some(DirectStart::Finished(_)) => {
             return Err("the handler finished without being handed to a driver".into())
@@ -267,11 +267,25 @@ pub(crate) fn clear_demoted() {
     }
 }
 
+/// Verdicts remembered, and a way to record one, for the tests.
+#[cfg(test)]
+pub(crate) fn demoted_len() -> usize {
+    demoted().len()
+}
+
+#[cfg(test)]
+pub(crate) fn demote_for_test(coroutine: &Bound<'_, PyAny>, key: Option<&Bound<'_, PyAny>>) {
+    demote(coroutine, key);
+}
+
 /// Whether this coroutine's handler used asyncio on an earlier call. Such a
 /// handler starts on a driver: handing it over each time would cost more than
 /// the direct steps save, and a task it creates from an executor thread costs
 /// a stop-the-world when it finishes on the driver.
-fn is_demoted(coroutine: &Bound<'_, PyAny>) -> bool {
+fn is_demoted(coroutine: &Bound<'_, PyAny>, key: Option<&Bound<'_, PyAny>>) -> bool {
+    if let Some(key) = key {
+        return demoted().contains_key(&(key.as_ptr() as usize));
+    }
     let Ok(code) = coroutine.getattr(intern!(coroutine.py(), "cr_code")) else {
         // Not a native coroutine: nothing to key a verdict on.
         return true;
@@ -279,10 +293,16 @@ fn is_demoted(coroutine: &Bound<'_, PyAny>) -> bool {
     demoted().contains_key(&(code.as_ptr() as usize))
 }
 
-fn demote(coroutine: &Bound<'_, PyAny>) {
+/// Remember that the unit `key` names (the coroutine's code object when the
+/// caller gave none) uses asyncio.
+fn demote(coroutine: &Bound<'_, PyAny>, key: Option<&Bound<'_, PyAny>>) {
     let python = coroutine.py();
     let Ok(code) = coroutine.getattr(intern!(python, "cr_code")) else {
         return;
+    };
+    let code = match key {
+        Some(key) => key.clone(),
+        None => code,
     };
     let key = code.as_ptr() as usize;
     if demoted().contains_key(&key) {
@@ -423,6 +443,8 @@ pub(crate) enum DirectStart {
 /// One coroutine driven from the executor.
 pub(crate) struct Drive {
     coroutine: Py<PyAny>,
+    /// What names the unit to remember as using asyncio, when not the code.
+    demotion_key: Option<Py<PyAny>>,
     /// The driver loop the coroutine is bound to: its running loop in every
     /// step, and where it goes if it is handed over.
     event_loop: Py<PyAny>,
@@ -445,25 +467,31 @@ pub(crate) struct Drive {
 /// debug mode, or the direct path is unavailable or failed its self-test.
 /// Otherwise the first step has run and the coroutine is finished, suspended
 /// on a siphon awaitable, or already on a driver.
-pub(crate) fn start(
+/// Also takes the object that names the unit to remember as using asyncio:
+/// a host that runs many handlers through one shared wrapper coroutine passes
+/// one per handler, since the wrapper's code object is the same for all of
+/// them. `None` keys on the coroutine's code object.
+pub(crate) fn start_keyed(
     pool: &Arc<AsyncPool>,
     python: Python<'_>,
     coroutine: &Bound<'_, PyAny>,
+    demotion_key: Option<&Bound<'_, PyAny>>,
 ) -> Option<DirectStart> {
     if !enabled() {
         return None;
     }
-    start_unchecked(pool, python, coroutine)
+    start_unchecked(pool, python, coroutine, demotion_key)
 }
 
-/// [`start`] without asking whether direct dispatch passed its self-test,
+/// [`start_keyed`] without asking whether direct dispatch passed its self-test,
 /// which is how the self-test itself starts.
 fn start_unchecked(
     pool: &Arc<AsyncPool>,
     python: Python<'_>,
     coroutine: &Bound<'_, PyAny>,
+    demotion_key: Option<&Bound<'_, PyAny>>,
 ) -> Option<DirectStart> {
-    if is_demoted(coroutine) {
+    if is_demoted(coroutine, demotion_key) {
         return None;
     }
     helpers(python)?;
@@ -488,6 +516,7 @@ fn start_unchecked(
     .ok()?;
     let drive = Arc::new(Drive {
         coroutine: coroutine.clone().unbind(),
+        demotion_key: demotion_key.map(|key| key.clone().unbind()),
         event_loop: driver_loop.event_loop.clone_ref(python),
         pool: Arc::clone(pool),
         driver,
@@ -588,7 +617,10 @@ impl Drive {
             // It scheduled on the loop (a task it created, a callback) and
             // returned: that work runs now, and the handler starts on a
             // driver next time.
-            demote(self.coroutine.bind(python));
+            demote(
+                self.coroutine.bind(python),
+                self.demotion_key.as_ref().map(|key| key.bind(python)),
+            );
             baton.release();
         }
         StepEnd::Finished(result)
@@ -754,7 +786,10 @@ impl Drive {
         // Before the driver is asked to park, not after: calls of this
         // handler that start meanwhile go straight to a driver instead of
         // each parking one and holding an executor worker while it does.
-        demote(self.coroutine.bind(python));
+        demote(
+            self.coroutine.bind(python),
+            self.demotion_key.as_ref().map(|key| key.bind(python)),
+        );
         let baton = Arc::new(Baton::new());
         let park = Py::new(
             python,
