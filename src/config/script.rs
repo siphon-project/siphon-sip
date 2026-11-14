@@ -45,6 +45,9 @@ pub struct ScriptConfig {
     /// budget (~30 % of the container's cgroup memory limit ÷ per-worker heap),
     /// clamped to at least `sync_pool_size`. On a 512 MB NF that resolves to ~15
     /// (not 32); set this explicitly to override the budget either way.
+    /// An explicit value below the core (`sync_pool_size`, default
+    /// `max(8, 2 × CPUs)`) is raised to the core with a startup warning; set
+    /// `sync_pool_size` as well to cap the pool lower.
     #[serde(default)]
     pub sync_pool_max: Option<usize>,
     /// Seconds the synchronous Python executor pool may show *zero forward
