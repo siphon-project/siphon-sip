@@ -252,6 +252,10 @@ name = "registrar_contact" # lookup by Contact (lookup_contact / binding_for_con
 harness = false
 
 [[bench]]
+name = "custom_metrics"    # script custom metric updates: repeat-label counter_inc / histogram observe / gauge set
+harness = false
+
+[[bench]]
 name = "admission"         # b2bua.inbound_limit: the per-INVITE admission check and the refused-retransmission lookup
 harness = false
 

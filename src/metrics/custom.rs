@@ -4,17 +4,147 @@
 //! All custom metrics are registered into the shared `prometheus::Registry` so they
 //! appear alongside built-in metrics on the `/metrics` endpoint.
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
-use prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry};
+use prometheus::{
+    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, Opts, Registry,
+};
 use regex::Regex;
 
 /// Maximum number of distinct label-value combinations per metric.
 const MAX_CARDINALITY: usize = 128;
+
+thread_local! {
+    /// Scratch space the label-value lookup key is built in, so an update of a
+    /// label combination already seen allocates nothing.
+    static KEY_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The resolved prometheus children of one metric, by label-value combination.
+///
+/// This is the whole per-update path: a repeat update builds its key in a
+/// thread-local buffer, finds the child with one lookup and updates it, with no
+/// lock and no allocation. The number of children is the metric's cardinality,
+/// so a combination is admitted, once, against [`MAX_CARDINALITY`] the first
+/// time it is seen. A metric's series is replaced when the metric is
+/// registered anew, so no child outlives the metric it belongs to.
+struct Series<T> {
+    /// Label names in the order the prometheus vector was declared with.
+    label_names: Box<[String]>,
+    /// Keyed by every label value in declaration order, each prefixed with its
+    /// length so that no two combinations encode alike.
+    children: DashMap<Box<[u8]>, T>,
+    /// The one child of a metric declared without labels, which has no
+    /// combination to look up.
+    unlabeled: OnceLock<T>,
+    /// Combinations admitted so far. Reserved before a child is created, so the
+    /// limit holds exactly however many threads race to pass it.
+    admitted: AtomicUsize,
+}
+
+impl<T> Series<T> {
+    fn new(labels: &[&str]) -> Self {
+        Self {
+            label_names: labels.iter().map(|label| (*label).to_owned()).collect(),
+            children: DashMap::new(),
+            unlabeled: OnceLock::new(),
+            admitted: AtomicUsize::new(0),
+        }
+    }
+
+    /// The value `labels` gives for `expected`.
+    fn value_of<'a>(
+        name: &str,
+        expected: &str,
+        labels: &[(&str, &'a str)],
+    ) -> Result<&'a str, String> {
+        labels
+            .iter()
+            .find(|(key, _)| *key == expected)
+            .map(|(_, value)| *value)
+            .ok_or_else(|| format!("missing label '{expected}' for metric '{name}'"))
+    }
+
+    /// Run `apply` on the child for `labels`, creating it with `create` (given
+    /// the label values in declaration order) the first time the combination is
+    /// seen, unless that would take the metric past [`MAX_CARDINALITY`].
+    fn with<R>(
+        &self,
+        name: &str,
+        labels: &[(&str, &str)],
+        create: impl FnOnce(&[&str]) -> Result<T, String>,
+        apply: impl FnOnce(&T) -> R,
+    ) -> Result<R, String> {
+        if self.label_names.is_empty() {
+            if let Some(child) = self.unlabeled.get() {
+                return Ok(apply(child));
+            }
+            // Two threads may both get here; the prometheus vector hands both
+            // the same child, and one of them is kept.
+            let child = create(&[])?;
+            return Ok(apply(self.unlabeled.get_or_init(|| child)));
+        }
+        // Taken out of the cell, not borrowed, so nothing here can be a
+        // re-entrant borrow.
+        let mut key = KEY_BUFFER.with(RefCell::take);
+        key.clear();
+        let outcome = self.with_key(name, labels, &mut key, create, apply);
+        KEY_BUFFER.with(|buffer| buffer.replace(key));
+        outcome
+    }
+
+    fn with_key<R>(
+        &self,
+        name: &str,
+        labels: &[(&str, &str)],
+        key: &mut Vec<u8>,
+        create: impl FnOnce(&[&str]) -> Result<T, String>,
+        apply: impl FnOnce(&T) -> R,
+    ) -> Result<R, String> {
+        for expected in self.label_names.iter() {
+            let value = Self::value_of(name, expected, labels)?;
+            key.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            key.extend_from_slice(value.as_bytes());
+        }
+        if let Some(child) = self.children.get(key.as_slice()) {
+            return Ok(apply(&child));
+        }
+        match self.children.entry(key.as_slice().into()) {
+            Entry::Occupied(occupied) => Ok(apply(occupied.get())),
+            Entry::Vacant(vacant) => {
+                let reserved =
+                    self.admitted
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                            (admitted < MAX_CARDINALITY).then_some(admitted + 1)
+                        });
+                if reserved.is_err() {
+                    return Err(format!(
+                        "cardinality limit ({MAX_CARDINALITY}) exceeded for metric '{name}'"
+                    ));
+                }
+                let mut values = Vec::with_capacity(self.label_names.len());
+                for expected in self.label_names.iter() {
+                    values.push(Self::value_of(name, expected, labels)?);
+                }
+                match create(&values) {
+                    Ok(child) => {
+                        let result = apply(&child);
+                        vacant.insert(child);
+                        Ok(result)
+                    }
+                    Err(error) => {
+                        self.admitted.fetch_sub(1, Ordering::AcqRel);
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// The three kinds of metric a script can declare.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -89,10 +219,11 @@ pub struct CustomMetrics {
     counters: DashMap<String, CounterVec>,
     gauges: DashMap<String, GaugeVec>,
     histograms: DashMap<String, HistogramVec>,
-    /// Label names stored per metric (needed for `with_label_values` ordering).
-    label_names: DashMap<String, Vec<String>>,
-    /// Cardinality tracking: metric name → set of distinct label combos seen.
-    cardinality: DashMap<String, Mutex<HashSet<Vec<String>>>>,
+    /// The children each metric's updates go to, by label values; they also
+    /// carry the metric's label names and its cardinality count.
+    counter_series: DashMap<String, Series<Counter>>,
+    gauge_series: DashMap<String, Series<Gauge>>,
+    histogram_series: DashMap<String, Series<Histogram>>,
     /// Every declared metric, with the script load that last declared it.
     declarations: DashMap<String, (Declaration, u64)>,
     /// The script load declarations are made by now; see [`Self::begin_script_load`].
@@ -107,8 +238,9 @@ impl CustomMetrics {
             counters: DashMap::new(),
             gauges: DashMap::new(),
             histograms: DashMap::new(),
-            label_names: DashMap::new(),
-            cardinality: DashMap::new(),
+            counter_series: DashMap::new(),
+            gauge_series: DashMap::new(),
+            histogram_series: DashMap::new(),
             declarations: DashMap::new(),
             script_load: AtomicU64::new(0),
         }
@@ -158,16 +290,6 @@ impl CustomMetrics {
             .remove_if(name, |_, (_, declared_in)| *declared_in == script_load);
     }
 
-    /// Record what a newly registered metric needs for later updates.
-    fn track(&self, name: &str, labels: &[&str]) {
-        self.label_names.insert(
-            name.to_owned(),
-            labels.iter().map(|s| (*s).to_owned()).collect(),
-        );
-        self.cardinality
-            .insert(name.to_owned(), Mutex::new(HashSet::new()));
-    }
-
     /// Register a new counter metric. See [`Self::begin_script_load`] for a
     /// reload declaring it again.
     pub fn register_counter(&self, name: &str, help: &str, labels: &[&str]) -> Result<(), String> {
@@ -186,8 +308,10 @@ impl CustomMetrics {
             return Err(format!("failed to register counter '{name}': {error}"));
         }
 
+        // The series first: an update finds the metric by its series.
+        self.counter_series
+            .insert(name.to_owned(), Series::new(labels));
         self.counters.insert(name.to_owned(), counter);
-        self.track(name, labels);
         Ok(())
     }
 
@@ -209,8 +333,9 @@ impl CustomMetrics {
             return Err(format!("failed to register gauge '{name}': {error}"));
         }
 
+        self.gauge_series
+            .insert(name.to_owned(), Series::new(labels));
         self.gauges.insert(name.to_owned(), gauge);
-        self.track(name, labels);
         Ok(())
     }
 
@@ -241,8 +366,9 @@ impl CustomMetrics {
             return Err(format!("failed to register histogram '{name}': {error}"));
         }
 
+        self.histogram_series
+            .insert(name.to_owned(), Series::new(labels));
         self.histograms.insert(name.to_owned(), histogram);
-        self.track(name, labels);
         Ok(())
     }
 
@@ -253,54 +379,59 @@ impl CustomMetrics {
         labels: &[(&str, &str)],
         value: f64,
     ) -> Result<(), String> {
-        let counter = self
-            .counters
+        let series = self
+            .counter_series
             .get(name)
             .ok_or_else(|| format!("counter '{name}' not registered"))?;
-        let label_values = self.resolve_label_values(name, labels)?;
-        let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
-        self.check_cardinality(name, &label_values)?;
-        counter.with_label_values(&refs).inc_by(value);
-        Ok(())
+        series.with(
+            name,
+            labels,
+            |values| {
+                self.counters
+                    .get(name)
+                    .map(|counter| counter.with_label_values(values))
+                    .ok_or_else(|| format!("counter '{name}' not registered"))
+            },
+            |counter| counter.inc_by(value),
+        )
     }
 
     /// Set a gauge value.
     pub fn gauge_set(&self, name: &str, labels: &[(&str, &str)], value: f64) -> Result<(), String> {
-        let gauge = self
-            .gauges
-            .get(name)
-            .ok_or_else(|| format!("gauge '{name}' not registered"))?;
-        let label_values = self.resolve_label_values(name, labels)?;
-        let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
-        self.check_cardinality(name, &label_values)?;
-        gauge.with_label_values(&refs).set(value);
-        Ok(())
+        self.gauge_update(name, labels, |gauge| gauge.set(value))
     }
 
     /// Increment a gauge.
     pub fn gauge_inc(&self, name: &str, labels: &[(&str, &str)], value: f64) -> Result<(), String> {
-        let gauge = self
-            .gauges
-            .get(name)
-            .ok_or_else(|| format!("gauge '{name}' not registered"))?;
-        let label_values = self.resolve_label_values(name, labels)?;
-        let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
-        self.check_cardinality(name, &label_values)?;
-        gauge.with_label_values(&refs).add(value);
-        Ok(())
+        self.gauge_update(name, labels, |gauge| gauge.add(value))
     }
 
     /// Decrement a gauge.
     pub fn gauge_dec(&self, name: &str, labels: &[(&str, &str)], value: f64) -> Result<(), String> {
-        let gauge = self
-            .gauges
+        self.gauge_update(name, labels, |gauge| gauge.sub(value))
+    }
+
+    fn gauge_update(
+        &self,
+        name: &str,
+        labels: &[(&str, &str)],
+        update: impl FnOnce(&Gauge),
+    ) -> Result<(), String> {
+        let series = self
+            .gauge_series
             .get(name)
             .ok_or_else(|| format!("gauge '{name}' not registered"))?;
-        let label_values = self.resolve_label_values(name, labels)?;
-        let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
-        self.check_cardinality(name, &label_values)?;
-        gauge.with_label_values(&refs).sub(value);
-        Ok(())
+        series.with(
+            name,
+            labels,
+            |values| {
+                self.gauges
+                    .get(name)
+                    .map(|gauge| gauge.with_label_values(values))
+                    .ok_or_else(|| format!("gauge '{name}' not registered"))
+            },
+            update,
+        )
     }
 
     /// Observe a histogram value.
@@ -310,58 +441,21 @@ impl CustomMetrics {
         labels: &[(&str, &str)],
         value: f64,
     ) -> Result<(), String> {
-        let histogram = self
-            .histograms
+        let series = self
+            .histogram_series
             .get(name)
             .ok_or_else(|| format!("histogram '{name}' not registered"))?;
-        let label_values = self.resolve_label_values(name, labels)?;
-        let refs: Vec<&str> = label_values.iter().map(|s| s.as_str()).collect();
-        self.check_cardinality(name, &label_values)?;
-        histogram.with_label_values(&refs).observe(value);
-        Ok(())
-    }
-
-    /// Resolve label key-value pairs into ordered values matching the registered label names.
-    fn resolve_label_values(
-        &self,
-        name: &str,
-        labels: &[(&str, &str)],
-    ) -> Result<Vec<String>, String> {
-        let label_names = self
-            .label_names
-            .get(name)
-            .ok_or_else(|| format!("metric '{name}' not registered"))?;
-
-        if labels.is_empty() && label_names.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let mut values = Vec::with_capacity(label_names.len());
-        for expected in label_names.iter() {
-            let found = labels
-                .iter()
-                .find(|(key, _)| key == expected)
-                .ok_or_else(|| format!("missing label '{expected}' for metric '{name}'"))?;
-            values.push(found.1.to_owned());
-        }
-        Ok(values)
-    }
-
-    /// Check cardinality for this metric — only counts distinct label combos.
-    fn check_cardinality(&self, name: &str, label_values: &[String]) -> Result<(), String> {
-        if let Some(seen) = self.cardinality.get(name) {
-            let mut set = seen.lock().unwrap();
-            if set.contains(label_values) {
-                return Ok(());
-            }
-            if set.len() >= MAX_CARDINALITY {
-                return Err(format!(
-                    "cardinality limit ({MAX_CARDINALITY}) exceeded for metric '{name}'"
-                ));
-            }
-            set.insert(label_values.to_vec());
-        }
-        Ok(())
+        series.with(
+            name,
+            labels,
+            |values| {
+                self.histograms
+                    .get(name)
+                    .map(|histogram| histogram.with_label_values(values))
+                    .ok_or_else(|| format!("histogram '{name}' not registered"))
+            },
+            |histogram| histogram.observe(value),
+        )
     }
 }
 
@@ -717,5 +811,348 @@ mod tests {
 
         assert!(output.contains("encode_test_total"));
         assert!(output.contains("INVITE"));
+    }
+
+    fn counter_value(registry: &Registry, name: &str, label_value: &str) -> Option<f64> {
+        registry
+            .gather()
+            .iter()
+            .find(|family| family.name() == name)?
+            .get_metric()
+            .iter()
+            .find(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.value() == label_value)
+            })
+            .map(|metric| metric.get_counter().value())
+    }
+
+    fn series_count(registry: &Registry, name: &str) -> usize {
+        registry
+            .gather()
+            .iter()
+            .find(|family| family.name() == name)
+            .map_or(0, |family| family.get_metric().len())
+    }
+
+    #[test]
+    fn repeat_updates_hit_the_same_series() {
+        let (registry, custom) = test_registry();
+        custom
+            .register_counter("repeat_total", "Test", &["method", "result"])
+            .unwrap();
+        for _ in 0..3 {
+            custom
+                .counter_inc(
+                    "repeat_total",
+                    &[("method", "INVITE"), ("result", "ok")],
+                    1.0,
+                )
+                .unwrap();
+        }
+        // Label order in the call does not matter.
+        custom
+            .counter_inc(
+                "repeat_total",
+                &[("result", "ok"), ("method", "INVITE")],
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(series_count(&registry, "repeat_total"), 1);
+        assert_eq!(
+            counter_value(&registry, "repeat_total", "INVITE"),
+            Some(4.0)
+        );
+    }
+
+    #[test]
+    fn label_values_that_would_concatenate_alike_stay_distinct() {
+        // Tested on the series itself: the prometheus crate keys its own
+        // children by a hash of the concatenated values, so it cannot show
+        // whether our key told these apart.
+        let series: Series<usize> = Series::new(&["first", "second"]);
+        let mut created = 0;
+        for (first, second) in [("a\0", "b"), ("a", "\0b"), ("ab", ""), ("a", "b")] {
+            let child = series
+                .with(
+                    "ambiguous",
+                    &[("first", first), ("second", second)],
+                    |_| {
+                        created += 1;
+                        Ok(created)
+                    },
+                    |child| *child,
+                )
+                .unwrap();
+            assert_eq!(child, created);
+        }
+        assert_eq!(created, 4);
+        // And the same combination again finds its child instead of creating one.
+        let again = series
+            .with(
+                "ambiguous",
+                &[("first", "ab"), ("second", "")],
+                |_| Ok(99),
+                |c| *c,
+            )
+            .unwrap();
+        assert_eq!(again, 3);
+    }
+
+    /// A metric without labels has one child, made once and then found without
+    /// a lookup, however many updates follow and however many threads make them.
+    #[test]
+    fn an_unlabeled_series_creates_its_child_once() {
+        let series: Series<usize> = Series::new(&[]);
+        let created = AtomicUsize::new(0);
+        for _ in 0..1000 {
+            let child = series
+                .with(
+                    "plain",
+                    &[],
+                    |_| Ok(created.fetch_add(1, Ordering::Relaxed) + 1),
+                    |child| *child,
+                )
+                .unwrap();
+            assert_eq!(child, 1);
+        }
+        assert_eq!(created.load(Ordering::Relaxed), 1);
+        assert_eq!(series.children.len(), 0, "no map entry for the one child");
+        // Labels a metric did not declare are not part of its identity.
+        let child = series
+            .with("plain", &[("extra", "x")], |_| Ok(99), |child| *child)
+            .unwrap();
+        assert_eq!(child, 1);
+    }
+
+    #[test]
+    fn an_unlabeled_series_failing_to_create_leaves_nothing_behind() {
+        let series: Series<usize> = Series::new(&[]);
+        assert!(series
+            .with("plain", &[], |_| Err("refused".to_owned()), |child| *child)
+            .is_err());
+        let child = series
+            .with("plain", &[], |_| Ok(7), |child| *child)
+            .unwrap();
+        assert_eq!(child, 7, "the next update creates it");
+    }
+
+    #[test]
+    fn unlabeled_updates_from_many_threads_share_one_series() {
+        let (registry, custom) = test_registry();
+        custom.register_counter("plain_total", "Test", &[]).unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let custom = Arc::clone(&custom);
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        custom.counter_inc("plain_total", &[], 1.0).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(series_count(&registry, "plain_total"), 1);
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|family| family.name() == "plain_total")
+            .unwrap();
+        assert_eq!(family.get_metric()[0].get_counter().value(), 8000.0);
+    }
+
+    #[test]
+    fn missing_label_error_names_label_and_metric() {
+        let (registry, custom) = test_registry();
+        custom
+            .register_counter("named_total", "Test", &["method", "result"])
+            .unwrap();
+        let error = custom
+            .counter_inc("named_total", &[("method", "INVITE")], 1.0)
+            .unwrap_err();
+        assert_eq!(error, "missing label 'result' for metric 'named_total'");
+        assert_eq!(
+            series_count(&registry, "named_total"),
+            0,
+            "a refused update must not create a series"
+        );
+    }
+
+    #[test]
+    fn an_already_seen_combination_still_updates_at_the_limit() {
+        let (registry, custom) = test_registry();
+        custom
+            .register_counter("limit_total", "Test", &["id"])
+            .unwrap();
+        for index in 0..MAX_CARDINALITY {
+            custom
+                .counter_inc("limit_total", &[("id", &index.to_string())], 1.0)
+                .unwrap();
+        }
+        let error = custom
+            .counter_inc("limit_total", &[("id", "overflow")], 1.0)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            format!("cardinality limit ({MAX_CARDINALITY}) exceeded for metric 'limit_total'")
+        );
+        custom
+            .counter_inc("limit_total", &[("id", "0")], 1.0)
+            .expect("a combination already seen is not new cardinality");
+        assert_eq!(counter_value(&registry, "limit_total", "0"), Some(2.0));
+        assert_eq!(counter_value(&registry, "limit_total", "overflow"), None);
+    }
+
+    #[test]
+    fn cardinality_limit_is_exact_under_concurrency() {
+        let (registry, custom) = test_registry();
+        custom
+            .register_counter("race_total", "Test", &["id"])
+            .unwrap();
+        let threads = 8;
+        let attempts_per_thread = 64;
+        let handles: Vec<_> = (0..threads)
+            .map(|thread_index| {
+                let custom = Arc::clone(&custom);
+                std::thread::spawn(move || {
+                    let mut accepted = 0;
+                    for attempt in 0..attempts_per_thread {
+                        // Every thread tries distinct combinations: 512 in all.
+                        let id = (thread_index * attempts_per_thread + attempt).to_string();
+                        if custom
+                            .counter_inc("race_total", &[("id", &id)], 1.0)
+                            .is_ok()
+                        {
+                            accepted += 1;
+                        }
+                    }
+                    accepted
+                })
+            })
+            .collect();
+        let accepted: usize = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .sum();
+        assert_eq!(accepted, MAX_CARDINALITY);
+        assert_eq!(series_count(&registry, "race_total"), MAX_CARDINALITY);
+    }
+
+    #[test]
+    fn concurrent_repeat_updates_lose_nothing() {
+        let (registry, custom) = test_registry();
+        custom
+            .register_histogram("hot_seconds", "Test", &["method"], vec![1.0])
+            .unwrap();
+        custom
+            .register_counter("hot_total", "Test", &["method"])
+            .unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let custom = Arc::clone(&custom);
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        custom
+                            .counter_inc("hot_total", &[("method", "INVITE")], 1.0)
+                            .unwrap();
+                        custom
+                            .histogram_observe("hot_seconds", &[("method", "INVITE")], 0.5)
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(
+            counter_value(&registry, "hot_total", "INVITE"),
+            Some(8000.0)
+        );
+        let histograms = custom.histograms.get("hot_seconds").unwrap();
+        assert_eq!(
+            histograms.with_label_values(&["INVITE"]).get_sample_count(),
+            8000
+        );
+    }
+
+    /// A claim the registry refuses leaves nothing behind that an update could
+    /// reach.
+    #[test]
+    fn a_refused_registration_leaves_no_series_to_update() {
+        let (registry, custom) = test_registry();
+        let taken = prometheus::IntCounter::new("refused_total", "Built in").unwrap();
+        registry.register(Box::new(taken)).unwrap();
+        assert!(custom
+            .register_counter("refused_total", "Script", &[])
+            .is_err());
+        let error = custom.counter_inc("refused_total", &[], 1.0).unwrap_err();
+        assert!(error.contains("not registered"), "{error}");
+    }
+
+    /// A taken-over metric keeps counting into the series it had, and its
+    /// cardinality budget carries over rather than resetting.
+    #[test]
+    fn a_taken_over_metric_keeps_its_series_and_cardinality_budget() {
+        let (registry, custom) = test_registry();
+        custom
+            .register_counter("carried_total", "Test", &["id"])
+            .unwrap();
+        for index in 0..MAX_CARDINALITY {
+            custom
+                .counter_inc("carried_total", &[("id", &index.to_string())], 1.0)
+                .unwrap();
+        }
+        custom.begin_script_load();
+        custom
+            .register_counter("carried_total", "Test", &["id"])
+            .unwrap();
+        custom
+            .counter_inc("carried_total", &[("id", "3")], 1.0)
+            .unwrap();
+        assert_eq!(counter_value(&registry, "carried_total", "3"), Some(2.0));
+        assert!(custom
+            .counter_inc("carried_total", &[("id", "fresh")], 1.0)
+            .is_err());
+    }
+
+    #[test]
+    fn gauge_and_histogram_share_the_limit_and_label_checks() {
+        let (_registry, custom) = test_registry();
+        custom
+            .register_gauge("shared_gauge", "Test", &["id"])
+            .unwrap();
+        custom
+            .register_histogram("shared_seconds", "Test", &["id"], vec![])
+            .unwrap();
+        assert!(custom
+            .gauge_inc("shared_gauge", &[], 1.0)
+            .unwrap_err()
+            .contains("missing label 'id'"));
+        assert!(custom
+            .histogram_observe("shared_seconds", &[], 1.0)
+            .unwrap_err()
+            .contains("missing label 'id'"));
+        for index in 0..MAX_CARDINALITY {
+            let id = index.to_string();
+            custom
+                .gauge_dec("shared_gauge", &[("id", &id)], 1.0)
+                .unwrap();
+            custom
+                .histogram_observe("shared_seconds", &[("id", &id)], 1.0)
+                .unwrap();
+        }
+        assert!(custom
+            .gauge_dec("shared_gauge", &[("id", "x")], 1.0)
+            .unwrap_err()
+            .contains("cardinality limit"));
+        assert!(custom
+            .histogram_observe("shared_seconds", &[("id", "x")], 1.0)
+            .unwrap_err()
+            .contains("cardinality limit"));
     }
 }
