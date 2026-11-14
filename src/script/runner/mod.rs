@@ -27,8 +27,18 @@
 //! invoked once with [`Fate::Abandoned`], attached, on the owner thread, and
 //! the fd is closed. A post that loses the race gets its message back.
 //!
-//! Internal: unstable until dispatch is routed through it.
+//! # Direct dispatch
+//!
+//! With `script.direct_dispatch: on`, an `async def` handler called through
+//! [`crate::script::ScriptHandle`] is stepped here, on its driver thread,
+//! without an asyncio task, for as long as it awaits only siphon's own
+//! awaitables. See [`drive`].
 
+mod awaitable;
+mod drive;
+mod python;
+mod switch;
+mod task;
 mod wake;
 
 use std::collections::VecDeque;
@@ -42,11 +52,20 @@ use tracing::{debug, error};
 
 use wake::{wake_pair, WakeReceiver, WakeSender};
 
+#[cfg(test)]
+pub(crate) use awaitable::SiphonAwaitable;
+pub use awaitable::{spawn_awaitable, AwaitableFuture, BuildValue};
+pub(crate) use drive::{in_direct_step, start, timeout_error, Admission, DriveHandle, Waited};
+pub use switch::{admission_rejected, configure, demotions, DEFAULT_ADMISSION_LIMIT};
+pub(crate) use switch::{clear_demoted, enabled as direct_dispatch_enabled, register};
+#[cfg(test)]
+pub(crate) use switch::{demoted_handlers, set_admission_limit_for_test, set_enabled_for_test};
+
 /// Items one drain runs before it yields to the loop.
-pub const DRAIN_ITEM_BUDGET: usize = 64;
+pub(crate) const DRAIN_ITEM_BUDGET: usize = 64;
 
 /// How long one drain runs before it yields to the loop.
-pub const DRAIN_TIME_BUDGET: Duration = Duration::from_millis(1);
+pub(crate) const DRAIN_TIME_BUDGET: Duration = Duration::from_millis(1);
 
 /// Messages moved off the channel per look at it. A drain looks once per item
 /// it runs, so intake stays far ahead of the work without a busy poster being
@@ -55,7 +74,7 @@ const PULL_BATCH: usize = 256;
 
 /// Why a [`Work`] item is being invoked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fate {
+pub(crate) enum Fate {
     /// Its turn came.
     Run,
     /// The runner shut down first. The item must fail whoever waits on it.
@@ -66,16 +85,22 @@ pub enum Fate {
 ///
 /// A posted item is invoked exactly once, on the runner's own thread, with the
 /// reason. It runs on the event loop, so it must not wait.
-pub struct Work(Box<dyn for<'py> FnOnce(Python<'py>, Fate) + Send>);
+pub(crate) struct Work(Box<dyn for<'py> FnOnce(Python<'py>, Fate) + Send>);
 
 impl Work {
-    pub fn new(work: impl for<'py> FnOnce(Python<'py>, Fate) + Send + 'static) -> Self {
+    pub(crate) fn new(work: impl for<'py> FnOnce(Python<'py>, Fate) + Send + 'static) -> Self {
         Self(Box::new(work))
+    }
+
+    /// Invoke an item its runner refused, with [`Fate::Abandoned`], on the
+    /// calling thread.
+    pub(crate) fn abandon(self, python: Python<'_>) {
+        invoke(self, python, Fate::Abandoned);
     }
 }
 
 /// What a runner is asked to do. The variant is the priority class.
-pub enum Message {
+pub(crate) enum Message {
     /// New work: runs after everything in flight.
     Start(Work),
     /// A continuation of work in flight: runs before any start.
@@ -87,8 +112,9 @@ pub enum Message {
 }
 
 /// A point-in-time copy of a runner's counters.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RunnerStats {
+pub(crate) struct RunnerStats {
     /// Items posted and not yet invoked.
     pub queued: usize,
     /// Items invoked with [`Fate::Run`].
@@ -101,10 +127,20 @@ pub struct RunnerStats {
     pub drains: u64,
     /// Drains that stopped on their budget with work left.
     pub budget_yields: u64,
+    /// Handlers admitted and not yet unwound.
+    pub in_flight: usize,
+    /// Coroutines in the driver's slab.
+    pub drives: usize,
+    /// Awaitables whose Rust future has not finished.
+    pub awaitables: usize,
+    /// Coroutines started without an asyncio task.
+    pub direct_starts: u64,
+    /// Steps run without an asyncio task.
+    pub direct_steps: u64,
 }
 
 /// The side of a runner any thread may hold. Carries no Python object.
-pub struct RunnerShared {
+pub(crate) struct RunnerShared {
     sender: Sender<Message>,
     wake: WakeSender,
     /// Set once the runner takes no more work.
@@ -116,6 +152,12 @@ pub struct RunnerShared {
     abandoned: AtomicU64,
     drains: AtomicU64,
     budget_yields: AtomicU64,
+    /// Handlers admitted and not yet unwound: what admission bounds.
+    in_flight: AtomicUsize,
+    drives: AtomicUsize,
+    awaitables: AtomicUsize,
+    direct_starts: AtomicU64,
+    direct_steps: AtomicU64,
 }
 
 impl RunnerShared {
@@ -124,7 +166,7 @@ impl RunnerShared {
     ///
     /// `Err` gives the message back: the runner has shut down and will not
     /// invoke it.
-    pub fn post(&self, message: Message) -> Result<(), Message> {
+    pub(crate) fn post(&self, message: Message) -> Result<(), Message> {
         // Refused here, a post never touches `queued`: only the posts already
         // past this line when the runner seals can hold the close up, and
         // there is a bounded number of those.
@@ -153,17 +195,23 @@ impl RunnerShared {
     /// Tell the runner to stop running work. The caller stops the loop next;
     /// what is still queued is abandoned when the driver thread closes the
     /// runner.
-    pub fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         // Refused only when the runner is sealed already.
         let _ = self.post(Message::Shutdown);
     }
 
     /// Whether the runner has stopped taking work.
-    pub fn is_shut_down(&self) -> bool {
+    pub(crate) fn is_shut_down(&self) -> bool {
         self.sealed.load(Ordering::SeqCst)
     }
 
-    pub fn stats(&self) -> RunnerStats {
+    /// Handlers this runner has admitted and not yet unwound.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> RunnerStats {
         RunnerStats {
             queued: self.queued.load(Ordering::SeqCst),
             ran: self.ran.load(Ordering::Relaxed),
@@ -171,6 +219,11 @@ impl RunnerShared {
             wake_writes: self.wake.writes(),
             drains: self.drains.load(Ordering::Relaxed),
             budget_yields: self.budget_yields.load(Ordering::Relaxed),
+            in_flight: self.in_flight.load(Ordering::SeqCst),
+            drives: self.drives.load(Ordering::Relaxed),
+            awaitables: self.awaitables.load(Ordering::Relaxed),
+            direct_starts: self.direct_starts.load(Ordering::Relaxed),
+            direct_steps: self.direct_steps.load(Ordering::Relaxed),
         }
     }
 
@@ -266,6 +319,11 @@ impl RunnerOwner {
                 abandoned: AtomicU64::new(0),
                 drains: AtomicU64::new(0),
                 budget_yields: AtomicU64::new(0),
+                in_flight: AtomicUsize::new(0),
+                drives: AtomicUsize::new(0),
+                awaitables: AtomicUsize::new(0),
+                direct_starts: AtomicU64::new(0),
+                direct_steps: AtomicU64::new(0),
             }),
             local: Mutex::new(Local {
                 receiver,
@@ -316,6 +374,7 @@ impl RunnerOwner {
             },
         )?;
         event_loop.call_method1("add_reader", (fd, drain))?;
+        drive::install_owner(python, &self.shared, event_loop);
         Ok(())
     }
 
@@ -408,6 +467,8 @@ impl RunnerOwner {
                 invoke(work, python, Fate::Abandoned);
             }
         }
+        // Nothing more can reach the slab: close what is still in it.
+        drive::close_owner(python);
         // Closes the read end, here rather than whenever the loop lets go of
         // the callback.
         drop(wake);
@@ -436,5 +497,9 @@ impl RunnerDrain {
     }
 }
 
+#[cfg(test)]
+mod direct_edge_tests;
+#[cfg(test)]
+pub(crate) mod direct_tests;
 #[cfg(test)]
 mod tests;

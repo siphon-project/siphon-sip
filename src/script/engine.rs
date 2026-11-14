@@ -487,6 +487,8 @@ impl ScriptEngine {
                 self.state.store(Arc::new(new_state));
                 // The verdicts describe code objects this reload replaced.
                 inline_dispatch::clear_inline_verdicts();
+                // And which handlers use asyncio: the callables are new.
+                crate::script::runner::clear_demoted();
                 self.restart_timers();
                 Ok(())
             }
@@ -1664,6 +1666,7 @@ mod tests {
             handler_timeout_secs: None,
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
+            direct_dispatch: Default::default(),
         };
         let engine = ScriptEngine::new(&config).expect("initial load");
         assert_eq!(std::fs::read_to_string(&output).unwrap(), "v1");
@@ -1732,6 +1735,7 @@ mod tests {
             handler_timeout_secs: None,
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
+            direct_dispatch: Default::default(),
         };
         let engine = Arc::new(ScriptEngine::new(&config).expect("initial load"));
         (dir, engine, imported, stranger)
@@ -2540,6 +2544,7 @@ async def route(request):
             handler_timeout_secs: None,
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
+            direct_dispatch: Default::default(),
         };
         let result = ScriptEngine::new(&config);
         assert!(result.is_err());
@@ -2568,6 +2573,7 @@ def route(request):
             handler_timeout_secs: None,
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
+            direct_dispatch: Default::default(),
         };
         let engine = ScriptEngine::new(&config).unwrap();
         assert_eq!(engine.state().handlers.len(), 1);
@@ -2614,6 +2620,7 @@ def route(request):
             handler_timeout_secs: None,
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
+            direct_dispatch: Default::default(),
         };
         let engine = ScriptEngine::new(&config).unwrap();
         assert_eq!(engine.state().handlers.len(), 1);
@@ -2639,6 +2646,7 @@ def route(request):
             handler_timeout_secs: None,
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
+            direct_dispatch: Default::default(),
         }
     }
 

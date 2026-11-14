@@ -331,6 +331,78 @@ Extension crates should create their awaitables with
 `pyo3_async_runtimes::tokio::future_into_py` directly still completes on the
 blocking pool and sets up a Python thread state per call.
 
+### Direct dispatch (`script.direct_dispatch`)
+
+```yaml
+script:
+  direct_dispatch: on   # default: off
+```
+
+By default an `async def` handler that suspends runs as an asyncio task on a
+driver, and each `await` of a siphon API goes through an asyncio future: the
+Rust future finishes on tokio, a completion thread builds the value and calls
+`loop.call_soon_threadsafe`, and the driver's loop resumes the task. The task
+itself is created through `asyncio.run_coroutine_threadsafe` and reports back
+through a `concurrent.futures.Future`.
+
+With `direct_dispatch: on`, a handler called through
+`ScriptHandle::call_handler_with` / `call_handler` (the handlers an extension
+registers under its own kind) skips all of that while it awaits only siphon's
+own awaitables. Each driver thread has a native runner next to its event loop.
+The executor job that called the handler passes the coroutine to the runner
+of the driver with the fewest handlers in flight, and from then on that one
+thread owns it:
+
+- the runner steps the coroutine, with the handler's own `contextvars`
+  context entered and a task object in place as `asyncio.current_task()`;
+- an awaited siphon API registers the coroutine as its waiter and the step
+  ends;
+- the Rust future's completion, on a tokio worker, posts a wake to that
+  runner without touching the interpreter. The runner builds the Python value
+  and steps the coroutine again.
+
+No asyncio task or future is made, no completion thread is involved, and the
+executor only runs the job that calls the handler and the job that finishes
+the call. Continuations never wait in the executor queue.
+
+A handler is free to use asyncio at any point. The first time it awaits
+something that is not a siphon awaitable (`asyncio.sleep`, a task, a future
+from another library), or asks its task for something only a real task
+answers (`add_done_callback`, `result()`, being awaited), it is handed over: a
+real `asyncio.Task` is created on the same thread and continues the coroutine
+where it was. `asyncio.current_task()` is the same object before and after.
+The handler is then remembered and starts as a task from its next call, so the
+hand-over is paid once per handler, not per call. A script reload forgets.
+These do not need a task and keep a handler on the runner: `asyncio.timeout`
+and `asyncio.wait_for` around a siphon awaitable, `asyncio.create_task`,
+`loop.call_soon` / `call_later`, `task.cancel()`, `task.get_name()` (logging).
+
+What stays the same in both modes: return values and exceptions, context
+variables, `handler_timeout_secs` (the coroutine is cancelled once,
+`CancelledError` at its await, and the call fails with `TimeoutError`), and
+that an awaiting handler holds no executor worker.
+
+Two things a script can see differ while a handler is on the runner. It is
+not in `asyncio.all_tasks()`, because no asyncio task exists for it. And a
+reference to its task kept past the end of a handler that never became a real
+task answers `done()`, `cancelled()` and `get_name()`, but has no `result()`
+or `exception()` to give. Inside the handler, and for anything that asks the
+task while the handler runs, the task behaves as asyncio's does.
+
+Admission is bounded: a driver takes at most 4096 direct handlers in flight.
+A call that finds every driver full fails at once, as a call that was never
+dispatched (`Err` from `call_handler_with`), is counted in
+`siphon_runner_admission_rejected_total` and logged at most once every five
+seconds. Nothing waits for room.
+
+A driver loop with a task factory set (`loop.set_task_factory`) starts every
+handler as a task, as with the switch off.
+
+The switch does not affect `@proxy.on_request`, the Diameter handlers or any
+other built-in handler kind. At startup the server drives one handler through
+a direct step, an await and a hand-over; if any of it misbehaves on the
+running interpreter the switch stays off and the log says so.
+
 ## Backpressure & liveness guarantees
 
 Beyond elasticity, the pool is defended on three more fronts so a misbehaving
@@ -461,6 +533,7 @@ siphon keeps every such wait detached:
 | `siphon_pyexec_jobs_shed_total` | jobs dropped because the queue was full |
 | `siphon_pyexec_stale_requests_shed_total{method}` | initial requests answered 503 without the script because they queued past the 8 s budget |
 | `siphon_async_coroutines_pending` | `async def` handler coroutines on a driver, not yet settled |
+| `siphon_runner_admission_rejected_total` | calls refused with `script.direct_dispatch: on` because every driver had its limit of handlers in flight |
 | `siphon_pyexec_queue_wait_ms` | how long the job a worker last took had waited in the queue; 0 with the queue empty |
 | `siphon_pyexec_queue_wait_seconds` | histogram: how long each job waited in the queue before a worker took it (buckets 100 µs to 13 s) |
 | `siphon_interpreter_attach_wait_seconds` | histogram: how long each attach of the liveness probe waited; one sample every 10 ms (buckets 100 µs to 3.3 s) |
