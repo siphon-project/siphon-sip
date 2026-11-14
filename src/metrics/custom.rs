@@ -6,6 +6,7 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
@@ -37,6 +38,9 @@ struct Series<T> {
     /// Keyed by every label value in declaration order, each prefixed with its
     /// length so that no two combinations encode alike.
     children: DashMap<Box<[u8]>, T>,
+    /// The one child of a metric declared without labels, which has no
+    /// combination to look up.
+    unlabeled: OnceLock<T>,
     /// Combinations admitted so far. Reserved before a child is created, so the
     /// limit holds exactly however many threads race to pass it.
     admitted: AtomicUsize,
@@ -47,6 +51,7 @@ impl<T> Series<T> {
         Self {
             label_names: labels.iter().map(|label| (*label).to_owned()).collect(),
             children: DashMap::new(),
+            unlabeled: OnceLock::new(),
             admitted: AtomicUsize::new(0),
         }
     }
@@ -74,6 +79,15 @@ impl<T> Series<T> {
         create: impl FnOnce(&[&str]) -> Result<T, String>,
         apply: impl FnOnce(&T) -> R,
     ) -> Result<R, String> {
+        if self.label_names.is_empty() {
+            if let Some(child) = self.unlabeled.get() {
+                return Ok(apply(child));
+            }
+            // Two threads may both get here; the prometheus vector hands both
+            // the same child, and one of them is kept.
+            let child = create(&[])?;
+            return Ok(apply(self.unlabeled.get_or_init(|| child)));
+        }
         // Taken out of the cell, not borrowed, so nothing here can be a
         // re-entrant borrow.
         let mut key = KEY_BUFFER.with(RefCell::take);
@@ -885,6 +899,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!(again, 3);
+    }
+
+    /// A metric without labels has one child, made once and then found without
+    /// a lookup, however many updates follow and however many threads make them.
+    #[test]
+    fn an_unlabeled_series_creates_its_child_once() {
+        let series: Series<usize> = Series::new(&[]);
+        let created = AtomicUsize::new(0);
+        for _ in 0..1000 {
+            let child = series
+                .with(
+                    "plain",
+                    &[],
+                    |_| Ok(created.fetch_add(1, Ordering::Relaxed) + 1),
+                    |child| *child,
+                )
+                .unwrap();
+            assert_eq!(child, 1);
+        }
+        assert_eq!(created.load(Ordering::Relaxed), 1);
+        assert_eq!(series.children.len(), 0, "no map entry for the one child");
+        // Labels a metric did not declare are not part of its identity.
+        let child = series
+            .with("plain", &[("extra", "x")], |_| Ok(99), |child| *child)
+            .unwrap();
+        assert_eq!(child, 1);
+    }
+
+    #[test]
+    fn an_unlabeled_series_failing_to_create_leaves_nothing_behind() {
+        let series: Series<usize> = Series::new(&[]);
+        assert!(series
+            .with("plain", &[], |_| Err("refused".to_owned()), |child| *child)
+            .is_err());
+        let child = series
+            .with("plain", &[], |_| Ok(7), |child| *child)
+            .unwrap();
+        assert_eq!(child, 7, "the next update creates it");
+    }
+
+    #[test]
+    fn unlabeled_updates_from_many_threads_share_one_series() {
+        let (registry, custom) = test_registry();
+        custom.register_counter("plain_total", "Test", &[]).unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let custom = Arc::clone(&custom);
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        custom.counter_inc("plain_total", &[], 1.0).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(series_count(&registry, "plain_total"), 1);
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|family| family.name() == "plain_total")
+            .unwrap();
+        assert_eq!(family.get_metric()[0].get_counter().value(), 8000.0);
     }
 
     #[test]
