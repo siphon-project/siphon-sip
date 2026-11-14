@@ -1518,6 +1518,23 @@ fn the_self_test_passes_and_turns_the_switch_on() {
         assert_eq!(rig.call("one_await", 5).await, Ok("5|True".to_string()));
         settles_to(baseline, "after the self-test").await;
 
+        // Turned off and on again, as often as asked: the test's own
+        // hand-over is not remembered against the next one, and leaves
+        // nothing in the memory of handlers that use asyncio.
+        let remembered = crate::script::runner::demoted_handlers();
+        for _ in 0..3 {
+            let (_, async_pool) = ensure_test_pools();
+            let turned_on = tokio::task::spawn_blocking(move || {
+                crate::script::runner::configure(false, &async_pool);
+                crate::script::runner::configure(true, &async_pool)
+            })
+            .await
+            .expect("joined");
+            assert!(turned_on, "the self-test passes every time");
+        }
+        assert_eq!(crate::script::runner::demoted_handlers(), remembered);
+        settles_to(baseline, "after the repeated self-tests").await;
+
         let (_, async_pool) = ensure_test_pools();
         assert!(!crate::script::runner::configure(false, &async_pool));
         assert_eq!(rig.call("one_await", 5).await, Ok("5|False".to_string()));

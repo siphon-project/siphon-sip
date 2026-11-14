@@ -93,7 +93,8 @@ impl SelfTestReport {
 
 fn self_test(pool: &Arc<AsyncPool>) -> Result<(), String> {
     let (sender, receiver) = std::sync::mpsc::channel();
-    let started = Python::attach(|python| -> Result<DriveHandle, String> {
+    type Started = (DriveHandle, DemotionKey);
+    let (started, key) = Python::attach(|python| -> Result<Started, String> {
         let helpers = helpers(python).ok_or("the helpers could not be built")?;
         let text = |error: PyErr| error.to_string();
         let report = Py::new(
@@ -108,8 +109,12 @@ fn self_test(pool: &Arc<AsyncPool>) -> Result<(), String> {
             .bind(python)
             .call1((&helpers.self_test_awaitable, report))
             .map_err(text)?;
-        match start_unchecked(pool, python, &coroutine, None) {
-            Ok(Some(handle)) => Ok(handle),
+        // The test hands itself over, which is remembered. It is remembered
+        // by its own coroutine, not by its code, and forgotten below, so that
+        // the next self-test starts direct again.
+        let identity = Arc::new(coroutine.clone().unbind());
+        match start_unchecked(pool, python, &coroutine, Some(&identity)) {
+            Ok(Some(handle)) => Ok((handle, DemotionKey::new(identity))),
             Ok(None) => {
                 let _ = coroutine.call_method0(intern!(python, "close"));
                 Err("the self-test handler was not taken by a runner".to_string())
@@ -133,6 +138,12 @@ fn self_test(pool: &Arc<AsyncPool>) -> Result<(), String> {
     };
     // Held until the verdict is in: dropping it is not what ends the test.
     drop(started);
+    Python::attach(|_python| {
+        let forgotten = demoted().remove(&key.address());
+        // The coroutine goes here, attached, outside the map's lock.
+        drop(forgotten);
+        drop(key);
+    });
     match passed {
         Ok(true) => Ok(()),
         Ok(false) => Err("a handler saw the wrong loop, task or value".into()),
