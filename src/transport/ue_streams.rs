@@ -356,11 +356,16 @@ struct AcceptLoop {
 /// the task instead lost a close sent before the task first ran, and the
 /// connection then lived until the peer closed it.
 async fn accept_loop(context: AcceptLoop) {
+    let mut accept_backoff =
+        crate::transport::accept_backoff::AcceptBackoff::new("tcp", context.address);
     loop {
         let (socket, remote_addr) = match context.listener.accept().await {
-            Ok(accepted) => accepted,
+            Ok(accepted) => {
+                accept_backoff.on_success();
+                accepted
+            }
             Err(accept_error) => {
-                error!(addr = %context.address, "per-UE TCP accept error: {accept_error}");
+                accept_backoff.on_error(&accept_error).await;
                 continue;
             }
         };

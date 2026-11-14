@@ -20,6 +20,7 @@ pub mod diameter;
 pub mod dispatcher;
 pub mod dns;
 pub mod error;
+pub mod fd_limit;
 pub mod file_sink;
 pub mod firewall;
 pub mod gateway;

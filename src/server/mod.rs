@@ -91,6 +91,8 @@ pub struct SiphonServer {
     extension_tasks: Vec<ExtensionTask>,
     control_adapters: Vec<ControlAdapterHandle>,
     lifecycle_participants: Vec<Arc<dyn crate::lifecycle::LifecycleParticipant>>,
+    /// What `run` did to `RLIMIT_NOFILE`, logged once logging is up.
+    nofile_limit: Option<crate::fd_limit::RaiseOutcome>,
 }
 
 impl SiphonServer {
@@ -109,6 +111,7 @@ impl SiphonServer {
             extension_tasks: Vec::new(),
             control_adapters: Vec::new(),
             lifecycle_participants: Vec::new(),
+            nofile_limit: None,
         }
     }
 
@@ -379,7 +382,11 @@ impl SiphonServer {
     /// Run the siphon server. This blocks until shutdown (SIGINT/SIGTERM).
     /// Creates its own tokio runtime, so callers do not need `#[tokio::main]`.
     #[allow(clippy::disallowed_methods)] // process entry, before anything attaches
-    pub fn run(self) {
+    pub fn run(mut self) {
+        // Raise the fd soft limit to the hard limit before any thread or
+        // descriptor exists. Logged after `init_logging`, which runs later.
+        self.nofile_limit = Some(crate::fd_limit::raise_soft_limit());
+
         // Install rustls crypto provider before any TLS operations
         if tokio_rustls::rustls::crypto::ring::default_provider()
             .install_default()
@@ -462,6 +469,9 @@ impl SiphonServer {
         } else {
             init_logging(&config.log)
         };
+        if let Some(outcome) = &self.nofile_limit {
+            crate::fd_limit::log_outcome(outcome);
+        }
 
         // --- Verify jemalloc is actually the global allocator ---
         // A binary that forgot `siphon::install_allocator!()` runs siphon's Rust

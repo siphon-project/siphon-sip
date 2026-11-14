@@ -1938,7 +1938,7 @@ impl IpsecManager {
             }
         };
         debug!(cmd = %args.join(" "), "IPsec: running ip command");
-        let output = tokio::process::Command::new("ip")
+        let output = crate::fd_limit::tokio_command("ip")
             .args(args)
             .output()
             .await
