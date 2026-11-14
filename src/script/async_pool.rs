@@ -52,6 +52,8 @@ use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
+use crate::script::runner::{RunnerOwner, RunnerShared};
+
 /// Global pool, initialised once at server startup.  Handlers route through
 /// here when present; tests and CLI helpers without a configured pool fall
 /// back to the legacy per-thread `run_until_complete` path.
@@ -68,6 +70,8 @@ struct Driver {
     /// Pings the loop has actually run. Equal to `pinged` means the loop is
     /// turning; falling behind means something is blocking on it.
     landed: Arc<AtomicU64>,
+    /// The native runner draining on this driver's loop.
+    runner: Arc<RunnerShared>,
 }
 
 /// A `#[pyclass]` callable the heartbeat schedules on a driver loop. Running
@@ -201,7 +205,17 @@ impl AsyncPool {
         self.drivers.len()
     }
 
-    fn spawn(size: usize, tokio_handle: TokioHandle, coroutine_timeout: Duration) -> Self {
+    /// The native runner on driver `index`'s loop.
+    #[doc(hidden)]
+    pub fn runner(&self, index: usize) -> Option<&Arc<RunnerShared>> {
+        self.drivers.get(index).map(|driver| &driver.runner)
+    }
+
+    pub(crate) fn spawn(
+        size: usize,
+        tokio_handle: TokioHandle,
+        coroutine_timeout: Duration,
+    ) -> Self {
         let mut drivers = Vec::with_capacity(size);
         for index in 0..size {
             drivers.push(spawn_driver(index, tokio_handle.clone()));
@@ -365,6 +379,9 @@ impl Drop for AsyncPool {
         // so this only matters for `Arc<AsyncPool>` instances the loser
         // of an `install()` race holds briefly.
         for driver in &self.drivers {
+            // The runner stops running work before its loop stops; the driver
+            // thread abandons what is left once `run_forever` returns.
+            driver.runner.shutdown();
             // `loop.call_soon_threadsafe(loop.stop)` schedules `stop()` on
             // the loop thread, which makes `run_forever` return on the
             // next iteration.
@@ -401,11 +418,12 @@ fn spawn_driver(index: usize, tokio_handle: TokioHandle) -> Driver {
         .expect("asyncio driver thread dropped sender before handing back its loop");
 
     match handshake {
-        DriverHandshake::Ready(loop_obj) => Driver {
+        DriverHandshake::Ready(loop_obj, runner) => Driver {
             loop_obj,
             thread: StdMutex::new(Some(thread)),
             pinged: Arc::new(AtomicU64::new(0)),
             landed: Arc::new(AtomicU64::new(0)),
+            runner,
         },
         DriverHandshake::Failed(message) => {
             // We can't recover from a missing asyncio loop; abort.
@@ -415,7 +433,7 @@ fn spawn_driver(index: usize, tokio_handle: TokioHandle) -> Driver {
 }
 
 enum DriverHandshake {
-    Ready(Py<PyAny>),
+    Ready(Py<PyAny>, Arc<RunnerShared>),
     Failed(String),
 }
 
@@ -450,7 +468,19 @@ fn driver_main(
         let _tstate = pyo3::ffi::PyEval_SaveThread();
     }
 
-    // Phase 1: build the loop and hand a handle back to the spawning thread.
+    // The runner's wake pipe, made before the loop that will watch it.
+    let runner = match RunnerOwner::new() {
+        Ok(runner) => runner,
+        Err(error) => {
+            let _ = handshake.send(DriverHandshake::Failed(format!(
+                "script runner wake pipe: {error}"
+            )));
+            return;
+        }
+    };
+
+    // Phase 1: build the loop, hook the runner's drain onto it and hand a
+    // handle back to the spawning thread.
     let loop_obj = match Python::attach(|python| -> PyResult<Py<PyAny>> {
         let asyncio = python.import("asyncio")?;
         let new_loop = asyncio.call_method0("new_event_loop")?;
@@ -458,6 +488,7 @@ fn driver_main(
         // that still calls the deprecated `asyncio.get_event_loop()` on
         // the driver thread gets ours.
         asyncio.call_method1("set_event_loop", (&new_loop,))?;
+        runner.install(python, &new_loop)?;
         Ok(new_loop.unbind())
     }) {
         Ok(handle) => handle,
@@ -469,11 +500,15 @@ fn driver_main(
 
     let loop_for_caller = Python::attach(|python| loop_obj.clone_ref(python));
     if handshake
-        .send(DriverHandshake::Ready(loop_for_caller))
+        .send(DriverHandshake::Ready(
+            loop_for_caller,
+            Arc::clone(runner.shared()),
+        ))
         .is_err()
     {
         // Caller went away before we could hand off — nothing to drive.
         debug!(driver = index, "async pool spawner dropped; driver exiting");
+        Python::attach(|python| runner.close(python, loop_obj.bind(python)));
         return;
     }
 
@@ -490,10 +525,12 @@ fn driver_main(
         debug!(driver = index, "asyncio driver loop stopped cleanly");
     }
 
-    // Phase 3: best-effort loop teardown.  Cancel any still-pending tasks
-    // and close the loop so file descriptors aren't leaked.
+    // Phase 3: best-effort loop teardown.  Abandon what the runner still
+    // holds, cancel any still-pending tasks and close the loop so file
+    // descriptors aren't leaked.
     let _ = Python::attach(|python| -> PyResult<()> {
         let bound = loop_obj.bind(python);
+        runner.close(python, bound);
         let asyncio = python.import("asyncio")?;
         let pending = asyncio.call_method1("all_tasks", (&bound,))?;
         let task_iter = pending.try_iter()?;

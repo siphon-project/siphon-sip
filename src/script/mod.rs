@@ -20,6 +20,8 @@ pub mod handler_select;
 pub mod inline_dispatch;
 pub(crate) mod liveness;
 pub mod py_executor;
+#[doc(hidden)]
+pub mod runner;
 pub mod runtime_info;
 pub mod script_config;
 #[cfg(test)]
