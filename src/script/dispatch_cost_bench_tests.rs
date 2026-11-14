@@ -58,6 +58,7 @@ import asyncio
 import gc
 import _siphon_registry as _r
 import _dispatch_bench
+from siphon import tasks
 
 def sync_h(x):
     return x
@@ -85,6 +86,19 @@ async def async_mixed(x):
     await asyncio.sleep(0)
     return value
 
+async def background_child():
+    return await _dispatch_bench.ready()
+
+async def spawn_wait(x):
+    handle = tasks.spawn(background_child())
+    first = await tasks.wait_first([handle], timeout=1.0)
+    return first.result()
+
+async def asyncio_spawn_wait(x):
+    task = asyncio.ensure_future(background_child())
+    await asyncio.wait({task}, timeout=1.0, return_when=asyncio.FIRST_COMPLETED)
+    return task.result()
+
 def gc_collections(*_):
     return sum(generation['collections'] for generation in gc.get_stats())
 
@@ -96,6 +110,8 @@ for name, fn, is_async in [
     ("async_sleep", async_sleep, True),
     ("async_yield", async_yield, True),
     ("async_mixed", async_mixed, True),
+    ("spawn_wait", spawn_wait, True),
+    ("asyncio_spawn_wait", asyncio_spawn_wait, True),
     ("gc_collections", gc_collections, False),
 ]:
     _r.register("bench." + name, None, fn, is_async, None)
@@ -109,6 +125,8 @@ const CASES: &[&str] = &[
     "async_sleep",
     "async_yield",
     "async_mixed",
+    "spawn_wait",
+    "asyncio_spawn_wait",
 ];
 
 fn env_usize(name: &str, default: usize) -> usize {

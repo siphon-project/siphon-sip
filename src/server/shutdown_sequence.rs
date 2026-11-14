@@ -59,6 +59,10 @@ pub(crate) async fn shut_down(
 
     drain_and_end(config, drain).await;
 
+    // Whatever the drain deadline found still running is cancelled by now;
+    // give it a moment to unwind so its cleanup (a release, a delete) runs.
+    crate::script::direct::cancel_all_and_wait(std::time::Duration::from_secs(2)).await;
+
     // Before the dispatcher goes: it delivers the de-REGISTER answers that
     // release the IMS UE SA sets. Bounded, so it never holds the exit.
     if let Some(manager) = shutdown_registrant {

@@ -2520,6 +2520,11 @@ impl SiphonServer {
 
         // --- Start dispatcher ---
         let drain = Arc::new(dispatcher::DrainState::new());
+        // Background coroutines a script spawned hold the drain open and are
+        // cancelled when its deadline passes.
+        drain
+            .participants
+            .register(Arc::new(crate::script::direct::BackgroundTasks));
         for participant in std::mem::take(&mut self.lifecycle_participants) {
             drain.participants.register(participant);
         }

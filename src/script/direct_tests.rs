@@ -99,7 +99,7 @@ pub(super) fn thread_name() -> String {
         .to_string()
 }
 
-fn install_probe_module() {
+pub(super) fn install_probe_module() {
     Python::initialize();
     Python::attach(|python| {
         let modules = python.import("sys").unwrap().getattr("modules").unwrap();
@@ -443,10 +443,11 @@ pub(super) struct Rig {
 }
 
 impl Rig {
-    fn new() -> Self {
+    /// A rig running `script`, whose handlers register as `direct.<name>`.
+    pub(super) fn with_script(script: &str) -> Self {
         install_probe_module();
         let mut file = NamedTempFile::new().unwrap();
-        file.write_all(SCRIPT.as_bytes()).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
         file.flush().unwrap();
         let engine = Arc::new(
             ScriptEngine::new(&crate::config::ScriptConfig {
@@ -501,11 +502,20 @@ where
     F: FnOnce(Rig) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    with_pools_running(SCRIPT, scenario);
+}
+
+/// [`with_pools`] for a rig running `script`.
+pub(super) fn with_pools_running<F, Fut>(script: &'static str, scenario: F)
+where
+    F: FnOnce(Rig) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let _serial = pool_test_guard();
     test_pools_runtime().block_on(async {
         ensure_test_pools();
         // No test waits longer than this: a hang is a failure, not a stall.
-        tokio::time::timeout(Duration::from_secs(60), scenario(Rig::new()))
+        tokio::time::timeout(Duration::from_secs(60), scenario(Rig::with_script(script)))
             .await
             .expect("the scenario finished");
     });
