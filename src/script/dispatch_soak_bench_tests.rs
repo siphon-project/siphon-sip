@@ -403,6 +403,8 @@ def _touch(seed):
     return session
 
 # How many async handlers finished as an asyncio task, and how many did not.
+# Unsynchronised, so threads finishing together lose counts: it tells the two
+# paths apart, it is not a tally.
 _finished = {}
 
 def _note_finish():
