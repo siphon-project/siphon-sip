@@ -906,7 +906,7 @@ pub(super) async fn start_on_executor(
             )
             .expect("the probe compiles");
             let coroutine = module.getattr(function).unwrap().call0().unwrap();
-            match crate::script::inline_dispatch::start_coroutine_direct(python, &coroutine) {
+            match crate::script::inline_dispatch::start_coroutine(python, &coroutine) {
                 Ok(crate::script::inline_dispatch::CoroutineStart::Suspended(pending)) => pending,
                 Ok(crate::script::inline_dispatch::CoroutineStart::Finished(_)) => {
                     panic!("{function} finished without suspending")

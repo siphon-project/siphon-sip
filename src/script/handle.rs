@@ -64,7 +64,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
 use crate::script::engine::{HandlerEntry, HandlerKind, ScriptState};
-use crate::script::inline_dispatch::{start_coroutine_direct, CoroutineStart};
+use crate::script::inline_dispatch::{start_coroutine, CoroutineStart};
 
 /// Owned, opaque reference to a script-registered handler. Returned by
 /// [`ScriptHandle::handlers_for`].
@@ -270,7 +270,7 @@ impl ScriptHandle {
                     callable.bind(py).call1(arg_tuple)
                 });
                 let returned = match returned {
-                    Ok(returned) if is_async => match start_coroutine_direct(py, &returned) {
+                    Ok(returned) if is_async => match start_coroutine(py, &returned) {
                         Ok(CoroutineStart::Finished(value)) => Ok(value.into_bound(py)),
                         Ok(CoroutineStart::Suspended(pending)) if pending.is_direct() => {
                             let (sender, receiver) = tokio::sync::oneshot::channel();
