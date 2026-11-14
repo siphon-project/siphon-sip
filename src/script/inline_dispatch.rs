@@ -1,5 +1,6 @@
-//! Running a script coroutine: inline where that is provably safe, on the
-//! asyncio driver pool otherwise.
+//! Running a script coroutine: inline where it provably cannot suspend, from
+//! the executor while all it awaits is siphon's own awaitables
+//! ([`crate::script::direct`]), on the asyncio driver pool otherwise.
 //!
 //! An asyncio task per SIP message is expensive out of all proportion to the
 //! work it wraps. Profiling the 40k proxy row moved **+23.85 % of total CPU into
@@ -16,7 +17,10 @@
 //! completion. That is the only case taken here, because a coroutine that *does*
 //! suspend cannot be recovered: probing it consumes the future the event loop
 //! needed, and handing it on afterwards fails with `RuntimeError: await wasn't
-//! used with future`. There is no general fast path, only this one.
+//! used with future`. A coroutine that may suspend is therefore never probed:
+//! it is either driven from the executor with everything asyncio needs in
+//! place from its first step, so that it can be handed to a driver whole
+//! ([`crate::script::direct`]), or started on a driver.
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -261,7 +265,8 @@ pub(crate) fn run_coroutine_value(
 pub(crate) enum CoroutineStart {
     /// It ran to the end here; this is its value.
     Finished(Py<PyAny>),
-    /// It is running on an asyncio driver. The caller waits for it with
+    /// It is suspended: on one of siphon's awaitables, to be resumed by the
+    /// executor, or on an asyncio driver. The caller waits for it with
     /// [`PendingCoroutine::resume_on_executor`] and continues from there.
     Suspended(PendingCoroutine),
 }
@@ -278,6 +283,26 @@ pub(crate) fn start_coroutine(
     python: Python<'_>,
     coroutine: &Bound<'_, pyo3::PyAny>,
 ) -> PyResult<CoroutineStart> {
+    start(python, coroutine, false)
+}
+
+/// [`start_coroutine`] for a caller that has opted in to having the executor
+/// drive the coroutine itself while all it awaits is siphon's own awaitables
+/// ([`crate::script::direct`]), with a driver as the fallback the moment it
+/// uses asyncio. So far that is `ScriptHandle`; the request and Diameter
+/// dispatchers still start every suspending coroutine on a driver.
+pub(crate) fn start_coroutine_direct(
+    python: Python<'_>,
+    coroutine: &Bound<'_, pyo3::PyAny>,
+) -> PyResult<CoroutineStart> {
+    start(python, coroutine, true)
+}
+
+fn start(
+    python: Python<'_>,
+    coroutine: &Bound<'_, pyo3::PyAny>,
+    direct: bool,
+) -> PyResult<CoroutineStart> {
     if let Some(value) = run_coroutine_inline(python, coroutine)? {
         return Ok(CoroutineStart::Finished(value));
     }
@@ -285,6 +310,19 @@ pub(crate) fn start_coroutine(
         && tokio::runtime::Handle::try_current().is_ok()
     {
         if let Some(pool) = crate::script::async_pool::AsyncPool::global() {
+            use crate::script::direct::DirectStart;
+            if direct {
+                match crate::script::direct::start(&pool, python, coroutine) {
+                    Some(DirectStart::Finished(result)) => {
+                        return result.map(CoroutineStart::Finished)
+                    }
+                    Some(DirectStart::Pending(pending)) => {
+                        return Ok(CoroutineStart::Suspended(pending))
+                    }
+                    // Its handler uses asyncio: it starts on a driver.
+                    None => {}
+                }
+            }
             return PendingCoroutine::submit(&pool, python, coroutine)
                 .map(CoroutineStart::Suspended);
         }

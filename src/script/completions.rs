@@ -41,7 +41,7 @@ use tracing::error;
 /// a collection's stop-the-world does not hold every awaitable up alone.
 pub(crate) const THREADS: usize = 2;
 
-type Job = Box<dyn FnOnce() + Send + 'static>;
+pub(crate) type Job = Box<dyn FnOnce() + Send + 'static>;
 
 /// The queue into the pool, started on first use. `None` if no thread could
 /// be started, which [`submit`] answers by falling back to tokio's pool.
@@ -104,7 +104,7 @@ fn run(receiver: &flume::Receiver<Job>) {
 }
 
 /// Run `job` on a completion thread.
-fn submit(job: Job) {
+pub(crate) fn submit(job: Job) {
     let job = match queue() {
         Some(queue) => match queue.send(job) {
             Ok(()) => return,

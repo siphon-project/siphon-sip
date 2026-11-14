@@ -1,6 +1,7 @@
-//! Behaviour of `async def` handlers that await siphon's own awaitables and
-//! asyncio in the same coroutine: what a script sees must not depend on how
-//! the handler is driven.
+//! Behaviour of `async def` handlers that await siphon's own awaitables:
+//! driven from the executor without an asyncio task while that is all they
+//! do, and handed to an asyncio driver, intact, the moment they use asyncio
+//! for anything else.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -18,7 +19,7 @@ use crate::script::stop_the_world_tests::{collect_garbage_until, in_child};
 
 /// Futures behind `never()` that were dropped: a cancelled awaitable must
 /// drop its Rust future, not leave it parked on tokio.
-static NEVER_DROPPED: AtomicUsize = AtomicUsize::new(0);
+pub(super) static NEVER_DROPPED: AtomicUsize = AtomicUsize::new(0);
 
 struct CountsDrop;
 
@@ -58,6 +59,27 @@ fn never(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     })
 }
 
+/// The sender that completes the awaitable `gate()` last made.
+static GATE: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
+/// An awaitable that completes when the test calls [`open_gate`].
+#[pyfunction]
+fn gate(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    *GATE.lock().unwrap() = Some(sender);
+    crate::script::awaitable(py, async move {
+        let _ = receiver.await;
+        Ok(5i64)
+    })
+}
+
+pub(super) fn open_gate() {
+    if let Some(sender) = GATE.lock().unwrap().take() {
+        let _ = sender.send(());
+    }
+}
+
 #[pyfunction]
 fn deferred(py: Python<'_>, text: String) -> PyResult<Bound<'_, PyAny>> {
     crate::script::awaitable(py, async move {
@@ -70,7 +92,7 @@ fn deferred(py: Python<'_>, text: String) -> PyResult<Bound<'_, PyAny>> {
 
 /// The OS thread name: Python's `threading` only knows threads it started.
 #[pyfunction]
-fn thread_name() -> String {
+pub(super) fn thread_name() -> String {
     std::thread::current()
         .name()
         .unwrap_or("<unnamed>")
@@ -90,6 +112,7 @@ fn install_probe_module() {
             pyo3::wrap_pyfunction!(sleep_ms, &module).unwrap(),
             pyo3::wrap_pyfunction!(fail, &module).unwrap(),
             pyo3::wrap_pyfunction!(never, &module).unwrap(),
+            pyo3::wrap_pyfunction!(gate, &module).unwrap(),
             pyo3::wrap_pyfunction!(deferred, &module).unwrap(),
             pyo3::wrap_pyfunction!(thread_name, &module).unwrap(),
         ] {
@@ -102,7 +125,9 @@ fn install_probe_module() {
 const SCRIPT: &str = r#"
 import asyncio
 import contextvars
+import gc
 import logging
+import weakref
 import _siphon_registry as _r
 import _direct_probe as probe
 
@@ -340,6 +365,39 @@ def uses_a_kept_task(*_):
     task.add_done_callback(called.append)
     return f"{task.done()}|{task.cancel()}|{task.cancelled()}|{task.get_name() != ''}"
 
+async def gated(x):
+    try:
+        value = await probe.gate()
+    except asyncio.CancelledError:
+        cancelled.append(x)
+        raise
+    resumed.append(value)
+    return "returned"
+
+held = []
+
+async def holds_a_cancelled_awaitable(x):
+    held.append(probe.never())
+    return await probe.ready(x)
+
+def the_held_awaitable(*_):
+    return held[0]
+
+failed = []
+
+async def fails_and_recovers(x):
+    pending = probe.fail("boom")
+    failed.append(weakref.ref(pending))
+    try:
+        await pending
+    except ValueError:
+        pass
+    return "recovered"
+
+def failed_awaitables_collected(*_):
+    gc.collect()
+    return ",".join(str(ref() is None) for ref in failed)
+
 def from_sync(x):
     return probe.ready(x)
 
@@ -369,12 +427,17 @@ for name, fn, is_async in [
     ("cancels_itself", cancels_itself, True),
     ("keeps_its_task", keeps_its_task, True),
     ("uses_a_kept_task", uses_a_kept_task, False),
+    ("gated", gated, True),
+    ("holds_a_cancelled_awaitable", holds_a_cancelled_awaitable, True),
+    ("the_held_awaitable", the_held_awaitable, False),
+    ("fails_and_recovers", fails_and_recovers, True),
+    ("failed_awaitables_collected", failed_awaitables_collected, False),
 ]:
     _r.register("direct." + name, None, fn, is_async, None)
 "#;
 
-struct Rig {
-    handle: ScriptHandle,
+pub(super) struct Rig {
+    pub(super) handle: ScriptHandle,
     // The engine owns the handlers the handle reads.
     _engine: Arc<ScriptEngine>,
 }
@@ -409,7 +472,7 @@ impl Rig {
 
     /// Call `direct.<name>(argument)`: its result as `str()`, or its error's
     /// text.
-    async fn call(&self, name: &str, argument: i64) -> Result<String, String> {
+    pub(super) async fn call(&self, name: &str, argument: i64) -> Result<String, String> {
         let handler = self
             .handle
             .handlers_for(&format!("direct.{name}"))
@@ -433,7 +496,7 @@ impl Rig {
 
 /// Run `scenario` on the pools' runtime with the pools installed, one test at
 /// a time.
-fn with_pools<F, Fut>(scenario: F)
+pub(super) fn with_pools<F, Fut>(scenario: F)
 where
     F: FnOnce(Rig) -> Fut,
     Fut: std::future::Future<Output = ()>,
@@ -445,6 +508,49 @@ where
         tokio::time::timeout(Duration::from_secs(60), scenario(Rig::new()))
             .await
             .expect("the scenario finished");
+    });
+}
+
+/// One await of a siphon awaitable resumes on the executor: no asyncio driver
+/// runs any part of the handler.
+#[test]
+fn one_await_resumes_off_the_asyncio_drivers() {
+    with_pools(|rig| async move {
+        assert_eq!(rig.call("one_await", 5).await, Ok("5|False".to_string()));
+        assert_eq!(rig.call("nested", 5).await, Ok("6|False".to_string()));
+        assert_eq!(
+            rig.call("built", 0).await,
+            Ok("built:abc|False".to_string())
+        );
+    });
+}
+
+/// Fifty awaits, ready and not: the sum is right and none of the fifty
+/// continuations ran on a driver.
+#[test]
+fn many_awaits_all_resume_off_the_asyncio_drivers() {
+    with_pools(|rig| async move {
+        let expected: i64 = (0..50).sum();
+        assert_eq!(
+            rig.call("many_awaits", 0).await,
+            Ok(format!("{expected}|0"))
+        );
+    });
+}
+
+/// An awaitable's error is raised at the `await`: the coroutine can catch it,
+/// and one it lets go is the handler's error.
+#[test]
+fn an_awaitable_error_is_thrown_into_the_coroutine() {
+    with_pools(|rig| async move {
+        assert_eq!(
+            rig.call("caught", 0).await,
+            Ok("caught:boom|False".to_string())
+        );
+        let escaped = rig.call("uncaught", 0).await.expect_err("raised");
+        assert!(escaped.contains("escapes"), "{escaped}");
+        let after = rig.call("raises_after", 0).await.expect_err("raised");
+        assert!(after.contains("after the await"), "{after}");
     });
 }
 
@@ -484,6 +590,21 @@ fn a_hand_over_after_a_suspension_finishes_once() {
             rig.call("counts_its_stages", 0).await,
             Ok("abcdabcd".to_string())
         );
+    });
+}
+
+/// Two handlers awaiting one awaitable both get its value.
+#[test]
+fn two_handlers_can_await_one_awaitable() {
+    with_pools(|rig| async move {
+        let rig = Arc::new(rig);
+        let first = {
+            let rig = Arc::clone(&rig);
+            tokio::spawn(async move { rig.call("shares_first", 0).await })
+        };
+        let second = rig.call("shares_second", 0).await;
+        assert_eq!(first.await.expect("joined"), Ok("5".to_string()));
+        assert_eq!(second, Ok("5".to_string()));
     });
 }
 
@@ -598,6 +719,18 @@ fn an_awaitable_runs_before_it_is_awaited() {
     });
 }
 
+/// Logging reads `asyncio.current_task().get_name()` for every record; that
+/// must not cost the handler its direct path.
+#[test]
+fn logging_in_a_handler_keeps_it_off_the_drivers() {
+    with_pools(|rig| async move {
+        assert_eq!(
+            rig.call("logs_then_awaits", 2).await,
+            Ok("2|False|True".to_string())
+        );
+    });
+}
+
 /// A context variable set before an await is there after it, on whichever
 /// thread the handler resumes and across the hand-over, and never leaks into
 /// the next call.
@@ -614,6 +747,13 @@ fn context_variables_follow_the_coroutine() {
                 Ok("unset".to_string())
             );
         }
+    });
+}
+
+#[test]
+fn an_async_generator_over_siphon_awaitables_iterates() {
+    with_pools(|rig| async move {
+        assert_eq!(rig.call("iterates", 0).await, Ok("6|False".to_string()));
     });
 }
 
@@ -745,5 +885,94 @@ fn awaiting_survives_stop_the_world_collections() {
         }
         stop.store(true, Ordering::Relaxed);
         collector.join().expect("the collector stops");
+    });
+}
+
+/// Start `function()` from a script on an executor worker, as a dispatcher
+/// does, and hand back what is left to wait for.
+pub(super) async fn start_on_executor(
+    function: &'static str,
+) -> crate::script::async_pool::PendingCoroutine {
+    install_probe_module();
+    crate::script::py_executor::run(move || {
+        Python::attach(|python| {
+            let module = PyModule::from_code(
+                python,
+                c"import _direct_probe as probe\n\
+                  async def waits():\n    return await probe.sleep_ms(5, 11)\n\
+                  async def wedged():\n    await probe.never()\n",
+                c"direct_wait_probe.py",
+                c"direct_wait_probe",
+            )
+            .expect("the probe compiles");
+            let coroutine = module.getattr(function).unwrap().call0().unwrap();
+            match crate::script::inline_dispatch::start_coroutine_direct(python, &coroutine) {
+                Ok(crate::script::inline_dispatch::CoroutineStart::Suspended(pending)) => pending,
+                Ok(crate::script::inline_dispatch::CoroutineStart::Finished(_)) => {
+                    panic!("{function} finished without suspending")
+                }
+                Err(error) => panic!("{function} failed to start: {error}"),
+            }
+        })
+    })
+    .await
+}
+
+/// A caller that waits on a tokio task instead of being resumed on the
+/// executor gets the same result, and the same timeout.
+#[test]
+fn a_direct_coroutine_can_be_waited_for_from_a_task() {
+    with_pools(|_rig| async move {
+        let pending = start_on_executor("waits").await;
+        assert!(pending.is_direct(), "driven by the executor");
+        let value = pending.wait().await.expect("settles");
+        assert_eq!(
+            Python::attach(|python| value.extract::<i64>(python).ok()),
+            Some(11)
+        );
+
+        let dropped_before = NEVER_DROPPED.load(Ordering::SeqCst);
+        let pending = start_on_executor("wedged").await;
+        let error = pending.wait().await.expect_err("times out");
+        assert!(error.to_string().contains("did not settle"), "{error}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while NEVER_DROPPED.load(Ordering::SeqCst) == dropped_before {
+            assert!(Instant::now() < deadline, "the awaitable was not cancelled");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+}
+
+/// A caller that asks to be resumed on the executor, as the request
+/// dispatcher does, is resumed there with the result, and with the timeout
+/// when the coroutine never settles.
+#[test]
+fn a_direct_coroutine_resumes_its_caller_on_the_executor() {
+    with_pools(|_rig| async move {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        start_on_executor("waits")
+            .await
+            .resume_on_executor(move |result| {
+                let value =
+                    result.map(|value| Python::attach(|python| value.extract::<i64>(python).ok()));
+                let _ = sender.send((value.ok().flatten(), thread_name()));
+            });
+        let (value, thread) = receiver.await.expect("resumed");
+        assert_eq!(value, Some(11));
+        assert!(thread.starts_with("siphon-pyexec"), "resumed on {thread}");
+
+        let baseline = crate::script::async_pool::pending_coroutines();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        start_on_executor("wedged")
+            .await
+            .resume_on_executor(move |result| {
+                let _ = sender.send(result.map(|_| ()).map_err(|error| error.to_string()));
+            });
+        let error = receiver.await.expect("resumed").expect_err("times out");
+        assert!(error.contains("did not settle"), "{error}");
+        assert!(
+            crate::script::async_pool::pending_coroutines() <= baseline,
+            "the timed-out coroutine is still counted as pending"
+        );
     });
 }
