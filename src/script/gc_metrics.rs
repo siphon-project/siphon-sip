@@ -369,8 +369,8 @@ mod tests {
                 .call1((surrogate, &none))
                 .expect("a phase that is not UTF-8");
         });
-        for generation in 0..GENERATIONS.len() {
-            assert_eq!(collectors.collections[generation].get(), 0);
+        for counter in collectors.collections.iter().take(GENERATIONS.len()) {
+            assert_eq!(counter.get(), 0);
         }
     }
 
