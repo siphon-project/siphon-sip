@@ -741,10 +741,12 @@ pub async fn listen(
     // create a new outbound TLS connection (registrant, probes, etc.).
     spawn_outbound_distributor(outbound_rx, connection_map.clone(), Transport::Tls, pool);
 
+    let mut accept_backoff = crate::transport::accept_backoff::AcceptBackoff::new("tls", bound);
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((mut tcp_stream, remote_addr)) => {
+                    accept_backoff.on_success();
                     if !acl.is_allowed(remote_addr.ip()) {
                         debug!("TLS rejected {} by ACL", remote_addr);
                         continue;
@@ -916,9 +918,7 @@ pub async fn listen(
                         .await;
                     });
                 }
-                Err(error) => {
-                    error!("TLS accept error: {}", error);
-                }
+                Err(error) => accept_backoff.on_error(&error).await,
             }
         }
     });

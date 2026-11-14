@@ -296,10 +296,12 @@ pub async fn listen(
         None,
     );
 
+    let mut accept_backoff = crate::transport::accept_backoff::AcceptBackoff::new("ws", bound);
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((mut tcp_stream, remote_addr)) => {
+                    accept_backoff.on_success();
                     if !acl.is_allowed(remote_addr.ip()) {
                         continue;
                     }
@@ -393,9 +395,7 @@ pub async fn listen(
                         .await;
                     });
                 }
-                Err(error) => {
-                    error!("WS accept error: {}", error);
-                }
+                Err(error) => accept_backoff.on_error(&error).await,
             }
         }
     });
@@ -446,10 +446,12 @@ pub async fn listen_secure(
         None,
     );
 
+    let mut accept_backoff = crate::transport::accept_backoff::AcceptBackoff::new("wss", bound);
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((mut tcp_stream, remote_addr)) => {
+                    accept_backoff.on_success();
                     if !acl.is_allowed(remote_addr.ip()) {
                         continue;
                     }
@@ -570,9 +572,7 @@ pub async fn listen_secure(
                         .await;
                     });
                 }
-                Err(error) => {
-                    error!("WSS accept error: {}", error);
-                }
+                Err(error) => accept_backoff.on_error(&error).await,
             }
         }
     });

@@ -691,12 +691,16 @@ pub async fn serve(config: Arc<LiX1Config>, server: Arc<X1Server>) -> io::Result
         "ETSI X1 listener started (mutual TLS)"
     );
 
+    let mut accept_backoff = crate::transport::accept_backoff::AcceptBackoff::new("x1", local_addr);
     tokio::spawn(async move {
         loop {
             let (stream, peer_addr) = match listener.accept().await {
-                Ok(accepted) => accepted,
+                Ok(accepted) => {
+                    accept_backoff.on_success();
+                    accepted
+                }
                 Err(error) => {
-                    error!(%error, "X1 accept failed");
+                    accept_backoff.on_error(&error).await;
                     continue;
                 }
             };
