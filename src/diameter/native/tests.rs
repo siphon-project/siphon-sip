@@ -975,3 +975,221 @@ fn named_pick_falls_back() {
         );
     });
 }
+
+// ── The catch-all handler ───────────────────────────────────────────────────
+
+/// An answer that says which handler made it.
+fn marked(request: &NativeRequest, by: &str) -> NativeResult {
+    Ok(NativeOutcome::Answer(request.answer_with_message(2001, by)))
+}
+
+/// A keyed handler for the test command and a catch-all steered by the
+/// Session-Id like [`steered`].
+fn keyed_and_catch_all() -> NativeHandlers {
+    NativeHandlers::new()
+        .handle(TEST_APPLICATION, TEST_COMMAND, |request| async move {
+            marked(&request, "keyed")
+        })
+        .and_then(|handlers| {
+            handlers.handle_any(|request| async move {
+                match request
+                    .session_id()
+                    .unwrap_or_default()
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                {
+                    "script" => Ok(NativeOutcome::Script),
+                    "error" => Err("no route".into()),
+                    "panic" => panic!("a catch-all bug"),
+                    _ => marked(&request, "catch-all"),
+                }
+            })
+        })
+        .expect("one keyed handler and one catch-all")
+}
+
+fn made_by(outcome: &HarnessOutcome) -> Option<String> {
+    outcome
+        .answer()
+        .and_then(|answer| answer.get_str(avp::ERROR_MESSAGE))
+}
+
+#[test]
+fn a_catch_all_is_resolved_only_when_no_keyed_handler_is() {
+    let handlers = keyed_and_catch_all();
+    assert_eq!(handlers.len(), 1, "the catch-all is not a keyed handler");
+    assert!(!handlers.is_empty());
+    assert!(handlers.catch_all().is_some());
+    let keyed = handlers
+        .get(TEST_APPLICATION, TEST_COMMAND)
+        .expect("the keyed handler");
+    let resolved = handlers
+        .resolve(TEST_APPLICATION, TEST_COMMAND)
+        .expect("resolved");
+    assert!(Arc::ptr_eq(keyed, resolved), "the keyed handler wins");
+    // Anything else resolves to the catch-all, and is not keyed.
+    assert!(handlers.get(dictionary::S6A_APP_ID, 318).is_none());
+    let any = handlers
+        .resolve(dictionary::S6A_APP_ID, 318)
+        .expect("the catch-all");
+    assert!(Arc::ptr_eq(any, handlers.catch_all().expect("registered")));
+    assert_eq!(
+        handlers.commands().collect::<Vec<_>>(),
+        vec![(TEST_APPLICATION, TEST_COMMAND)]
+    );
+    assert!(format!("{handlers:?}").contains("catch_all: true"));
+
+    // Without one, an unkeyed command resolves to nothing.
+    let keyed_only = script_handler();
+    assert!(keyed_only.catch_all().is_none());
+    assert!(keyed_only.resolve(dictionary::CX_APP_ID, 303).is_none());
+}
+
+#[test]
+fn a_set_with_only_a_catch_all_is_not_empty() {
+    let handlers = NativeHandlers::new()
+        .handle_any(|_request| async { Ok(NativeOutcome::Script) })
+        .expect("a first catch-all");
+    assert_eq!(handlers.len(), 0);
+    assert!(!handlers.is_empty());
+    assert!(handlers.resolve(0, 0).is_some());
+}
+
+#[test]
+fn a_second_catch_all_is_refused() {
+    let one = || {
+        NativeHandlers::new()
+            .handle_any(|_request| async { Ok(NativeOutcome::Script) })
+            .expect("a first catch-all")
+    };
+    let error = one()
+        .handle_any(|_request| async { Ok(NativeOutcome::Script) })
+        .expect_err("a second catch-all is an error");
+    assert_eq!(error, NativeHandlerError::DuplicateCatchAll);
+    assert!(error.to_string().contains("catch-all"));
+    // One from each side of a merge is two.
+    assert_eq!(
+        one().merge(one()).expect_err("two catch-alls"),
+        NativeHandlerError::DuplicateCatchAll
+    );
+    // A catch-all merges with keyed handlers, from either side.
+    let merged = script_handler().merge(one()).expect("no clash");
+    assert!(merged.catch_all().is_some());
+    assert_eq!(merged.len(), 1);
+    assert!(one()
+        .merge(script_handler())
+        .expect("no clash")
+        .catch_all()
+        .is_some());
+}
+
+/// A catch-all serves every application and names none: the capabilities
+/// exchange advertises what the keyed handlers name and nothing more.
+#[test]
+fn a_catch_all_advertises_no_application() {
+    let only = NativeHandlers::new()
+        .handle_any(|_request| async { Ok(NativeOutcome::Script) })
+        .expect("a first catch-all");
+    assert!(applications_of(&only).is_empty());
+    let with_keyed = script_handler().merge(only).expect("no clash");
+    assert_eq!(
+        applications_of(&with_keyed),
+        vec![(dictionary::VENDOR_3GPP, dictionary::S6A_APP_ID)]
+    );
+}
+
+#[tokio::test]
+async fn the_harness_runs_the_catch_all_for_what_no_keyed_handler_takes() {
+    let harness = NativeHarness::new(keyed_and_catch_all());
+    // Keyed: the catch-all is not asked.
+    let keyed = harness.call(&steered_request("script;any;1")).await;
+    assert_eq!(made_by(&keyed).as_deref(), Some("keyed"));
+
+    // Another application and another command of the keyed application.
+    let mut other_application = request(dictionary::S6A_APP_ID, 318);
+    other_application.avps[0] = Avp::utf8(avp::SESSION_ID, 0, "answer;any;2");
+    let answered = harness.call(&other_application).await;
+    assert_eq!(made_by(&answered).as_deref(), Some("catch-all"));
+    let answer = answered.answer().expect("answered");
+    assert_eq!(answer.application_id, dictionary::S6A_APP_ID);
+    assert_eq!(answer.command_code, 318);
+    assert_eq!(answer.hop_by_hop, 0x1111_2222);
+    let mut other_command = request(TEST_APPLICATION, TEST_NAMED_COMMAND);
+    other_command.avps[0] = Avp::utf8(avp::SESSION_ID, 0, "answer;any;3");
+    assert_eq!(
+        made_by(&harness.call(&other_command).await).as_deref(),
+        Some("catch-all")
+    );
+
+    // Declining, failing and panicking are what they are for a keyed one.
+    let steer = |kind: &str| {
+        let mut message = request(dictionary::S6A_APP_ID, 318);
+        message.avps[0] = Avp::utf8(avp::SESSION_ID, 0, &format!("{kind};any;4"));
+        message
+    };
+    assert_eq!(harness.call(&steer("script")).await, HarnessOutcome::Script);
+    for kind in ["error", "panic"] {
+        let outcome = harness.call(&steer(kind)).await;
+        assert_eq!(result_code(&outcome), Some(5012), "{kind}");
+    }
+}
+
+#[tokio::test]
+async fn a_catch_all_that_never_finishes_is_answered_unable_to_comply() {
+    let handlers = NativeHandlers::new()
+        .handle_any(|_request| std::future::pending::<NativeResult>())
+        .expect("a first catch-all");
+    let handler = handlers.resolve(dictionary::S6A_APP_ID, 318).expect("it");
+    let (peer, _written) = silent_peer("siphon.example.com");
+    let inbound = dispatch::Inbound {
+        peer: &peer,
+        peer_name: "peer",
+        tenant: "default",
+        origin: ("siphon.example.com", "example.com"),
+    };
+    let wire = dispatch::answer_wire_within(
+        handler,
+        request(dictionary::S6A_APP_ID, 318),
+        &inbound,
+        std::time::Duration::from_millis(50),
+    )
+    .await
+    .expect("answered");
+    let answer = DiameterMsg::from_wire(&wire).expect("the answer parses");
+    assert_eq!(answer.answer_result_codes().0, Some(5012));
+}
+
+// ── A directly connected peer, with its name ────────────────────────────────
+
+#[test]
+fn a_connected_peer_is_found_with_the_name_it_is_configured_under() {
+    let (peer, _written) = silent_peer("siphon.example.com");
+    peer.set_remote_identity("hss-7.example.com", "example.com");
+    let _listing = crate::diameter::directory::list("t-native-named", "hss-pool-a", &peer)
+        .expect("the peer gave an Origin-Host");
+
+    let (name, found) = peer_for_host_named("t-native-named", "HSS-7.example.com").expect("listed");
+    assert_eq!(name, "hss-pool-a");
+    assert!(Arc::ptr_eq(&found, &peer));
+    // The unnamed form is the same lookup.
+    let unnamed = peer_for_host("t-native-named", "hss-7.example.com").expect("listed");
+    assert!(Arc::ptr_eq(&unnamed, &peer));
+    // And so is the request's, in its own tenant.
+    let request = NativeRequest::new(
+        request(TEST_APPLICATION, TEST_COMMAND),
+        Arc::clone(&peer),
+        "mme",
+        "t-native-named",
+        ("siphon.example.com", "example.com"),
+    );
+    let (name, _) = request
+        .peer_for_host_named("hss-7.example.com")
+        .expect("listed");
+    assert_eq!(name, "hss-pool-a");
+
+    assert!(peer_for_host_named("t-native-other", "hss-7.example.com").is_none());
+    assert!(peer_for_host_named("t-native-named", "hss-8.example.com").is_none());
+    peer.set_state_for_test(crate::diameter::peer::PeerState::Closed);
+    assert!(peer_for_host_named("t-native-named", "hss-7.example.com").is_none());
+}

@@ -628,3 +628,161 @@ fn over_a_connection_a_handler_answers_and_relays_as_the_script_relay_does() {
         client_peer.shutdown();
     });
 }
+
+/// A catch-all handler through the dispatch every connection uses. In a
+/// process of its own, with its own set of handlers in force: the other
+/// tests of this binary share a set that has no catch-all.
+#[test]
+fn a_catch_all_handler_serves_what_no_keyed_handler_takes() {
+    crate::own_process::run(
+        concat!(
+            module_path!(),
+            "::a_catch_all_handler_serves_what_no_keyed_handler_takes"
+        ),
+        catch_all_through_dispatch,
+    );
+}
+
+fn catch_all_through_dispatch() {
+    use crate::diameter::native::{self, NativeHandlers, NativeOutcome};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static KEYED: AtomicUsize = AtomicUsize::new(0);
+    static ANY: AtomicUsize = AtomicUsize::new(0);
+
+    let handlers = NativeHandlers::new()
+        .handle(TEST_APPLICATION, TEST_COMMAND, |request| async move {
+            KEYED.fetch_add(1, Ordering::SeqCst);
+            Ok(NativeOutcome::Answer(
+                request.answer_with_message(2001, "keyed"),
+            ))
+        })
+        .and_then(|handlers| {
+            handlers.handle_any(|request| async move {
+                ANY.fetch_add(1, Ordering::SeqCst);
+                let session = request.session_id().unwrap_or_default();
+                match session.split(';').next().unwrap_or_default() {
+                    "script" => Ok(NativeOutcome::Script),
+                    "error" => Err("no route".into()),
+                    "panic" => panic!("a catch-all bug"),
+                    _ => Ok(NativeOutcome::Answer(
+                        request.answer_with_message(2001, "catch-all"),
+                    )),
+                }
+            })
+        })
+        .expect("one keyed handler and one catch-all");
+    native::install(handlers).expect("nothing installed in this process yet");
+    // An application the dictionary knows, served only by the catch-all, is
+    // not advertised on its account.
+    assert!(native::served_applications().is_empty());
+
+    let made_by = |answer: &DiameterMsg| answer.get_str(dictionary::avp::ERROR_MESSAGE);
+    // A request of an application no keyed handler names.
+    let unkeyed = |session: &str, extra: Vec<Avp>| {
+        let mut message = request(session, dictionary::CMD_PURGE_UE, extra);
+        message.application_id = dictionary::S6A_APP_ID;
+        message
+    };
+
+    let _serial = pool_test_guard();
+    test_pools_runtime().block_on(async {
+        ensure_test_pools();
+        crate::metrics::init().ok();
+        let metrics = crate::metrics::try_metrics().expect("metrics are initialised");
+        let engine =
+            Arc::new(ScriptEngine::new_embedded(SCRIPT).expect("the test script compiles"));
+        let request_name = crate::diameter::codec::command_name(dictionary::CMD_PURGE_UE, true);
+        let answer_name = crate::diameter::codec::command_name(dictionary::CMD_PURGE_UE, false);
+        let requests = |path: &str| {
+            counter(
+                &metrics.diameter_inbound_requests_total,
+                &[request_name, path],
+            )
+        };
+
+        // The keyed handler wins; the catch-all is not asked.
+        let answer =
+            dispatch_one(&engine, &request("script;any;1", TEST_COMMAND, Vec::new())).await;
+        assert_eq!(made_by(&answer).as_deref(), Some("keyed"));
+        assert_eq!(
+            (KEYED.load(Ordering::SeqCst), ANY.load(Ordering::SeqCst)),
+            (1, 0)
+        );
+
+        // What no keyed handler takes goes to the catch-all, not the script.
+        let session = "answer;any;2";
+        let answer = dispatch_one(&engine, &unkeyed(session, Vec::new())).await;
+        assert_eq!(made_by(&answer).as_deref(), Some("catch-all"));
+        assert_eq!(answer.application_id, dictionary::S6A_APP_ID);
+        assert_eq!(answer.hop_by_hop, 0x0A0B_0C0D);
+        assert_eq!(ANY.load(Ordering::SeqCst), 1);
+        assert_eq!(script_calls(&engine, session), 0);
+        assert_eq!((requests("native"), requests("script")), (1, 0));
+
+        // Declined: the script's own catch-all serves it, once, and it is
+        // counted under the script's path only.
+        let session = "script;any;3";
+        let declined = unkeyed(session, Vec::new());
+        let answer = dispatch_one(&engine, &declined).await;
+        assert_eq!(answer.answer_result_codes().0, Some(2001));
+        assert_eq!(made_by(&answer), None, "the script's answer");
+        assert_eq!(ANY.load(Ordering::SeqCst), 2);
+        assert_eq!(script_calls(&engine, session), 1, "exactly once");
+        assert_eq!((requests("native"), requests("script")), (1, 1));
+        // The bytes the script path alone gives for it.
+        let alone = Python::attach(|python| {
+            build_answer_via_handler(
+                python,
+                &engine,
+                &incoming(&declined),
+                &peer_info(),
+                "siphon.example.com",
+                "example.com",
+            )
+            .into_done()
+            .wire
+        });
+        assert_eq!(answer.to_wire(), alone);
+
+        // A failure and a panic are answered 5012, without the script.
+        for kind in ["error", "panic"] {
+            let session = format!("{kind};any;4");
+            let answer = dispatch_one(&engine, &unkeyed(&session, Vec::new())).await;
+            assert_eq!(answer.answer_result_codes().0, Some(5012), "{kind}");
+            assert_eq!(script_calls(&engine, &session), 0, "{kind}");
+        }
+        assert_eq!(
+            counter(
+                &metrics.diameter_inbound_answers_total,
+                &[answer_name, "5012", "native"]
+            ),
+            2
+        );
+        assert_eq!((requests("native"), requests("script")), (3, 1));
+
+        // Above the admission limit it is not called, and the 3004 carries
+        // the overload report.
+        let config: crate::config::DiameterConfig = serde_saphyr::from_str(
+            "overload:\n  reporting:\n    validity: 30\n    admission_limit: 0\n",
+        )
+        .expect("the configuration parses");
+        overload::install(Overload::from_config(config.overload.as_ref()));
+        let advertising = vec![overload::supported_features_avp(overload::FEATURE_LOSS)];
+        let before = ANY.load(Ordering::SeqCst);
+        let shed = dispatch_one(&engine, &unkeyed("answer;any;5", advertising.clone())).await;
+        assert_eq!(shed.answer_result_codes().0, Some(3004));
+        assert!(overload::parse_olr(&shed).is_some());
+        assert_eq!(ANY.load(Ordering::SeqCst), before, "never called");
+
+        // Within it, its answer carries this node's DOIC features.
+        let config: crate::config::DiameterConfig =
+            serde_saphyr::from_str("overload:\n  reporting:\n    admission_limit: 100\n")
+                .expect("the configuration parses");
+        overload::install(Overload::from_config(config.overload.as_ref()));
+        let served = dispatch_one(&engine, &unkeyed("answer;any;6", advertising)).await;
+        assert_eq!(made_by(&served).as_deref(), Some("catch-all"));
+        assert!(overload::supports_loss(&served));
+        overload::install(Overload::new(false, None));
+    });
+}

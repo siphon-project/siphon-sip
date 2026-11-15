@@ -144,6 +144,34 @@ mod tests {
     }
 
     #[test]
+    fn tenants_are_listed_in_the_order_of_the_configuration() {
+        // Not alphabetical, and not the order a hash map gives.
+        let names = ["zulu", "alpha", "mike", "bravo", "yankee", "charlie"];
+        let yaml: String = std::iter::once("tenants:\n".to_owned())
+            .chain(names.iter().map(|name| {
+                format!("  {name}:\n    identity:\n      origin_host: agent.{name}.example.com\n")
+            }))
+            .collect();
+        let runtime = ServerRuntime::new(&config(&yaml), None);
+        assert_eq!(runtime.tenants, names);
+        // Three, as a deployment would have them.
+        let runtime = ServerRuntime::new(
+            &config(concat!(
+                "tenants:\n",
+                "  roaming:\n    identity:\n      origin_host: a.example.com\n",
+                "  home:\n    identity:\n      origin_host: b.example.com\n",
+                "  ims:\n    identity:\n      origin_host: c.example.com\n",
+            )),
+            None,
+        );
+        assert_eq!(runtime.tenants, ["roaming", "home", "ims"]);
+        assert_eq!(
+            runtime.tenant_identity("home").map(|identity| identity.0),
+            Some("b.example.com")
+        );
+    }
+
+    #[test]
     fn a_single_domain_server_is_the_tenant_default() {
         let runtime = ServerRuntime::new(
             &config(concat!(
@@ -159,6 +187,7 @@ mod tests {
             runtime.tenant_identity("default"),
             Some(("agent.example.com", "example.com"))
         );
+        assert_eq!(runtime.tenants, ["default"]);
     }
 
     #[test]
@@ -168,6 +197,7 @@ mod tests {
             None,
         );
         assert_eq!(runtime.tenant_identity("default"), None);
+        assert!(runtime.tenants.is_empty());
     }
 
     /// A node that only dials out has no `diameter.event_sink` in its script,
@@ -203,7 +233,7 @@ mod tests {
     fn handler_and_script_emit_to_the_same_sink() {
         use crate::diameter::native::tests::{request, TEST_APPLICATION, TEST_COMMAND};
         use crate::diameter::native::{
-            event_sink, tenant_identity, NativeHandlers, NativeHarness, NativeOutcome,
+            event_sink, tenant_identity, tenants, NativeHandlers, NativeHarness, NativeOutcome,
         };
         use pyo3::prelude::*;
 
@@ -230,6 +260,7 @@ mod tests {
 
         assert!(event_sink().is_none(), "nothing before the server starts");
         assert!(tenant_identity("alpha").is_none());
+        assert!(tenants().is_empty());
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -249,6 +280,7 @@ mod tests {
                 Some(("agent.beta.example.com", "beta.example.com"))
             );
             assert_eq!(tenant_identity("gamma"), None);
+            assert_eq!(tenants(), ["alpha", "beta"]);
 
             // The script's row, through `diameter.event_sink.emit`.
             pyo3::Python::initialize();
