@@ -101,7 +101,7 @@ async def first_exception(x):
     del cancelled[:]
     held = probe.never()
     try:
-        await tasks.gather(slow_sibling("a"), failing(5), held, slow_sibling("b"))
+        await tasks.gather(slow_sibling("a"), failing(40), held, slow_sibling("b"))
     except ValueError as error:
         after = await probe.ready(1)
         return f"{error}|{sorted(cancelled)}|{held.cancelled()}|{after}|{direct()}"
@@ -118,7 +118,9 @@ async def awaitable_fails(x):
 
 async def fails_quietly(x):
     try:
-        await tasks.gather(probe.never(), failing(2), slow_sibling(("sibling", x)))
+        # Late enough for the others' futures to have been polled: one
+        # aborted before its first poll never existed to be dropped.
+        await tasks.gather(probe.never(), failing(60), slow_sibling(("sibling", x)))
     except ValueError:
         return "failed"
     return "not raised"
@@ -212,6 +214,7 @@ async def stubborn(x):
 async def leaves_children(x):
     await probe.ready(0)
     tasks.gather(stubborn(x), slow_sibling("left"))
+    await probe.sleep_ms(40, 0)
     return "returned"
 
 def the_events(*_):
@@ -390,10 +393,12 @@ fn the_first_exception_is_raised_and_cancels_the_siblings() {
         );
         settles_to(before, "after the failed gathers").await;
         if on {
-            // Two siblings and the held awaitable, then one sibling: their
-            // Rust futures were dropped, not left parked.
+            // Two siblings and the held awaitable of the first gather:
+            // their Rust futures were dropped, not left parked. (The second
+            // gather fails within a millisecond, before its sibling's future
+            // is sure to have been polled at all.)
             let deadline = Instant::now() + Duration::from_secs(5);
-            while NEVER_DROPPED.load(Ordering::SeqCst) - dropped < 4 {
+            while NEVER_DROPPED.load(Ordering::SeqCst) - dropped < 3 {
                 assert!(Instant::now() < deadline, "the cancelled futures dropped");
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -621,9 +626,11 @@ fn children_never_outlive_the_handler() {
             rig.call("the_events", 0).await,
             Ok("ignored the cancellation,closed|left".to_string())
         );
-        // The stubborn child's two awaitables and the sibling's one.
+        // The stubborn child's first awaitable and the sibling's. Its
+        // second is cancelled as soon as it is made, before its future is
+        // sure to have been polled.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while NEVER_DROPPED.load(Ordering::SeqCst) - dropped < 3 {
+        while NEVER_DROPPED.load(Ordering::SeqCst) - dropped < 2 {
             assert!(Instant::now() < deadline, "the children's futures dropped");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

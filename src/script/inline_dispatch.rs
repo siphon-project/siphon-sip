@@ -400,23 +400,34 @@ impl PendingHandler {
     {
         match self {
             Self::Task(pending) => pending.resume_on_executor(resume),
-            Self::Direct(drive, handler) => {
-                tokio::spawn(async move {
-                    let waited = drive.wait().await;
-                    let queued = crate::script::py_executor::spawn_queued(move || {
-                        resume(direct_result(waited, &handler));
-                    })
-                    .await;
-                    if !queued {
-                        error!(
-                            "Python executor closed while an async handler was awaiting; \
-                             the work after its await cannot run"
-                        );
-                    }
-                });
-            }
+            // Boxed, so the wait below is compiled once and not per caller.
+            Self::Direct(drive, handler) => resume_direct(drive, handler, Box::new(resume)),
         }
     }
+}
+
+/// The continuation of a directly driven handler.
+type Resume = Box<dyn FnOnce(PyResult<Py<PyAny>>) + Send>;
+
+/// Wait for `drive` on a tokio task, then queue `resume` on the executor.
+fn resume_direct(
+    drive: crate::script::runner::DriveHandle,
+    handler: std::sync::Arc<Py<PyAny>>,
+    resume: Resume,
+) {
+    tokio::spawn(async move {
+        let waited = drive.wait().await;
+        let queued = crate::script::py_executor::spawn_queued(move || {
+            resume(direct_result(waited, &handler));
+        })
+        .await;
+        if !queued {
+            error!(
+                "Python executor closed while an async handler was awaiting; \
+                 the work after its await cannot run"
+            );
+        }
+    });
 }
 
 /// What [`start_handler_coroutine`] did with a coroutine.

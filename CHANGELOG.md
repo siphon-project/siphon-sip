@@ -96,9 +96,6 @@ entry, but a working config keeps working.
   nothing. A handler's cancellation or timeout cancels what it gathered. With
   the switch off, or in a handler that runs as an asyncio task, it is
   `asyncio.gather` with that same rule. Mirrored in the SDK mock.
-  `siphon_runner_admission_rejected_total`. SIP request and Diameter handlers
-  are not affected by the switch yet. Off, dispatch is unchanged. See
-  `docs/handler-execution-model.md`.
 - `siphon_accept_errors_total{transport,listener,reason}`, `reason` one of
   `emfile`, `enfile`, `enobufs`, `enomem`, `other`, counted on every accept
   error. Alert on `process_open_fds / process_max_fds > 0.8` for the warning

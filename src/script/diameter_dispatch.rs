@@ -17,6 +17,8 @@
 //! every tenant.
 
 mod backend;
+mod shed;
+use shed::shed_too_busy;
 #[cfg(test)]
 mod direct_tests;
 #[cfg(test)]
@@ -1004,34 +1006,6 @@ fn emitted_answer_result_label(wire: &[u8]) -> &'static str {
     };
     let (base, experimental) = answer.answer_result_codes();
     dictionary::answer_result_label(base, experimental)
-}
-
-/// Answer `incoming` DIAMETER_TOO_BUSY (3004) without running the script, as
-/// `diameter.overload.reporting.admission_limit` asks or because no asyncio
-/// driver had room for its handler (`reason` says which, in the shed metric),
-/// with the overload this node reports (RFC 7683) for a requester that
-/// advertised DOIC.
-async fn shed_too_busy(
-    inbound_peer: &DiameterPeer,
-    incoming: &IncomingRequest,
-    local_origin: (&str, &str),
-    reason: &str,
-    start: Instant,
-) {
-    let Some(wire) =
-        crate::diameter::overload::too_busy_answer(&incoming.raw, local_origin, reason)
-    else {
-        warn!("Diameter server: shed a request that does not parse, no answer sent");
-        return;
-    };
-    if let Err(error) = inbound_peer.send_response(wire).await {
-        warn!(%error, "Diameter server: failed to send the 3004 of the admission limit");
-    }
-    crate::metrics::record_diameter_inbound(
-        incoming.command_code,
-        dictionary::answer_result_label(Some(dictionary::DIAMETER_TOO_BUSY), None),
-        start.elapsed(),
-    );
 }
 
 /// The answer bytes plus optional Py handles for the completed hook.
