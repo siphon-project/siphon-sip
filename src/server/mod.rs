@@ -1268,6 +1268,8 @@ impl SiphonServer {
             }
             info!("extension tasks started");
         }
+        // `script.gc`: last, so what the extensions built is frozen as well.
+        crate::script::gc_control::apply(&config.script.gc);
 
         // --- Kernel firewall (nf_tables) — opt-in, needs CAP_NET_ADMIN ---
         // Programs banned sources into a kernel set so abusive traffic is

@@ -379,6 +379,18 @@ pub(crate) fn run_interpreter_probe(
             if let Some(longest) = window.sample(waited, Instant::now()) {
                 wait.last_ms
                     .set(i64::try_from(longest.as_millis()).unwrap_or(i64::MAX));
+                // Once a window, on this thread because it is the one that
+                // attaches anyway. Inside a beat of its own: this attaches
+                // too, and a wedge that caught it between two beats would go
+                // unseen. Its attach is one more sample of the wait, so a
+                // stop-the-world that began after the probe above is counted.
+                beat.begin();
+                let sampler_waited = super::gc_metrics::sample_young_objects();
+                beat.end();
+                if let Some(sampler_waited) = sampler_waited {
+                    wait.seconds.observe(sampler_waited.as_secs_f64());
+                    window.note(sampler_waited);
+                }
             }
         }
         if waited >= Duration::from_secs(1) {
@@ -412,6 +424,11 @@ struct LongestWait {
 }
 
 impl LongestWait {
+    /// A wait that belongs to the current window and does not close it.
+    fn note(&mut self, waited: Duration) {
+        self.longest = self.longest.max(waited);
+    }
+
     /// One sample at `now`. Returns the window's longest wait when the window
     /// closes, and starts the next.
     fn sample(&mut self, waited: Duration, now: Instant) -> Option<Duration> {
@@ -919,6 +936,10 @@ mod tests {
         assert_eq!(window.sample(ms(1), at(2000)), Some(ms(3)));
         // One attach that outlasts the window reports itself.
         assert_eq!(window.sample(ms(5000), at(7000)), Some(ms(5000)));
+        // A wait noted between two samples counts in its window.
+        window.note(ms(250));
+        assert_eq!(window.sample(ms(1), at(7500)), None);
+        assert_eq!(window.sample(ms(1), at(8000)), Some(ms(250)));
     }
 
     #[test]

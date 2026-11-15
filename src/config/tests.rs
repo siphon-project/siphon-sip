@@ -6564,3 +6564,74 @@ fn direct_dispatch_rejects_anything_else() {
     let error = Config::from_str(&yaml).expect_err("not a mode");
     assert!(error.to_string().contains("direct_dispatch"), "{error}");
 }
+
+#[test]
+fn script_gc_defaults_to_leaving_the_collector_alone() {
+    use crate::config::ScriptGcConfig;
+    let untouched = ScriptGcConfig {
+        freeze_after_load: false,
+        threshold: None,
+    };
+    assert_eq!(ScriptGcConfig::default(), untouched);
+    assert_eq!(ScriptConfig::default().gc, untouched);
+    let config = Config::from_str(MINIMAL_DIRECT_DISPATCH_YAML).unwrap();
+    assert_eq!(config.script.gc, untouched);
+    // An empty block is the same as none.
+    let yaml = format!("{MINIMAL_DIRECT_DISPATCH_YAML}  gc: {{}}\n");
+    assert_eq!(Config::from_str(&yaml).unwrap().script.gc, untouched);
+}
+
+#[test]
+fn script_gc_reads_both_keys() {
+    let yaml = format!(
+        "{MINIMAL_DIRECT_DISPATCH_YAML}  gc:\n    freeze_after_load: true\n    threshold: 50000\n"
+    );
+    let gc = Config::from_str(&yaml).unwrap().script.gc;
+    assert!(gc.freeze_after_load);
+    assert_eq!(gc.threshold, Some(50_000));
+
+    let yaml = format!("{MINIMAL_DIRECT_DISPATCH_YAML}  gc:\n    threshold: 1\n");
+    let gc = Config::from_str(&yaml).unwrap().script.gc;
+    assert!(!gc.freeze_after_load);
+    assert_eq!(gc.threshold, Some(1));
+
+    let yaml = format!("{MINIMAL_DIRECT_DISPATCH_YAML}  gc:\n    threshold: null\n");
+    assert_eq!(Config::from_str(&yaml).unwrap().script.gc.threshold, None);
+
+    let largest = crate::config::GC_THRESHOLD_MAX;
+    assert_eq!(largest, 53_687_091);
+    let yaml = format!("{MINIMAL_DIRECT_DISPATCH_YAML}  gc:\n    threshold: {largest}\n");
+    assert_eq!(
+        Config::from_str(&yaml).unwrap().script.gc.threshold,
+        Some(largest)
+    );
+}
+
+#[test]
+fn script_gc_threshold_refuses_zero_and_what_overflows_cpython() {
+    let yaml = format!("{MINIMAL_DIRECT_DISPATCH_YAML}  gc:\n    threshold: 0\n");
+    let error = Config::from_str(&yaml).expect_err("0 disables collection");
+    let message = error.to_string();
+    assert!(message.contains("script.gc.threshold"), "{message}");
+    assert!(message.contains("at least 1"), "{message}");
+
+    for too_large in ["53687092", "4294967296", "18446744073709551615"] {
+        let yaml = format!("{MINIMAL_DIRECT_DISPATCH_YAML}  gc:\n    threshold: {too_large}\n");
+        let error = Config::from_str(&yaml).expect_err("overflows threshold * 40");
+        let message = error.to_string();
+        assert!(message.contains("script.gc.threshold"), "{message}");
+        assert!(message.contains("at most 53687091"), "{message}");
+    }
+
+    for not_a_count in ["-1", "many", "1.5"] {
+        let yaml = format!("{MINIMAL_DIRECT_DISPATCH_YAML}  gc:\n    threshold: {not_a_count}\n");
+        assert!(Config::from_str(&yaml).is_err(), "{not_a_count}");
+    }
+}
+
+#[test]
+fn script_gc_refuses_a_key_it_does_not_know() {
+    let yaml = format!("{MINIMAL_DIRECT_DISPATCH_YAML}  gc:\n    freeze: true\n");
+    let error = Config::from_str(&yaml).expect_err("a misspelled key");
+    assert!(error.to_string().contains("freeze"), "{error}");
+}
