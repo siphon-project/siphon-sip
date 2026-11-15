@@ -12,6 +12,8 @@ use crate::diameter::event_sink::EventSink;
 pub(crate) struct ServerRuntime {
     /// Origin-Host and Origin-Realm by tenant name.
     identities: HashMap<String, (String, String)>,
+    /// The tenant names, in the order the configuration lists them.
+    tenants: Vec<String>,
     event_sink: Option<Arc<EventSink>>,
 }
 
@@ -19,8 +21,9 @@ impl ServerRuntime {
     /// The identities of `config`'s tenants (the flat single-domain form is
     /// the tenant `default`), with `event_sink`.
     pub(crate) fn new(config: &DiameterConfig, event_sink: Option<Arc<EventSink>>) -> Self {
-        let identities = config
-            .effective_tenants()
+        let effective = config.effective_tenants();
+        let tenants = effective.keys().cloned().collect();
+        let identities = effective
             .into_iter()
             .map(|(name, tenant)| {
                 (
@@ -31,6 +34,7 @@ impl ServerRuntime {
             .collect();
         Self {
             identities,
+            tenants,
             event_sink,
         }
     }
@@ -80,6 +84,17 @@ pub(crate) fn install(config: &DiameterConfig) -> Option<Arc<EventSink>> {
 /// [`NativeRequest::origin_host`](super::NativeRequest::origin_host).
 pub fn tenant_identity(tenant: &str) -> Option<(&'static str, &'static str)> {
     RUNTIME.get()?.tenant_identity(tenant)
+}
+
+/// The names of the configured tenants, in the order the configuration lists
+/// them under `diameter.tenants`; `["default"]` for a single-domain server.
+/// Empty on a node that is not a Diameter server, and before the server has
+/// read its configuration.
+pub fn tenants() -> Vec<&'static str> {
+    RUNTIME
+        .get()
+        .map(|runtime| runtime.tenants.iter().map(String::as_str).collect())
+        .unwrap_or_default()
 }
 
 /// The event sink of `diameter.event_sink`, the one a script emits to with

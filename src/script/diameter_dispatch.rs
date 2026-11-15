@@ -86,7 +86,7 @@ fn served_applications(configured: &[(u32, u32)], state: &ScriptState) -> Vec<(u
 /// it is asked so that a reload which adds or drops a handler changes what the
 /// next capabilities exchange advertises.
 fn tenant_applications(
-    tenants: &HashMap<String, crate::config::DiameterTenant>,
+    tenants: &indexmap::IndexMap<String, crate::config::DiameterTenant>,
     engine: &Arc<ScriptEngine>,
 ) -> TenantApplications {
     let configured: HashMap<String, Vec<(u32, u32)>> = tenants
@@ -1562,7 +1562,7 @@ mod served_applications_tests {
 
     #[test]
     fn each_tenant_gets_its_own_configured_list_and_the_shared_script() {
-        let mut tenants = HashMap::new();
+        let mut tenants = indexmap::IndexMap::new();
         tenants.insert(
             "alpha".to_string(),
             crate::config::DiameterTenant {

@@ -18,7 +18,8 @@ pub enum HarnessOutcome {
     /// The handler returned [`NativeOutcome::Script`](super::NativeOutcome),
     /// or the request does not parse: the server hands it to the script.
     Script,
-    /// No handler is registered for the request's application and command.
+    /// No handler is registered for the request's application and command,
+    /// and there is no catch-all.
     Unregistered,
 }
 
@@ -33,7 +34,8 @@ impl HarnessOutcome {
 }
 
 /// Runs a request through a set of handlers the way the server does, short
-/// of sending the answer: the lookup by (application id, command code), the
+/// of sending the answer: the lookup by (application id, command code) and
+/// then the catch-all, the
 /// handler, and the 5012 for one that fails, panics or times out. The answer
 /// comes back as the bytes the server would send, before any overload report.
 /// Call it on a tokio runtime with the time driver enabled.
@@ -124,7 +126,7 @@ impl NativeHarness {
     pub async fn call(&self, request: &DiameterMsg) -> HarnessOutcome {
         let Some(handler) = self
             .handlers
-            .get(request.application_id, request.command_code)
+            .resolve(request.application_id, request.command_code)
         else {
             return HarnessOutcome::Unregistered;
         };

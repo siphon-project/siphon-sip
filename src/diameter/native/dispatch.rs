@@ -56,7 +56,7 @@ pub(crate) async fn serve_with(
     request_features: u64,
     start: Instant,
 ) -> Served {
-    let Some(handler) = handlers.get(incoming.application_id, incoming.command_code) else {
+    let Some(handler) = handlers.resolve(incoming.application_id, incoming.command_code) else {
         return Served::Script(incoming);
     };
     // A request that does not parse is the script path's to refuse (5014).

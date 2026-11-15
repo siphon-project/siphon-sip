@@ -6,6 +6,9 @@
 //! Every other request, and one whose handler returns
 //! [`NativeOutcome::Script`], goes to `@diameter.on_request` as it always did.
 //!
+//! One catch-all handler ([`NativeHandlers::handle_any`]) may take what no
+//! keyed handler is registered for.
+//!
 //! Both paths share what is around the handler: the admission limit and its
 //! 3004, the DOIC report on the answer, the inbound metrics (labelled
 //! `path="native"` or `path="script"`), and the relay driver
@@ -57,9 +60,9 @@ use std::sync::{Arc, OnceLock};
 
 pub use super::relay::RelayOptions;
 pub use answer::NativeAnswer;
-pub use request::{peer_for_host, NativeRequest, PoolPick, RelayTarget};
+pub use request::{peer_for_host, peer_for_host_named, NativeRequest, PoolPick, RelayTarget};
 pub(crate) use runtime::install as install_runtime;
-pub use runtime::{event_sink, tenant_identity};
+pub use runtime::{event_sink, tenant_identity, tenants};
 pub use testing::{HarnessOutcome, NativeHarness};
 
 /// What a handler failed with. It is logged, and the request is answered
@@ -91,11 +94,14 @@ pub enum NativeOutcome {
 }
 
 /// The handlers a composing binary hands to the Diameter server, keyed by
-/// (application id, command code). Built once, before the server starts, and
-/// not changed after.
+/// (application id, command code), with at most one catch-all for what none
+/// of them is keyed for. Built once, before the server starts, and not
+/// changed after.
 #[derive(Clone, Default)]
 pub struct NativeHandlers {
     handlers: HashMap<(u32, u32), NativeHandler>,
+    /// Serves every request no keyed handler is registered for.
+    catch_all: Option<NativeHandler>,
 }
 
 impl NativeHandlers {
@@ -122,12 +128,43 @@ impl NativeHandlers {
         Ok(self)
     }
 
-    /// With every handler of `other` too. A pair both have is an error.
+    /// Serve with `handler` every request that no keyed handler is
+    /// registered for, whatever its application and command: what a relay
+    /// agent needs, which forwards applications it does not itself serve.
+    /// It is asked only after the keyed lookup misses, and
+    /// [`NativeOutcome::Script`] hands the request on to the script as for
+    /// a command with no handler at all.
+    ///
+    /// It names no application, so it adds nothing to what the capabilities
+    /// exchange advertises: list what the node advertises under the tenant's
+    /// `applications` (`relay` for an agent). A second catch-all is an error.
+    pub fn handle_any<F, Fut>(mut self, handler: F) -> Result<Self, NativeHandlerError>
+    where
+        F: Fn(NativeRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = NativeResult> + Send + 'static,
+    {
+        self.insert_catch_all(Arc::new(move |request| Box::pin(handler(request))))?;
+        Ok(self)
+    }
+
+    /// With every handler of `other` too. A pair both have is an error, and
+    /// so is a catch-all in both.
     pub fn merge(mut self, other: NativeHandlers) -> Result<Self, NativeHandlerError> {
         for (key, handler) in other.handlers {
             self.insert(key, handler)?;
         }
+        if let Some(handler) = other.catch_all {
+            self.insert_catch_all(handler)?;
+        }
         Ok(self)
+    }
+
+    fn insert_catch_all(&mut self, handler: NativeHandler) -> Result<(), NativeHandlerError> {
+        if self.catch_all.is_some() {
+            return Err(NativeHandlerError::DuplicateCatchAll);
+        }
+        self.catch_all = Some(handler);
+        Ok(())
     }
 
     fn insert(
@@ -145,22 +182,36 @@ impl NativeHandlers {
         Ok(())
     }
 
-    /// The handler for `command_code` in `application_id`.
+    /// The handler keyed for `command_code` in `application_id`.
     pub fn get(&self, application_id: u32, command_code: u32) -> Option<&NativeHandler> {
         self.handlers.get(&(application_id, command_code))
     }
 
-    /// The (application id, command code) pairs that have a handler.
+    /// The catch-all handler, if one is registered.
+    pub fn catch_all(&self) -> Option<&NativeHandler> {
+        self.catch_all.as_ref()
+    }
+
+    /// The handler a request of `command_code` in `application_id` goes to:
+    /// the one keyed for it, else the catch-all.
+    pub fn resolve(&self, application_id: u32, command_code: u32) -> Option<&NativeHandler> {
+        self.get(application_id, command_code)
+            .or(self.catch_all.as_ref())
+    }
+
+    /// The (application id, command code) pairs that have a keyed handler.
     pub fn commands(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         self.handlers.keys().copied()
     }
 
+    /// How many keyed handlers there are; the catch-all is not counted.
     pub fn len(&self) -> usize {
         self.handlers.len()
     }
 
+    /// Whether there is no handler at all, keyed or catch-all.
     pub fn is_empty(&self) -> bool {
-        self.handlers.is_empty()
+        self.handlers.is_empty() && self.catch_all.is_none()
     }
 }
 
@@ -171,6 +222,7 @@ impl std::fmt::Debug for NativeHandlers {
         formatter
             .debug_struct("NativeHandlers")
             .field("commands", &commands)
+            .field("catch_all", &self.catch_all.is_some())
             .finish()
     }
 }
@@ -185,6 +237,8 @@ pub enum NativeHandlerError {
         application_id: u32,
         command_code: u32,
     },
+    #[error("a catch-all native handler is already registered")]
+    DuplicateCatchAll,
     #[error("the Diameter native handlers are already installed")]
     AlreadyInstalled,
 }
@@ -206,10 +260,11 @@ pub(crate) fn installed() -> Option<&'static NativeHandlers> {
     INSTALLED.get()
 }
 
-/// The applications the installed handlers serve, as `(vendor_id,
+/// The applications the installed keyed handlers serve, as `(vendor_id,
 /// application_id)` pairs for the capabilities exchange. An application the
 /// dictionary does not know has no vendor to advertise it with and is left
-/// to the tenant's `applications` list.
+/// to the tenant's `applications` list. A catch-all names no application
+/// and adds none.
 pub(crate) fn served_applications() -> Vec<(u32, u32)> {
     installed().map(applications_of).unwrap_or_default()
 }

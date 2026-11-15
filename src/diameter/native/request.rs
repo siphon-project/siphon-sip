@@ -147,6 +147,12 @@ impl NativeRequest {
         peer_for_host(&self.tenant, host)
     }
 
+    /// [`peer_for_host`](Self::peer_for_host), with the configured name of
+    /// the peer: see [`peer_for_host_named`].
+    pub fn peer_for_host_named(&self, host: &str) -> Option<(String, Arc<DiameterPeer>)> {
+        peer_for_host_named(&self.tenant, host)
+    }
+
     /// Relay the request, as it is now, to `target` and wait for the answer:
     /// the path `request.forward_to` takes. The peer the request came from is
     /// recorded in a Route-Record, the relayed copy gets a fresh Hop-by-Hop
@@ -216,7 +222,13 @@ impl std::fmt::Debug for NativeRequest {
 /// A relay sends a request whose Destination-Host is a directly connected
 /// peer to that peer (RFC 6733 section 6.1.6).
 pub fn peer_for_host(tenant: &str, host: &str) -> Option<Arc<DiameterPeer>> {
-    crate::diameter::directory::find(tenant, host).map(|(_, peer)| peer)
+    peer_for_host_named(tenant, host).map(|(_, peer)| peer)
+}
+
+/// [`peer_for_host`], with the name the peer is configured under (its entry
+/// in `clients`, `servers` or `connect_to`).
+pub fn peer_for_host_named(tenant: &str, host: &str) -> Option<(String, Arc<DiameterPeer>)> {
+    crate::diameter::directory::find(tenant, host)
 }
 
 /// Where [`NativeRequest::relay`] sends a request.
