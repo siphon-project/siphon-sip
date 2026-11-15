@@ -745,6 +745,16 @@ fn catch_all_through_dispatch() {
         });
         assert_eq!(answer.to_wire(), alone);
 
+        // A base protocol request (a capabilities exchange sent again on
+        // an open connection) is not the catch-all's: the script gets it.
+        let session = "answer;any;base";
+        let mut base = request(session, dictionary::CMD_CAPABILITIES_EXCHANGE, Vec::new());
+        base.application_id = 0;
+        let before = ANY.load(Ordering::SeqCst);
+        dispatch_one(&engine, &base).await;
+        assert_eq!(ANY.load(Ordering::SeqCst), before);
+        assert_eq!(script_calls(&engine, session), 1);
+
         // A failure and a panic are answered 5012, without the script.
         for kind in ["error", "panic"] {
             let session = format!("{kind};any;4");

@@ -65,6 +65,10 @@ pub(crate) use runtime::install as install_runtime;
 pub use runtime::{event_sink, tenant_identity, tenants};
 pub use testing::{HarnessOutcome, NativeHarness};
 
+/// The application id of the base protocol's own commands (RFC 6733
+/// section 2.4, "Diameter common messages").
+const BASE_PROTOCOL: u32 = 0;
+
 /// What a handler failed with. It is logged, and the request is answered
 /// DIAMETER_UNABLE_TO_COMPLY (5012).
 pub type NativeError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -135,6 +139,9 @@ impl NativeHandlers {
     /// [`NativeOutcome::Script`] hands the request on to the script as for
     /// a command with no handler at all.
     ///
+    /// It is not asked for a request of the base protocol (application id
+    /// 0), which goes to the script as before.
+    ///
     /// It names no application, so it adds nothing to what the capabilities
     /// exchange advertises: list what the node advertises under the tenant's
     /// `applications` (`relay` for an agent). A second catch-all is an error.
@@ -193,10 +200,15 @@ impl NativeHandlers {
     }
 
     /// The handler a request of `command_code` in `application_id` goes to:
-    /// the one keyed for it, else the catch-all.
+    /// the one keyed for it, else the catch-all. The catch-all does not take
+    /// the base protocol (application id 0): its commands are between two
+    /// peers and are never relayed (RFC 6733 section 2.4).
     pub fn resolve(&self, application_id: u32, command_code: u32) -> Option<&NativeHandler> {
-        self.get(application_id, command_code)
-            .or(self.catch_all.as_ref())
+        self.get(application_id, command_code).or_else(|| {
+            self.catch_all
+                .as_ref()
+                .filter(|_| application_id != BASE_PROTOCOL)
+        })
     }
 
     /// The (application id, command code) pairs that have a keyed handler.

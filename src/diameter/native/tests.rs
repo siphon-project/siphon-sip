@@ -1040,6 +1040,13 @@ fn a_catch_all_is_resolved_only_when_no_keyed_handler_is() {
     );
     assert!(format!("{handlers:?}").contains("catch_all: true"));
 
+    // The base protocol is between two peers: never the catch-all's. A
+    // capabilities exchange sent again on an open connection gets here.
+    assert!(handlers
+        .resolve(0, dictionary::CMD_CAPABILITIES_EXCHANGE)
+        .is_none());
+    assert!(handlers.resolve(0, TEST_COMMAND).is_none());
+
     // Without one, an unkeyed command resolves to nothing.
     let keyed_only = script_handler();
     assert!(keyed_only.catch_all().is_none());
@@ -1053,7 +1060,7 @@ fn a_set_with_only_a_catch_all_is_not_empty() {
         .expect("a first catch-all");
     assert_eq!(handlers.len(), 0);
     assert!(!handlers.is_empty());
-    assert!(handlers.resolve(0, 0).is_some());
+    assert!(handlers.resolve(dictionary::CX_APP_ID, 303).is_some());
 }
 
 #[test]
@@ -1120,6 +1127,14 @@ async fn the_harness_runs_the_catch_all_for_what_no_keyed_handler_takes() {
     assert_eq!(
         made_by(&harness.call(&other_command).await).as_deref(),
         Some("catch-all")
+    );
+
+    // A base protocol request has no handler here.
+    let mut capabilities = request(0, dictionary::CMD_CAPABILITIES_EXCHANGE);
+    capabilities.avps[0] = Avp::utf8(avp::SESSION_ID, 0, "answer;any;0");
+    assert_eq!(
+        harness.call(&capabilities).await,
+        HarnessOutcome::Unregistered
     );
 
     // Declining, failing and panicking are what they are for a keyed one.
