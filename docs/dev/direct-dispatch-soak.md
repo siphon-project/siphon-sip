@@ -289,6 +289,39 @@ Read in the 3.14.8 sources; the same code is in 3.14.2, which the runs used.
   new objects have been deferred. A large live heap therefore collects
   rarely, and each collection is a full one.
 
+## Request and Diameter handlers on the runner
+
+The redesign steps a coroutine on its asyncio driver's runner, never on the
+executor. With request handlers routed through it (`SOAK_DIRECT=1`), the mix
+was moved onto the request path and given a gathering handler:
+`call=10,request=40,request_gather=15,sync=20,gather=5,wrapped=5,wrapped_asyncio=5`.
+`request_gather` is `tasks.gather` of a script coroutine and one awaitable.
+One binary, the switch off and on in turn, four runs each, 300/s.
+
+Six CPUs, 300 MB heap, 120 s:
+
+| Switch | Attach max ms | Unpinned max ms | GC max ms | In-flight max | Pending max | Goodput /s | Late | CPU us/request |
+|---|---|---|---|---|---|---|---|---|
+| off | 244 to 265 | 184 to 198 | 454 to 485 | 8 to 48 | 39 to 74 | 298 to 299 | 0 | 449 to 494 |
+| on | 252 to 276 | 169 to 246 | 464 to 505 | 5 to 15 | 49 to 69 | 300 to 302 | 0 | 364 to 403 |
+
+One-CPU quota, no heap, `SOAK_WORK=1100`, 90 s:
+
+| Switch | Attach max ms | Unpinned max ms | GC max ms | In-flight max | Pool at end | Pending max | Goodput /s | Late | CPU us/request |
+|---|---|---|---|---|---|---|---|---|---|
+| off, 3 runs | 10 to 17 | 0.9 to 1.5 | 31 to 32 | 4 to 6 | 10 to 13 | 21 to 22 | 300 to 302 | 0 | 1710 to 1792 |
+| off, 1 run | 85 | 609 | 1208 | 20 | 32 | 8424 | 67 | 21241 | 3301 |
+| on, 4 runs | 11 to 15 | 0.9 to 1.2 | 27 to 33 | 5 to 7 | 8 to 16 | 20 to 21 | 299 to 301 | 0 | 1594 to 1698 |
+
+No run failed or shed a request and the runners refused none. With the switch
+on, about 25,000 handlers per run (19,000 under the quota) finished without an
+asyncio task. The attach wait with the 300 MB heap is the collector scanning
+that heap, the same in both arms. The one collapse was a run with the switch
+off: the executor grew to its ceiling and never caught up, which is the
+failure the quota run exists to show, on the asyncio path this time. Four
+runs an arm do not say how often either arm collapses, only that the switch
+did not in these.
+
 ## Limits of this record
 
 - One machine, not a quiet one, and runs of a minute or two. The collapse is

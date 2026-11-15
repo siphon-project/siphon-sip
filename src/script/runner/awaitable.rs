@@ -49,10 +49,18 @@ impl Bridge {
     }
 }
 
+/// What the runner resumes when an awaitable finishes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Waiter {
+    /// The directly driven coroutine suspended on it.
+    Drive(DriveKey),
+    /// The gather it is argument `index` of.
+    Gather { gather: u64, index: usize },
+}
+
 struct Inner {
     state: State,
-    /// The directly driven coroutine suspended on this awaitable.
-    waiter: Option<DriveKey>,
+    waiter: Option<Waiter>,
     bridges: Vec<Bridge>,
 }
 
@@ -112,21 +120,45 @@ impl SiphonAwaitable {
         if inner.waiter.is_some() {
             return Registered::Elsewhere;
         }
-        inner.waiter = Some(key);
+        inner.waiter = Some(Waiter::Drive(key));
         Registered::Waiting
     }
 
     pub(super) fn forget_waiter(&self, key: DriveKey) {
         let mut inner = locked(&self.inner);
-        if inner.waiter == Some(key) {
+        if inner.waiter == Some(Waiter::Drive(key)) {
+            inner.waiter = None;
+        }
+    }
+
+    /// Record gather `gather` as the one to tell, as its argument `index`.
+    pub(super) fn register_gather(&self, gather: u64, index: usize) -> Registered {
+        if !self.on_owner_thread() {
+            return Registered::Elsewhere;
+        }
+        let mut inner = locked(&self.inner);
+        if !matches!(inner.state, State::Pending) {
+            return Registered::Finished;
+        }
+        if inner.waiter.is_some() {
+            return Registered::Elsewhere;
+        }
+        inner.waiter = Some(Waiter::Gather { gather, index });
+        Registered::Waiting
+    }
+
+    /// Gather `gather` no longer wants to hear of this awaitable.
+    pub(super) fn forget_gather(&self, gather: u64) {
+        let mut inner = locked(&self.inner);
+        if matches!(inner.waiter, Some(Waiter::Gather { gather: waiting, .. }) if waiting == gather)
+        {
             inner.waiter = None;
         }
     }
 
     /// The Rust future finished: build its value and settle everything that
-    /// waits. Runs on the owner thread, attached. Returns the coroutine to
-    /// resume.
-    pub(super) fn settle(&self, python: Python<'_>, build: BuildValue) -> Option<DriveKey> {
+    /// waits. Runs on the owner thread, attached. Returns what to resume.
+    pub(super) fn settle(&self, python: Python<'_>, build: BuildValue) -> Option<Waiter> {
         // The conversion is Python (a `Deferred` builds a value), so it runs
         // before the lock is taken. A panic in it must still wake the waiter.
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(python)))
@@ -205,7 +237,7 @@ impl SiphonAwaitable {
     }
 
     /// The awaitable's result.
-    fn result(&self, python: Python<'_>) -> PyResult<Py<PyAny>> {
+    pub(super) fn result(&self, python: Python<'_>) -> PyResult<Py<PyAny>> {
         enum Read {
             Value(Py<PyAny>),
             Raised(Py<PyAny>),
@@ -235,8 +267,8 @@ impl SiphonAwaitable {
     }
 
     /// Mark the awaitable cancelled and drop its Rust future. `None` if it
-    /// had finished; otherwise the coroutine that waited on it.
-    fn cancel_inner(&self, python: Python<'_>) -> Option<Option<DriveKey>> {
+    /// had finished; otherwise what waited on it.
+    fn cancel_inner(&self, python: Python<'_>) -> Option<Option<Waiter>> {
         let (waiter, bridges) = {
             let mut inner = locked(&self.inner);
             if !matches!(inner.state, State::Pending) {
@@ -253,16 +285,19 @@ impl SiphonAwaitable {
         if let Some(abort) = self.abort.get() {
             abort.abort();
         }
-        // Its future will never post a wake: stop tracking it here.
+        // Its future will never post a wake: stop tracking it here. If it is
+        // a gather's, what the gather still runs is cancelled with it.
         if self.on_owner_thread() {
             drop(drive::untrack_awaitable(self.id));
+            super::gather::cancel(python, self.id);
         } else {
             let id = self.id;
             let _ = self
                 .runner
-                .post(Message::Cancel(Work::new(move |_python, fate| {
+                .post(Message::Cancel(Work::new(move |python, fate| {
                     if fate == Fate::Run {
                         drop(drive::untrack_awaitable(id));
+                        super::gather::cancel(python, id);
                     }
                 })));
         }
@@ -290,24 +325,42 @@ impl SiphonAwaitable {
         let Some(waiter) = self.cancel_inner(python) else {
             return false;
         };
-        if let Some(key) = waiter {
-            // Never stepped from here: the caller may be another coroutine's
-            // step. The runner resumes it, and the resume raises.
-            let id = self.id;
-            let _ = self
-                .runner
-                .post(Message::Wake(Work::new(move |python, fate| {
-                    if fate == Fate::Run {
-                        drive::wake(python, key, id);
-                    }
-                })));
+        if let Some(waiter) = waiter {
+            self.post_cancelled(waiter);
         }
         true
     }
 
-    /// [`Self::cancel`] for a caller that resumes the waiter itself.
+    /// Tell `waiter`, from the runner's next drain, that the awaitable it
+    /// waited on was cancelled. Never resumed from here: the caller may be
+    /// another coroutine's step.
+    fn post_cancelled(&self, waiter: Waiter) {
+        let id = self.id;
+        let _ = self
+            .runner
+            .post(Message::Wake(Work::new(move |python, fate| {
+                if fate != Fate::Run {
+                    return;
+                }
+                match waiter {
+                    // The resume raises.
+                    Waiter::Drive(key) => drive::wake(python, key, id),
+                    Waiter::Gather { gather, index } => super::gather::child_done(
+                        python,
+                        gather,
+                        index,
+                        Err(cancelled_error(python)),
+                    ),
+                }
+            })));
+    }
+
+    /// [`Self::cancel`] for a caller that resumes the coroutine waiting on it
+    /// itself. A gather that waited on it is still told.
     pub(super) fn cancel_without_wake(&self, python: Python<'_>) {
-        let _ = self.cancel_inner(python);
+        if let Some(Some(waiter @ Waiter::Gather { .. })) = self.cancel_inner(python) {
+            self.post_cancelled(waiter);
+        }
     }
 
     /// The owner is closing: nothing will resume or settle this awaitable.
@@ -403,7 +456,7 @@ impl SiphonAwaitable {
 /// Whether the coroutine awaiting right now is the one this thread's runner
 /// is stepping, and not something else running inside its step (a task
 /// started eagerly, say), which could not take the awaitable as a yield.
-fn awaited_by_the_step(python: Python<'_>) -> bool {
+pub(super) fn awaited_by_the_step(python: Python<'_>) -> bool {
     let Some(task) = drive::active_task(python) else {
         return false;
     };
@@ -525,6 +578,34 @@ impl SiphonAwaitable {
         };
         format!("<SiphonAwaitable {state}>")
     }
+}
+
+/// An awaitable no Rust future stands behind: the runner settles it itself,
+/// through [`drive::complete_awaitable`], or it is cancelled. Made on a
+/// driver thread; `None` off one, or once the driver is shutting down.
+pub(super) fn local_awaitable(python: Python<'_>) -> PyResult<Option<(Py<SiphonAwaitable>, u64)>> {
+    let Some((id, runner, event_loop)) = drive::next_awaitable(python) else {
+        return Ok(None);
+    };
+    let awaitable = Py::new(
+        python,
+        SiphonAwaitable {
+            id,
+            owner: std::thread::current().id(),
+            runner,
+            event_loop,
+            inner: Mutex::new(Inner {
+                state: State::Pending,
+                waiter: None,
+                bridges: Vec::new(),
+            }),
+            abort: OnceLock::new(),
+        },
+    )?;
+    if !drive::track_awaitable(awaitable.clone_ref(python), id) {
+        return Ok(None);
+    }
+    Ok(Some((awaitable, id)))
 }
 
 /// [`crate::script::blocking::awaitable`] for a caller inside a direct step:

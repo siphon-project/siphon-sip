@@ -59,6 +59,25 @@ impl ScriptDecision {
         }
     }
 
+    /// The handler could not be run for want of room (`script.direct_dispatch`:
+    /// every asyncio driver has its limit of handlers in flight): answer 503,
+    /// as a request the node sheds (RFC 3261 section 21.5.4).
+    fn overloaded() -> Self {
+        Self {
+            action: RequestAction::Reply {
+                code: 503,
+                reason: "Service Unavailable".to_string(),
+                reliable: false,
+            },
+            reply_headers: vec![(
+                crate::script::api::request::ReplyHeaderOp::Replace,
+                "Retry-After".to_string(),
+                OVERLOADED_RETRY_AFTER_SECS.to_string(),
+            )],
+            ..Self::nothing()
+        }
+    }
+
     /// A handler raised: answer 500, whatever it had decided before.
     fn script_error() -> Self {
         Self {
@@ -90,13 +109,18 @@ impl ScriptDecision {
     }
 }
 
+/// The `Retry-After` of a request refused because every asyncio driver was
+/// full, in seconds. Handlers in flight are bounded by the coroutine timeout,
+/// so room comes back within seconds, not minutes.
+const OVERLOADED_RETRY_AFTER_SECS: u64 = 5;
+
 /// Where running the handlers stopped.
 enum HandlerStep {
     /// Every handler that runs has returned.
     Decided(Box<ScriptDecision>),
     /// The async handler before `next` is awaiting on an asyncio driver.
     Suspended {
-        pending: crate::script::async_pool::PendingCoroutine,
+        pending: crate::script::inline_dispatch::PendingHandler,
         py_request: Py<PyRequest>,
         next: usize,
     },
@@ -153,14 +177,30 @@ pub(super) fn run_request_handlers(
             };
             // If the handler is async, the return value is a coroutine.
             if handler.is_async {
-                match crate::script::inline_dispatch::start_coroutine(python, &returned) {
-                    Ok(crate::script::inline_dispatch::CoroutineStart::Finished(_)) => {}
-                    Ok(crate::script::inline_dispatch::CoroutineStart::Suspended(pending)) => {
+                // The request's first pass is new work, which a full pool
+                // refuses; after an await it has been accepted.
+                let admit = if first == 0 {
+                    crate::script::runner::Admit::Bounded
+                } else {
+                    crate::script::runner::Admit::Accepted
+                };
+                match crate::script::inline_dispatch::start_handler_coroutine(
+                    python,
+                    &returned,
+                    &handler.callable,
+                    admit,
+                ) {
+                    Ok(crate::script::inline_dispatch::HandlerStart::Finished(_)) => {}
+                    Ok(crate::script::inline_dispatch::HandlerStart::Suspended(pending)) => {
                         return HandlerStep::Suspended {
                             pending,
                             py_request,
                             next: index + 1,
                         };
+                    }
+                    Ok(crate::script::inline_dispatch::HandlerStart::Refused(refused)) => {
+                        debug!(%refused, "async request handler refused; answering 503");
+                        return HandlerStep::Decided(Box::new(ScriptDecision::overloaded()));
                     }
                     Err(error) => {
                         record_script_error("async Python", &error);

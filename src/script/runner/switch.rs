@@ -10,7 +10,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use tracing::{debug, error, info, warn};
 
-use super::drive::{locked, start_unchecked, DriveHandle};
+use super::drive::{locked, start_unchecked, Admit, DriveHandle};
 use super::python::helpers;
 use crate::script::async_pool::AsyncPool;
 
@@ -57,9 +57,10 @@ pub fn configure(on: bool, pool: &Arc<AsyncPool>) -> bool {
         Ok(()) => {
             MODE.store(ON, Ordering::Release);
             info!(
-                "script.direct_dispatch is on: async handlers called through \
-                 the script handle are stepped on their asyncio driver without \
-                 a task while they await only siphon's awaitables"
+                "script.direct_dispatch is on: async request handlers, Diameter \
+                 handlers and handlers called through the script handle are \
+                 stepped on their asyncio driver without a task while they \
+                 await only siphon's awaitables"
             );
             true
         }
@@ -113,7 +114,7 @@ fn self_test(pool: &Arc<AsyncPool>) -> Result<(), String> {
         // by its own coroutine, not by its code, and forgotten below, so that
         // the next self-test starts direct again.
         let identity = Arc::new(coroutine.clone().unbind());
-        match start_unchecked(pool, python, &coroutine, Some(&identity)) {
+        match start_unchecked(pool, python, &coroutine, Some(&identity), Admit::Bounded) {
             Ok(Some(handle)) => Ok((handle, DemotionKey::new(identity))),
             Ok(None) => {
                 let _ = coroutine.call_method0(intern!(python, "close"));
