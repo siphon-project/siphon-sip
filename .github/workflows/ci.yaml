@@ -3420,6 +3420,12 @@ jobs:
   fuzz:
     runs-on: ubuntu-24.04
     needs: rust-tests
+    # cargo-fuzz defaults to one codegen unit with debug info, which puts the
+    # whole siphon-sip crate through LLVM as one module: rustc peaked at ~17 GB,
+    # over the runner's 16 GB, and the runner was shut down mid-compile. 16
+    # units without debug info peak at ~12.6 GB and build in about half the time.
+    env:
+      RUSTFLAGS: -Cdebuginfo=0
     steps:
       - uses: actions/checkout@v7
 
@@ -3436,13 +3442,13 @@ jobs:
         run: cargo install cargo-fuzz
 
       - name: Run fuzz target — SIP parser (60s)
-        run: PYO3_PYTHON=python3.14 cargo +nightly fuzz run sip_parser_fuzz -- -max_total_time=60
+        run: PYO3_PYTHON=python3.14 cargo +nightly fuzz run --codegen-units 16 sip_parser_fuzz -- -max_total_time=60
 
       - name: Run fuzz target — stream framing (60s)
-        run: PYO3_PYTHON=python3.14 cargo +nightly fuzz run stream_framing_fuzz -- -max_total_time=60
+        run: PYO3_PYTHON=python3.14 cargo +nightly fuzz run --codegen-units 16 stream_framing_fuzz -- -max_total_time=60
 
       - name: Run fuzz target — framer/parser agreement (60s)
-        run: PYO3_PYTHON=python3.14 cargo +nightly fuzz run framing_parser_agreement_fuzz -- -max_total_time=60
+        run: PYO3_PYTHON=python3.14 cargo +nightly fuzz run --codegen-units 16 framing_parser_agreement_fuzz -- -max_total_time=60
 
   # ── SIPp IPsec VoLTE test (self-hosted) ────────────────────────────────
   # IPsec XFRM SA installation needs CAP_NET_ADMIN, which GitHub-hosted runners
