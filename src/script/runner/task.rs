@@ -278,12 +278,21 @@ impl DirectTask {
         if let Some(real) = self.real_task(python) {
             return real.call_method0(intern!(python, "uncancel"))?.extract();
         }
-        let left = self
-            .cancel_requests
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |requests| {
-                Some(requests.saturating_sub(1))
-            })
-            .map_or(0, |before| before.saturating_sub(1));
+        // A compare-exchange loop, not `fetch_update`: newer toolchains
+        // deprecate that name and its replacement is past the MSRV.
+        let mut before = self.cancel_requests.load(Ordering::Acquire);
+        loop {
+            match self.cancel_requests.compare_exchange_weak(
+                before,
+                before.saturating_sub(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => before = current,
+            }
+        }
+        let left = before.saturating_sub(1);
         if left == 0 && std::thread::current().id() == self.owner {
             // As a task does: a cancellation not yet delivered is taken back.
             if let Some(key) = self.key() {

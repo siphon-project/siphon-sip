@@ -370,12 +370,23 @@ impl RunnerShared {
         if self.is_shut_down() {
             return None;
         }
-        self.in_flight
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |in_flight| {
-                (in_flight < limit).then_some(in_flight + 1)
-            })
-            .ok()
-            .map(|_| Admission(Arc::clone(self)))
+        // A compare-exchange loop, not `fetch_update`: newer toolchains
+        // deprecate that name and its replacement is past the MSRV.
+        let mut in_flight = self.in_flight.load(Ordering::SeqCst);
+        loop {
+            if in_flight >= limit {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                in_flight,
+                in_flight + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Some(Admission(Arc::clone(self))),
+                Err(current) => in_flight = current,
+            }
+        }
     }
 }
 
