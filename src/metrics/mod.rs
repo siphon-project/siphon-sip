@@ -7,6 +7,7 @@
 pub mod accept;
 pub mod admission;
 pub mod custom;
+mod diameter_inbound;
 pub mod enum_servers;
 pub mod event_lag;
 pub mod glibc;
@@ -54,6 +55,7 @@ pub fn try_metrics() -> Option<&'static SiphonMetrics> {
 }
 
 mod startup;
+pub use diameter_inbound::*;
 pub use python_stats::update_python_stats;
 pub use startup::init;
 
@@ -1164,17 +1166,17 @@ impl SiphonMetrics {
         let diameter_inbound_requests_total = IntCounterVec::new(
             Opts::new(
                 "siphon_diameter_inbound_requests_total",
-                "Total Diameter requests received and dispatched, by command",
+                "Total Diameter requests received and dispatched, by command and path",
             ),
-            &["command"],
+            &["command", "path"],
         )?;
 
         let diameter_inbound_answers_total = IntCounterVec::new(
             Opts::new(
                 "siphon_diameter_inbound_answers_total",
-                "Total Diameter answers emitted as a server, by command and Result-Code",
+                "Total Diameter answers emitted as a server, by command, Result-Code and path",
             ),
-            &["command", "result_code"],
+            &["command", "result_code", "path"],
         )?;
 
         let diameter_inbound_duration_seconds = HistogramVec::new(
@@ -1185,7 +1187,7 @@ impl SiphonMetrics {
             .buckets(vec![
                 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0,
             ]),
-            &["command"],
+            &["command", "path"],
         )?;
 
         let rtpengine_instances_up = IntGauge::new(
@@ -1690,38 +1692,6 @@ pub fn remove_diameter_peer_up(peer: &str) {
         return;
     };
     let _ = metrics.diameter_peer_up.remove_label_values(&[peer]);
-}
-
-/// Record one inbound Diameter transaction siphon served as a server.
-///
-/// Takes the raw `command_code` and derives both names here rather than at the
-/// call site, so the request series is labelled `CCR` and the answer series
-/// `CCA` exactly as on the client side — a counter of answers labelled with the
-/// request name would be a lie about which half of the exchange it counted, and
-/// the two directions must not be able to drift apart on that.
-///
-/// Called once per dispatched request, at the single point every inbound
-/// connection type funnels through.
-pub fn record_diameter_inbound(command_code: u32, result_code: &str, elapsed: std::time::Duration) {
-    let Some(metrics) = try_metrics() else {
-        return;
-    };
-    let request_name = crate::diameter::codec::command_name(command_code, true);
-    metrics
-        .diameter_inbound_requests_total
-        .with_label_values(&[request_name])
-        .inc();
-    metrics
-        .diameter_inbound_answers_total
-        .with_label_values(&[
-            crate::diameter::codec::command_name(command_code, false),
-            result_code,
-        ])
-        .inc();
-    metrics
-        .diameter_inbound_duration_seconds
-        .with_label_values(&[request_name])
-        .observe(elapsed.as_secs_f64());
 }
 
 /// Count a call refused credit by the OCS (Ro, TS 32.299).

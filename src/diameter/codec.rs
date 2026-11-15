@@ -622,6 +622,38 @@ impl Avp {
         }
     }
 
+    /// Build an Unsigned64 AVP.
+    pub fn u64(code: u32, vendor: u32, value: u64) -> Avp {
+        Avp::raw(code, vendor, value.to_be_bytes().to_vec())
+    }
+
+    /// Build a Grouped AVP of `members`, with the flags [`Avp::raw`] gives.
+    pub fn grouped(code: u32, vendor: u32, members: Vec<Avp>) -> Avp {
+        Avp {
+            value: AvpData::Grouped(members),
+            ..Avp::raw(code, vendor, Vec::new())
+        }
+    }
+
+    /// With the Mandatory bit set or cleared, for an AVP whose M bit the
+    /// dictionary does not decide.
+    pub fn mandatory(mut self, mandatory: bool) -> Avp {
+        if mandatory {
+            self.flags |= AVP_FLAG_MANDATORY;
+        } else {
+            self.flags &= !AVP_FLAG_MANDATORY;
+        }
+        self
+    }
+
+    /// The members of a grouped AVP.
+    pub fn members(&self) -> Option<&[Avp]> {
+        match &self.value {
+            AvpData::Raw(_) => None,
+            AvpData::Grouped(members) => Some(members),
+        }
+    }
+
     /// Raw value bytes, if this AVP is not grouped.
     pub fn raw_bytes(&self) -> Option<&[u8]> {
         match &self.value {

@@ -37,11 +37,12 @@ use crate::config::DiameterConfig;
 use crate::diameter::auth::{AclMatch, OriginHostPolicy, SourceIpAcl};
 use crate::diameter::codec::{Avp, DiameterMsg};
 use crate::diameter::dictionary;
+use crate::diameter::forward::{self, emitted_answer_result_label};
 use crate::diameter::peer::{self, DiameterPeer, IncomingRequest, PeerConfig};
 use crate::diameter::reauthorize::ServingConnection;
 use crate::diameter::server::{CerDecision, ServerHandshake, ServerIdentity, TenantApplications};
 use crate::diameter::transport::DiameterListener;
-use crate::diameter::{forward, DiameterClient, DiameterManager};
+use crate::diameter::{native, DiameterClient, DiameterManager};
 use crate::script::api::diameter_server::{PyDiameterAnswer, PyDiameterRequest, PyInboundPeer};
 use crate::script::engine::{
     run_coroutine_value, HandlerEntry, HandlerKind, ScriptEngine, ScriptState,
@@ -70,7 +71,8 @@ fn served_applications(configured: &[(u32, u32)], state: &ScriptState) -> Vec<(u
         .filter_map(|(filter, _)| split_request_filter(filter?).0)
         .filter_map(dictionary::app_id_by_name);
     let mut applications: Vec<(u32, u32)> = Vec::new();
-    for application in configured.iter().copied().chain(named) {
+    let native = native::served_applications();
+    for application in configured.iter().copied().chain(named).chain(native) {
         if !applications.iter().any(|known| known.1 == application.1) {
             applications.push(application);
         }
@@ -706,6 +708,18 @@ pub(crate) async fn dispatch_request(
         return;
     }
 
+    // A request with a native handler is answered there, without the script.
+    let inbound = native::dispatch::Inbound {
+        peer: &inbound_peer,
+        peer_name: &peer_info.name,
+        tenant: &peer_info.tenant,
+        origin: (&local_origin_host, &local_origin_realm),
+    };
+    let served = native::dispatch::serve(inbound, incoming, request_features, start).await;
+    let native::dispatch::Served::Script(incoming) = served else {
+        return;
+    };
+
     // Build the answer (and keep the Py request/answer for the completed hook)
     // on the Python executor. An `async def` handler that awaits — at any of
     // the three stages — ends that job instead of holding its worker: its
@@ -817,7 +831,8 @@ pub(crate) async fn dispatch_request(
     // The server-side twin of the client-side request/answer/latency trio. A
     // node in a DRA or HSS role carried none of its inbound load in any metric
     // before this — `diameter_requests_total` counts only what siphon sends.
-    crate::metrics::record_diameter_inbound(command_code, result_label, start.elapsed());
+    let path = crate::metrics::DIAMETER_PATH_SCRIPT;
+    crate::metrics::record_diameter_inbound(command_code, result_label, start.elapsed(), path);
 
     // Post-answer hook (best-effort).
     let latency_us = start.elapsed().as_micros() as u64;
@@ -984,28 +999,6 @@ fn run_on_request_completed(
         }
     }
     CompletedStep::Done
-}
-
-/// Bounded metric label for the Result-Code of an answer siphon is *emitting*.
-///
-/// The lossless-tree extractor. The precedence rule itself is shared with the
-/// client side in [`dictionary::answer_result_label`], so an answer siphon sends
-/// and an answer siphon receives can never be labelled by two different rules.
-///
-/// Read from the final wire rather than from the answer tree earlier in the
-/// build, because `@diameter.on_reply` is explicitly allowed to rewrite the
-/// Result-Code on its way upstream — labelling before that would report what
-/// siphon decided rather than what the peer was told.
-///
-/// AVPs are matched on code alone, not `(code, vendor)`: `Experimental-Result`
-/// is a base-protocol grouped AVP whose *contents* are vendor-specific, and
-/// peers differ on whether they set the V-bit on the group itself.
-fn emitted_answer_result_label(wire: &[u8]) -> &'static str {
-    let Ok(answer) = DiameterMsg::from_wire(wire) else {
-        return "none";
-    };
-    let (base, experimental) = answer.answer_result_codes();
-    dictionary::answer_result_label(base, experimental)
 }
 
 /// The answer bytes plus optional Py handles for the completed hook.

@@ -32,5 +32,6 @@ pub(super) async fn shed_too_busy(
         incoming.command_code,
         dictionary::answer_result_label(Some(dictionary::DIAMETER_TOO_BUSY), None),
         start.elapsed(),
+        crate::metrics::DIAMETER_PATH_SCRIPT,
     );
 }

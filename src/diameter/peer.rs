@@ -597,8 +597,9 @@ impl DiameterPeer {
 
     /// Create a peer handle for unit testing (no background tasks). Starts in
     /// the `Open` state so manager/pool tests treat it as live; flip with
-    /// [`DiameterPeer::set_state_for_test`].
-    #[cfg(test)]
+    /// [`DiameterPeer::set_state_for_test`]. What it sends goes to `write_tx`
+    /// and nothing answers: also the peer of
+    /// [`NativeHarness`](crate::diameter::native::NativeHarness).
     pub fn new_for_test(config: PeerConfig, write_tx: mpsc::Sender<Vec<u8>>) -> Self {
         let reopen_watchdog_answers = config.lifecycle.reopen_watchdog_answers;
         Self {
