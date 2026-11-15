@@ -795,3 +795,191 @@ async fn emit_answers_for_external_dissection() {
     }
     std::fs::write(&path, dump).expect("hex dump must be writable");
 }
+
+// ── Which peer a pool picked ────────────────────────────────────────────────
+
+/// A pool of `names`, each an open peer whose written requests come out of
+/// the receiver beside it.
+fn pool_of(
+    names: &[&str],
+) -> (
+    crate::diameter::pool::PeerPool,
+    Vec<(
+        Arc<crate::diameter::peer::DiameterPeer>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+    )>,
+) {
+    let manager = Arc::new(crate::diameter::DiameterManager::new());
+    let peers: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let (peer, written) = silent_peer("siphon.example.com");
+            manager.register_backend(
+                "default",
+                name,
+                Arc::new(crate::diameter::DiameterClient::new(Arc::clone(&peer))),
+            );
+            (peer, written)
+        })
+        .collect();
+    let pool = crate::diameter::pool::PeerPool::new(
+        "default",
+        manager,
+        names.iter().map(|name| (*name).to_owned()).collect(),
+    );
+    (pool, peers)
+}
+
+#[tokio::test]
+async fn a_named_pool_pick_reports_the_peer_it_relays_to() {
+    let (pool, mut peers) = pool_of(&["hss-a", "hss-b"]);
+    let first = RelayTarget::pool_named(&pool);
+    assert_eq!(first.peer.as_deref(), Some("hss-a"));
+    assert!(!first.affinity_hit, "round robin has no affinity");
+    assert!(first.target.is_reachable());
+    let second = RelayTarget::pool_named(&pool);
+    assert_eq!(second.peer.as_deref(), Some("hss-b"), "the next in turn");
+
+    // The request goes to the peer that was named.
+    let options = RelayOptions::default().timeout(std::time::Duration::from_millis(100));
+    let outcome = NativeHarness::new(relaying(second.target, options))
+        .call(&steered_request("relay;pick;1"))
+        .await;
+    assert_eq!(result_code(&outcome), Some(3004));
+    assert!(peers[1].1.try_recv().is_ok(), "hss-b got the request");
+    assert!(peers[0].1.try_recv().is_err(), "hss-a did not");
+}
+
+#[tokio::test]
+async fn a_named_sticky_pick_reports_the_peer_and_the_affinity() {
+    let (pool, peers) = pool_of(&["hss-a", "hss-b"]);
+    let ttl = std::time::Duration::from_secs(60);
+
+    let miss = RelayTarget::pool_sticky_named(&pool, "001010000000001", ttl);
+    assert_eq!(miss.peer.as_deref(), Some("hss-a"));
+    assert!(!miss.affinity_hit, "the first pick binds the key");
+    assert!(miss.target.is_reachable());
+
+    let hit = RelayTarget::pool_sticky_named(&pool, "001010000000001", ttl);
+    assert_eq!(hit.peer.as_deref(), Some("hss-a"));
+    assert!(hit.affinity_hit);
+
+    // The bound peer closes: the key moves, and that is not a hit.
+    peers[0]
+        .0
+        .set_state_for_test(crate::diameter::peer::PeerState::Closed);
+    let moved = RelayTarget::pool_sticky_named(&pool, "001010000000001", ttl);
+    assert_eq!(moved.peer.as_deref(), Some("hss-b"));
+    assert!(!moved.affinity_hit);
+}
+
+#[tokio::test]
+async fn a_named_pick_from_a_pool_with_no_open_peer_names_none() {
+    let manager = Arc::new(crate::diameter::DiameterManager::new());
+    let pool = crate::diameter::pool::PeerPool::new("default", manager, vec!["hss".to_owned()]);
+    let ttl = std::time::Duration::from_secs(60);
+    for pick in [
+        RelayTarget::pool_named(&pool),
+        RelayTarget::pool_sticky_named(&pool, "key", ttl),
+    ] {
+        assert_eq!(pick.peer, None);
+        assert!(!pick.affinity_hit);
+        assert!(!pick.target.is_reachable());
+        let outcome = NativeHarness::new(relaying(pick.target, RelayOptions::default()))
+            .call(&steered_request("relay;pick;2"))
+            .await;
+        assert_eq!(result_code(&outcome), Some(3002));
+    }
+}
+
+/// A named pick keeps the pool's other peers: when the picked peer cannot
+/// take the request and `diameter.retry` allows it, the next peer gets it,
+/// marked as a retransmission. A single connection has nowhere to go. In a
+/// process of its own, since the retry policy is the process's.
+#[test]
+fn a_named_pick_falls_back_to_the_pools_other_peer() {
+    crate::own_process::run(
+        concat!(
+            module_path!(),
+            "::a_named_pick_falls_back_to_the_pools_other_peer"
+        ),
+        named_pick_falls_back,
+    );
+}
+
+#[allow(clippy::disallowed_methods)] // a test's own runtime, nothing attached
+fn named_pick_falls_back() {
+    use crate::diameter::retry::{self, RetryPolicy, RetryRule};
+
+    retry::install(RetryPolicy {
+        rules: vec![RetryRule {
+            application_id: TEST_APPLICATION,
+            commands: vec![TEST_COMMAND],
+            too_busy: true,
+            unable_to_deliver: true,
+            timeout: true,
+        }],
+        divert_abated: false,
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let options = RelayOptions::default().timeout(std::time::Duration::from_millis(100));
+        type Pick = fn(&crate::diameter::pool::PeerPool) -> PoolPick;
+        let picks: [(&str, Pick); 3] = [
+            ("pool_named", RelayTarget::pool_named),
+            ("pool_sticky_named", |pool| {
+                RelayTarget::pool_sticky_named(pool, "key", std::time::Duration::from_secs(60))
+            }),
+            ("pool_peer", |pool| {
+                let (name, client) = pool.pick_round_robin_named().expect("an open peer");
+                PoolPick {
+                    target: RelayTarget::pool_peer(pool, client),
+                    peer: Some(name),
+                    affinity_hit: false,
+                }
+            }),
+        ];
+        for (label, pick) in picks {
+            let (pool, mut peers) = pool_of(&["hss-a", "hss-b"]);
+            let picked = pick(&pool);
+            assert_eq!(picked.peer.as_deref(), Some("hss-a"), "{label}");
+            // The picked peer's connection is gone under the request.
+            let (_, gone) = peers.remove(0);
+            drop(gone);
+
+            let outcome = NativeHarness::new(relaying(picked.target, options.clone()))
+                .call(&steered_request("relay;fallback;1"))
+                .await;
+            let retried = peers[0]
+                .1
+                .try_recv()
+                .unwrap_or_else(|_| panic!("{label}: the other peer got the request"));
+            let retried = DiameterMsg::from_wire(&retried).expect("the request parses");
+            assert_ne!(
+                retried.flags & crate::diameter::codec::FLAG_RETRANSMITTED,
+                0,
+                "{label}: sent again, so with the T flag"
+            );
+            assert_eq!(retried.end_to_end, 0x3333_4444, "{label}");
+            // The other peer is silent too: its timeout is the answer.
+            assert_eq!(result_code(&outcome), Some(3004), "{label}");
+        }
+
+        // One connection alone: nothing else is tried.
+        let (pool, mut peers) = pool_of(&["hss-a", "hss-b"]);
+        let (_, client) = pool.pick_round_robin_named().expect("an open peer");
+        let (_, gone) = peers.remove(0);
+        drop(gone);
+        let outcome = NativeHarness::new(relaying(RelayTarget::client(client), options))
+            .call(&steered_request("relay;fallback;2"))
+            .await;
+        assert_eq!(result_code(&outcome), Some(3002));
+        assert!(
+            peers[0].1.try_recv().is_err(),
+            "the other peer was not tried"
+        );
+    });
+}

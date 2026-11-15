@@ -376,4 +376,69 @@ mod tests {
         register(&manager, "a", PeerState::Open);
         assert!(pool.pick_round_robin().is_some());
     }
+
+    #[test]
+    fn a_sticky_pick_says_whether_the_key_was_already_bound() {
+        let manager = Arc::new(DiameterManager::new());
+        let first = register(&manager, "a", PeerState::Open);
+        register(&manager, "b", PeerState::Open);
+        let pool = PeerPool::new("t", Arc::clone(&manager), vec!["a".into(), "b".into()]);
+        let ttl = Duration::from_secs(60);
+
+        let bound = pool.pick_sticky_reported("session-1", ttl).unwrap();
+        assert!(!bound.affinity_hit, "the first pick binds the key");
+        assert_eq!(bound.name, "a");
+        assert_eq!(picked_name(&bound.client), "a");
+
+        let again = pool.pick_sticky_reported("session-1", ttl).unwrap();
+        assert!(again.affinity_hit);
+        assert_eq!(again.name, "a");
+
+        // Another key is bound on its own.
+        assert!(
+            !pool
+                .pick_sticky_reported("session-2", ttl)
+                .unwrap()
+                .affinity_hit
+        );
+
+        // The bound peer goes away: a re-pick, not a hit.
+        first.peer().set_state_for_test(PeerState::Closed);
+        let moved = pool.pick_sticky_reported("session-1", ttl).unwrap();
+        assert!(!moved.affinity_hit);
+        assert_eq!(moved.name, "b");
+        assert!(
+            pool.pick_sticky_reported("session-1", ttl)
+                .unwrap()
+                .affinity_hit
+        );
+
+        // A binding that has expired is bound again.
+        assert!(
+            !pool
+                .pick_sticky_reported("session-3", Duration::ZERO)
+                .unwrap()
+                .affinity_hit
+        );
+        assert!(
+            !pool
+                .pick_sticky_reported("session-3", Duration::ZERO)
+                .unwrap()
+                .affinity_hit
+        );
+
+        // The named form is the same pick without the report.
+        let (name, _) = pool.pick_sticky_named("session-1", ttl).unwrap();
+        assert_eq!(name, "b");
+    }
+
+    #[test]
+    fn a_sticky_pick_from_a_pool_with_no_open_peer_is_none() {
+        let manager = Arc::new(DiameterManager::new());
+        register(&manager, "a", PeerState::Closed);
+        let pool = PeerPool::new("t", manager, vec!["a".into()]);
+        assert!(pool
+            .pick_sticky_reported("session-1", Duration::from_secs(60))
+            .is_none());
+    }
 }
