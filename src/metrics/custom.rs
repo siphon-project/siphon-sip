@@ -116,6 +116,9 @@ impl<T> Series<T> {
         match self.children.entry(key.as_slice().into()) {
             Entry::Occupied(occupied) => Ok(apply(occupied.get())),
             Entry::Vacant(vacant) => {
+                // `fetch_update` is deprecated from Rust 1.99 for `try_update`,
+                // which the MSRV does not have. Same operation under either name.
+                #[allow(deprecated)]
                 let reserved =
                     self.admitted
                         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
