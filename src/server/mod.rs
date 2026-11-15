@@ -558,11 +558,14 @@ impl SiphonServer {
             .script
             .async_pool_size
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-        crate::script::async_pool::AsyncPool::install(
+        let async_pool = crate::script::async_pool::AsyncPool::install(
             async_pool_size,
             tokio::runtime::Handle::current(),
             crate::config::coroutine_timeout(config.script.handler_timeout_secs),
         );
+        // `script.direct_dispatch`: on only if a handler driven without an
+        // asyncio task behaves on this interpreter (it says so if not).
+        crate::script::runner::configure(config.script.direct_dispatch.is_on(), &async_pool);
 
         // Spin up the synchronous Python executor pool — a fixed set of
         // never-reaped OS threads that all `Python::attach` handler

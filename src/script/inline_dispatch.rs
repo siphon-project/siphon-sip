@@ -292,6 +292,54 @@ pub(crate) fn start_coroutine(
     drive_suspending_coroutine(python, coroutine).map(CoroutineStart::Finished)
 }
 
+/// What [`start_handle_coroutine`] did with a coroutine.
+pub(crate) enum HandleStart {
+    /// It ran to the end here; this is its value.
+    Finished(Py<PyAny>),
+    /// It runs as a task on an asyncio driver.
+    Suspended(PendingCoroutine),
+    /// A driver's runner steps it, without a task.
+    Direct(crate::script::runner::DriveHandle),
+    /// Every runner was full: it never ran, and the call fails with this.
+    Refused(PyErr),
+}
+
+/// [`start_coroutine`] for a handler called through the script handle, which
+/// is where `script.direct_dispatch` applies: with it on, a coroutine that
+/// suspends is stepped by its driver's runner instead of an asyncio task,
+/// unless `handler` is known to use asyncio. With it off this is
+/// [`start_coroutine`], unchanged.
+pub(crate) fn start_handle_coroutine(
+    python: Python<'_>,
+    coroutine: &Bound<'_, pyo3::PyAny>,
+    handler: &std::sync::Arc<Py<PyAny>>,
+) -> PyResult<HandleStart> {
+    if !crate::script::runner::direct_dispatch_enabled() {
+        return start_coroutine(python, coroutine).map(|started| match started {
+            CoroutineStart::Finished(value) => HandleStart::Finished(value),
+            CoroutineStart::Suspended(pending) => HandleStart::Suspended(pending),
+        });
+    }
+    if let Some(value) = run_coroutine_inline(python, coroutine)? {
+        return Ok(HandleStart::Finished(value));
+    }
+    if crate::script::py_executor::on_worker_thread()
+        && tokio::runtime::Handle::try_current().is_ok()
+    {
+        if let Some(pool) = crate::script::async_pool::AsyncPool::global() {
+            return match crate::script::runner::start(&pool, python, coroutine, Some(handler)) {
+                Ok(Some(drive)) => Ok(HandleStart::Direct(drive)),
+                // A handler that uses asyncio starts as a task.
+                Ok(None) => {
+                    PendingCoroutine::submit(&pool, python, coroutine).map(HandleStart::Suspended)
+                }
+                Err(refused) => Ok(HandleStart::Refused(refused)),
+            };
+        }
+    }
+    drive_suspending_coroutine(python, coroutine).map(HandleStart::Finished)
+}
+
 /// Run a coroutine that may suspend to completion, blocking this thread: on
 /// the async pool when one is installed, else on this thread's own loop.
 #[allow(clippy::disallowed_methods)] // drives an asyncio loop attached: bytecode reaches safe points

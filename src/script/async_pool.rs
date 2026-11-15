@@ -52,7 +52,7 @@ use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
-use crate::script::runner::{RunnerOwner, RunnerShared};
+use crate::script::runner::{Admission, RunnerOwner, RunnerShared};
 
 /// Global pool, initialised once at server startup.  Handlers route through
 /// here when present; tests and CLI helpers without a configured pool fall
@@ -206,9 +206,54 @@ impl AsyncPool {
     }
 
     /// The native runner on driver `index`'s loop.
-    #[doc(hidden)]
-    pub fn runner(&self, index: usize) -> Option<&Arc<RunnerShared>> {
+    #[cfg(test)]
+    pub(crate) fn runner(&self, index: usize) -> Option<&Arc<RunnerShared>> {
         self.drivers.get(index).map(|driver| &driver.runner)
+    }
+
+    /// Driver `index`'s event loop.
+    #[cfg(test)]
+    pub(crate) fn driver_loop<'py>(
+        &self,
+        python: Python<'py>,
+        index: usize,
+    ) -> Option<Bound<'py, PyAny>> {
+        self.drivers
+            .get(index)
+            .map(|driver| driver.loop_obj.bind(python).clone())
+    }
+
+    /// Reserve a place for one more handler on the runner with the fewest in
+    /// flight, among the drivers whose loop is turning. `None` when each of
+    /// them already has `limit` in flight: the caller fails the call, it
+    /// never waits for room.
+    ///
+    /// A stalled driver is only chosen when every driver is stalled: handing
+    /// a coroutine to a pinned loop buys it a timeout rather than a turn.
+    pub(crate) fn admit(&self, limit: usize) -> Option<Admission> {
+        let count = self.drivers.len();
+        // Ties go round the drivers, so an idle pool does not put every
+        // handler on the first one.
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        // A runner that fills between the look and the reservation is looked
+        // past on the next round; there are at most `count` of those.
+        for _ in 0..=count {
+            let pick = |stalled: bool| {
+                (0..count)
+                    .map(|offset| &self.drivers[(start + offset) % count])
+                    .filter(|driver| Self::driver_is_stalled(driver) == stalled)
+                    .map(|driver| (driver.runner.in_flight(), driver))
+                    .filter(|(in_flight, _)| *in_flight < limit)
+                    .min_by_key(|(in_flight, _)| *in_flight)
+                    .map(|(_, driver)| driver)
+            };
+            let all_stalled = self.drivers.iter().all(Self::driver_is_stalled);
+            let driver = pick(false).or_else(|| if all_stalled { pick(true) } else { None })?;
+            if let Some(admission) = driver.runner.try_admit(limit) {
+                return Some(admission);
+            }
+        }
+        None
     }
 
     pub(crate) fn spawn(
@@ -671,10 +716,10 @@ static PENDING_COROUTINES: AtomicUsize = AtomicUsize::new(0);
 /// Counts one coroutine in [`PENDING_COROUTINES`] for as long as it lives, so
 /// every way out — settled, timed out, dropped unresumed — gives the count
 /// back.
-struct PendingCount;
+pub(crate) struct PendingCount;
 
 impl PendingCount {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         let pending = PENDING_COROUTINES.fetch_add(1, Ordering::Relaxed) + 1;
         publish_pending(pending);
         Self
@@ -951,7 +996,7 @@ def submit(coro, loop, done):
     })
 }
 
-fn coroutine_name(coroutine: &Bound<'_, PyAny>) -> String {
+pub(crate) fn coroutine_name(coroutine: &Bound<'_, PyAny>) -> String {
     coroutine
         .getattr("__qualname__")
         .and_then(|value| value.extract::<String>())

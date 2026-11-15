@@ -53,6 +53,24 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`script.direct_dispatch: off | on`, default `off`.** With `on`, an
+  `async def` handler that a host extension calls through the script handle
+  (an HTTP route, an SMPP or GTP-C handler) is stepped on its asyncio driver
+  thread without an asyncio task for as long as it awaits only siphon's own
+  awaitables (`await cache.fetch(...)`, `await diameter.cx_uar(...)`). Each
+  such await then skips the task, the `concurrent.futures` bridge and the
+  completion-thread hop; the Rust future's completion wakes the driver
+  directly and the Python value is built there. A handler that uses asyncio
+  itself (`asyncio.sleep`, a future that is not siphon's, a task method only
+  a real task answers) is handed to a real task on the same thread the first
+  time it does, with the same `asyncio.current_task()`, and starts as a task
+  from its next call. Results, exceptions, context variables and the
+  coroutine timeout are the same in both modes. Each driver takes at most
+  4096 such handlers in flight; with every driver full a call fails at once
+  (`Err` from `call_handler_with`) and is counted in
+  `siphon_runner_admission_rejected_total`. SIP request and Diameter handlers
+  are not affected by the switch yet. Off, dispatch is unchanged. See
+  `docs/handler-execution-model.md`.
 - `siphon_accept_errors_total{transport,listener,reason}`, `reason` one of
   `emfile`, `enfile`, `enobufs`, `enomem`, `other`, counted on every accept
   error. Alert on `process_open_fds / process_max_fds > 0.8` for the warning

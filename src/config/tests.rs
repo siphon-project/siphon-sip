@@ -6507,3 +6507,60 @@ fn registrar_redis_presence_key_prefix_defaults_and_overrides() {
         "scscf-a:presence:"
     );
 }
+
+#[test]
+fn direct_dispatch_defaults_to_off() {
+    assert_eq!(
+        ScriptConfig::default().direct_dispatch,
+        crate::config::DirectDispatch::Off
+    );
+    let config: Config = Config::from_str(MINIMAL_DIRECT_DISPATCH_YAML).unwrap();
+    assert_eq!(
+        config.script.direct_dispatch,
+        crate::config::DirectDispatch::Off
+    );
+    assert!(!config.script.direct_dispatch.is_on());
+}
+
+const MINIMAL_DIRECT_DISPATCH_YAML: &str = "\
+listen:
+  udp:
+    - \"0.0.0.0:5060\"
+domain:
+  local:
+    - \"example.com\"
+script:
+  path: \"scripts/proxy_default.py\"
+";
+
+/// `on` and `off` are read as written, quoted or bare, in any case, and as
+/// the booleans a YAML 1.1 reader makes of them.
+#[test]
+fn direct_dispatch_reads_on_and_off() {
+    use crate::config::DirectDispatch;
+    for (written, expected) in [
+        ("on", DirectDispatch::On),
+        ("off", DirectDispatch::Off),
+        ("\"on\"", DirectDispatch::On),
+        ("\"off\"", DirectDispatch::Off),
+        ("On", DirectDispatch::On),
+        ("OFF", DirectDispatch::Off),
+        ("true", DirectDispatch::On),
+        ("false", DirectDispatch::Off),
+    ] {
+        let yaml = format!("{MINIMAL_DIRECT_DISPATCH_YAML}  direct_dispatch: {written}\n");
+        let config = Config::from_str(&yaml).unwrap();
+        assert_eq!(config.script.direct_dispatch, expected, "{written}");
+        assert_eq!(
+            config.script.direct_dispatch.is_on(),
+            expected == DirectDispatch::On
+        );
+    }
+}
+
+#[test]
+fn direct_dispatch_rejects_anything_else() {
+    let yaml = format!("{MINIMAL_DIRECT_DISPATCH_YAML}  direct_dispatch: auto\n");
+    let error = Config::from_str(&yaml).expect_err("not a mode");
+    assert!(error.to_string().contains("direct_dispatch"), "{error}");
+}

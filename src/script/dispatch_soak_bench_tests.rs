@@ -548,6 +548,7 @@ fn load_engine(config: &SoakConfig) -> Arc<ScriptEngine> {
             handler_timeout_secs: None,
             executor_queue_capacity: config.queue,
             include_paths: Vec::new(),
+            direct_dispatch: crate::config::DirectDispatch::Off,
         })
         .unwrap(),
     )

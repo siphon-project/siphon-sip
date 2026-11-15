@@ -90,7 +90,7 @@ pub use registrar::{
     LivenessDeregMode, PostgresBackendConfig, RedisBackendConfig, RegistrarBackendType,
     RegistrarConfig, RegistrarLivenessConfig,
 };
-pub use script::{coroutine_timeout, ReloadMode, ScriptConfig};
+pub use script::{coroutine_timeout, DirectDispatch, ReloadMode, ScriptConfig};
 pub use security::{
     ApiBanConfig, ConnectionLimitsConfig, CrlfKeepaliveConfig, FailedAuthBanConfig, FirewallConfig,
     NatConfig, NatKeepaliveConfig, RateLimitConfig, ScannerBlockConfig, SecurityConfig,
