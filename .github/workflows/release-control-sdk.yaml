@@ -43,7 +43,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/control-sdk-v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: siphon-control-sdk version must equal the tag
         run: |
           tag_version="${GITHUB_REF_NAME#control-sdk-v}"
@@ -70,9 +70,9 @@ jobs:
           - { os: ubuntu-24.04-arm, target: aarch64, pyver: "3.14t", abi: cp314t, interpreter: /opt/python/cp314-cp314t/bin/python3.14t }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build wheel (${{ matrix.target }} / ${{ matrix.abi }})
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: ${{ matrix.target }}
           manylinux: auto
@@ -81,7 +81,7 @@ jobs:
             --out dist
             --manifest-path ${{ env.MANIFEST }}
             --interpreter ${{ matrix.interpreter }}
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-linux-${{ matrix.target }}-${{ matrix.abi }}
           path: dist/*.whl
@@ -107,13 +107,13 @@ jobs:
           - { os: windows-latest, target: x64,     pyver: "3.14t", abi: cp314t }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         id: py
         with:
           python-version: ${{ matrix.pyver }}
       - name: Build wheel (${{ matrix.os }} / ${{ matrix.target }} / ${{ matrix.abi }})
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: ${{ matrix.target }}
           args: >-
@@ -121,7 +121,7 @@ jobs:
             --out dist
             --manifest-path ${{ env.MANIFEST }}
             --interpreter ${{ steps.py.outputs.python-path }}
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.abi }}
           path: dist/*.whl
@@ -131,15 +131,15 @@ jobs:
   sdist:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build sdist
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           command: sdist
           args: >-
             --out dist
             --manifest-path ${{ env.MANIFEST }}
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-sdist
           path: dist/*.tar.gz
@@ -156,13 +156,13 @@ jobs:
       id-token: write   # OIDC for PyPI Trusted Publishing
     steps:
       - name: Gather every wheel + the sdist
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           pattern: wheels-*
           merge-multiple: true
       - name: Publish to PyPI (Trusted Publishing — OIDC, no token)
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           packages-dir: dist
           # Idempotent re-tag: skip any wheel/sdist already on PyPI so
@@ -183,13 +183,13 @@ jobs:
     permissions:
       id-token: write   # mint a short-lived crates.io token via GitHub OIDC
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: siphon-control-sdk
       - name: Authenticate to crates.io (OIDC Trusted Publishing)
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: auth
       - name: Publish siphon-control-proto
         # Idempotent re-tag: skip if this version is already on crates.io so a
