@@ -90,3 +90,12 @@ Periodic (`@timer.every`) and one-shot (`timer.set`) callbacks.
 Returned by `timer.set(...)` — cancel a scheduled one-shot.
 
 ::: siphon_sdk.mock_module.MockTimerHandle
+
+## `tasks` namespace
+
+Running several awaitables of one handler at the same time, without handing
+the handler to asyncio. See
+[Several awaits at once](../handler-execution-model.md#several-awaits-at-once-tasksgather)
+for how it runs and how it differs from `asyncio.gather`.
+
+::: siphon_sdk.tasks.MockTasksNamespace

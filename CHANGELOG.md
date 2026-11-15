@@ -15,6 +15,19 @@ entry, but a working config keeps working.
 
 ### Changed
 
+- **`script.direct_dispatch: on` now also covers `@proxy.on_request` and the
+  Diameter server handlers** (`@diameter.on_request`, `@diameter.on_reply`,
+  `@diameter.on_request_completed`). An awaiting one is stepped on its asyncio
+  driver thread without an asyncio task while it awaits only siphon's own
+  awaitables, and the reply, relay or answer that follows runs as one
+  executor job per call. A new request that finds every driver at its limit
+  of handlers in flight is not run: SIP answers `503 Service Unavailable`
+  with `Retry-After: 5`, Diameter answers `3004 DIAMETER_TOO_BUSY`, and both
+  count in `siphon_runner_admission_rejected_total`. The later handlers of a
+  request that was admitted are never refused. Replies, relays, answers,
+  error answers and the coroutine timeout are the same as with the switch
+  off, and `def` handlers are not touched. Default still `off`.
+
 - **A `script.sync_pool_max` below the core pool size is now warned about at
   startup.** The ceiling has always been raised to the core
   (`sync_pool_size`, default `max(8, 2 x CPUs)`), so `sync_pool_max: 8` on a
@@ -68,9 +81,21 @@ entry, but a working config keeps working.
   coroutine timeout are the same in both modes. Each driver takes at most
   4096 such handlers in flight; with every driver full a call fails at once
   (`Err` from `call_handler_with`) and is counted in
-  `siphon_runner_admission_rejected_total`. SIP request and Diameter handlers
-  are not affected by the switch yet. Off, dispatch is unchanged. See
+  `siphon_runner_admission_rejected_total`. Off, dispatch is unchanged. See
   `docs/handler-execution-model.md`.
+- **`tasks.gather(*awaitables, return_exceptions=False)`**, a new `tasks`
+  namespace. It runs several awaitables of one handler at the same time and
+  returns their results in argument order, like `asyncio.gather`, but with
+  `script.direct_dispatch: on` it keeps the handler off asyncio: a coroutine
+  argument is stepped on the same asyncio driver thread as the handler, and a
+  siphon awaitable is waited on as it is. No asyncio task is made for either
+  (`asyncio.gather` makes one per coroutine and turns the handler into a
+  task). One difference from `asyncio.gather`, in every mode: when an argument
+  raises, the others are cancelled before the exception reaches the handler.
+  `return_exceptions=True` collects exceptions as results and cancels
+  nothing. A handler's cancellation or timeout cancels what it gathered. With
+  the switch off, or in a handler that runs as an asyncio task, it is
+  `asyncio.gather` with that same rule. Mirrored in the SDK mock.
 - `siphon_accept_errors_total{transport,listener,reason}`, `reason` one of
   `emfile`, `enfile`, `enobufs`, `enomem`, `other`, counted on every accept
   error. Alert on `process_open_fds / process_max_fds > 0.8` for the warning
