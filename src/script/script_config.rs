@@ -395,12 +395,13 @@ pub(crate) fn install(store: Arc<ScriptConfigStore>) {
     let _ = INSTALLED.set(store);
 }
 
-/// The `script_config` document the script reads right now, for Rust code in
-/// the same process: the very snapshot `config.get` resolves against, so the
-/// two cannot disagree across a reload. Read it with [`lookup`]. Taking it
-/// does not lock; hold the returned snapshot for as long as one decision
-/// needs a consistent document and take a new one for the next. None before
-/// the server has built the store.
+/// The `script_config` document being served right now, for Rust code in the
+/// same process: a snapshot of the one store the script's `config` namespace
+/// reads, so a call here and a `config.get` between the same two reloads see
+/// the same document. Read it with [`lookup`]. Taking it does not lock. A
+/// snapshot does not follow a later reload: hold it for as long as one
+/// decision needs a consistent document and take a new one for the next.
+/// None before the server has built the store.
 pub fn current() -> Option<Arc<Value>> {
     INSTALLED.get().map(|store| store.snapshot())
 }

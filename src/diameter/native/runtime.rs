@@ -44,6 +44,12 @@ impl ServerRuntime {
 
 static RUNTIME: OnceLock<ServerRuntime> = OnceLock::new();
 
+/// Whether `config` makes this node a Diameter server (`listen`, or a
+/// tenant): the nodes whose script has `diameter.event_sink`.
+fn is_server(config: &DiameterConfig) -> bool {
+    config.listen.is_some() || !config.effective_tenants().is_empty()
+}
+
 /// Start the event sink `config` asks for and keep it, with the tenant
 /// identities, for this process. Returns the sink, which is also the one
 /// `diameter.event_sink` gets. Called once, on the runtime, where the
@@ -55,6 +61,7 @@ pub(crate) fn install(config: &DiameterConfig) -> Option<Arc<EventSink>> {
             let event_sink = config
                 .event_sink
                 .as_ref()
+                .filter(|_| is_server(config))
                 .map(|sink| Arc::new(EventSink::spawn(sink)));
             ServerRuntime::new(config, event_sink)
         })
@@ -79,7 +86,8 @@ pub fn tenant_identity(tenant: &str) -> Option<(&'static str, &'static str)> {
 /// `diameter.event_sink.emit(row)`: a row a handler emits here lands in the
 /// same place. [`EventSink::emit`] takes the row as serialized JSON, does not
 /// block, and drops the row when the sink's queue is full. None when no
-/// event sink is configured.
+/// event sink is configured, and on a node that is not a Diameter server
+/// (no `diameter.listen` and no tenant), where a script has none either.
 pub fn event_sink() -> Option<Arc<EventSink>> {
     RUNTIME.get()?.event_sink.clone()
 }
@@ -147,6 +155,22 @@ mod tests {
         assert_eq!(runtime.tenant_identity("default"), None);
     }
 
+    /// A node that only dials out has no `diameter.event_sink` in its script,
+    /// so a configured sink is not started for Rust either.
+    #[test]
+    fn only_a_server_has_an_event_sink() {
+        let sink = "event_sink:\n  backend: none\n";
+        assert!(!is_server(&config(&format!(
+            "origin_host: scscf.example.com\norigin_realm: example.com\n{sink}"
+        ))));
+        assert!(is_server(&config(&format!(
+            "listen:\n  tcp: \"192.0.2.1:3868\"\n{sink}"
+        ))));
+        assert!(is_server(&config(&format!(
+            "tenants:\n  alpha:\n    identity:\n      origin_host: a.example.com\n{sink}"
+        ))));
+    }
+
     /// The process-wide accessors, the way the server sets them up: the sink
     /// `install` returns is the one handed to the script namespace, and a row
     /// a Rust handler emits lands in the file a script's row lands in.
@@ -161,7 +185,6 @@ mod tests {
         );
     }
 
-    #[allow(clippy::disallowed_methods)] // a test's own runtime, nothing attached
     fn handler_and_script_emit_to_the_same_sink() {
         use crate::diameter::native::tests::{request, TEST_APPLICATION, TEST_COMMAND};
         use crate::diameter::native::{

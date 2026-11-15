@@ -540,12 +540,13 @@ fn relaying(target: RelayTarget, options: RelayOptions) -> NativeHandlers {
         .expect("a first handler")
 }
 
-fn silent_peer(
-    origin_host: &str,
-) -> (
+/// A peer nothing answers, and what it was asked to send.
+type SilentPeer = (
     Arc<crate::diameter::peer::DiameterPeer>,
     tokio::sync::mpsc::Receiver<Vec<u8>>,
-) {
+);
+
+fn silent_peer(origin_host: &str) -> SilentPeer {
     let (write_tx, written) = tokio::sync::mpsc::channel(8);
     let config = crate::diameter::peer::PeerConfig {
         host: "192.0.2.20".to_owned(),
@@ -800,15 +801,7 @@ async fn emit_answers_for_external_dissection() {
 
 /// A pool of `names`, each an open peer whose written requests come out of
 /// the receiver beside it.
-fn pool_of(
-    names: &[&str],
-) -> (
-    crate::diameter::pool::PeerPool,
-    Vec<(
-        Arc<crate::diameter::peer::DiameterPeer>,
-        tokio::sync::mpsc::Receiver<Vec<u8>>,
-    )>,
-) {
+fn pool_of(names: &[&str]) -> (crate::diameter::pool::PeerPool, Vec<SilentPeer>) {
     let manager = Arc::new(crate::diameter::DiameterManager::new());
     let peers: Vec<_> = names
         .iter()
@@ -907,7 +900,6 @@ fn a_named_pick_falls_back_to_the_pools_other_peer() {
     );
 }
 
-#[allow(clippy::disallowed_methods)] // a test's own runtime, nothing attached
 fn named_pick_falls_back() {
     use crate::diameter::retry::{self, RetryPolicy, RetryRule};
 
