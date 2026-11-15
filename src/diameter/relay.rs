@@ -103,6 +103,11 @@ pub(crate) async fn relay(
         inbound.previous_hop
     };
 
+    // Every answer this node makes from here on goes back with the inbound
+    // identifiers (RFC 6733 section 6.2), the one for a loop included.
+    tree.hop_by_hop = inbound.hop_by_hop;
+    tree.end_to_end = inbound.end_to_end;
+
     // Loop detection + Route-Record append.
     let identities: Vec<&str> = identities.iter().map(String::as_str).collect();
     if let Err(error) = forward::prepare_forward(&mut tree, &identities, &previous_hop) {
@@ -115,16 +120,13 @@ pub(crate) async fn relay(
         );
     }
 
-    // Fresh outbound hop-by-hop; End-to-End is preserved. Every answer this
-    // node makes from here on goes back with the inbound one (RFC 6733
-    // section 6.2).
+    // Fresh outbound hop-by-hop (`overload_agent::relay`); End-to-End is
+    // preserved.
     // A retransmission keeps its T bit on the relayed copy (RFC 6733 section
     // 3); answers mask it off (forward::answer_in keeps only P).
     if options.retransmitted {
         tree.flags |= FLAG_RETRANSMITTED;
     }
-    tree.hop_by_hop = inbound.hop_by_hop;
-    tree.end_to_end = inbound.end_to_end;
     let policy = retry::current();
     overload_agent::relay(
         &policy,

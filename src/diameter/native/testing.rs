@@ -34,8 +34,9 @@ impl HarnessOutcome {
 
 /// Runs a request through a set of handlers the way the server does, short
 /// of sending the answer: the lookup by (application id, command code), the
-/// handler, and the 5012 for one that fails or panics. The answer comes back
-/// as the bytes the server would send, before any overload report.
+/// handler, and the 5012 for one that fails, panics or times out. The answer
+/// comes back as the bytes the server would send, before any overload report.
+/// Call it on a tokio runtime with the time driver enabled.
 ///
 /// The peer the request "arrived on" is a connection to nothing: what a
 /// handler sends on it goes nowhere and is never answered.
@@ -59,7 +60,9 @@ impl HarnessOutcome {
 ///     end_to_end: 2,
 ///     avps: vec![Avp::utf8(avp::SESSION_ID, 0, "mme.example.com;1;1")],
 /// };
-/// let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+/// let runtime = tokio::runtime::Builder::new_current_thread()
+///     .enable_time()
+///     .build()?;
 /// let outcome = runtime.block_on(NativeHarness::new(handlers).call(&request));
 /// let answer = outcome.answer().ok_or("no answer")?;
 /// assert_eq!(answer.answer_result_codes().0, Some(2001));

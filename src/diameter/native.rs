@@ -13,9 +13,9 @@
 //! `@diameter.on_reply` and `@diameter.on_request_completed` hooks belong to
 //! the script path and do not run for a request a handler answered.
 //!
-//! A handler that returns an error or panics is answered
-//! DIAMETER_UNABLE_TO_COMPLY (5012) and logged; a request is never left
-//! without an answer.
+//! A handler that returns an error, panics or outlasts
+//! `script.handler_timeout_secs` is answered DIAMETER_UNABLE_TO_COMPLY (5012)
+//! and logged; a request is never left without an answer.
 //!
 //! ```rust,no_run
 //! use siphon::diameter::dictionary;
@@ -70,8 +70,9 @@ pub type NativeResult = Result<NativeOutcome, NativeError>;
 pub type NativeFuture = Pin<Box<dyn Future<Output = NativeResult> + Send + 'static>>;
 
 /// A handler: the request in, what to do with it out. It runs on a tokio
-/// worker, so it must not block and must not attach to the interpreter. It
-/// bounds its own waits: nothing times a handler out.
+/// worker, so it must not block and must not attach to the interpreter. One
+/// that is not done within `script.handler_timeout_secs` is dropped and the
+/// request answered 5012.
 pub type NativeHandler = Arc<dyn Fn(NativeRequest) -> NativeFuture + Send + Sync + 'static>;
 
 /// What a handler decided.

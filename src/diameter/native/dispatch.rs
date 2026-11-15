@@ -3,7 +3,7 @@
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
 use tracing::{error, warn};
@@ -83,12 +83,28 @@ pub(crate) async fn serve_with(
 }
 
 /// Run `handler` on `message` and return the answer to send, None when it
-/// hands the request to the script. A handler that fails or panics is
-/// answered DIAMETER_UNABLE_TO_COMPLY (5012).
+/// hands the request to the script. A handler that fails, panics or is not
+/// done within the handler timeout of the script path
+/// (`script.handler_timeout_secs`) is answered DIAMETER_UNABLE_TO_COMPLY
+/// (5012).
 pub(crate) async fn answer_wire(
     handler: &NativeHandler,
     message: DiameterMsg,
     inbound: &Inbound<'_>,
+) -> Option<Vec<u8>> {
+    let limit = match crate::script::async_pool::AsyncPool::global() {
+        Some(pool) => pool.coroutine_timeout(),
+        None => crate::config::coroutine_timeout(None),
+    };
+    answer_wire_within(handler, message, inbound, limit).await
+}
+
+/// [`answer_wire`] with the time a handler gets.
+pub(crate) async fn answer_wire_within(
+    handler: &NativeHandler,
+    message: DiameterMsg,
+    inbound: &Inbound<'_>,
+    limit: Duration,
 ) -> Option<Vec<u8>> {
     let request = NativeRequest::new(
         message,
@@ -113,7 +129,19 @@ pub(crate) async fn answer_wire(
 
     // A panic in the handler, or in its future at any poll, unwinds to here.
     let outcome = match std::panic::catch_unwind(AssertUnwindSafe(|| handler(request))) {
-        Ok(future) => AssertUnwindSafe(future).catch_unwind().await,
+        Ok(future) => {
+            let guarded = AssertUnwindSafe(future).catch_unwind();
+            let Ok(outcome) = tokio::time::timeout(limit, guarded).await else {
+                error!(
+                    application_id,
+                    command_code,
+                    timeout_secs = limit.as_secs(),
+                    "Diameter server: native handler timed out; answering 5012"
+                );
+                return Some(cannot_comply("native handler timed out"));
+            };
+            outcome
+        }
         Err(panic) => Err(panic),
     };
     match outcome {

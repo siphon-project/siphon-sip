@@ -63,7 +63,7 @@ fn a_second_handler_for_a_command_is_refused() {
     let duplicate = script_handler().handle(dictionary::S6A_APP_ID, 318, |_request| async {
         Ok(NativeOutcome::Script)
     });
-    let error = duplicate.err().expect("a duplicate is an error");
+    let error = duplicate.expect_err("a duplicate is an error");
     assert_eq!(
         error,
         NativeHandlerError::Duplicate {
@@ -623,6 +623,66 @@ async fn a_relay_that_would_loop_is_answered_loop_detected_and_not_sent() {
     let outcome = harness.call(&looping).await;
     assert_eq!(result_code(&outcome), Some(3005));
     assert!(written.try_recv().is_err(), "nothing was sent");
+}
+
+/// The answer made for a loop goes back with the identifiers the request
+/// was received with, whatever the handler wrote to the header since.
+#[tokio::test]
+async fn a_loop_is_answered_with_the_received_identifiers() {
+    let (backend, _written) = silent_peer("siphon.example.com");
+    let target = RelayTarget::peer(backend);
+    let handlers = NativeHandlers::new()
+        .handle(TEST_APPLICATION, TEST_COMMAND, move |mut request| {
+            let target = target.clone();
+            async move {
+                request.message_mut().hop_by_hop = 1;
+                request.message_mut().end_to_end = 2;
+                let answer = request.relay(target, RelayOptions::default()).await;
+                Ok(NativeOutcome::Answer(answer))
+            }
+        })
+        .expect("a first handler");
+    let mut looping = steered_request("relay;harness;10");
+    looping
+        .avps
+        .push(Avp::utf8(avp::ROUTE_RECORD, 0, "siphon.example.com"));
+    let answer = NativeHarness::new(handlers)
+        .call(&looping)
+        .await
+        .answer()
+        .expect("answered");
+    assert_eq!(answer.answer_result_codes().0, Some(3005));
+    assert_eq!(answer.hop_by_hop, 0x1111_2222);
+    assert_eq!(answer.end_to_end, 0x3333_4444);
+}
+
+/// A handler that never finishes is answered once the handler timeout of
+/// the script path has passed.
+#[tokio::test]
+async fn a_handler_that_never_finishes_is_answered_unable_to_comply() {
+    let stuck: NativeHandler = Arc::new(|_request| Box::pin(std::future::pending()));
+    let (peer, _written) = silent_peer("siphon.example.com");
+    let inbound = dispatch::Inbound {
+        peer: &peer,
+        peer_name: "peer",
+        tenant: "default",
+        origin: ("siphon.example.com", "example.com"),
+    };
+    let wire = dispatch::answer_wire_within(
+        &stuck,
+        steered_request("stuck;harness;11"),
+        &inbound,
+        std::time::Duration::from_millis(50),
+    )
+    .await
+    .expect("answered, not handed to the script");
+    let answer = DiameterMsg::from_wire(&wire).expect("the answer parses");
+    assert_eq!(answer.answer_result_codes().0, Some(5012));
+    assert_eq!(answer.hop_by_hop, 0x1111_2222);
+    assert_eq!(
+        answer.get_str(avp::ERROR_MESSAGE).as_deref(),
+        Some("native handler timed out")
+    );
 }
 
 #[tokio::test]
