@@ -173,6 +173,11 @@ pub struct PoolSizing {
     pub core_threads: usize,
     pub max_threads: usize,
     pub bound: SizingBound,
+    /// The explicit `script.sync_pool_max` when it was below `core_threads`
+    /// and so raised to it. The ceiling never goes under the core, so a max
+    /// of 8 on a 6-CPU node (core 12) still allows 12 workers; startup warns
+    /// with this value rather than letting the cap look honoured.
+    pub max_raised_from: Option<usize>,
 }
 
 /// Resolve the elastic pool's `core` / `max` worker counts from the CPU count
@@ -227,10 +232,13 @@ pub fn resolve_sizing(
         },
     };
 
+    let max_raised_from = sync_pool_max.filter(|&explicit| explicit < core_threads);
+
     PoolSizing {
         core_threads,
         max_threads,
         bound,
+        max_raised_from,
     }
 }
 
@@ -1608,6 +1616,37 @@ mod tests {
         assert_eq!(sizing.core_threads, 12);
         assert_eq!(sizing.max_threads, 12);
         assert_eq!(sizing.bound, SizingBound::Override);
+        assert_eq!(sizing.max_raised_from, Some(4));
+    }
+
+    /// A `sync_pool_max` below the derived core (2 x CPUs) is raised to the
+    /// core too, and the sizing says so, so startup can warn instead of the
+    /// cap silently not holding.
+    #[test]
+    fn resolve_sizing_reports_a_max_raised_to_the_derived_core() {
+        let sizing = resolve_sizing(6, None, None, Some(8));
+        assert_eq!(sizing.core_threads, 12);
+        assert_eq!(sizing.max_threads, 12);
+        assert_eq!(sizing.max_raised_from, Some(8));
+    }
+
+    /// Only a raised override is reported: a max at or above core, or none at
+    /// all, leaves it unset.
+    #[test]
+    fn resolve_sizing_reports_nothing_when_the_max_holds() {
+        assert_eq!(
+            resolve_sizing(6, None, None, Some(12)).max_raised_from,
+            None
+        );
+        assert_eq!(
+            resolve_sizing(6, None, Some(8), Some(8)).max_raised_from,
+            None
+        );
+        assert_eq!(resolve_sizing(6, None, None, None).max_raised_from, None);
+        assert_eq!(
+            resolve_sizing(2, Some(256 * MB), Some(20), Some(40)).max_raised_from,
+            None
+        );
     }
 
     /// A pathologically tiny budget still yields a usable (≥1) pool.

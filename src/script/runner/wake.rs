@@ -117,6 +117,7 @@ impl WakeSender {
     }
 
     /// Bytes written to the pipe so far.
+    #[cfg(test)]
     pub(crate) fn writes(&self) -> u64 {
         self.writes.load(Ordering::Relaxed)
     }

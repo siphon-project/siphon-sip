@@ -62,7 +62,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
 use crate::script::engine::{HandlerEntry, HandlerKind, ScriptState};
-use crate::script::inline_dispatch::{start_coroutine, CoroutineStart};
+use crate::script::inline_dispatch::{start_handle_coroutine, HandleStart};
 
 /// Owned, opaque reference to a script-registered handler. Returned by
 /// [`ScriptHandle::handlers_for`].
@@ -155,6 +155,16 @@ impl ScriptHandle {
         Self { state, runtime }
     }
 
+    /// A handle on `engine`'s handlers, for benchmarks that dispatch without
+    /// a server.
+    #[doc(hidden)]
+    pub fn for_engine(
+        engine: &crate::script::engine::ScriptEngine,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self::new(engine.state_arc(), runtime)
+    }
+
     /// Tokio runtime handle for spawning extension-owned background work
     /// (HTTP listeners, side-channel clients, periodic sweeps).
     pub fn tokio_handle(&self) -> &tokio::runtime::Handle {
@@ -227,8 +237,10 @@ impl ScriptHandle {
     /// as Rust data from [`HandlerHandle::options_value`] without an attach.
     ///
     /// `Err` means the handler never ran or its job was lost (the executor
-    /// shed it or is shutting down, or a closure panicked); what the handler
-    /// itself raised reaches `finish`.
+    /// shed it or is shutting down, a closure panicked, or, with
+    /// `script.direct_dispatch` on, every asyncio driver already had its
+    /// limit of handlers in flight); what the handler itself raised reaches
+    /// `finish`.
     pub async fn call_handler_with<A, F, R>(
         &self,
         handler: &HandlerHandle,
@@ -248,6 +260,15 @@ impl ScriptHandle {
         enum Started<R> {
             Done(R),
             Suspended(crate::script::async_pool::PendingCoroutine, Finish<R>),
+            /// Stepped by a driver's runner (`script.direct_dispatch`). The
+            /// callable names the handler if it times out.
+            Direct(
+                crate::script::runner::DriveHandle,
+                Finish<R>,
+                Arc<Py<PyAny>>,
+            ),
+            /// Every runner was full: the handler's body never ran.
+            Refused(PyErr),
         }
 
         let join = crate::script::py_executor::try_run(move || {
@@ -259,13 +280,19 @@ impl ScriptHandle {
                     callable.bind(py).call1(arg_tuple)
                 });
                 let returned = match returned {
-                    Ok(returned) if is_async => match start_coroutine(py, &returned) {
-                        Ok(CoroutineStart::Finished(value)) => Ok(value.into_bound(py)),
-                        Ok(CoroutineStart::Suspended(pending)) => {
-                            return Started::Suspended(pending, Box::new(finish));
+                    Ok(returned) if is_async => {
+                        match start_handle_coroutine(py, &returned, &callable) {
+                            Ok(HandleStart::Finished(value)) => Ok(value.into_bound(py)),
+                            Ok(HandleStart::Suspended(pending)) => {
+                                return Started::Suspended(pending, Box::new(finish));
+                            }
+                            Ok(HandleStart::Direct(drive)) => {
+                                return Started::Direct(drive, Box::new(finish), callable);
+                            }
+                            Ok(HandleStart::Refused(error)) => return Started::Refused(error),
+                            Err(error) => Err(error),
                         }
-                        Err(error) => Err(error),
-                    },
+                    }
                     other => other,
                 };
                 Started::Done(finish(py, returned))
@@ -289,6 +316,35 @@ impl ScriptHandle {
                     )
                 })
             }
+            Ok(Started::Direct(drive, finish, callable)) => {
+                // No executor worker held and no interpreter attached: the
+                // runner on the handler's driver steps it and sends the
+                // result here.
+                let waited = drive.wait().await;
+                crate::script::py_executor::run_queued(move || {
+                    crate::script::attach::attach(|py| {
+                        let settled = match waited {
+                            crate::script::runner::Waited::Settled(result) => result,
+                            crate::script::runner::Waited::TimedOut(timeout) => {
+                                let handler = callable
+                                    .bind(py)
+                                    .getattr("__qualname__")
+                                    .and_then(|name| name.extract::<String>())
+                                    .unwrap_or_else(|_| "<unknown>".to_string());
+                                Err(crate::script::runner::timeout_error(&handler, timeout))
+                            }
+                        };
+                        finish(py, settled.map(|value| value.into_bound(py)))
+                    })
+                })
+                .await
+                .map_err(|_| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        "script handler continuation did not run".to_string(),
+                    )
+                })
+            }
+            Ok(Started::Refused(error)) => Err(error),
             Err(_panic) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 "script handler dispatch panicked".to_string(),
             )),
@@ -327,6 +383,7 @@ mod tests {
                 handler_timeout_secs: None,
                 executor_queue_capacity: 1024,
                 include_paths: Vec::new(),
+                direct_dispatch: Default::default(),
             })
             .unwrap(),
         )
@@ -367,8 +424,12 @@ _r.register("beta.kind",  None, beta_only, False, None)
 
     /// `call_handler_with` builds the arguments and reads the outcome inside
     /// the executor jobs, for sync and async handlers and for a raise.
+    #[allow(clippy::await_holding_lock)] // a test-only serialising guard
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn call_handler_with_keeps_every_python_touch_in_the_job() {
+        // An async handler goes through the shared drivers, whose switch and
+        // admission limit other tests set: one at a time.
+        let _serial = crate::script::async_pool::pool_test_guard();
         let engine = engine_with_source(
             r#"
 import asyncio
@@ -509,8 +570,12 @@ _r.register("ext.echo", None, echo, False, None)
         });
     }
 
+    #[allow(clippy::await_holding_lock)] // a test-only serialising guard
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn call_handler_dispatches_async_handler() {
+        // An async handler goes through the shared drivers, whose switch and
+        // admission limit other tests set: one at a time.
+        let _serial = crate::script::async_pool::pool_test_guard();
         let engine = engine_with_source(
             r#"
 import asyncio
@@ -615,21 +680,88 @@ _r.register("ext.thing", None, custom, False, None)
     // guard is a std mutex, which is not held across an await of this test's.
     #[test]
     fn awaiting_handlers_beyond_the_executor_size_all_run_at_once() {
+        awaiting_handlers_all_run_at_once(false, "asyncio.sleep(1.0)");
+    }
+
+    /// The same with `script.direct_dispatch` on, for a handler that stays on
+    /// the runner (a siphon awaitable) and for one that becomes a task.
+    #[test]
+    fn awaiting_handlers_beyond_the_executor_size_all_run_at_once_direct() {
+        awaiting_handlers_all_run_at_once(true, "probe.sleep_ms(1000, 0)");
+        awaiting_handlers_all_run_at_once(true, "asyncio.sleep(1.0)");
+    }
+
+    /// `script.direct_dispatch` for one test, off again when dropped. Held
+    /// with the pool guard, which every test that dispatches takes.
+    struct DirectDispatch;
+
+    impl DirectDispatch {
+        fn set(on: bool) -> Self {
+            crate::script::runner::set_enabled_for_test(on);
+            Self
+        }
+    }
+
+    impl Drop for DirectDispatch {
+        fn drop(&mut self) {
+            crate::script::runner::set_enabled_for_test(false);
+        }
+    }
+
+    #[pyfunction]
+    fn sleep_ms(py: Python<'_>, millis: u64, value: i64) -> PyResult<Bound<'_, PyAny>> {
+        crate::script::awaitable(py, async move {
+            tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+            Ok(value)
+        })
+    }
+
+    #[pyfunction]
+    fn never(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+        crate::script::awaitable(py, async move {
+            std::future::pending::<()>().await;
+            Ok(0i64)
+        })
+    }
+
+    fn install_probe_module() {
+        use pyo3::types::PyModuleMethods;
+        Python::initialize();
+        Python::attach(|python| {
+            let modules = python.import("sys").unwrap().getattr("modules").unwrap();
+            if modules.contains("_handle_probe").unwrap() {
+                return;
+            }
+            let module = pyo3::types::PyModule::new(python, "_handle_probe").unwrap();
+            module
+                .add_function(pyo3::wrap_pyfunction!(sleep_ms, &module).unwrap())
+                .unwrap();
+            module
+                .add_function(pyo3::wrap_pyfunction!(never, &module).unwrap())
+                .unwrap();
+            modules.set_item("_handle_probe", &module).unwrap();
+        });
+    }
+
+    fn awaiting_handlers_all_run_at_once(direct: bool, awaited: &str) {
         let _serial = crate::script::async_pool::pool_test_guard();
+        install_probe_module();
         crate::script::async_pool::test_pools_runtime().block_on(async {
             let (executor, _async_pool) = crate::script::async_pool::ensure_test_pools();
-            let engine = engine_with_source(
+            let _switch = DirectDispatch::set(direct);
+            let engine = engine_with_source(&format!(
                 r#"
 import asyncio
 import _siphon_registry as _r
+import _handle_probe as probe
 
 async def slow(value):
-    await asyncio.sleep(1.0)
+    await {awaited}
     return value
 
 _r.register("ext.slow", None, slow, True, None)
-"#,
-            );
+"#
+            ));
             let handle = Arc::new(ScriptHandle::new(
                 engine.state_arc(),
                 tokio::runtime::Handle::current(),
@@ -679,19 +811,41 @@ _r.register("ext.slow", None, slow, True, None)
     // guard is a std mutex, which is not held across an await of this test's.
     #[test]
     fn timed_out_handlers_are_cancelled_and_leave_nothing_pending() {
+        timed_out_handlers_leave_nothing_pending(
+            false,
+            "asyncio.get_running_loop().create_future()",
+        );
+    }
+
+    /// The same with `script.direct_dispatch` on: a handler wedged on a
+    /// siphon awaitable is cancelled by its runner, one wedged on an asyncio
+    /// future by the task it was handed to.
+    #[test]
+    fn timed_out_handlers_are_cancelled_and_leave_nothing_pending_direct() {
+        timed_out_handlers_leave_nothing_pending(true, "probe.never()");
+        timed_out_handlers_leave_nothing_pending(
+            true,
+            "asyncio.get_running_loop().create_future()",
+        );
+    }
+
+    fn timed_out_handlers_leave_nothing_pending(direct: bool, awaited: &str) {
         let _serial = crate::script::async_pool::pool_test_guard();
+        install_probe_module();
         crate::script::async_pool::test_pools_runtime().block_on(async {
             let (_executor, async_pool) = crate::script::async_pool::ensure_test_pools();
-            let engine = engine_with_source(
+            let _switch = DirectDispatch::set(direct);
+            let engine = engine_with_source(&format!(
                 r#"
 import asyncio
 import _siphon_registry as _r
+import _handle_probe as probe
 
 cancelled = []
 
 async def wedged(value):
     try:
-        await asyncio.get_running_loop().create_future()
+        await {awaited}
     except asyncio.CancelledError:
         cancelled.append(value)
         raise
@@ -706,8 +860,8 @@ def cancelled_count():
 _r.register("ext.wedged", None, wedged, True, None)
 _r.register("ext.quick", None, quick, True, None)
 _r.register("ext.cancelled", None, cancelled_count, False, None)
-"#,
-            );
+"#
+            ));
             let handle = Arc::new(ScriptHandle::new(
                 engine.state_arc(),
                 tokio::runtime::Handle::current(),

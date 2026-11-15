@@ -28,6 +28,11 @@ free-threaded-CPython attach from leaking (reaping a persistently-attached
 thread orphans ~2 MB of heap). Growth-on-demand restores the burst headroom that
 blocking handlers need; never-reaping keeps the no-leak property.
 
+The ceiling is never below the core. A `sync_pool_max` smaller than the core is
+raised to it and logged as a startup warning: on a 6-CPU node the core is 12, so
+`sync_pool_max: 8` alone still runs 12 workers. To cap the pool at 8, set
+`sync_pool_size: 8` and `sync_pool_max: 8`.
+
 > Why elastic: an earlier change moved inbound dispatch off tokio's elastic
 > `spawn_blocking` pool (which grew threads on demand) onto a **fixed** pool to
 > stop the heap leak — but that removed the burst valve. A blocking handler pins
@@ -331,6 +336,149 @@ Extension crates should create their awaitables with
 `pyo3_async_runtimes::tokio::future_into_py` directly still completes on the
 blocking pool and sets up a Python thread state per call.
 
+### Direct dispatch (`script.direct_dispatch`)
+
+```yaml
+script:
+  direct_dispatch: on   # default: off
+```
+
+By default an `async def` handler that suspends runs as an asyncio task on a
+driver, and each `await` of a siphon API goes through an asyncio future: the
+Rust future finishes on tokio, a completion thread builds the value and calls
+`loop.call_soon_threadsafe`, and the driver's loop resumes the task. The task
+itself is created through `asyncio.run_coroutine_threadsafe` and reports back
+through a `concurrent.futures.Future`.
+
+With `direct_dispatch: on`, these handlers skip all of that while they await
+only siphon's own awaitables:
+
+- `@proxy.on_request` handlers;
+- the Diameter server handlers: `@diameter.on_request`, `@diameter.on_reply`
+  and `@diameter.on_request_completed`;
+- a handler called through `ScriptHandle::call_handler_with` / `call_handler`
+  (the handlers an extension registers under its own kind).
+
+Each driver thread has a native runner next to its event loop.
+The executor job that called the handler passes the coroutine to the runner
+of the driver with the fewest handlers in flight, and from then on that one
+thread owns it:
+
+- the runner steps the coroutine, with the handler's own `contextvars`
+  context entered and a task object in place as `asyncio.current_task()`;
+- an awaited siphon API registers the coroutine as its waiter and the step
+  ends;
+- the Rust future's completion, on a tokio worker, posts a wake to that
+  runner without touching the interpreter. The runner builds the Python value
+  and steps the coroutine again.
+
+No asyncio task or future is made, no completion thread is involved, and the
+executor only runs the job that calls the handler and the job that finishes
+the call. Continuations never wait in the executor queue.
+
+A handler is free to use asyncio at any point. The first time it awaits
+something that is not a siphon awaitable (`asyncio.sleep`, a task, a future
+from another library), or asks its task for something only a real task
+answers (`add_done_callback`, `result()`, being awaited), it is handed over: a
+real `asyncio.Task` is created on the same thread and continues the coroutine
+where it was. `asyncio.current_task()` is the same object before and after.
+The handler is then remembered and starts as a task from its next call, so the
+hand-over is paid once per handler, not per call. A script reload forgets.
+These do not need a task and keep a handler on the runner: `asyncio.timeout`
+and `asyncio.wait_for` around a siphon awaitable, `asyncio.create_task`,
+`loop.call_soon` / `call_later`, `task.cancel()`, `task.get_name()` (logging).
+
+What stays the same in both modes: return values and exceptions, context
+variables, `handler_timeout_secs` (the coroutine is cancelled once,
+`CancelledError` at its await, and the call fails with `TimeoutError`), and
+that an awaiting handler holds no executor worker.
+
+Two things a script can see differ while a handler is on the runner. It is
+not in `asyncio.all_tasks()`, because no asyncio task exists for it. And a
+reference to its task kept past the end of a handler that never became a real
+task answers `done()`, `cancelled()` and `get_name()`, but has no `result()`
+or `exception()` to give. Inside the handler, and for anything that asks the
+task while the handler runs, the task behaves as asyncio's does.
+
+Admission is bounded: a driver takes at most 4096 direct handlers in flight.
+A call that finds every driver full is refused at once, without running the
+handler, and answered as each kind sheds:
+
+| Handler | A refused call |
+|---|---|
+| `@proxy.on_request` | `503 Service Unavailable` with `Retry-After: 5` |
+| `@diameter.on_request` | `3004 DIAMETER_TOO_BUSY`, with the overload report a requester that advertised DOIC gets |
+| `call_handler_with` | `Err`, as a call that was never dispatched |
+
+Every refusal is counted in `siphon_runner_admission_rejected_total` and
+logged at most once every five seconds. Nothing waits for room. Only new work
+is refused: once a request's first handler was admitted, the handlers that
+follow it (a second `@proxy.on_request` handler after the first one's await,
+`@diameter.on_reply`, `@diameter.on_request_completed`) always get a place,
+because the request has been accepted and has to be finished.
+
+The work after a handler (the SIP reply or relay, the Diameter answer) runs as
+one executor job per call, however many awaits the handler made.
+
+#### Several awaits at once: `tasks.gather`
+
+```python
+from siphon import diameter, tasks
+
+@diameter.on_request("ULR")
+async def on_update_location(request):
+    profile, vectors = await tasks.gather(
+        load_profile(request),                    # a coroutine of the script
+        diameter.send_request(vector_request()),  # a siphon awaitable
+    )
+    return build_answer(request, profile, vectors)
+```
+
+`asyncio.gather` wraps each coroutine in an asyncio task, so a handler that
+calls it is handed to asyncio and starts as a task from then on. On a handler
+that gathers on every request, that gives back all of what the switch saves.
+`tasks.gather(*awaitables, return_exceptions=False)` runs its arguments on the
+runner instead:
+
+- a coroutine becomes a second entry on the same driver thread, stepped by the
+  same runner, with its own task object and a copy of the handler's context;
+- a siphon awaitable is waited on as it is;
+- anything else `await` accepts (an asyncio future, a task) is awaited by a
+  small coroutine, which is handed to an asyncio task of its own. The handler
+  that gathered it stays on the runner. So does the handler of a coroutine
+  argument that uses asyncio: only that coroutine becomes a task.
+
+The result is the list of results in argument order. It differs from
+`asyncio.gather` in one way, on purpose: **when an argument raises, the others
+are cancelled** before the exception reaches the handler (coroutines get
+`CancelledError` at their await, a siphon awaitable's request is dropped).
+`asyncio.gather` leaves them running with nobody to collect them. With
+`return_exceptions=True` nothing is cancelled and an exception is that
+argument's result. Cancelling the handler, or its timeout, cancels every
+argument still running. On the runner nothing gathered outlives its handler: a
+handler that returns with arguments still running has them cancelled, and a
+coroutine that ignores the cancellation is closed. The exception is an
+argument that uses asyncio and so became an asyncio task: it is cancelled as a
+task is, and one that ignores the cancellation runs until it ends by itself.
+
+Where no runner steps the caller (the switch is off, the handler runs as an
+asyncio task, or the caller is a task the handler created), `tasks.gather` is
+`asyncio.gather` over asyncio tasks with the same cancel-on-failure rule, so a
+script behaves the same in every mode. A coroutine argument then starts at the
+handler's next await rather than at once. Await the gather in the handler that
+made it.
+
+A driver loop with a task factory set (`loop.set_task_factory`) starts every
+handler as a task, as with the switch off.
+
+The switch does not affect the handler kinds that hold their worker while a
+coroutine runs (`@proxy.on_reply` / `on_failure` callbacks, B2BUA handlers,
+`@diameter.on_inbound_cer`, timers, SBI callbacks, RTPEngine events), nor any
+`def` handler: the synchronous path is the same code with the switch on or
+off. At startup the server drives one handler through a direct step, an await
+and a hand-over; if any of it misbehaves on the running interpreter the switch
+stays off and the log says so.
+
 ## Backpressure & liveness guarantees
 
 Beyond elasticity, the pool is defended on three more fronts so a misbehaving
@@ -461,6 +609,7 @@ siphon keeps every such wait detached:
 | `siphon_pyexec_jobs_shed_total` | jobs dropped because the queue was full |
 | `siphon_pyexec_stale_requests_shed_total{method}` | initial requests answered 503 without the script because they queued past the 8 s budget |
 | `siphon_async_coroutines_pending` | `async def` handler coroutines on a driver, not yet settled |
+| `siphon_runner_admission_rejected_total` | requests and calls refused with `script.direct_dispatch: on` because every driver had its limit of handlers in flight (answered 503, 3004 or `Err`) |
 | `siphon_pyexec_queue_wait_ms` | how long the job a worker last took had waited in the queue; 0 with the queue empty |
 | `siphon_pyexec_queue_wait_seconds` | histogram: how long each job waited in the queue before a worker took it (buckets 100 µs to 13 s) |
 | `siphon_interpreter_attach_wait_seconds` | histogram: how long each attach of the liveness probe waited; one sample every 10 ms (buckets 100 µs to 3.3 s) |

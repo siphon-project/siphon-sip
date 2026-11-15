@@ -30,7 +30,7 @@ your handlers. Import the namespaces you need:
 ```python
 from siphon import proxy, registrar, b2bua, auth, log, cache
 from siphon import gateway, cdr, diameter, presence, li, registration
-from siphon import timer, metrics, sdp, sbi, ipsec, rtpengine, isc, config
+from siphon import timer, tasks, metrics, sdp, sbi, ipsec, rtpengine, isc, config
 ```
 
 ## How this reference is organised
@@ -51,7 +51,7 @@ from siphon import timer, metrics, sdp, sbi, ipsec, rtpengine, isc, config
 | [Least-Cost Routing](lcr-api.md) | The `lcr` namespace, the external API's JSON contract, and the typed request/response models |
 | [Diameter](diameter.md) | Cx / Rx / Sh / Rf interfaces and inbound-request handling |
 | [IMS control](ims.md) | iFC evaluation, SBI/N5, presence, lawful intercept, SRS |
-| [Observability](observability.md) | Logging, cache, CDR, custom metrics, timers |
+| [Observability](observability.md) | Logging, cache, CDR, custom metrics, timers, `tasks.gather` |
 | [CDR records](cdr.md) | The record a CDR sink writes, typed for collectors |
 | [LCR API contract](lcr-api.md) | The JSON siphon exchanges with an external least-cost-routing API |
 | [Control plane (remote SDKs)](control-plane.md) | Driving handed-over calls from an out-of-process app (`pip install siphon-control`, `cargo add siphon-control-client`) |

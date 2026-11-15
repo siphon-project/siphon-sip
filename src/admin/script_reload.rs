@@ -158,6 +158,7 @@ mod tests {
                 handler_timeout_secs: None,
                 executor_queue_capacity: 1024,
                 include_paths: Vec::new(),
+                direct_dispatch: Default::default(),
             })
             .expect("the script loads"),
         );
@@ -227,6 +228,7 @@ mod tests {
                 handler_timeout_secs: None,
                 executor_queue_capacity: 1024,
                 include_paths: Vec::new(),
+                direct_dispatch: Default::default(),
             })
             .expect("the script loads"),
         );

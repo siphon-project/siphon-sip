@@ -252,6 +252,10 @@ name = "registrar_contact" # lookup by Contact (lookup_contact / binding_for_con
 harness = false
 
 [[bench]]
+name = "custom_metrics"    # script custom metric updates: repeat-label counter_inc / histogram observe / gauge set
+harness = false
+
+[[bench]]
 name = "admission"         # b2bua.inbound_limit: the per-INVITE admission check and the refused-retransmission lookup
 harness = false
 
@@ -265,6 +269,10 @@ harness = false
 
 [[bench]]
 name = "flow_over_mtu"      # RFC 3261 §18.1.1 over a UE's SA flow: the per-request switch decision
+harness = false
+
+[[bench]]
+name = "dispatch_await"     # an async handler call through the script handle: 0/1/4 awaits, direct dispatch off vs on
 harness = false
 
 [features]

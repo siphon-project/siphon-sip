@@ -63,6 +63,7 @@ NAMESPACE_AWAITABLE = {
         "conference_bridge", "conference_play", "conference_stop_play",
         "conference_set_play_gain",
     },
+    "tasks": {"gather"},
 }
 
 # Awaitable methods on `<namespace>.subscribe_state`.
@@ -231,7 +232,7 @@ def check_doc(path):
 # marked FINDING — so a broken matcher is caught by CI rather than by a release.
 SELF_TEST_FIXTURE = """
 import asyncio
-from siphon import proxy, auth, diameter, presence, sbi
+from siphon import proxy, auth, diameter, presence, sbi, tasks
 
 
 @proxy.on_request("REGISTER")
@@ -255,6 +256,8 @@ async def handler(request, socket, process):
     process.terminate()
     later.notify(body="y")                                # FINDING
     await proxy.send_request("OPTIONS", "sip:a@b")
+    await tasks.gather(diameter.cx_sar("sip:a@b"), sbi.create_session("s"))
+    tasks.gather(diameter.cx_lir("sip:a@b"))              # FINDING
 """
 
 
