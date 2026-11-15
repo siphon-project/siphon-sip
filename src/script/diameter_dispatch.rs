@@ -1439,19 +1439,23 @@ fn request_filter_score(
         return Some(0); // catch-all
     };
     let (app_token, commands) = split_request_filter(filter);
-    let command_matches = commands
-        .split('|')
-        .any(|token| dictionary::command_code_by_name(token.trim()) == Some(command_code));
+    // A name is read in the application the filter names: "Sy:SNR" is Sy's
+    // Spending-Status-Notification, a bare "SNR" is Sh's.
+    let filter_application = match app_token {
+        Some(app) => match dictionary::app_id_by_name(app) {
+            Some((_, app_id)) if app_id == application_id => app_id,
+            _ => return None,
+        },
+        None => 0,
+    };
+    let command_matches = commands.split('|').any(|token| {
+        dictionary::command_code_in_application(filter_application, token.trim())
+            == Some(command_code)
+    });
     if !command_matches {
         return None;
     }
-    match app_token {
-        Some(app) => match dictionary::app_id_by_name(app) {
-            Some((_, app_id)) if app_id == application_id => Some(2),
-            _ => None,
-        },
-        None => Some(1),
-    }
+    Some(if app_token.is_some() { 2 } else { 1 })
 }
 
 /// Split a `@diameter.on_request` filter into the application it names, if
@@ -1541,6 +1545,19 @@ mod served_applications_tests {
             "    return request.answer(2001)\n",
         );
         assert_eq!(served(&[], handlers), vec![(10415, 16_777_220)]);
+    }
+
+    #[test]
+    fn a_sy_filter_makes_the_node_a_sy_server_or_client() {
+        let handlers = concat!(
+            "@on_request('sy:SNR')\n",
+            "def on_snr(request):\n",
+            "    return request.answer(2001)\n",
+            "@on_request('Sy:SLR|STR')\n",
+            "def on_slr(request):\n",
+            "    return request.answer(2001)\n",
+        );
+        assert_eq!(served(&[], handlers), vec![(10415, 16_777_302)]);
     }
 
     #[test]
@@ -1726,6 +1743,42 @@ mod filter_tests {
     }
 
     #[test]
+    fn request_filter_score_reads_snr_by_its_application() {
+        let sy = dictionary::SY_APP_ID;
+        let sh = dictionary::SH_APP_ID;
+        let sy_snr = dictionary::CMD_SPENDING_STATUS_NOTIFICATION;
+        let sh_snr = dictionary::CMD_SH_SUBSCRIBE_NOTIFICATIONS;
+        assert_eq!((sy_snr, sh_snr), (8_388_636, 308));
+
+        assert_eq!(request_filter_score(Some("Sy:SNR"), sy, sy_snr), Some(2));
+        assert_eq!(request_filter_score(Some("sy:snr"), sy, sy_snr), Some(2));
+        assert_eq!(request_filter_score(Some("Sy:SNR"), sh, sh_snr), None);
+        assert_eq!(request_filter_score(Some("Sy:SNR"), sy, sh_snr), None);
+        assert_eq!(request_filter_score(Some("Sh:SNR"), sh, sh_snr), Some(2));
+        assert_eq!(request_filter_score(Some("Sh:SNR"), sy, sy_snr), None);
+        // A bare SNR is still Sh's.
+        assert_eq!(request_filter_score(Some("SNR"), sh, sh_snr), Some(1));
+        assert_eq!(request_filter_score(Some("SNR"), sy, sy_snr), None);
+        // The other Sy commands, alone and in a list.
+        assert_eq!(
+            request_filter_score(Some("sy:SLR"), sy, dictionary::CMD_SPENDING_LIMIT),
+            Some(2)
+        );
+        assert_eq!(
+            request_filter_score(Some("sy:STR"), sy, dictionary::CMD_SESSION_TERMINATION),
+            Some(2)
+        );
+        assert_eq!(
+            request_filter_score(Some("Sy:SLR|SNR|STR"), sy, sy_snr),
+            Some(2)
+        );
+        assert_eq!(
+            request_filter_score(Some("sy:STR"), dictionary::GX_APP_ID, 275),
+            None
+        );
+    }
+
+    #[test]
     fn request_filter_score_specificity() {
         let s6a = dictionary::S6A_APP_ID;
         let ulr = dictionary::CMD_UPDATE_LOCATION;
@@ -1818,7 +1871,14 @@ mod handler_failure_tests {
 
     /// An inbound Credit-Control-Request on the given application.
     fn incoming_credit_control(application_id: u32) -> crate::diameter::peer::IncomingRequest {
-        let command_code = dictionary::CMD_CREDIT_CONTROL;
+        incoming_request(application_id, dictionary::CMD_CREDIT_CONTROL)
+    }
+
+    /// An inbound request of the given application and command.
+    fn incoming_request(
+        application_id: u32,
+        command_code: u32,
+    ) -> crate::diameter::peer::IncomingRequest {
         crate::diameter::peer::IncomingRequest {
             command_code,
             application_id,
@@ -2133,6 +2193,66 @@ mod handler_failure_tests {
         );
         assert_eq!(
             answer_result_code_for(gx_only, &incoming_credit_control(dictionary::RO_APP_ID)),
+            dictionary::DIAMETER_UNABLE_TO_DELIVER,
+        );
+    }
+
+    /// A script serving Sy: the three commands of TS 29.219 table 5.6.1 and
+    /// clause 5.6.6, each answering a Result-Code of its own.
+    const SY_HANDLERS: &str = concat!(
+        "import _siphon_registry\n",
+        "\n",
+        "def spending_limit(request):\n",
+        "    return request.answer(2001)\n",
+        "\n",
+        "def spending_status_notification(request):\n",
+        "    return request.answer(2002)\n",
+        "\n",
+        "def session_termination(request):\n",
+        "    return request.answer(2003)\n",
+        "\n",
+        "_siphon_registry.register('diameter.on_request', 'sy:SLR', spending_limit, False)\n",
+        "_siphon_registry.register('diameter.on_request', 'sy:SNR', spending_status_notification, False)\n",
+        "_siphon_registry.register('diameter.on_request', 'sy:STR', session_termination, False)\n",
+    );
+
+    #[test]
+    fn each_sy_command_reaches_its_own_handler() {
+        for (command_code, expected) in [
+            (dictionary::CMD_SPENDING_LIMIT, 2001),
+            (dictionary::CMD_SPENDING_STATUS_NOTIFICATION, 2002),
+            (dictionary::CMD_SESSION_TERMINATION, 2003),
+        ] {
+            assert_eq!(
+                answer_result_code_for(
+                    SY_HANDLERS,
+                    &incoming_request(dictionary::SY_APP_ID, command_code),
+                ),
+                expected,
+                "command {command_code}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_sh_subscribe_notifications_does_not_reach_the_sy_snr_handler() {
+        // Same abbreviation, different application and command code (308).
+        assert_eq!(
+            answer_result_code_for(
+                SY_HANDLERS,
+                &incoming_request(
+                    dictionary::SH_APP_ID,
+                    dictionary::CMD_SH_SUBSCRIBE_NOTIFICATIONS,
+                ),
+            ),
+            dictionary::DIAMETER_UNABLE_TO_DELIVER,
+        );
+        // And an STR on another application does not reach Sy's STR handler.
+        assert_eq!(
+            answer_result_code_for(
+                SY_HANDLERS,
+                &incoming_request(dictionary::GX_APP_ID, dictionary::CMD_SESSION_TERMINATION),
+            ),
             dictionary::DIAMETER_UNABLE_TO_DELIVER,
         );
     }

@@ -69,6 +69,21 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **Diameter Sy (TS 29.219 Rel-18).** Application `Sy` (16777302, vendor 10415)
+  is accepted by `@diameter.on_request("Sy:SLR")`, `"Sy:SNR"` and `"Sy:STR"`,
+  by `send_request` and `originate`, by `diameter.routes`, `retry` and the
+  server `applications` list (`sy`), and advertised in the capabilities
+  exchange. The seven AVPs (2901 to 2907) are in the dictionary with the flags
+  of table 5.3.0.1 (SN-Request-Type goes without the M bit), and experimental
+  results 5570 and 4241 have metric labels. A PCRF script sends SLR and STR,
+  an OCS script answers them and originates the SNR on the connection that
+  carried the SLR, in its session; answers read back with the grouped
+  Policy-Counter-Status-Report decoded. SNR and SNA are Sh's command (308) on
+  their own and Sy's (8388636) on the Sy application: filters, `send_request`,
+  `originate` and `retry` read the abbreviation in the application they are
+  given, so nothing written for Sh changes. Sy keeps its session state, so its
+  requests and answers carry `Auth-Application-Id` and no
+  `Auth-Session-State` or `Vendor-Specific-Application-Id`.
 - **`script.direct_dispatch: off | on`, default `off`.** With `on`, an
   `async def` handler that a host extension calls through the script handle
   (an HTTP route, an SMPP or GTP-C handler) is stepped on its asyncio driver

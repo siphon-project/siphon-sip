@@ -61,8 +61,8 @@ use tracing::warn;
 use super::diameter_kwargs::encode_kwarg_avps;
 use crate::config::DiameterApplication;
 use crate::diameter::codec::{
-    encode_avp_u32, encode_avp_utf8, encode_diameter_message, encode_vendor_specific_app_id,
-    FLAG_PROXIABLE, FLAG_REQUEST,
+    encode_application_identity, encode_avp_utf8, encode_diameter_message, FLAG_PROXIABLE,
+    FLAG_REQUEST,
 };
 use crate::diameter::cx::octet_string_as_utf8;
 use crate::diameter::dictionary::{self, avp};
@@ -519,11 +519,17 @@ fn validate_request_filter(filter: &str) -> PyResult<()> {
         Some((app, commands)) => (Some(app.trim()), commands),
         None => (None, filter),
     };
+    // The application a command abbreviation is read in: SNR is Sh's on its
+    // own and Sy's behind "Sy:".
+    let mut application_id = 0;
     if let Some(app) = app {
-        if dictionary::app_id_by_name(app).is_none() {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown Diameter application in on_request filter: {app:?}"
-            )));
+        match dictionary::app_id_by_name(app) {
+            Some((_, id)) => application_id = id,
+            None => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown Diameter application in on_request filter: {app:?}"
+                )))
+            }
         }
     }
     let mut saw_command = false;
@@ -533,7 +539,7 @@ fn validate_request_filter(filter: &str) -> PyResult<()> {
             continue;
         }
         saw_command = true;
-        if dictionary::command_code_by_name(command).is_none() {
+        if dictionary::command_code_in_application(application_id, command).is_none() {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown Diameter command in on_request filter: {command:?}"
             )));
@@ -2851,16 +2857,17 @@ impl PyDiameter {
         timeout_ms: u64,
         avps: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let command_code = dictionary::command_code_by_name(command).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown Diameter command name: {command}"
-            ))
-        })?;
         let (app_vendor, app_id) = dictionary::app_id_by_name(application).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown Diameter application name: {application}"
             ))
         })?;
+        let command_code =
+            dictionary::command_code_in_application(app_id, command).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown Diameter command name: {command}"
+                ))
+            })?;
 
         let client = match peer {
             Some(name) => self.manager.client(name),
@@ -2894,8 +2901,7 @@ impl PyDiameter {
         if let Some(dest_host) = &config.destination_host {
             avp_bytes.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, dest_host));
         }
-        avp_bytes.extend_from_slice(&encode_avp_u32(avp::AUTH_SESSION_STATE, 1));
-        avp_bytes.extend_from_slice(&encode_vendor_specific_app_id(app_vendor, app_id));
+        avp_bytes.extend_from_slice(&encode_application_identity(app_vendor, app_id));
 
         // Reserved kwargs siphon consumes itself never travel on the wire.
         avp_bytes.extend_from_slice(&encode_kwarg_avps(
@@ -5375,6 +5381,166 @@ mod tests {
     // -----------------------------------------------------------------
     // Generic API surface — send_request / on_command
     // -----------------------------------------------------------------
+
+    #[test]
+    fn on_request_accepts_the_sy_qualified_filters() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            for filter in [
+                "sy:SLR",
+                "sy:SNR",
+                "sy:STR",
+                "Sy:SLR|SNR|STR",
+                " SY : Spending-Status-Notification ",
+                "Sy:Spending-Limit",
+            ] {
+                validate_request_filter(filter)
+                    .unwrap_or_else(|error| panic!("{filter:?} must validate: {error}"));
+                let argument = pyo3::types::PyString::new(python, filter).into_any();
+                let decorator = PyDiameter::on_request(python, Some(argument))
+                    .unwrap_or_else(|error| panic!("{filter:?} must be accepted: {error}"));
+                assert!(decorator.is_callable(), "{filter}");
+            }
+            // A bare SNR is still Sh's, and "Sy" does not turn a typo into a command.
+            validate_request_filter("SNR").unwrap();
+            assert!(validate_request_filter("sy:Subscribe-Pizza").is_err());
+        });
+    }
+
+    /// What `send_request` hands back for an SLA an OCS sends: the dict keyed
+    /// by snake_case AVP name, the two reports a list, each report's pending
+    /// information a dict, its Time as Unix seconds.
+    #[test]
+    fn a_send_request_answer_decodes_the_grouped_policy_counters() {
+        use crate::diameter::sy_test_vectors::SLA_REPORT;
+        let mut wire = vec![
+            0x01, 0, 0, 0, 0x40, 0x80, 0x00, 0x1b, 0x01, 0x00, 0x00, 0x56,
+        ];
+        wire.extend_from_slice(&[0, 0, 0, 5, 0, 0, 0, 6]);
+        wire.extend_from_slice(&crate::diameter::codec::hex::decode(SLA_REPORT).unwrap());
+        let length = (wire.len() as u32).to_be_bytes();
+        wire[1..4].copy_from_slice(&length[1..]);
+        let message = crate::diameter::codec::decode_diameter(&wire).unwrap();
+        assert_eq!(message.application_id, dictionary::SY_APP_ID);
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let answer = decode_avps_to_pydict(python, &message.avps).unwrap();
+            fn get<'py>(dict: &Bound<'py, PyDict>, key: &str) -> Bound<'py, PyAny> {
+                dict.get_item(key)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{key} missing in {dict:?}"))
+            }
+            assert_eq!(
+                get(&answer, "session_id").extract::<String>().unwrap(),
+                "pcrf.epc.mnc001.mcc001.3gppnetwork.org;5;5"
+            );
+            assert_eq!(get(&answer, "result_code").extract::<u32>().unwrap(), 2001);
+            let reports = get(&answer, "policy_counter_status_report");
+            let reports = reports.cast::<pyo3::types::PyList>().unwrap();
+            assert_eq!(reports.len(), 2);
+            let gold = reports.get_item(0).unwrap();
+            let gold = gold.cast::<PyDict>().unwrap();
+            assert_eq!(
+                get(gold, "policy_counter_identifier")
+                    .extract::<String>()
+                    .unwrap(),
+                "gold"
+            );
+            assert_eq!(
+                get(gold, "policy_counter_status")
+                    .extract::<String>()
+                    .unwrap(),
+                "EXHAUSTED"
+            );
+            let pending = get(gold, "pending_policy_counter_information");
+            let pending = pending.cast::<PyDict>().unwrap();
+            assert_eq!(
+                get(pending, "policy_counter_status")
+                    .extract::<String>()
+                    .unwrap(),
+                "VALID"
+            );
+            assert_eq!(
+                get(pending, "pending_policy_counter_change_time")
+                    .extract::<u32>()
+                    .unwrap(),
+                1_700_000_000
+            );
+            let silver = reports.get_item(1).unwrap();
+            let silver = silver.cast::<PyDict>().unwrap();
+            assert_eq!(
+                get(silver, "policy_counter_identifier")
+                    .extract::<String>()
+                    .unwrap(),
+                "silver"
+            );
+            assert!(silver
+                .get_item("pending_policy_counter_information")
+                .unwrap()
+                .is_none());
+        });
+    }
+
+    /// The SLR `send_request` puts on the wire towards a peer: Sy's
+    /// application id in the header and `Auth-Application-Id`, and none of the
+    /// Auth-Session-State and Vendor-Specific-Application-Id the other
+    /// applications are sent with (TS 29.219 clauses 5.2 and 5.6.2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_request_sends_an_sy_slr_with_its_own_envelope() {
+        use crate::diameter::cx_test_support::mock_hss_client;
+        pyo3::Python::initialize();
+        let (client, captured) = mock_hss_client().await;
+        let manager = Arc::new(DiameterManager::new());
+        manager.register("ocs".to_string(), client);
+        let diameter = PyDiameter::new(manager);
+        tokio::task::spawn_blocking(move || {
+            pyo3::Python::attach(|python| {
+                let diameter = Py::new(python, diameter).unwrap();
+                let helper = pyo3::types::PyModule::from_code(
+                    python,
+                    c"import asyncio\ndef call(diameter, command, application):\n    async def run():\n        return await diameter.send_request(command, application, peer='ocs', sl_request_type=0, policy_counter_identifier='gold')\n    return asyncio.run(run())\n",
+                    c"_sy_test_helper.py",
+                    c"_sy_test_helper",
+                )
+                .unwrap();
+                let answer = helper
+                    .getattr("call")
+                    .unwrap()
+                    .call1((diameter, "SLR", "Sy"))
+                    .unwrap();
+                let code: u32 = answer.get_item("result_code").unwrap().extract().unwrap();
+                assert_eq!(code, 2001);
+            });
+        })
+        .await
+        .unwrap();
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        let slr = &requests[0];
+        assert_eq!(slr["Auth-Application-Id"], 16_777_302);
+        assert_eq!(slr["SL-Request-Type"], 0);
+        assert_eq!(slr["Policy-Counter-Identifier"], "gold");
+        assert!(slr.get("Session-Id").is_some());
+        assert!(slr.get("Auth-Session-State").is_none(), "{slr}");
+        assert!(slr.get("Vendor-Specific-Application-Id").is_none(), "{slr}");
+    }
+
+    #[test]
+    fn send_request_accepts_the_sy_commands_by_name() {
+        // With no peer connected the call resolves to None, which it only
+        // reaches once the command and application names have both resolved.
+        pyo3::Python::initialize();
+        let manager = Arc::new(DiameterManager::new());
+        let py_diameter = PyDiameter::new(manager);
+        pyo3::Python::attach(|python| {
+            for command in ["SLR", "Spending-Limit-Request", "SNR", "STR"] {
+                let result = py_diameter
+                    .send_request(python, command, "Sy", None, 10_000, None)
+                    .unwrap();
+                assert!(resolve(python, result).is_none(), "{command}");
+            }
+        });
+    }
 
     #[test]
     fn on_request_accepts_a_gx_qualified_filter() {
