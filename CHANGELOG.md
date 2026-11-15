@@ -66,6 +66,9 @@ entry, but a working config keeps working.
 
 ### Added
 
+- Inbound Diameter requests can be answered by Rust handlers registered at
+  server start (`SiphonServer::register_diameter_handlers`); the
+  `siphon_diameter_inbound_*` metrics gain a `path` label (`script` | `native`).
 - **`script.direct_dispatch: off | on`, default `off`.** With `on`, an
   `async def` handler that a host extension calls through the script handle
   (an HTTP route, an SMPP or GTP-C handler) is stepped on its asyncio driver

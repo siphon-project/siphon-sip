@@ -22,6 +22,8 @@ use shed::shed_too_busy;
 #[cfg(test)]
 mod direct_tests;
 #[cfg(test)]
+mod native_tests;
+#[cfg(test)]
 use backend::spawn_backend_connection;
 
 use std::collections::HashMap;

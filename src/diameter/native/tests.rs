@@ -664,3 +664,74 @@ async fn a_relay_to_a_pool_takes_its_open_peer() {
     );
     assert_eq!(result_code(&outcome), Some(3004));
 }
+
+/// Emit three answers to an S6a Authentication-Information-Request as hex
+/// for [`scripts/validate_diameter_native_answers.sh`] to feed to tshark: a
+/// handler's success with a vendor-specific grouped AVP two levels deep, a
+/// handler's Experimental-Result, and the 5012 sent for a handler that
+/// failed.
+#[tokio::test]
+async fn emit_answers_for_external_dissection() {
+    let Ok(path) = std::env::var("SIPHON_DIAMETER_NATIVE_ANSWERS_HEX_OUT") else {
+        // Nothing to do in an ordinary test run.
+        return;
+    };
+    const AIR: u32 = dictionary::CMD_AUTHENTICATION_INFORMATION;
+    let vendor = dictionary::VENDOR_3GPP;
+    let handlers = NativeHandlers::new()
+        .handle(dictionary::S6A_APP_ID, AIR, move |request| async move {
+            match request.session_id().unwrap_or_default().as_str() {
+                "mme.epc.example.com;1;1" => {
+                    let vector = Avp::grouped(
+                        avp::E_UTRAN_VECTOR,
+                        vendor,
+                        vec![
+                            Avp::raw(avp::RAND, vendor, vec![0x11; 16]),
+                            Avp::raw(avp::XRES, vendor, vec![0x22; 8]),
+                            Avp::raw(avp::AUTN, vendor, vec![0x33; 16]),
+                            Avp::raw(avp::KASME, vendor, vec![0x44; 32]),
+                        ],
+                    );
+                    let answer = request.answer(2001).with_avp(Avp::grouped(
+                        avp::AUTHENTICATION_INFO,
+                        vendor,
+                        vec![vector],
+                    ));
+                    Ok(NativeOutcome::Answer(answer))
+                }
+                "mme.epc.example.com;1;2" => Ok(NativeOutcome::Answer(
+                    request.answer_experimental(vendor, 5001),
+                )),
+                _ => Err("no such subscriber store".into()),
+            }
+        })
+        .expect("a first handler");
+    let harness = NativeHarness::new(handlers).with_origin(
+        "hss.epc.mnc001.mcc001.3gppnetwork.org",
+        "epc.mnc001.mcc001.3gppnetwork.org",
+    );
+
+    // `text2pcap`'s hex-dump form: an offset, then the octets. An offset of
+    // zero starts the next packet.
+    let mut dump = String::new();
+    for sequence in 1..=3 {
+        let mut message = request(dictionary::S6A_APP_ID, AIR);
+        message.avps[0] = Avp::utf8(
+            avp::SESSION_ID,
+            0,
+            &format!("mme.epc.example.com;1;{sequence}"),
+        );
+        let HarnessOutcome::Answer(wire) = harness.call(&message).await else {
+            panic!("every request is answered");
+        };
+        for (offset, chunk) in wire.chunks(16).enumerate() {
+            dump.push_str(&format!("{:06x}", offset * 16));
+            for byte in chunk {
+                dump.push_str(&format!(" {byte:02x}"));
+            }
+            dump.push('\n');
+        }
+        dump.push('\n');
+    }
+    std::fs::write(&path, dump).expect("hex dump must be writable");
+}
