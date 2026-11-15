@@ -46,7 +46,8 @@
 //! | Kind | Path | Handler |
 //! |---|---|---|
 //! | `call` | `ScriptHandle::call_handler_with` | `async def`, K siphon awaitables |
-//! | `request` | executor job, `start_coroutine`, `resume_on_executor`, as the request dispatcher | `async def`, K siphon awaitables |
+//! | `request` | executor job, `start_handler_coroutine`, `resume_on_executor`, as the request dispatcher | `async def`, K siphon awaitables |
+//! | `request_gather` | as `request` | `tasks.gather` of a script coroutine (K - 1 awaitables) and one awaitable |
 //! | `sync` | `ScriptHandle::call_handler_with` | `def`, blocks released for 5 to 50 ms |
 //! | `gather` | `ScriptHandle::call_handler_with` | `asyncio.gather` of two awaitables, then K - 2 more |
 //! | `wrapped` | `ScriptHandle::call_handler_with` | K awaitables behind a wrapper coroutine shared with `wrapped_asyncio` |
@@ -74,7 +75,8 @@
 //! | `SOAK_WORK` | `0` | Session reads a handler does before each await and before it returns |
 //! | `SOAK_DELAY_P50_MS` / `SOAK_DELAY_P99_MS` | `2` / `80` | Awaitable delay |
 //! | `SOAK_SYNC_BLOCK_MS` | `5,50` | Shortest and longest sync block |
-//! | `SOAK_MIX` | `call=25,request=25,sync=30,gather=5,wrapped=10,wrapped_asyncio=5` | Weights |
+//! | `SOAK_MIX` | `call=25,request=25,sync=30,gather=5,wrapped=10,wrapped_asyncio=5` | Weights (`request_gather` is 0 unless named) |
+//! | `SOAK_DIRECT` | `0` | `1` runs with `script.direct_dispatch: on` |
 //! | `SOAK_ASYNCIO` | `1` | `0` moves the two asyncio kinds' weight to `call` |
 //! | `SOAK_WORKERS` | `6` | Tokio workers |
 //! | `SOAK_DRIVERS` | `6` | Asyncio drivers (`script.async_pool_size`) |
@@ -95,9 +97,10 @@
 //! bound on the stop-the-world inside it. In-flight, pool size and queue wait
 //! are the executor's own gauges, which it publishes once a second. One line
 //! says how many async handlers finished as an asyncio task and how many
-//! without one, which is how to tell which path a build took. A last
+//! without one, which is how to tell which path a run took. A last
 //! `SOAK_RESULT` line repeats the headline figures as `key=value` for
-//! collating runs.
+//! collating runs, with the switch, the calls the runners refused and the
+//! machine's one-minute load average at the end.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -107,10 +110,9 @@ use std::time::{Duration, Instant};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule, PyModuleMethods};
 
-use crate::script::async_pool::PendingCoroutine;
 use crate::script::engine::ScriptEngine;
 use crate::script::handle::{HandlerHandle, ScriptHandle};
-use crate::script::inline_dispatch::{start_coroutine, CoroutineStart};
+use crate::script::inline_dispatch::{start_handler_coroutine, HandlerStart, PendingHandler};
 use crate::script::py_executor::{self, RunFailure};
 
 // ---------------------------------------------------------------------------
@@ -137,15 +139,17 @@ fn env_pair(name: &str, default: (u64, u64)) -> (u64, u64) {
 }
 
 /// The request kinds, in table order.
-const KINDS: [&str; 6] = [
+const KINDS: [&str; 7] = [
     "call",
     "request",
     "sync",
     "gather",
     "wrapped",
     "wrapped_asyncio",
+    "request_gather",
 ];
-const REQUEST_KIND: usize = 1;
+/// The kinds dispatched as the request dispatcher does.
+const REQUEST_KINDS: [usize; 2] = [1, 6];
 const ASYNCIO_KINDS: [usize; 2] = [3, 5];
 const DEFAULT_MIX: &str = "call=25,request=25,sync=30,gather=5,wrapped=10,wrapped_asyncio=5";
 
@@ -160,7 +164,9 @@ struct SoakConfig {
     sync_block_ms: (u64, u64),
     delay_p50_ms: f64,
     delay_p99_ms: f64,
-    weights: [u64; 6],
+    weights: [u64; 7],
+    /// `script.direct_dispatch`.
+    direct: bool,
     workers: usize,
     drivers: usize,
     cpus: usize,
@@ -174,7 +180,7 @@ struct SoakConfig {
 impl SoakConfig {
     fn from_env() -> Self {
         let mix = std::env::var("SOAK_MIX").unwrap_or_else(|_| DEFAULT_MIX.to_string());
-        let mut weights = [0u64; 6];
+        let mut weights = [0u64; 7];
         for entry in mix.split(',') {
             let Some((name, weight)) = entry.split_once('=') else {
                 continue;
@@ -204,6 +210,7 @@ impl SoakConfig {
             delay_p50_ms: env_parse("SOAK_DELAY_P50_MS", 2.0),
             delay_p99_ms: env_parse("SOAK_DELAY_P99_MS", 80.0),
             weights,
+            direct: env_parse("SOAK_DIRECT", 0u8) != 0,
             workers: env_parse("SOAK_WORKERS", 6),
             drivers: env_parse("SOAK_DRIVERS", 6),
             cpus: env_parse("SOAK_CPUS", available),
@@ -327,6 +334,7 @@ import threading
 import time
 import _siphon_registry as _r
 import _dispatch_soak as soak
+from siphon import tasks
 
 _PAGE = os.sysconf("SC_PAGE_SIZE")
 
@@ -427,6 +435,21 @@ async def request_h(request):
         _work(request["seed"] + request["waited"])
     _note_finish()
 
+async def _lookup(seed, awaits):
+    total = 0
+    for _ in range(awaits):
+        total += await soak.wait()
+        _work(seed + total)
+    return total
+
+async def request_gather_h(request):
+    _touch(request["seed"])
+    looked_up, waited = await tasks.gather(
+        _lookup(request["seed"], max(1, request["awaits"] - 1)), soak.wait())
+    request["waited"] += looked_up + waited
+    _work(request["seed"] + request["waited"])
+    _note_finish()
+
 def sync_h(seed, awaits):
     _touch(seed)
     return soak.block()
@@ -501,6 +524,7 @@ for name, handler, is_async in [
     ("gather", gather_h, True),
     ("wrapped", route(_wrapped), True),
     ("wrapped_asyncio", route(_wrapped_asyncio), True),
+    ("request_gather", request_gather_h, True),
     ("gc_reset", gc_reset, False),
     ("gc_report", gc_report, False),
     ("finished", finished, False),
@@ -548,7 +572,11 @@ fn load_engine(config: &SoakConfig) -> Arc<ScriptEngine> {
             handler_timeout_secs: None,
             executor_queue_capacity: config.queue,
             include_paths: Vec::new(),
-            direct_dispatch: crate::config::DirectDispatch::Off,
+            direct_dispatch: if config.direct {
+                crate::config::DirectDispatch::On
+            } else {
+                crate::config::DirectDispatch::Off
+            },
         })
         .unwrap(),
     )
@@ -577,11 +605,12 @@ struct KindStats {
 /// What the request tasks share.
 struct Shared {
     handle: ScriptHandle,
-    /// By kind; `None` for the request kind, which is not called through the
-    /// handle.
+    /// By kind; `None` for the request kinds, which are not called through
+    /// the handle.
     handlers: Vec<Option<HandlerHandle>>,
-    /// The request kind's callable, as the dispatcher holds a handler's.
-    request_callable: Arc<Py<PyAny>>,
+    /// By kind: a request kind's callable, as the dispatcher holds a
+    /// handler's.
+    request_callables: Vec<Option<Arc<Py<PyAny>>>>,
     awaits: (u64, u64),
     measuring: AtomicBool,
     stopping: AtomicBool,
@@ -640,14 +669,20 @@ async fn call_through_handle(shared: &Shared, kind: usize, seed: u64, awaits: u6
 /// What the first executor job of a request-path call came to.
 enum RequestStep {
     Decided(Result<(), String>),
-    Suspended(PendingCoroutine, Py<PyAny>),
+    Suspended(PendingHandler, Py<PyAny>),
+    /// No runner had room: the dispatcher answers such a request as shed.
+    Refused,
 }
 
 /// The request dispatcher's shape (`dispatcher::request_script`): a job calls
 /// the handler and starts its coroutine; if that suspends the job ends, and
 /// the rest runs as a new executor job once the coroutine has settled.
-async fn call_as_request(shared: &Shared, seed: u64, awaits: u64) -> Outcome {
-    let callable = Arc::clone(&shared.request_callable);
+async fn call_as_request(shared: &Shared, kind: usize, seed: u64, awaits: u64) -> Outcome {
+    let callable = Arc::clone(
+        shared.request_callables[kind]
+            .as_ref()
+            .expect("a request kind"),
+    );
     let (sender, receiver) = tokio::sync::oneshot::channel::<Result<(), String>>();
     let started = py_executor::try_run_classified(move || {
         let step = crate::script::attach::attach(|python| {
@@ -660,13 +695,20 @@ async fn call_as_request(shared: &Shared, seed: u64, awaits: u64) -> Outcome {
             };
             let started = build().and_then(|request| {
                 let returned = callable.bind(python).call1((&request,))?;
-                Ok((start_coroutine(python, &returned)?, request))
+                let started = start_handler_coroutine(
+                    python,
+                    &returned,
+                    &callable,
+                    crate::script::runner::Admit::Bounded,
+                )?;
+                Ok((started, request))
             });
             match started {
-                Ok((CoroutineStart::Finished(_), _)) => RequestStep::Decided(Ok(())),
-                Ok((CoroutineStart::Suspended(pending), request)) => {
+                Ok((HandlerStart::Finished(_), _)) => RequestStep::Decided(Ok(())),
+                Ok((HandlerStart::Suspended(pending), request)) => {
                     RequestStep::Suspended(pending, request.into_any().unbind())
                 }
+                Ok((HandlerStart::Refused(_), _)) => RequestStep::Refused,
                 Err(error) => RequestStep::Decided(Err(error.to_string())),
             }
         });
@@ -674,6 +716,8 @@ async fn call_as_request(shared: &Shared, seed: u64, awaits: u64) -> Outcome {
             RequestStep::Decided(result) => {
                 let _ = sender.send(result);
             }
+            // The sender goes unused: the caller counts the request as shed.
+            RequestStep::Refused => drop(sender),
             RequestStep::Suspended(pending, request) => {
                 pending.resume_on_executor(move |result| {
                     // The handler's value is dropped released, as the
@@ -705,8 +749,8 @@ async fn one_request(shared: Arc<Shared>, kind: usize, measured: bool) {
     let seed = (uniform() * 1e12) as u64;
     let awaits = uniform_between(shared.awaits);
     let begun = Instant::now();
-    let outcome = if kind == REQUEST_KIND {
-        call_as_request(&shared, seed, awaits).await
+    let outcome = if REQUEST_KINDS.contains(&kind) {
+        call_as_request(&shared, kind, seed, awaits).await
     } else {
         call_through_handle(&shared, kind, seed, awaits).await
     };
@@ -718,7 +762,7 @@ async fn one_request(shared: Arc<Shared>, kind: usize, measured: bool) {
 
 /// Open-loop arrivals: exponential gaps, and a late tick is followed at once
 /// by the ones it delayed, so the offered load never bends to the node.
-async fn generate(shared: Arc<Shared>, rate: f64, weights: [u64; 6]) {
+async fn generate(shared: Arc<Shared>, rate: f64, weights: [u64; 7]) {
     let total: u64 = weights.iter().sum();
     let mut next = tokio::time::Instant::now();
     while !shared.stopping.load(Ordering::Relaxed) {
@@ -840,6 +884,14 @@ fn cpu_quota() -> String {
         Some(format!("{:.0}%", quota / period * 100.0))
     };
     quota().unwrap_or_else(|| "none".to_string())
+}
+
+/// The machine's one-minute load average.
+fn load_average() -> f64 {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| text.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0.0)
 }
 
 /// Threads in the process.
@@ -1131,7 +1183,7 @@ fn print_report(config: &SoakConfig, report: &Report) {
          latency_p50_ms={:.2} latency_p99_ms={:.2} latency_max_ms={:.2} cpu_us={cpu_us:.0} \
          switches={switches:.1} preemptions={preemptions:.1} rss_max_mb={:.0} attach_over_1ms={} \
          attach_over_10ms={} no_task={} threads={} unpinned_p50_ms={:.3} unpinned_p99_ms={:.3} \
-         unpinned_max_ms={:.3}",
+         unpinned_max_ms={:.3} direct={} runner_rejected={} load1={:.2}",
         config.rate,
         config.heap_mb,
         attach.p50,
@@ -1158,6 +1210,9 @@ fn print_report(config: &SoakConfig, report: &Report) {
         unpinned.p50,
         unpinned.p99,
         unpinned.max,
+        u8::from(config.direct),
+        crate::script::runner::admission_rejected(),
+        load_average(),
     );
 }
 
@@ -1189,11 +1244,15 @@ fn dispatch_soak() {
             stall_abort: None,
         },
     );
-    crate::script::async_pool::AsyncPool::install(
+    let async_pool = crate::script::async_pool::AsyncPool::install(
         config.drivers,
         runtime.handle().clone(),
         crate::config::coroutine_timeout(None),
     );
+    // As the server applies `script.direct_dispatch`: on only if the
+    // self-test passes on this interpreter.
+    let direct = crate::script::runner::configure(config.direct, &async_pool);
+    assert_eq!(direct, config.direct, "the direct dispatch self-test");
     install_module(&config);
 
     let building = Instant::now();
@@ -1228,7 +1287,7 @@ fn dispatch_soak() {
     );
     println!(
         "mix={} workers={} drivers={} cpus={} cpu quota={} executor core={} max={} queue={} \
-         free_threaded={}",
+         free_threaded={} direct_dispatch={}",
         config.mix(),
         config.workers,
         config.drivers,
@@ -1238,22 +1297,31 @@ fn dispatch_soak() {
         sizing.max_threads,
         config.queue,
         free_threaded,
+        if direct { "on" } else { "off" },
     );
 
-    let request_callable = Arc::clone(
-        &engine
-            .state_arc()
-            .load()
-            .handlers_for_custom("soak.request")
-            .first()
-            .expect("registered")
-            .callable,
-    );
+    let request_callables = KINDS
+        .iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            REQUEST_KINDS.contains(&index).then(|| {
+                Arc::clone(
+                    &engine
+                        .state_arc()
+                        .load()
+                        .handlers_for_custom(&format!("soak.{kind}"))
+                        .first()
+                        .expect("registered")
+                        .callable,
+                )
+            })
+        })
+        .collect();
     let handlers = KINDS
         .iter()
         .enumerate()
         .map(|(index, kind)| {
-            (index != REQUEST_KIND).then(|| {
+            (!REQUEST_KINDS.contains(&index)).then(|| {
                 handle
                     .handlers_for(&format!("soak.{kind}"))
                     .into_iter()
@@ -1265,7 +1333,7 @@ fn dispatch_soak() {
     let shared = Arc::new(Shared {
         handle: handle.clone(),
         handlers,
-        request_callable,
+        request_callables,
         awaits: config.awaits,
         measuring: AtomicBool::new(false),
         stopping: AtomicBool::new(false),

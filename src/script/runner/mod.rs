@@ -32,10 +32,13 @@
 //! With `script.direct_dispatch: on`, an `async def` handler called through
 //! [`crate::script::ScriptHandle`] is stepped here, on its driver thread,
 //! without an asyncio task, for as long as it awaits only siphon's own
-//! awaitables. See [`drive`].
+//! awaitables, and so are a request's and a Diameter request's handlers.
+//! See [`drive`]. `tasks.gather` runs several coroutines of such a handler
+//! on the same runner: see [`gather`].
 
 mod awaitable;
 mod drive;
+mod gather;
 mod python;
 mod switch;
 mod task;
@@ -55,7 +58,10 @@ use wake::{wake_pair, WakeReceiver, WakeSender};
 #[cfg(test)]
 pub(crate) use awaitable::SiphonAwaitable;
 pub use awaitable::{spawn_awaitable, AwaitableFuture, BuildValue};
-pub(crate) use drive::{in_direct_step, start, timeout_error, Admission, DriveHandle, Waited};
+pub(crate) use drive::{
+    in_direct_step, start, timeout_error, Admission, Admit, DriveHandle, Waited,
+};
+pub(crate) use gather::gather;
 pub use switch::{admission_rejected, configure, demotions, DEFAULT_ADMISSION_LIMIT};
 pub(crate) use switch::{clear_demoted, enabled as direct_dispatch_enabled, register};
 #[cfg(test)]
@@ -133,6 +139,8 @@ pub(crate) struct RunnerStats {
     pub drives: usize,
     /// Awaitables whose Rust future has not finished.
     pub awaitables: usize,
+    /// Gathers with a child still running.
+    pub gathers: usize,
     /// Coroutines started without an asyncio task.
     pub direct_starts: u64,
     /// Steps run without an asyncio task.
@@ -156,6 +164,7 @@ pub(crate) struct RunnerShared {
     in_flight: AtomicUsize,
     drives: AtomicUsize,
     awaitables: AtomicUsize,
+    gathers: AtomicUsize,
     direct_starts: AtomicU64,
     direct_steps: AtomicU64,
 }
@@ -222,6 +231,7 @@ impl RunnerShared {
             in_flight: self.in_flight.load(Ordering::SeqCst),
             drives: self.drives.load(Ordering::Relaxed),
             awaitables: self.awaitables.load(Ordering::Relaxed),
+            gathers: self.gathers.load(Ordering::Relaxed),
             direct_starts: self.direct_starts.load(Ordering::Relaxed),
             direct_steps: self.direct_steps.load(Ordering::Relaxed),
         }
@@ -322,6 +332,7 @@ impl RunnerOwner {
                 in_flight: AtomicUsize::new(0),
                 drives: AtomicUsize::new(0),
                 awaitables: AtomicUsize::new(0),
+                gathers: AtomicUsize::new(0),
                 direct_starts: AtomicU64::new(0),
                 direct_steps: AtomicU64::new(0),
             }),
@@ -501,5 +512,7 @@ impl RunnerDrain {
 mod direct_edge_tests;
 #[cfg(test)]
 pub(crate) mod direct_tests;
+#[cfg(test)]
+mod gather_tests;
 #[cfg(test)]
 mod tests;

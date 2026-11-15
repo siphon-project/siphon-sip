@@ -18,6 +18,8 @@
 
 mod backend;
 #[cfg(test)]
+mod direct_tests;
+#[cfg(test)]
 use backend::spawn_backend_connection;
 
 use std::collections::HashMap;
@@ -39,11 +41,11 @@ use crate::diameter::server::{CerDecision, ServerHandshake, ServerIdentity, Tena
 use crate::diameter::transport::DiameterListener;
 use crate::diameter::{forward, DiameterClient, DiameterManager};
 use crate::script::api::diameter_server::{PyDiameterAnswer, PyDiameterRequest, PyInboundPeer};
-use crate::script::async_pool::PendingCoroutine;
 use crate::script::engine::{
     run_coroutine_value, HandlerEntry, HandlerKind, ScriptEngine, ScriptState,
 };
-use crate::script::inline_dispatch::{start_coroutine, CoroutineStart};
+use crate::script::inline_dispatch::{start_handler_coroutine, HandlerStart, PendingHandler};
+use crate::script::runner::Admit;
 
 /// Global cap on concurrently in-flight inbound requests being relayed.
 const MAX_INFLIGHT: usize = 512;
@@ -695,6 +697,7 @@ pub(crate) async fn dispatch_request(
             &inbound_peer,
             &incoming,
             (&local_origin_host, &local_origin_realm),
+            "admission_limit",
             start,
         )
         .await;
@@ -724,12 +727,30 @@ pub(crate) async fn dispatch_request(
                 AnswerStart::Awaiting(pending, suspended) => {
                     DispatchStep::AwaitingRequestHandler { pending, suspended }
                 }
+                AnswerStart::Refused => DispatchStep::Refused {
+                    incoming,
+                    origin: (local_origin_host, local_origin_realm),
+                },
             }
         })
     })
     .await;
 
     let mut step = match join {
+        // Every asyncio driver was full (`script.direct_dispatch`): the
+        // handler never ran, and the request is answered 3004 as one the
+        // admission limit sheds.
+        Ok(DispatchStep::Refused { incoming, origin }) => {
+            shed_too_busy(
+                &inbound_peer,
+                &incoming,
+                (&origin.0, &origin.1),
+                "runner_admission",
+                start,
+            )
+            .await;
+            return;
+        }
         Ok(step) => step,
         Err(_panic) => {
             warn!("Diameter server: dispatch task panicked");
@@ -739,6 +760,8 @@ pub(crate) async fn dispatch_request(
     let outcome = loop {
         let resumed = match step {
             DispatchStep::Answered(outcome) => break outcome,
+            // Only the request handler is refused, and that was answered above.
+            DispatchStep::Refused { .. } => return,
             DispatchStep::AwaitingRequestHandler { pending, suspended } => {
                 let result = pending.wait().await;
                 let engine = Arc::clone(&engine);
@@ -845,14 +868,21 @@ pub(crate) async fn dispatch_request(
 /// async handler's coroutine on an asyncio driver.
 enum DispatchStep {
     Answered(AnswerOutcome),
+    /// `@diameter.on_request` could not be started: no asyncio driver had
+    /// room for it. The request comes back, with the identity to answer as,
+    /// to be answered 3004.
+    Refused {
+        incoming: IncomingRequest,
+        origin: (String, String),
+    },
     /// `@diameter.on_request` is awaiting.
     AwaitingRequestHandler {
-        pending: PendingCoroutine,
+        pending: PendingHandler,
         suspended: SuspendedAnswer,
     },
     /// The `@diameter.on_reply` handler before `next` is awaiting.
     AwaitingReplyHandler {
-        pending: PendingCoroutine,
+        pending: PendingHandler,
         /// The script the handlers come from, so a reload while one awaits
         /// neither changes nor frees the handlers still to run.
         script: Arc<ScriptState>,
@@ -906,7 +936,7 @@ enum CompletedStep {
     Done,
     /// The handler before `next` is awaiting.
     Awaiting {
-        pending: PendingCoroutine,
+        pending: PendingHandler,
         script: Arc<ScriptState>,
         hook: CompletedHook,
         next: usize,
@@ -929,18 +959,24 @@ fn run_on_request_completed(
             hook.latency_us,
         ));
         match call {
-            Ok(value) if handler.is_async => match start_coroutine(python, &value) {
-                Ok(CoroutineStart::Finished(_)) => {}
-                Ok(CoroutineStart::Suspended(pending)) => {
-                    return CompletedStep::Awaiting {
-                        pending,
-                        script: Arc::clone(script),
-                        hook,
-                        next: index + 1,
-                    };
+            // The request was admitted and answered: its hooks are never
+            // refused a place.
+            Ok(value) if handler.is_async => {
+                match start_handler_coroutine(python, &value, &handler.callable, Admit::Accepted) {
+                    Ok(HandlerStart::Finished(_)) => {}
+                    Ok(HandlerStart::Suspended(pending)) => {
+                        return CompletedStep::Awaiting {
+                            pending,
+                            script: Arc::clone(script),
+                            hook,
+                            next: index + 1,
+                        };
+                    }
+                    Ok(HandlerStart::Refused(error)) | Err(error) => {
+                        warn!(%error, "Diameter server: async on_request_completed failed")
+                    }
                 }
-                Err(error) => warn!(%error, "Diameter server: async on_request_completed failed"),
-            },
+            }
             Ok(_) => {}
             Err(error) => warn!(%error, "Diameter server: on_request_completed failed"),
         }
@@ -971,16 +1007,19 @@ fn emitted_answer_result_label(wire: &[u8]) -> &'static str {
 }
 
 /// Answer `incoming` DIAMETER_TOO_BUSY (3004) without running the script, as
-/// `diameter.overload.reporting.admission_limit` asks, with the overload this
-/// node reports (RFC 7683) for a requester that advertised DOIC.
+/// `diameter.overload.reporting.admission_limit` asks or because no asyncio
+/// driver had room for its handler (`reason` says which, in the shed metric),
+/// with the overload this node reports (RFC 7683) for a requester that
+/// advertised DOIC.
 async fn shed_too_busy(
     inbound_peer: &DiameterPeer,
     incoming: &IncomingRequest,
     local_origin: (&str, &str),
+    reason: &str,
     start: Instant,
 ) {
     let Some(wire) =
-        crate::diameter::overload::too_busy_answer(&incoming.raw, local_origin, "admission_limit")
+        crate::diameter::overload::too_busy_answer(&incoming.raw, local_origin, reason)
     else {
         warn!("Diameter server: shed a request that does not parse, no answer sent");
         return;
@@ -1109,22 +1148,28 @@ fn build_answer_via_handler(
 
     let handler_callable = handler.callable.bind(python);
     let resolved = match handler_callable.call1((request_py.bind(python),)) {
-        Ok(value) if handler.is_async => match start_coroutine(python, &value) {
-            Ok(CoroutineStart::Finished(resolved)) => Ok(resolved),
-            Ok(CoroutineStart::Suspended(pending)) => {
-                return AnswerStart::Awaiting(
-                    pending,
-                    SuspendedAnswer {
-                        request_msg,
-                        request_py,
-                        handler_callable: handler_callable.clone().unbind(),
-                        local_origin_host: local_origin_host.to_string(),
-                        local_origin_realm: local_origin_realm.to_string(),
-                    },
-                );
+        Ok(value) if handler.is_async => {
+            match start_handler_coroutine(python, &value, &handler.callable, Admit::Bounded) {
+                Ok(HandlerStart::Finished(resolved)) => Ok(resolved),
+                Ok(HandlerStart::Refused(refused)) => {
+                    tracing::debug!(%refused, "Diameter server: on_request handler refused; answering 3004");
+                    return AnswerStart::Refused;
+                }
+                Ok(HandlerStart::Suspended(pending)) => {
+                    return AnswerStart::Awaiting(
+                        pending,
+                        SuspendedAnswer {
+                            request_msg,
+                            request_py,
+                            handler_callable: handler_callable.clone().unbind(),
+                            local_origin_host: local_origin_host.to_string(),
+                            local_origin_realm: local_origin_realm.to_string(),
+                        },
+                    );
+                }
+                Err(error) => Err(HandlerFailure::Coroutine(error)),
             }
-            Err(error) => Err(HandlerFailure::Coroutine(error)),
-        },
+        }
         Ok(value) => Ok(value.unbind()),
         Err(error) => Err(HandlerFailure::Call(error)),
     };
@@ -1143,7 +1188,10 @@ fn build_answer_via_handler(
 /// asyncio driver.
 enum AnswerStart {
     Done(AnswerOutcome),
-    Awaiting(PendingCoroutine, SuspendedAnswer),
+    Awaiting(PendingHandler, SuspendedAnswer),
+    /// No asyncio driver had room for the handler: the request is to be
+    /// answered DIAMETER_TOO_BUSY.
+    Refused,
 }
 
 #[cfg(test)]
@@ -1154,6 +1202,7 @@ impl AnswerStart {
         match self {
             AnswerStart::Done(outcome) => outcome,
             AnswerStart::Awaiting(..) => panic!("a handler suspended off an executor worker"),
+            AnswerStart::Refused => panic!("a handler was refused off an executor worker"),
         }
     }
 }
@@ -1310,7 +1359,7 @@ enum ReplyRun {
     Done { ran: bool },
     /// The handler before `next` is awaiting.
     Awaiting {
-        pending: PendingCoroutine,
+        pending: PendingHandler,
         next: usize,
     },
 }
@@ -1336,18 +1385,21 @@ fn run_on_reply(
             .bind(python)
             .call1((request_py.bind(python), answer_py.bind(python)))
         {
-            Ok(value) if handler.is_async => match start_coroutine(python, &value) {
-                Ok(CoroutineStart::Finished(_)) => {}
-                Ok(CoroutineStart::Suspended(pending)) => {
-                    return ReplyRun::Awaiting {
-                        pending,
-                        next: index + 1,
-                    };
+            // The request was admitted: its reply handlers are never refused.
+            Ok(value) if handler.is_async => {
+                match start_handler_coroutine(python, &value, &handler.callable, Admit::Accepted) {
+                    Ok(HandlerStart::Finished(_)) => {}
+                    Ok(HandlerStart::Suspended(pending)) => {
+                        return ReplyRun::Awaiting {
+                            pending,
+                            next: index + 1,
+                        };
+                    }
+                    Ok(HandlerStart::Refused(error)) | Err(error) => {
+                        warn!(error = %crate::script::error_report::describe(python, &error), "Diameter server: async on_reply failed");
+                    }
                 }
-                Err(error) => {
-                    warn!(error = %crate::script::error_report::describe(python, &error), "Diameter server: async on_reply failed");
-                }
-            },
+            }
             Ok(_) => {}
             Err(error) => {
                 warn!(error = %crate::script::error_report::describe(python, &error), "Diameter server: on_reply handler raised")

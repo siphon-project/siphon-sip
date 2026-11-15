@@ -302,9 +302,15 @@ fn an_eager_task_inside_a_step_awaits_through_asyncio() {
         let drive = tokio::task::spawn_blocking(move || {
             Python::attach(|python| {
                 let coroutine = handler.bind(python).call0().unwrap();
-                crate::script::runner::start(&pool, python, &coroutine, None)
-                    .expect("admitted")
-                    .expect("taken by a runner")
+                crate::script::runner::start(
+                    &pool,
+                    python,
+                    &coroutine,
+                    None,
+                    crate::script::runner::Admit::Bounded,
+                )
+                .expect("admitted")
+                .expect("taken by a runner")
             })
         })
         .await
@@ -397,9 +403,15 @@ fn shutdown_closes_suspended_coroutines(collect: bool) {
                 // Most stay direct; a few are tasks by the time the driver stops.
                 let name = if index % 6 == 5 { "demoted" } else { "wedged" };
                 let coroutine = module.getattr(name).unwrap().call1((index,)).unwrap();
-                crate::script::runner::start(&pool, python, &coroutine, None)
-                    .expect("admitted")
-                    .expect("taken by the runner")
+                crate::script::runner::start(
+                    &pool,
+                    python,
+                    &coroutine,
+                    None,
+                    crate::script::runner::Admit::Bounded,
+                )
+                .expect("admitted")
+                .expect("taken by the runner")
             })
             .collect();
         (module.unbind(), drives)

@@ -15145,6 +15145,15 @@ _numbers = MockNumbersNamespace()
 
 
 # ---------------------------------------------------------------------------
+# tasks namespace: several awaitables of one handler at the same time
+# ---------------------------------------------------------------------------
+
+from siphon_sdk.tasks import MockTasksNamespace
+
+_tasks = MockTasksNamespace()
+
+
+# ---------------------------------------------------------------------------
 # config namespace: operator-supplied script configuration (script_config:)
 # ---------------------------------------------------------------------------
 
@@ -15636,6 +15645,7 @@ def install() -> ModuleType:
     mod.stir = _stir  # type: ignore[attr-defined]
     mod.sdp = _sdp  # type: ignore[attr-defined]
     mod.numbers = _numbers  # type: ignore[attr-defined]
+    mod.tasks = _tasks  # type: ignore[attr-defined]
     mod.qos = _qos  # type: ignore[attr-defined]
     mod.config = _script_config  # type: ignore[attr-defined]
     # LCR namespace (B2BUA-only) + the Route / LcrDecision types (mirrors the
@@ -15699,6 +15709,7 @@ def reset() -> None:
     _ipsec.clear()
     _stir.clear()
     _numbers.clear()
+    _tasks.clear()
     _script_config.clear()
     _smpp.clear()
     _http.clear()

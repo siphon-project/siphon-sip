@@ -20,7 +20,7 @@ use crate::script::stop_the_world_tests::{collect_garbage_until, in_child};
 
 /// Futures behind `never()` that were dropped: a cancelled awaitable must
 /// drop its Rust future, not leave it parked on tokio.
-pub(super) static NEVER_DROPPED: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static NEVER_DROPPED: AtomicUsize = AtomicUsize::new(0);
 
 struct CountsDrop;
 
@@ -110,7 +110,7 @@ fn direct() -> bool {
     crate::script::runner::in_direct_step()
 }
 
-fn install_probe_module() {
+pub(crate) fn install_probe_module() {
     Python::initialize();
     Python::attach(|python| {
         let modules = python.import("sys").unwrap().getattr("modules").unwrap();
@@ -582,10 +582,11 @@ pub(super) struct Rig {
 }
 
 impl Rig {
-    fn new() -> Self {
+    /// A rig whose handlers are the `direct.<name>` ones `script` registers.
+    pub(super) fn with_script(script: &str) -> Self {
         install_probe_module();
         let mut file = NamedTempFile::new().unwrap();
-        file.write_all(SCRIPT.as_bytes()).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
         file.flush().unwrap();
         let engine = Arc::new(
             ScriptEngine::new(&crate::config::ScriptConfig {
@@ -638,20 +639,22 @@ impl Rig {
 
 /// The runners' counters, summed over the pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Totals {
-    pub(super) in_flight: usize,
-    pub(super) drives: usize,
-    pub(super) awaitables: usize,
-    pub(super) direct_starts: u64,
-    pub(super) direct_steps: u64,
+pub(crate) struct Totals {
+    pub(crate) in_flight: usize,
+    pub(crate) drives: usize,
+    pub(crate) awaitables: usize,
+    pub(crate) gathers: usize,
+    pub(crate) direct_starts: u64,
+    pub(crate) direct_steps: u64,
 }
 
-pub(super) fn totals() -> Totals {
+pub(crate) fn totals() -> Totals {
     let (_, pool) = ensure_test_pools();
     let mut totals = Totals {
         in_flight: 0,
         drives: 0,
         awaitables: 0,
+        gathers: 0,
         direct_starts: 0,
         direct_steps: 0,
     };
@@ -660,6 +663,7 @@ pub(super) fn totals() -> Totals {
         totals.in_flight += stats.in_flight;
         totals.drives += stats.drives;
         totals.awaitables += stats.awaitables;
+        totals.gathers += stats.gathers;
         totals.direct_starts += stats.direct_starts;
         totals.direct_steps += stats.direct_steps;
     }
@@ -668,13 +672,14 @@ pub(super) fn totals() -> Totals {
 
 /// Wait until nothing is in flight on any runner: slab, admissions and
 /// tracked awaitables all back to `baseline`.
-pub(super) async fn settles_to(baseline: Totals, what: &str) {
+pub(crate) async fn settles_to(baseline: Totals, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let now = totals();
         if now.in_flight == baseline.in_flight
             && now.drives == baseline.drives
             && now.awaitables == baseline.awaitables
+            && now.gathers == baseline.gathers
         {
             return;
         }
@@ -687,10 +692,10 @@ pub(super) async fn settles_to(baseline: Totals, what: &str) {
 }
 
 /// Puts the switch back off when a scenario ends, however it ends.
-struct Switch;
+pub(crate) struct Switch;
 
 impl Switch {
-    fn set(on: bool) -> Self {
+    pub(crate) fn set(on: bool) -> Self {
         crate::script::runner::set_enabled_for_test(on);
         Self
     }
@@ -712,12 +717,21 @@ where
     F: FnOnce(Rig) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    with_pools_running(on, SCRIPT, scenario);
+}
+
+/// [`with_pools`] for a rig running `script`.
+pub(super) fn with_pools_running<F, Fut>(on: bool, script: &str, scenario: F)
+where
+    F: FnOnce(Rig) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let _serial = pool_test_guard();
     test_pools_runtime().block_on(async {
         ensure_test_pools();
         let _switch = Switch::set(on);
         // No test waits longer than this: a hang is a failure, not a stall.
-        tokio::time::timeout(Duration::from_secs(90), scenario(Rig::new()))
+        tokio::time::timeout(Duration::from_secs(90), scenario(Rig::with_script(script)))
             .await
             .expect("the scenario finished");
     });

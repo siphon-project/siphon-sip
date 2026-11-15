@@ -327,7 +327,13 @@ pub(crate) fn start_handle_coroutine(
         && tokio::runtime::Handle::try_current().is_ok()
     {
         if let Some(pool) = crate::script::async_pool::AsyncPool::global() {
-            return match crate::script::runner::start(&pool, python, coroutine, Some(handler)) {
+            return match crate::script::runner::start(
+                &pool,
+                python,
+                coroutine,
+                Some(handler),
+                crate::script::runner::Admit::Bounded,
+            ) {
                 Ok(Some(drive)) => Ok(HandleStart::Direct(drive)),
                 // A handler that uses asyncio starts as a task.
                 Ok(None) => {
@@ -338,6 +344,142 @@ pub(crate) fn start_handle_coroutine(
         }
     }
     drive_suspending_coroutine(python, coroutine).map(HandleStart::Finished)
+}
+
+/// A request or Diameter handler's coroutine that suspended, as its
+/// dispatcher holds it while it waits: an asyncio task on a driver, or, with
+/// `script.direct_dispatch` on, a coroutine its driver's runner steps.
+pub(crate) enum PendingHandler {
+    Task(PendingCoroutine),
+    /// The callable names the handler if it times out.
+    Direct(
+        crate::script::runner::DriveHandle,
+        std::sync::Arc<Py<PyAny>>,
+    ),
+}
+
+/// The handler's result once a direct drive is over. Attaches only to name a
+/// handler that timed out.
+fn direct_result(
+    waited: crate::script::runner::Waited,
+    handler: &std::sync::Arc<Py<PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    match waited {
+        crate::script::runner::Waited::Settled(result) => result,
+        crate::script::runner::Waited::TimedOut(timeout) => {
+            let name = Python::attach(|python| {
+                handler
+                    .bind(python)
+                    .getattr("__qualname__")
+                    .and_then(|name| name.extract::<String>())
+                    .unwrap_or_else(|_| "<unknown>".to_string())
+            });
+            Err(crate::script::runner::timeout_error(&name, timeout))
+        }
+    }
+}
+
+impl PendingHandler {
+    /// Wait for the handler's result from async code: no executor worker is
+    /// held and, unless it times out, the interpreter is not attached. On
+    /// timeout the coroutine is cancelled.
+    pub(crate) async fn wait(self) -> PyResult<Py<PyAny>> {
+        match self {
+            Self::Task(pending) => pending.wait().await,
+            Self::Direct(drive, handler) => direct_result(drive.wait().await, &handler),
+        }
+    }
+
+    /// Wait on a tokio task, then run `resume` with the handler's result as
+    /// one queued job on the Python executor, detached. One job for the
+    /// call, however often the handler awaited. See
+    /// [`PendingCoroutine::resume_on_executor`].
+    pub(crate) fn resume_on_executor<F>(self, resume: F)
+    where
+        F: FnOnce(PyResult<Py<PyAny>>) + Send + 'static,
+    {
+        match self {
+            Self::Task(pending) => pending.resume_on_executor(resume),
+            Self::Direct(drive, handler) => {
+                tokio::spawn(async move {
+                    let waited = drive.wait().await;
+                    let queued = crate::script::py_executor::spawn_queued(move || {
+                        resume(direct_result(waited, &handler));
+                    })
+                    .await;
+                    if !queued {
+                        error!(
+                            "Python executor closed while an async handler was awaiting; \
+                             the work after its await cannot run"
+                        );
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// What [`start_handler_coroutine`] did with a coroutine.
+pub(crate) enum HandlerStart {
+    /// It ran to the end here; this is its value.
+    Finished(Py<PyAny>),
+    /// It suspended. The caller waits for it with [`PendingHandler::wait`] or
+    /// [`PendingHandler::resume_on_executor`] and continues from there.
+    Suspended(PendingHandler),
+    /// Every runner was full: it never ran. The caller answers the request as
+    /// one it sheds.
+    Refused(PyErr),
+}
+
+/// [`start_coroutine`] for a request or Diameter handler, which is where
+/// `script.direct_dispatch` applies: with it on, a coroutine that suspends is
+/// stepped by its driver's runner instead of an asyncio task, unless
+/// `handler` is known to use asyncio. With it off this is [`start_coroutine`],
+/// unchanged.
+///
+/// `admit` says whether the coroutine is new work, which a full pool refuses,
+/// or a later handler of a request that was admitted already, which is never
+/// refused.
+pub(crate) fn start_handler_coroutine(
+    python: Python<'_>,
+    coroutine: &Bound<'_, pyo3::PyAny>,
+    handler: &std::sync::Arc<Py<PyAny>>,
+    admit: crate::script::runner::Admit,
+) -> PyResult<HandlerStart> {
+    if !crate::script::runner::direct_dispatch_enabled() {
+        return start_coroutine(python, coroutine).map(|started| match started {
+            CoroutineStart::Finished(value) => HandlerStart::Finished(value),
+            CoroutineStart::Suspended(pending) => {
+                HandlerStart::Suspended(PendingHandler::Task(pending))
+            }
+        });
+    }
+    if let Some(value) = run_coroutine_inline(python, coroutine)? {
+        return Ok(HandlerStart::Finished(value));
+    }
+    if crate::script::py_executor::on_worker_thread()
+        && tokio::runtime::Handle::try_current().is_ok()
+    {
+        if let Some(pool) = crate::script::async_pool::AsyncPool::global() {
+            return match crate::script::runner::start(
+                &pool,
+                python,
+                coroutine,
+                Some(handler),
+                admit,
+            ) {
+                Ok(Some(drive)) => Ok(HandlerStart::Suspended(PendingHandler::Direct(
+                    drive,
+                    std::sync::Arc::clone(handler),
+                ))),
+                // A handler that uses asyncio starts as a task.
+                Ok(None) => PendingCoroutine::submit(&pool, python, coroutine)
+                    .map(|pending| HandlerStart::Suspended(PendingHandler::Task(pending))),
+                Err(refused) => Ok(HandlerStart::Refused(refused)),
+            };
+        }
+    }
+    drive_suspending_coroutine(python, coroutine).map(HandlerStart::Finished)
 }
 
 /// Run a coroutine that may suspend to completion, blocking this thread: on

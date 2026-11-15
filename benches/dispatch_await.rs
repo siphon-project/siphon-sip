@@ -36,8 +36,10 @@ fn step(py: Python<'_>, value: i64) -> PyResult<Bound<'_, PyAny>> {
 }
 
 const SCRIPT: &str = r#"
+import asyncio
 import _siphon_registry as _r
 import _dispatch_await_bench as probe
+from siphon import tasks
 
 async def awaits_0(value):
     return value
@@ -51,8 +53,23 @@ async def awaits_4(value):
         total += await probe.step(value)
     return total
 
+async def lookup(value):
+    return await probe.step(value)
+
+# The shape of a handler that fetches two things at once: a coroutine of the
+# script that awaits one siphon API, beside one siphon awaitable.
+async def gather_tasks(value):
+    left, right = await tasks.gather(lookup(value), probe.step(value))
+    return left + right
+
+async def gather_asyncio(value):
+    left, right = await asyncio.gather(lookup(value), probe.step(value))
+    return left + right
+
 for awaits, handler in ((0, awaits_0), (1, awaits_1), (4, awaits_4)):
     _r.register(f"bench.awaits_{awaits}", None, handler, True, None)
+_r.register("bench.gather_tasks", None, gather_tasks, True, None)
+_r.register("bench.gather_asyncio", None, gather_asyncio, True, None)
 "#;
 
 async fn call(handle: &ScriptHandle, handler: &HandlerHandle, value: i64) -> i64 {
@@ -113,9 +130,18 @@ fn bench_dispatch_await(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("dispatch_await");
     group.throughput(Throughput::Elements(BATCH as u64));
     group.sample_size(30);
-    for awaits in [0usize, 1, 4] {
+    // The handler, what it is called in the report, and how many times its
+    // argument it returns.
+    let cases: [(&str, String, usize); 5] = [
+        ("awaits_0", "0".to_string(), 1),
+        ("awaits_1", "1".to_string(), 1),
+        ("awaits_4", "4".to_string(), 4),
+        ("gather_tasks", "gather_tasks".to_string(), 2),
+        ("gather_asyncio", "gather_asyncio".to_string(), 2),
+    ];
+    for (name, label, awaits) in cases {
         let handler = handle
-            .handlers_for(&format!("bench.awaits_{awaits}"))
+            .handlers_for(&format!("bench.{name}"))
             .into_iter()
             .next()
             .expect("registered");
@@ -124,7 +150,7 @@ fn bench_dispatch_await(criterion: &mut Criterion) {
             assert_eq!(applied, on, "the switch took");
             let mode = if on { "on" } else { "off" };
             group.bench_with_input(
-                BenchmarkId::new(mode, awaits),
+                BenchmarkId::new(mode, &label),
                 &awaits,
                 |bencher, &awaits| {
                     bencher.iter(|| {
@@ -145,7 +171,7 @@ fn bench_dispatch_await(criterion: &mut Criterion) {
                             total
                         });
                         let each: i64 = (0..BATCH as i64).sum();
-                        assert_eq!(total, each * awaits.max(1) as i64);
+                        assert_eq!(total, each * awaits as i64);
                     });
                 },
             );
