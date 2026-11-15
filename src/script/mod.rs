@@ -32,3 +32,7 @@ pub mod watcher;
 pub(crate) use blocking::{awaitable, detach_block_on, ready};
 pub use deferred::Deferred;
 pub use handle::{HandlerHandle, ScriptHandle};
+
+// A soak run by name on a release build, never as part of the suite.
+#[cfg(test)]
+mod dispatch_soak_bench_tests;

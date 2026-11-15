@@ -335,6 +335,10 @@ script:
   #
   # sync_pool_size: <int>          # core (always-on) threads. Default: max(8, 2 x CPUs).
   # sync_pool_max: <int>           # elastic ceiling. Default: max(32, 4 x core).
+  #                                # Never below core: a max under the core
+  #                                # (default 2 x CPUs) is raised to it, with a
+  #                                # startup warning. Set sync_pool_size too to
+  #                                # cap lower.
   #                                # Each grown worker costs ~2 MB of persistent
   #                                # Python heap, so peak memory ~= sync_pool_max
   #                                # x 2 MB. Lower it on memory-constrained NFs

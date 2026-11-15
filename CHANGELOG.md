@@ -15,6 +15,12 @@ entry, but a working config keeps working.
 
 ### Changed
 
+- **A `script.sync_pool_max` below the core pool size is now warned about at
+  startup.** The ceiling has always been raised to the core
+  (`sync_pool_size`, default `max(8, 2 x CPUs)`), so `sync_pool_max: 8` on a
+  6-CPU node silently allowed 12 workers. siphon now logs the requested and
+  effective values; set `sync_pool_size` as well to cap the pool lower.
+
 - **The open file limit is raised to the hard limit at startup.** Docker,
   containerd and systemd start services with a soft `RLIMIT_NOFILE` of 1024
   and a hard limit of 524288; siphon only used the 1024, so one TCP or TLS
