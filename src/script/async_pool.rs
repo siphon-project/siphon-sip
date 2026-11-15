@@ -38,16 +38,6 @@
 //! handler spawns is fully driven, including its `await` continuations on
 //! pyo3-async-bridged tokio futures (the wake-up
 //! `loop.call_soon_threadsafe(set_result, ...)` always lands on a live loop).
-//!
-//! # Which coroutines come here
-//!
-//! Not every `async def` handler needs a loop. One that cannot suspend runs
-//! inline (`script::inline_dispatch`), and one that awaits only siphon's own
-//! awaitables is stepped by the executor (`script::direct`) with a driver's
-//! loop as its running loop, so that the moment it does use asyncio (a task
-//! it creates, a sleep, a `gather`) it is handed to that driver whole and the
-//! guarantee above holds for it too. A handler that was handed over once
-//! starts here from then on.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -62,6 +52,8 @@ use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
+use crate::script::runner::{Admission, RunnerOwner, RunnerShared};
+
 /// Global pool, initialised once at server startup.  Handlers route through
 /// here when present; tests and CLI helpers without a configured pool fall
 /// back to the legacy per-thread `run_until_complete` path.
@@ -69,9 +61,8 @@ static GLOBAL: OnceLock<Arc<AsyncPool>> = OnceLock::new();
 
 /// One driver thread + its asyncio event loop handle.
 struct Driver {
-    /// The `asyncio` event loop bound to this driver's OS thread, and what a
-    /// handler step driven from the executor installs to run against it.
-    driver_loop: crate::script::direct::DriverLoop,
+    /// Python `asyncio.AbstractEventLoop` bound to this driver's OS thread.
+    loop_obj: Py<PyAny>,
     /// OS thread running `loop.run_forever()`.  `None` after [`AsyncPool::drop`].
     thread: StdMutex<Option<JoinHandle<()>>>,
     /// Pings the heartbeat monitor has scheduled on this loop.
@@ -79,6 +70,8 @@ struct Driver {
     /// Pings the loop has actually run. Equal to `pinged` means the loop is
     /// turning; falling behind means something is blocking on it.
     landed: Arc<AtomicU64>,
+    /// The native runner draining on this driver's loop.
+    runner: Arc<RunnerShared>,
 }
 
 /// A `#[pyclass]` callable the heartbeat schedules on a driver loop. Running
@@ -98,10 +91,7 @@ impl DriverHeartbeat {
 /// A coroutine handed to a driver: the oneshot its result arrives on, and the
 /// `concurrent.futures.Future` driving it, which the waiter cancels if it gives
 /// up first.
-type SubmittedCoroutine = (CoroutineOutcome, Py<PyAny>);
-
-/// Where a coroutine's result, or the exception it raised, arrives.
-pub(crate) type CoroutineOutcome = oneshot::Receiver<PyResult<Py<PyAny>>>;
+type SubmittedCoroutine = (oneshot::Receiver<PyResult<Py<PyAny>>>, Py<PyAny>);
 
 /// How often the monitor pings each driver loop.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
@@ -194,9 +184,6 @@ impl AsyncPool {
                     // nothing saying why.
                     error!(%error, "could not start the asyncio driver heartbeat");
                 }
-                // Executor-driven handlers stay off until one has been
-                // driven through every step on this interpreter.
-                crate::script::direct::self_test(&pool);
                 pool
             }
             Err(_) => {
@@ -218,7 +205,62 @@ impl AsyncPool {
         self.drivers.len()
     }
 
-    fn spawn(size: usize, tokio_handle: TokioHandle, coroutine_timeout: Duration) -> Self {
+    /// The native runner on driver `index`'s loop.
+    #[cfg(test)]
+    pub(crate) fn runner(&self, index: usize) -> Option<&Arc<RunnerShared>> {
+        self.drivers.get(index).map(|driver| &driver.runner)
+    }
+
+    /// Driver `index`'s event loop.
+    #[cfg(test)]
+    pub(crate) fn driver_loop<'py>(
+        &self,
+        python: Python<'py>,
+        index: usize,
+    ) -> Option<Bound<'py, PyAny>> {
+        self.drivers
+            .get(index)
+            .map(|driver| driver.loop_obj.bind(python).clone())
+    }
+
+    /// Reserve a place for one more handler on the runner with the fewest in
+    /// flight, among the drivers whose loop is turning. `None` when each of
+    /// them already has `limit` in flight: the caller fails the call, it
+    /// never waits for room.
+    ///
+    /// A stalled driver is only chosen when every driver is stalled: handing
+    /// a coroutine to a pinned loop buys it a timeout rather than a turn.
+    pub(crate) fn admit(&self, limit: usize) -> Option<Admission> {
+        let count = self.drivers.len();
+        // Ties go round the drivers, so an idle pool does not put every
+        // handler on the first one.
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        // A runner that fills between the look and the reservation is looked
+        // past on the next round; there are at most `count` of those.
+        for _ in 0..=count {
+            let pick = |stalled: bool| {
+                (0..count)
+                    .map(|offset| &self.drivers[(start + offset) % count])
+                    .filter(|driver| Self::driver_is_stalled(driver) == stalled)
+                    .map(|driver| (driver.runner.in_flight(), driver))
+                    .filter(|(in_flight, _)| *in_flight < limit)
+                    .min_by_key(|(in_flight, _)| *in_flight)
+                    .map(|(_, driver)| driver)
+            };
+            let all_stalled = self.drivers.iter().all(Self::driver_is_stalled);
+            let driver = pick(false).or_else(|| if all_stalled { pick(true) } else { None })?;
+            if let Some(admission) = driver.runner.try_admit(limit) {
+                return Some(admission);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn spawn(
+        size: usize,
+        tokio_handle: TokioHandle,
+        coroutine_timeout: Duration,
+    ) -> Self {
         let mut drivers = Vec::with_capacity(size);
         for index in 0..size {
             drivers.push(spawn_driver(index, tokio_handle.clone()));
@@ -274,8 +316,7 @@ impl AsyncPool {
                 // test. A closed loop raises, and a driver whose loop is gone
                 // is not a stall worth reporting.
                 if driver
-                    .driver_loop
-                    .event_loop
+                    .loop_obj
                     .bind(python)
                     .call_method1("call_soon_threadsafe", (callback,))
                     .is_ok()
@@ -334,12 +375,22 @@ impl AsyncPool {
         if self.drivers.is_empty() {
             return Err(PyRuntimeError::new_err("async pool has no drivers"));
         }
-        let index = self
-            .pick_driver()
-            .ok_or_else(|| PyRuntimeError::new_err("async pool has no drivers"))?;
-        let driver_loop = self.drivers[index].driver_loop.event_loop.bind(python);
+        // Round-robin, but step over a driver whose loop is pinned: handing a
+        // coroutine to a stalled loop buys it a timeout rather than a turn.
+        // Falls back to the round-robin pick when every driver is stalled —
+        // there is nowhere better, and the wait is bounded either way.
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        let index = (0..self.drivers.len())
+            .map(|offset| (start + offset) % self.drivers.len())
+            .find(|candidate| !Self::driver_is_stalled(&self.drivers[*candidate]))
+            .unwrap_or(start % self.drivers.len());
+        let driver_loop = self.drivers[index].loop_obj.bind(python);
 
-        let (py_bridge, receiver) = Self::completion_bridge(python)?;
+        let (sender, receiver) = oneshot::channel();
+        let bridge = AsyncPoolBridge {
+            sender: StdMutex::new(Some(sender)),
+        };
+        let py_bridge = Py::new(python, bridge)?;
 
         // One boundary crossing for the whole handover. The `is_closed()`
         // pre-check this replaced cost a Python call on every request to
@@ -364,41 +415,6 @@ impl AsyncPool {
             })?;
         Ok((receiver, cf.unbind()))
     }
-
-    /// The driver the next coroutine goes to.
-    ///
-    /// Round-robin, but stepping over a driver whose loop is pinned: handing a
-    /// coroutine to a stalled loop buys it a timeout rather than a turn. Falls
-    /// back to the round-robin pick when every driver is stalled — there is
-    /// nowhere better, and the wait is bounded either way. `None` only for a
-    /// pool with no drivers.
-    pub(crate) fn pick_driver(&self) -> Option<usize> {
-        if self.drivers.is_empty() {
-            return None;
-        }
-        let start = self.next.fetch_add(1, Ordering::Relaxed);
-        Some(
-            (0..self.drivers.len())
-                .map(|offset| (start + offset) % self.drivers.len())
-                .find(|candidate| !Self::driver_is_stalled(&self.drivers[*candidate]))
-                .unwrap_or(start % self.drivers.len()),
-        )
-    }
-
-    /// Driver `index`'s event loop.
-    pub(crate) fn driver_loop(&self, index: usize) -> Option<&crate::script::direct::DriverLoop> {
-        self.drivers.get(index).map(|driver| &driver.driver_loop)
-    }
-
-    /// A done-callback for a future or task on a driver loop, and the
-    /// receiver its outcome arrives on.
-    pub(crate) fn completion_bridge(python: Python<'_>) -> PyResult<(Py<PyAny>, CoroutineOutcome)> {
-        let (sender, receiver) = oneshot::channel();
-        let bridge = AsyncPoolBridge {
-            sender: StdMutex::new(Some(sender)),
-        };
-        Ok((Py::new(python, bridge)?.into_any(), receiver))
-    }
 }
 
 impl Drop for AsyncPool {
@@ -408,11 +424,14 @@ impl Drop for AsyncPool {
         // so this only matters for `Arc<AsyncPool>` instances the loser
         // of an `install()` race holds briefly.
         for driver in &self.drivers {
+            // The runner stops running work before its loop stops; the driver
+            // thread abandons what is left once `run_forever` returns.
+            driver.runner.shutdown();
             // `loop.call_soon_threadsafe(loop.stop)` schedules `stop()` on
             // the loop thread, which makes `run_forever` return on the
             // next iteration.
             let _ = Python::attach(|python| -> PyResult<()> {
-                let bound = driver.driver_loop.event_loop.bind(python);
+                let bound = driver.loop_obj.bind(python);
                 let stop = bound.getattr("stop")?;
                 bound.call_method1("call_soon_threadsafe", (stop,))?;
                 Ok(())
@@ -444,11 +463,12 @@ fn spawn_driver(index: usize, tokio_handle: TokioHandle) -> Driver {
         .expect("asyncio driver thread dropped sender before handing back its loop");
 
     match handshake {
-        DriverHandshake::Ready(driver_loop) => Driver {
-            driver_loop,
+        DriverHandshake::Ready(loop_obj, runner) => Driver {
+            loop_obj,
             thread: StdMutex::new(Some(thread)),
             pinged: Arc::new(AtomicU64::new(0)),
             landed: Arc::new(AtomicU64::new(0)),
+            runner,
         },
         DriverHandshake::Failed(message) => {
             // We can't recover from a missing asyncio loop; abort.
@@ -458,7 +478,7 @@ fn spawn_driver(index: usize, tokio_handle: TokioHandle) -> Driver {
 }
 
 enum DriverHandshake {
-    Ready(crate::script::direct::DriverLoop),
+    Ready(Py<PyAny>, Arc<RunnerShared>),
     Failed(String),
 }
 
@@ -493,19 +513,28 @@ fn driver_main(
         let _tstate = pyo3::ffi::PyEval_SaveThread();
     }
 
-    // Phase 1: build the loop and hand a handle back to the spawning thread.
-    //
-    // The loop is siphon's subclass of the default one: it reports a handler
-    // step on an executor thread scheduling on it, which is what lets such a
-    // step be handed over to this driver safely (`script::direct`).
-    let (loop_obj, driver_loop) = match Python::attach(|python| {
-        let driver_loop = crate::script::direct::new_driver_loop(python)?;
+    // The runner's wake pipe, made before the loop that will watch it.
+    let runner = match RunnerOwner::new() {
+        Ok(runner) => runner,
+        Err(error) => {
+            let _ = handshake.send(DriverHandshake::Failed(format!(
+                "script runner wake pipe: {error}"
+            )));
+            return;
+        }
+    };
+
+    // Phase 1: build the loop, hook the runner's drain onto it and hand a
+    // handle back to the spawning thread.
+    let loop_obj = match Python::attach(|python| -> PyResult<Py<PyAny>> {
         let asyncio = python.import("asyncio")?;
+        let new_loop = asyncio.call_method0("new_event_loop")?;
         // `set_event_loop` binds the loop to *this* thread so any code
         // that still calls the deprecated `asyncio.get_event_loop()` on
         // the driver thread gets ours.
-        asyncio.call_method1("set_event_loop", (&driver_loop.event_loop,))?;
-        PyResult::Ok((driver_loop.event_loop.clone_ref(python), driver_loop))
+        asyncio.call_method1("set_event_loop", (&new_loop,))?;
+        runner.install(python, &new_loop)?;
+        Ok(new_loop.unbind())
     }) {
         Ok(handle) => handle,
         Err(error) => {
@@ -514,9 +543,17 @@ fn driver_main(
         }
     };
 
-    if handshake.send(DriverHandshake::Ready(driver_loop)).is_err() {
+    let loop_for_caller = Python::attach(|python| loop_obj.clone_ref(python));
+    if handshake
+        .send(DriverHandshake::Ready(
+            loop_for_caller,
+            Arc::clone(runner.shared()),
+        ))
+        .is_err()
+    {
         // Caller went away before we could hand off — nothing to drive.
         debug!(driver = index, "async pool spawner dropped; driver exiting");
+        Python::attach(|python| runner.close(python, loop_obj.bind(python)));
         return;
     }
 
@@ -533,10 +570,12 @@ fn driver_main(
         debug!(driver = index, "asyncio driver loop stopped cleanly");
     }
 
-    // Phase 3: best-effort loop teardown.  Cancel any still-pending tasks
-    // and close the loop so file descriptors aren't leaked.
+    // Phase 3: best-effort loop teardown.  Abandon what the runner still
+    // holds, cancel any still-pending tasks and close the loop so file
+    // descriptors aren't leaked.
     let _ = Python::attach(|python| -> PyResult<()> {
         let bound = loop_obj.bind(python);
+        runner.close(python, bound);
         let asyncio = python.import("asyncio")?;
         let pending = asyncio.call_method1("all_tasks", (&bound,))?;
         let task_iter = pending.try_iter()?;
@@ -677,10 +716,10 @@ static PENDING_COROUTINES: AtomicUsize = AtomicUsize::new(0);
 /// Counts one coroutine in [`PENDING_COROUTINES`] for as long as it lives, so
 /// every way out — settled, timed out, dropped unresumed — gives the count
 /// back.
-struct PendingCount;
+pub(crate) struct PendingCount;
 
 impl PendingCount {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         let pending = PENDING_COROUTINES.fetch_add(1, Ordering::Relaxed) + 1;
         publish_pending(pending);
         Self
@@ -707,44 +746,20 @@ pub fn pending_coroutines() -> usize {
     PENDING_COROUTINES.load(Ordering::Relaxed)
 }
 
-/// A coroutine that has started and not finished, not yet waited for.
+/// A coroutine running on a driver loop, not yet waited for.
 ///
-/// Waiting is split from starting so the wait need not cost a thread: the
-/// request dispatcher resumes on the executor once it is over
-/// ([`PendingCoroutine::resume_on_executor`]), while
-/// [`run_coroutine_via_pool`] blocks on [`PendingCoroutine::settle`] for
-/// callers that cannot be resumed.
+/// Waiting is split from submitting so the wait need not cost a thread: the
+/// request dispatcher awaits [`PendingCoroutine::settle`] on a tokio task and
+/// resumes on the executor once it is over, while [`run_coroutine_via_pool`]
+/// blocks on the same future for callers that cannot be resumed.
 pub(crate) struct PendingCoroutine {
-    waiting: Waiting,
+    receiver: oneshot::Receiver<PyResult<Py<PyAny>>>,
+    /// The `concurrent.futures.Future` driving it, cancelled on timeout.
+    future: Py<PyAny>,
+    /// The coroutine itself, named in the log line if it wedges.
+    coroutine: Py<PyAny>,
     timeout: Duration,
-    /// `None` for the task a directly driven coroutine was handed to, which
-    /// its own entry already counts.
-    _count: Option<PendingCount>,
-}
-
-/// Where a pending coroutine runs.
-enum Waiting {
-    /// On a driver loop, as an asyncio task.
-    Driver {
-        receiver: oneshot::Receiver<PyResult<Py<PyAny>>>,
-        /// What drives it, cancelled on timeout: anything with a `cancel()`
-        /// that is safe from any thread.
-        future: Py<PyAny>,
-        /// The coroutine itself, named in the log line if it wedges.
-        coroutine: Py<PyAny>,
-    },
-    /// On the executor, suspended on one of siphon's own awaitables
-    /// (`script::direct`).
-    Direct(Arc<crate::script::direct::Drive>),
-}
-
-/// What a wait that timed out cancels.
-enum Abandoned {
-    Driver {
-        future: Py<PyAny>,
-        coroutine: Py<PyAny>,
-    },
-    Direct(Arc<crate::script::direct::Drive>),
+    _count: PendingCount,
 }
 
 /// How waiting for a [`PendingCoroutine`] ended. Turned into the handler's
@@ -752,7 +767,8 @@ enum Abandoned {
 pub(crate) struct SettledCoroutine {
     outcome:
         Result<Result<PyResult<Py<PyAny>>, oneshot::error::RecvError>, tokio::time::error::Elapsed>,
-    abandoned: Abandoned,
+    future: Py<PyAny>,
+    coroutine: Py<PyAny>,
     timeout: Duration,
 }
 
@@ -764,97 +780,36 @@ impl PendingCoroutine {
         coroutine: &Bound<'_, PyAny>,
     ) -> PyResult<Self> {
         let (receiver, future) = pool.submit(python, coroutine)?;
-        Ok(Self::on_driver(
+        Ok(Self {
             receiver,
             future,
-            coroutine.clone().unbind(),
-            pool.coroutine_timeout(),
-        ))
-    }
-
-    /// A coroutine already running as a task on a driver: its outcome arrives
-    /// on `receiver`, and `future.cancel()` cancels it from any thread.
-    pub(crate) fn on_driver(
-        receiver: oneshot::Receiver<PyResult<Py<PyAny>>>,
-        future: Py<PyAny>,
-        coroutine: Py<PyAny>,
-        timeout: Duration,
-    ) -> Self {
-        Self {
-            waiting: Waiting::Driver {
-                receiver,
-                future,
-                coroutine,
-            },
-            timeout,
-            _count: Some(PendingCount::start()),
-        }
-    }
-
-    /// [`on_driver`](Self::on_driver) for a coroutine that started under
-    /// [`direct`](Self::direct), whose entry stays counted until its waiter
-    /// has the result.
-    pub(crate) fn handed_over(
-        receiver: oneshot::Receiver<PyResult<Py<PyAny>>>,
-        future: Py<PyAny>,
-        coroutine: Py<PyAny>,
-        timeout: Duration,
-    ) -> Self {
-        Self {
-            waiting: Waiting::Driver {
-                receiver,
-                future,
-                coroutine,
-            },
-            timeout,
-            _count: None,
-        }
-    }
-
-    /// A coroutine the executor drives without an asyncio task.
-    pub(crate) fn direct(drive: Arc<crate::script::direct::Drive>) -> Self {
-        Self {
-            timeout: drive.timeout(),
-            waiting: Waiting::Direct(drive),
-            _count: Some(PendingCount::start()),
-        }
+            coroutine: coroutine.clone().unbind(),
+            timeout: pool.coroutine_timeout(),
+            _count: PendingCount::start(),
+        })
     }
 
     /// Wait for the coroutine to settle, for at most the pool's coroutine
     /// timeout. Touches no Python object, so it can run on any thread.
     ///
-    /// Bounded, because nothing else ends the wait for a coroutine that never
-    /// settles: its done-callback never fires and never drops the sender
-    /// either, so not even `RecvError` arrives.
+    /// Bounded, because the responder is a done-callback on the
+    /// `concurrent.futures.Future`: a coroutine that never settles never fires
+    /// it and never drops the sender either, so not even `RecvError` arrives and
+    /// the wait has no other way out.
     pub(crate) async fn settle(self) -> SettledCoroutine {
         let Self {
-            waiting,
+            receiver,
+            future,
+            coroutine,
             timeout,
             _count,
         } = self;
-        match waiting {
-            Waiting::Driver {
-                receiver,
-                future,
-                coroutine,
-            } => SettledCoroutine {
-                outcome: tokio::time::timeout(timeout, receiver).await,
-                abandoned: Abandoned::Driver { future, coroutine },
-                timeout,
-            },
-            Waiting::Direct(drive) => {
-                let (sender, receiver) = oneshot::channel();
-                drive.on_complete(Box::new(move |result| {
-                    // A waiter that timed out is gone; the late result is
-                    // dropped with the closure.
-                    let _ = sender.send(result);
-                }));
-                SettledCoroutine {
-                    outcome: tokio::time::timeout(timeout, receiver).await,
-                    abandoned: Abandoned::Direct(drive),
-                    timeout,
-                }
-            }
+        let outcome = tokio::time::timeout(timeout, receiver).await;
+        SettledCoroutine {
+            outcome,
+            future,
+            coroutine,
+            timeout,
         }
     }
 
@@ -866,20 +821,9 @@ impl PendingCoroutine {
         self.settle().await.into_result()
     }
 
-    /// Whether the executor drives this coroutine itself, so that
-    /// [`resume_on_executor`](Self::resume_on_executor) runs `resume` in the
-    /// job that finishes it rather than in a job of its own.
-    pub(crate) fn is_direct(&self) -> bool {
-        matches!(self.waiting, Waiting::Direct(_))
-    }
-
-    /// Wait without holding an executor worker, then `resume` with the
-    /// coroutine's result as a job on the Python executor.
-    ///
-    /// A coroutine on a driver is waited for on a tokio task
-    /// ([`settle`](Self::settle)) and `resume` is queued as a job of its own.
-    /// One the executor drives runs `resume` in the job whose step finished
-    /// it, with no thread handoff in between.
+    /// Wait without holding an executor worker: [`settle`](Self::settle) on a
+    /// tokio task, then `resume` with the coroutine's result as a job on the
+    /// Python executor.
     ///
     /// `resume` runs **detached** from the interpreter and attaches only for
     /// its own Python calls. What follows an await is mostly Rust — the reply
@@ -898,52 +842,6 @@ impl PendingCoroutine {
     /// Must be called with a tokio runtime entered, which every executor
     /// worker has.
     pub(crate) fn resume_on_executor<F>(self, resume: F)
-    where
-        F: FnOnce(PyResult<Py<PyAny>>) + Send + 'static,
-    {
-        if let Waiting::Direct(drive) = &self.waiting {
-            let drive = Arc::clone(drive);
-            // Counted as pending until `resume` has the result.
-            drive.on_complete(Box::new(move |result| {
-                drop(self);
-                resume(result);
-            }));
-            // Nothing else bounds this wait.
-            drive.arm_timeout();
-            return;
-        }
-        self.resume_from_driver(resume);
-    }
-
-    /// [`resume_on_executor`](Self::resume_on_executor) for a caller that
-    /// stays awake for what `resume` produces: it bounds the wait with the
-    /// [`Deadline`](crate::script::direct::Deadline) it gets back, which costs
-    /// a timer where an unattended wait costs a tokio task.
-    ///
-    /// `None` when the coroutine is on a driver: that wait is bounded on its
-    /// own, as under `resume_on_executor`.
-    pub(crate) fn resume_on_executor_watched<F>(
-        self,
-        resume: F,
-    ) -> Option<crate::script::direct::Deadline>
-    where
-        F: FnOnce(PyResult<Py<PyAny>>) + Send + 'static,
-    {
-        if let Waiting::Direct(drive) = &self.waiting {
-            let drive = Arc::clone(drive);
-            let deadline = drive.deadline();
-            drive.on_complete(Box::new(move |result| {
-                drop(self);
-                resume(result);
-            }));
-            return Some(deadline);
-        }
-        self.resume_from_driver(resume);
-        None
-    }
-
-    /// Wait for a coroutine on a driver on a tokio task, then queue `resume`.
-    fn resume_from_driver<F>(self, resume: F)
     where
         F: FnOnce(PyResult<Py<PyAny>>) + Send + 'static,
     {
@@ -979,29 +877,27 @@ impl SettledCoroutine {
             Ok(Err(_recv_err)) => Err(PyValueError::new_err(
                 "async pool driver dropped the coroutine sender before completion",
             )),
-            Err(_elapsed) => Python::attach(|python| match self.abandoned {
-                Abandoned::Direct(drive) => Err(drive.expire(python)),
-                Abandoned::Driver { future, coroutine } => {
-                    let cancelled = future
-                        .bind(python)
-                        .call_method0("cancel")
-                        .and_then(|value| value.extract::<bool>())
-                        .unwrap_or(false);
-                    let handler = coroutine_name(coroutine.bind(python));
-                    error!(
-                        handler = %handler,
-                        timeout_secs = self.timeout.as_secs(),
-                        cancelled,
-                        "async script handler did not settle within the coroutine timeout; \
-                         failing this call. The handler is awaiting something that never \
-                         completes — an unbounded backend call, a DNS lookup, or a future \
-                         nothing resolves."
-                    );
-                    Err(PyTimeoutError::new_err(format!(
-                        "async handler '{handler}' did not settle within {}s",
-                        self.timeout.as_secs()
-                    )))
-                }
+            Err(_elapsed) => Python::attach(|python| {
+                let cancelled = self
+                    .future
+                    .bind(python)
+                    .call_method0("cancel")
+                    .and_then(|value| value.extract::<bool>())
+                    .unwrap_or(false);
+                let handler = coroutine_name(self.coroutine.bind(python));
+                error!(
+                    handler = %handler,
+                    timeout_secs = self.timeout.as_secs(),
+                    cancelled,
+                    "async script handler did not settle within the coroutine timeout; \
+                     failing this call. The handler is awaiting something that never \
+                     completes — an unbounded backend call, a DNS lookup, or a future \
+                     nothing resolves."
+                );
+                Err(PyTimeoutError::new_err(format!(
+                    "async handler '{handler}' did not settle within {}s",
+                    self.timeout.as_secs()
+                )))
             }),
         }
     }
@@ -1938,8 +1834,7 @@ mod tests {
                     )
                     .unwrap();
                     driver
-                        .driver_loop
-                        .event_loop
+                        .loop_obj
                         .bind(python)
                         .call_method1("call_soon_threadsafe", (callback,))
                         .unwrap();

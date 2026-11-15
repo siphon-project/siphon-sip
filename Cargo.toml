@@ -271,6 +271,10 @@ harness = false
 name = "flow_over_mtu"      # RFC 3261 §18.1.1 over a UE's SA flow: the per-request switch decision
 harness = false
 
+[[bench]]
+name = "dispatch_await"     # an async handler call through the script handle: 0/1/4 awaits, direct dispatch off vs on
+harness = false
+
 [features]
 default = ["redis-backend", "postgres-backend"]
 redis-backend = ["dep:redis"]

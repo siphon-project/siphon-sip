@@ -45,6 +45,9 @@ pub struct ScriptConfig {
     /// budget (~30 % of the container's cgroup memory limit ÷ per-worker heap),
     /// clamped to at least `sync_pool_size`. On a 512 MB NF that resolves to ~15
     /// (not 32); set this explicitly to override the budget either way.
+    /// An explicit value below the core (`sync_pool_size`, default
+    /// `max(8, 2 × CPUs)`) is raised to the core with a startup warning; set
+    /// `sync_pool_size` as well to cap the pool lower.
     #[serde(default)]
     pub sync_pool_max: Option<usize>,
     /// Seconds the synchronous Python executor pool may show *zero forward
@@ -107,6 +110,59 @@ pub struct ScriptConfig {
     /// just like the main script.  Defaults to empty.
     #[serde(default)]
     pub include_paths: Vec<String>,
+    /// Whether an `async def` handler called through the script handle (an
+    /// extension's HTTP route, SMPP handler and the like) is stepped on its
+    /// asyncio driver without an asyncio task while it awaits only siphon's
+    /// own awaitables. `off` (the default) runs every such handler as an
+    /// asyncio task, as before. `on` skips the task, its
+    /// `concurrent.futures` bridge and the completion-thread hop for each
+    /// await; a handler that uses asyncio itself (`asyncio.sleep`, a foreign
+    /// future, `gather`) is handed to a task on the same thread the first
+    /// time it does, and starts as one from then on. SIP request and Diameter
+    /// handlers are not affected by this switch. See `script::runner`.
+    #[serde(default)]
+    pub direct_dispatch: DirectDispatch,
+}
+
+/// `script.direct_dispatch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DirectDispatch {
+    #[default]
+    Off,
+    On,
+}
+
+impl DirectDispatch {
+    pub fn is_on(self) -> bool {
+        self == Self::On
+    }
+}
+
+impl<'de> Deserialize<'de> for DirectDispatch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // `on` and `off` are booleans to a YAML 1.1 reader and strings to a
+        // YAML 1.2 one; both spellings mean the same thing here.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Written {
+            Flag(bool),
+            Word(String),
+        }
+        match Written::deserialize(deserializer)? {
+            Written::Flag(true) => Ok(Self::On),
+            Written::Flag(false) => Ok(Self::Off),
+            Written::Word(word) => match word.to_ascii_lowercase().as_str() {
+                "on" => Ok(Self::On),
+                "off" => Ok(Self::Off),
+                other => Err(serde::de::Error::custom(format!(
+                    "script.direct_dispatch must be `on` or `off`, not `{other}`"
+                ))),
+            },
+        }
+    }
 }
 
 fn default_script_path() -> String {
@@ -162,6 +218,7 @@ impl Default for ScriptConfig {
             handler_timeout_secs: None,
             executor_queue_capacity: default_executor_queue_capacity(),
             include_paths: Vec::new(),
+            direct_dispatch: DirectDispatch::Off,
         }
     }
 }

@@ -33,6 +33,7 @@
     "sbi",
     "sdp",
     "srs",
+    "tasks",
     "timer"
   ],
   "types": {
@@ -3293,6 +3294,13 @@
         "doc": "Originate an outbound SUBSCRIBE and capture the resulting dialog.",
         "kind": "method_descriptor",
         "sig": "($self, ruri, event, expires, accept=None, target_uri=None, headers=None, timeout_ms=2000, flow=None, route=..., body=None, content_type=None)"
+      }
+    },
+    "TasksNamespace": {
+      "gather": {
+        "doc": "Run `awaitables` at the same time and return their results as a list,",
+        "kind": "method_descriptor",
+        "sig": "($self, *awaitables, return_exceptions=False)"
       }
     },
     "TimerHandle": {

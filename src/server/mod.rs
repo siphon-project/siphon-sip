@@ -558,11 +558,14 @@ impl SiphonServer {
             .script
             .async_pool_size
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-        crate::script::async_pool::AsyncPool::install(
+        let async_pool = crate::script::async_pool::AsyncPool::install(
             async_pool_size,
             tokio::runtime::Handle::current(),
             crate::config::coroutine_timeout(config.script.handler_timeout_secs),
         );
+        // `script.direct_dispatch`: on only if a handler driven without an
+        // asyncio task behaves on this interpreter (it says so if not).
+        crate::script::runner::configure(config.script.direct_dispatch.is_on(), &async_pool);
 
         // Spin up the synchronous Python executor pool — a fixed set of
         // never-reaped OS threads that all `Python::attach` handler
@@ -613,6 +616,15 @@ impl SiphonServer {
             bound = sizing.bound.as_str(),
             "resolved synchronous Python executor pool sizing"
         );
+        if let Some(requested) = sizing.max_raised_from {
+            warn!(
+                sync_pool_max = requested,
+                core_threads = sizing.core_threads,
+                max_threads = sizing.max_threads,
+                "script.sync_pool_max is below the core pool size and was raised to it; \
+                 set script.sync_pool_size as well to cap the pool lower"
+            );
+        }
         let core_threads = sizing.core_threads;
         let max_threads = sizing.max_threads;
         // Bound the queue (load-shed, not unbounded growth) and arm the pool

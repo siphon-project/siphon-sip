@@ -64,25 +64,33 @@ where
 /// [`crate::script::Deferred`] that builds the Python value. The conversion
 /// runs in the completion step, off the workers, on one of the fixed threads
 /// in [`super::completions`] (never on tokio's elastic blocking pool, whose
-/// threads come and go). Called from a synchronous
+/// threads come and go). In a handler stepped by its driver's runner
+/// (`script.direct_dispatch`) the conversion runs on that driver thread
+/// instead, and no asyncio future is made. Called from a synchronous
 /// handler (no running event loop) it fails with an error that says to make
 /// the handler `async def`.
-///
-/// In a handler the executor drives itself ([`super::direct`]) the result is
-/// not an asyncio future but an awaitable that resumes the coroutine straight
-/// from the executor: awaiting it there involves no event loop, and the
-/// conversion runs on the worker that resumes. To anything else it still is a
-/// future, on demand. Either way `future` starts now, not when it is awaited,
-/// and cancelling what is returned drops it.
 pub fn awaitable<'py, F, T>(python: Python<'py>, future: F) -> PyResult<Bound<'py, PyAny>>
 where
     F: Future<Output = PyResult<T>> + Send + 'static,
     T: for<'a> IntoPyObject<'a> + Send + 'static,
 {
-    // In a handler step the executor is driving, the coroutine is resumed by
-    // the executor too, with no asyncio future in between.
-    if super::direct::in_direct_step() {
-        return super::direct::awaitable_in_step(python, future);
+    if super::runner::in_direct_step() {
+        // A handler stepped by its driver's runner: the future's completion
+        // wakes the runner instead of an asyncio future. Boxed here, once, so
+        // that nothing behind this call is compiled per awaitable API.
+        return super::runner::spawn_awaitable(
+            python,
+            Box::pin(async move {
+                let build: super::runner::BuildValue = match future.await {
+                    Ok(value) => Box::new(move |python| {
+                        use pyo3::IntoPyObjectExt;
+                        value.into_py_any(python)
+                    }),
+                    Err(error) => Box::new(move |_python| Err(error)),
+                };
+                build
+            }),
+        );
     }
     pyo3_async_runtimes::generic::future_into_py::<super::completions::AwaitableRuntime, _, _>(
         python, future,

@@ -947,6 +947,7 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
             "queue_depth": metrics.pyexec_queue_depth.get(),
             "jobs_completed": metrics.pyexec_jobs_completed_total.get(),
             "jobs_shed": metrics.pyexec_jobs_shed_total.get(),
+            "queue_wait": crate::script::py_executor::queue_wait_seconds().map(crate::metrics::histogram_summary),
             // Not a pool figure, but read with them: a pinned asyncio driver
             // stops every coroutine on it while the pool itself looks healthy.
             "async_drivers_stalled": metrics.async_drivers_stalled.get(),

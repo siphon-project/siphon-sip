@@ -107,6 +107,7 @@ nav:
   - Internals:
       - Handler execution model: handler-execution-model.md
       - Feature readiness matrix: feature-readiness-matrix.md
+      - Direct dispatch soak (dev note): dev/direct-dispatch-soak.md
 
 markdown_extensions:
   - admonition

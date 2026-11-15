@@ -344,6 +344,14 @@ pub struct ScriptState {
 // Script engine
 // ---------------------------------------------------------------------------
 
+/// Initialise the interpreter and what siphon installs in it once for the life
+/// of the process. A no-op once done, so every engine calls it and a reload,
+/// which builds no engine, never does.
+fn initialize_interpreter() {
+    Python::initialize();
+    super::gc_metrics::install();
+}
+
 /// The script engine manages Python initialisation, script compilation,
 /// hot-reload watching, and the handler registry.
 pub struct ScriptEngine {
@@ -380,7 +388,7 @@ impl ScriptEngine {
         }
 
         // Initialise the free-threaded Python interpreter (no-op if already done).
-        Python::initialize();
+        initialize_interpreter();
 
         let include_paths: Vec<PathBuf> = config.include_paths.iter().map(PathBuf::from).collect();
 
@@ -411,7 +419,7 @@ impl ScriptEngine {
         let script_path = PathBuf::from(EMBEDDED_SCRIPT_PATH);
 
         // Initialise the free-threaded Python interpreter (no-op if already done).
-        Python::initialize();
+        initialize_interpreter();
 
         let state = Self::compile_source_standalone(&script_path, source)?;
 
@@ -435,7 +443,7 @@ impl ScriptEngine {
     pub fn new_from_bytecode(pyc: &[u8]) -> Result<Self> {
         let script_path = PathBuf::from(EMBEDDED_SCRIPT_PATH);
 
-        Python::initialize();
+        initialize_interpreter();
 
         let state = Self::load_bytecode(&script_path, pyc)?;
 
@@ -479,7 +487,8 @@ impl ScriptEngine {
                 self.state.store(Arc::new(new_state));
                 // The verdicts describe code objects this reload replaced.
                 inline_dispatch::clear_inline_verdicts();
-                crate::script::direct::clear_demoted();
+                // And which handlers use asyncio: the callables are new.
+                crate::script::runner::clear_demoted();
                 self.restart_timers();
                 Ok(())
             }
@@ -1657,6 +1666,7 @@ mod tests {
             handler_timeout_secs: None,
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
+            direct_dispatch: Default::default(),
         };
         let engine = ScriptEngine::new(&config).expect("initial load");
         assert_eq!(std::fs::read_to_string(&output).unwrap(), "v1");
@@ -1725,6 +1735,7 @@ mod tests {
             handler_timeout_secs: None,
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
+            direct_dispatch: Default::default(),
         };
         let engine = Arc::new(ScriptEngine::new(&config).expect("initial load"));
         (dir, engine, imported, stranger)
@@ -2533,6 +2544,7 @@ async def route(request):
             handler_timeout_secs: None,
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
+            direct_dispatch: Default::default(),
         };
         let result = ScriptEngine::new(&config);
         assert!(result.is_err());
@@ -2561,6 +2573,7 @@ def route(request):
             handler_timeout_secs: None,
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
+            direct_dispatch: Default::default(),
         };
         let engine = ScriptEngine::new(&config).unwrap();
         assert_eq!(engine.state().handlers.len(), 1);
@@ -2607,6 +2620,7 @@ def route(request):
             handler_timeout_secs: None,
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
+            direct_dispatch: Default::default(),
         };
         let engine = ScriptEngine::new(&config).unwrap();
         assert_eq!(engine.state().handlers.len(), 1);
@@ -2632,6 +2646,7 @@ def route(request):
             handler_timeout_secs: None,
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
+            direct_dispatch: Default::default(),
         }
     }
 

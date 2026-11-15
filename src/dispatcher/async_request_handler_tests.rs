@@ -29,7 +29,7 @@ pub(super) fn ensure_pools() -> (Arc<PyExecutor>, Arc<AsyncPool>) {
     crate::script::async_pool::ensure_test_pools()
 }
 
-fn message(call_id: &str, extra_headers: &str) -> String {
+pub(super) fn message(call_id: &str, extra_headers: &str) -> String {
     format!(
         "MESSAGE sip:201@siphon.example.com SIP/2.0\r\n\
          Via: SIP/2.0/UDP {SOURCE};branch=z9hG4bK-{call_id}\r\n\
@@ -46,7 +46,7 @@ fn message(call_id: &str, extra_headers: &str) -> String {
 
 /// Hand `raw` to `handle_request` on the executor, as the dispatcher's
 /// inbound loop does.
-fn receive_on_executor(state: &Arc<DispatcherState>, raw: String) {
+pub(super) fn receive_on_executor(state: &Arc<DispatcherState>, raw: String) {
     let state = Arc::clone(state);
     crate::script::py_executor::spawn(move || {
         let parsed = parse_sip_message_bytes(raw.as_bytes()).expect("the request parses");
@@ -97,7 +97,7 @@ fn status_lines(
         .collect()
 }
 
-fn dispatcher(script: &str) -> (Arc<DispatcherState>, flume::Receiver<OutboundMessage>) {
+pub(super) fn dispatcher(script: &str) -> (Arc<DispatcherState>, flume::Receiver<OutboundMessage>) {
     let TestDispatcher { state, udp } = test_dispatcher_with_script(script);
     (Arc::new(state), udp)
 }

@@ -37,6 +37,10 @@ pub fn init() -> Result<(), prometheus::Error> {
     stale_shed::init(&metrics.registry)?;
     timer::init(&metrics.registry)?;
     crate::script::blocking_metrics::register(&metrics.registry)?;
+    crate::script::gc_metrics::register(&metrics.registry)?;
+    crate::script::liveness::register(&metrics.registry)?;
+    crate::script::py_executor::register(&metrics.registry)?;
+    crate::script::runner::register(&metrics.registry)?;
     let custom = Arc::new(CustomMetrics::new(&metrics.registry));
     let _ = CUSTOM_METRICS.set(custom);
     let _ = METRICS.set(metrics);

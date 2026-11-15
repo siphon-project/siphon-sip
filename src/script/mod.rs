@@ -11,21 +11,17 @@ pub(crate) mod blocking_metrics;
 pub(crate) mod completions;
 pub mod deferred;
 pub mod diameter_dispatch;
-pub(crate) mod direct;
-#[cfg(test)]
-mod direct_edge_tests;
-#[cfg(test)]
-mod direct_tests;
-#[cfg(test)]
-mod dispatch_cost_bench_tests;
 pub mod engine;
 pub mod error_report;
+pub(crate) mod gc_metrics;
 pub mod handle;
 pub mod handler_keyword;
 pub mod handler_select;
 pub mod inline_dispatch;
 pub(crate) mod liveness;
 pub mod py_executor;
+#[doc(hidden)]
+pub mod runner;
 pub mod runtime_info;
 pub mod script_config;
 #[cfg(test)]
@@ -36,3 +32,7 @@ pub mod watcher;
 pub(crate) use blocking::{awaitable, detach_block_on, ready};
 pub use deferred::Deferred;
 pub use handle::{HandlerHandle, ScriptHandle};
+
+// A soak run by name on a release build, never as part of the suite.
+#[cfg(test)]
+mod dispatch_soak_bench_tests;
