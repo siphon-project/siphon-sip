@@ -45,6 +45,7 @@
 mod answer;
 pub(crate) mod dispatch;
 mod request;
+mod runtime;
 mod testing;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -56,7 +57,9 @@ use std::sync::{Arc, OnceLock};
 
 pub use super::relay::RelayOptions;
 pub use answer::NativeAnswer;
-pub use request::{peer_for_host, NativeRequest, RelayTarget};
+pub use request::{peer_for_host, NativeRequest, PoolPick, RelayTarget};
+pub(crate) use runtime::install as install_runtime;
+pub use runtime::{event_sink, tenant_identity};
 pub use testing::{HarnessOutcome, NativeHarness};
 
 /// What a handler failed with. It is logged, and the request is answered

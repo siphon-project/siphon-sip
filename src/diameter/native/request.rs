@@ -226,13 +226,30 @@ pub struct RelayTarget {
     backends: Option<relay::Backends>,
 }
 
+/// A [`RelayTarget`] picked from a pool, with what was picked.
+pub struct PoolPick {
+    /// Where to relay: the picked peer first, the pool's other open peers
+    /// after it, as [`RelayTarget::pool`] gives.
+    pub target: RelayTarget,
+    /// The configured name of the picked peer, None when the pool has no
+    /// open peer.
+    pub peer: Option<String>,
+    /// For a sticky pick, whether the key was already bound to that peer.
+    /// False for a first pick, a re-pick, and every round-robin pick.
+    pub affinity_hit: bool,
+}
+
 impl RelayTarget {
-    /// One connection, with nowhere else to go when it cannot serve.
+    /// One connection, with nowhere else to go when it cannot serve: no
+    /// other peer is tried, whatever `diameter.retry` allows. For a peer of
+    /// a pool use [`pool`](Self::pool) or [`pool_peer`](Self::pool_peer),
+    /// which keep the pool's other peers.
     pub fn peer(peer: Arc<DiameterPeer>) -> Self {
         Self::client(Arc::new(DiameterClient::new(peer)))
     }
 
-    /// One connection, by its client handle.
+    /// One connection, by its client handle. Like [`peer`](Self::peer), it
+    /// has no other peer to go to.
     pub fn client(client: Arc<DiameterClient>) -> Self {
         Self {
             backends: Some(relay::Backends {
@@ -254,6 +271,40 @@ impl RelayTarget {
     /// `ttl`, picked round-robin the first time.
     pub fn pool_sticky(pool: &PeerPool, key: &str, ttl: Duration) -> Self {
         Self::picked(pool, pool.pick_sticky(key, ttl))
+    }
+
+    /// [`pool`](Self::pool), also naming the peer it picked.
+    pub fn pool_named(pool: &PeerPool) -> PoolPick {
+        let (peer, client) = pool.pick_round_robin_named().unzip();
+        PoolPick {
+            target: Self::picked(pool, client),
+            peer,
+            affinity_hit: false,
+        }
+    }
+
+    /// [`pool_sticky`](Self::pool_sticky), also naming the peer it picked
+    /// and saying whether `key` was already bound to it.
+    pub fn pool_sticky_named(pool: &PeerPool, key: &str, ttl: Duration) -> PoolPick {
+        match pool.pick_sticky_reported(key, ttl) {
+            Some(pick) => PoolPick {
+                target: Self::picked(pool, Some(pick.client)),
+                peer: Some(pick.name),
+                affinity_hit: pick.affinity_hit,
+            },
+            None => PoolPick {
+                target: Self::picked(pool, None),
+                peer: None,
+                affinity_hit: false,
+            },
+        }
+    }
+
+    /// `client`, a peer of `pool` the caller picked itself (by weight, by
+    /// its own rule), with the pool's other open peers to take the request
+    /// once when that one cannot serve it and `diameter.retry` allows it.
+    pub fn pool_peer(pool: &PeerPool, client: Arc<DiameterClient>) -> Self {
+        Self::picked(pool, Some(client))
     }
 
     fn picked(pool: &PeerPool, picked: Option<Arc<DiameterClient>>) -> Self {

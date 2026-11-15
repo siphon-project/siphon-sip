@@ -29,6 +29,11 @@ impl PyScriptConfig {
     pub fn new(store: Arc<ScriptConfigStore>) -> Self {
         Self { store }
     }
+
+    /// The store this namespace reads.
+    pub(crate) fn store(&self) -> &Arc<ScriptConfigStore> {
+        &self.store
+    }
 }
 
 #[pymethods]

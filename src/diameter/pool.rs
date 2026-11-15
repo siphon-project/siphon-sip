@@ -18,6 +18,17 @@ use dashmap::DashMap;
 
 use crate::diameter::{DiameterClient, DiameterManager};
 
+/// What [`PeerPool::pick_sticky_reported`] picked.
+pub struct StickyPick {
+    /// The configured name of the peer.
+    pub name: String,
+    pub client: Arc<DiameterClient>,
+    /// Whether the key was already bound to this peer. False when it was
+    /// bound now: the first pick for the key, or a re-pick because its peer
+    /// went away or the binding expired.
+    pub affinity_hit: bool,
+}
+
 /// A pool of backend peers for one tenant + routing target.
 pub struct PeerPool {
     tenant: String,
@@ -145,12 +156,23 @@ impl PeerPool {
         key: &str,
         ttl: Duration,
     ) -> Option<(String, Arc<DiameterClient>)> {
+        self.pick_sticky_reported(key, ttl)
+            .map(|pick| (pick.name, pick.client))
+    }
+
+    /// Sticky pick that also says whether the key was already bound to the
+    /// peer it returns.
+    pub fn pick_sticky_reported(&self, key: &str, ttl: Duration) -> Option<StickyPick> {
         let now = Instant::now();
         if let Some(entry) = self.sticky.get(key) {
             let (name, expires) = entry.value();
             if *expires > now {
                 if let Some(client) = self.manager.live_backend(&self.tenant, name) {
-                    return Some((name.clone(), client));
+                    return Some(StickyPick {
+                        name: name.clone(),
+                        client,
+                        affinity_hit: true,
+                    });
                 }
             }
         }
@@ -158,7 +180,11 @@ impl PeerPool {
         let (name, client) = self.pick_round_robin_named()?;
         self.sticky
             .insert(key.to_string(), (name.clone(), now + ttl));
-        Some((name, client))
+        Some(StickyPick {
+            name,
+            client,
+            affinity_hit: false,
+        })
     }
 
     /// Drop expired sticky entries (lazy eviction also happens on lookup).
