@@ -625,7 +625,19 @@ impl DispatcherState {
         self.advertised_addrs
             .get(transport)
             .map(|h| format_sip_host(h))
-            .unwrap_or_else(|| format_sip_host(&self.local_addr.ip().to_string()))
+            .unwrap_or_else(|| format_sip_host(&self.default_ip_for(transport).to_string()))
+    }
+
+    /// The IP a transport names for itself when nothing is advertised: its own
+    /// first listener's, never a sibling transport's (`local_addr` is the first
+    /// listener of any transport). A wildcard listener names no address and a
+    /// transport with no listener has none, so both keep `local_addr`'s.
+    fn default_ip_for(&self, transport: &Transport) -> std::net::IpAddr {
+        self.listen_addrs
+            .get(transport)
+            .map(SocketAddr::ip)
+            .filter(|ip| !ip.is_unspecified())
+            .unwrap_or_else(|| self.local_addr.ip())
     }
 
     /// Return the port to use in Via/Contact headers for the given transport:
@@ -781,7 +793,7 @@ impl DispatcherState {
         resolve_advertised_host(
             &self.listener_registry,
             &self.advertised_addrs,
-            self.local_addr.ip(),
+            self.default_ip_for(transport),
             a_leg_local_addr,
             transport,
         )

@@ -1421,6 +1421,36 @@ fn family_egress_socket_picks_the_listener_in_the_destination_family() {
 
 /// The sent-by of an unpinned request follows the same pick, so a 2xx ACK
 /// relayed to an IPv6 UAS names the IPv6 listener it leaves from, bracketed.
+/// UDP and TCP listeners on different addresses, no `advertise`: each
+/// transport's Via host is its own listener's, not the first listener of any
+/// transport (`local_addr`).
+#[test]
+fn via_host_names_the_transports_own_listener_when_nothing_is_advertised() {
+    let mut dispatcher = super::test_dispatcher::test_dispatcher();
+    let udp: SocketAddr = "192.0.2.10:5061".parse().unwrap();
+    let tcp: SocketAddr = "192.0.2.20:5060".parse().unwrap();
+    let wildcard_tls: SocketAddr = "0.0.0.0:5061".parse().unwrap();
+    dispatcher.state.local_addr = udp;
+    dispatcher.state.advertised_addrs = std::collections::HashMap::new();
+    dispatcher.state.listen_addrs = std::collections::HashMap::from([
+        (Transport::Udp, udp),
+        (Transport::Tcp, tcp),
+        (Transport::Tls, wildcard_tls),
+    ]);
+    assert_eq!(dispatcher.state.via_host(&Transport::Udp), "192.0.2.10");
+    assert_eq!(dispatcher.state.via_host(&Transport::Tcp), "192.0.2.20");
+    assert_eq!(
+        dispatcher
+            .state
+            .a_leg_advertised_host(None, &Transport::Tcp),
+        "192.0.2.20"
+    );
+    // A wildcard listener names no address: the previous choice stands.
+    assert_eq!(dispatcher.state.via_host(&Transport::Tls), "192.0.2.10");
+    // No listener for the transport at all: the previous choice stands.
+    assert_eq!(dispatcher.state.via_host(&Transport::Sctp), "192.0.2.10");
+}
+
 #[test]
 fn unpinned_sent_by_names_the_listener_in_the_destination_family() {
     let mut dispatcher = super::test_dispatcher::test_dispatcher();

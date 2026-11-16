@@ -53,6 +53,7 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A node whose UDP and TCP listeners sit on different addresses now sources outbound TCP from the TCP listener, and names it in the Via host.** The default outbound TCP bind (unpinned INVITE, ACK, BYE, OPTIONS probes, registrations) and the Via host of a transport with no `advertise` took the first listener of any transport, so with `listen.udp` on one address and `listen.tcp` on another the peer saw the UDP address as the TCP source. Each now uses its own transport's first listener. Single-address configs, wildcard listeners and nodes without a TCP listener behave as before.
 - **A listener out of file descriptors no longer spins.** `accept()` failing
   with `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM` leaves the connection in the
   backlog, so every stream listener (TCP, TLS, WS, WSS, the shared SIP+WS
