@@ -57,6 +57,7 @@ pub mod uac;
 pub mod xml_text;
 
 pub use lifecycle::LifecycleParticipant;
+pub use script::script_config;
 pub use server::SiphonServer;
 
 // Re-export the jemalloc allocator crate so the macro can name

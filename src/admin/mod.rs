@@ -997,7 +997,7 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
             "inbound_answers_by_result_code":
                 crate::metrics::int_counter_vec_by_label(&metrics.diameter_inbound_answers_total, "result_code"),
             "inbound_latency_by_command":
-                crate::metrics::histogram_vec_summary_by_label(&metrics.diameter_inbound_duration_seconds, "command"),
+                crate::metrics::histogram_vec_summary_merged_by_label(&metrics.diameter_inbound_duration_seconds, "command"),
         })),
         "rtpengine": state.features.media.then(|| serde_json::json!({
             "up": metrics.rtpengine_instances_up.get(),

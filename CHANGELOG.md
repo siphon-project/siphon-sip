@@ -69,6 +69,9 @@ entry, but a working config keeps working.
 
 ### Added
 
+- Inbound Diameter requests can be answered by Rust handlers registered at
+  server start (`SiphonServer::register_diameter_handlers`); the
+  `siphon_diameter_inbound_*` metrics gain a `path` label (`script` | `native`).
 - **Diameter Sy (TS 29.219 Rel-18).** Application `Sy` (16777302, vendor 10415)
   is accepted by `@diameter.on_request("Sy:SLR")`, `"Sy:SNR"` and `"Sy:STR"`,
   by `send_request` and `originate`, by `diameter.routes`, `retry` and the

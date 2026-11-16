@@ -13,7 +13,7 @@
 //! the last good snapshot keeps serving and the failure is logged.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::config::yaml::{Mapping, Value};
@@ -383,6 +383,27 @@ impl ScriptConfigStore {
         info!(path = %path.display(), "script_config reloaded");
         ReloadOutcome::Reloaded
     }
+}
+
+/// The store behind the script's `config` namespace, once the server has
+/// built it.
+static INSTALLED: OnceLock<Arc<ScriptConfigStore>> = OnceLock::new();
+
+/// Record `store` as the one the script's `config` namespace reads. The
+/// first call stands.
+pub(crate) fn install(store: Arc<ScriptConfigStore>) {
+    let _ = INSTALLED.set(store);
+}
+
+/// The `script_config` document being served right now, for Rust code in the
+/// same process: a snapshot of the one store the script's `config` namespace
+/// reads, so a call here and a `config.get` between the same two reloads see
+/// the same document. Read it with [`lookup`]. Taking it does not lock. A
+/// snapshot does not follow a later reload: hold it for as long as one
+/// decision needs a consistent document and take a new one for the next.
+/// None before the server has built the store.
+pub fn current() -> Option<Arc<Value>> {
+    INSTALLED.get().map(|store| store.snapshot())
 }
 
 /// How often the watcher checks that the store it serves still exists.

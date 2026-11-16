@@ -9,8 +9,8 @@
 //! awaits the answer is wired in the dispatch layer (Phase 5); these are the
 //! message-shaping building blocks it composes.
 
-use crate::diameter::codec::{Avp, DiameterMsg, FLAG_ERROR, FLAG_PROXIABLE};
-use crate::diameter::dictionary::avp;
+use crate::diameter::codec::{Avp, DiameterMsg, AVP_FLAG_MANDATORY, FLAG_ERROR, FLAG_PROXIABLE};
+use crate::diameter::dictionary::{self, avp};
 
 /// Outcome of relaying a request to a backend peer. The dispatch layer maps
 /// each variant to the Diameter Result-Code it answers upstream with.
@@ -36,7 +36,6 @@ pub enum ForwardError {
 impl ForwardError {
     /// The Diameter Result-Code to answer upstream with for this failure.
     pub fn result_code(&self) -> u32 {
-        use crate::diameter::dictionary;
         match self {
             ForwardError::PeerUnreachable | ForwardError::PeerClosed => {
                 dictionary::DIAMETER_UNABLE_TO_DELIVER
@@ -198,11 +197,102 @@ pub fn build_error_answer(
     )
 }
 
+/// The AVPs an answer takes from its request. Every answer of the 3GPP
+/// applications lists Vendor-Specific-Application-Id and Auth-Session-State,
+/// with the values of the request: both as required on Cx and Sh (TS 29.229
+/// clause 6.1, TS 29.329 clause 6.1), Auth-Session-State as required and the
+/// other as optional on S6a, S6c and SGd (TS 29.272 clause 7.2, TS 29.338
+/// clauses 5.3.2 and 6.3.2).
+const APPLICATION_AVPS: [u32; 2] = [avp::VENDOR_SPECIFIC_APPLICATION_ID, avp::AUTH_SESSION_STATE];
+
+/// [`build_answer`] for a handler to fill in, with the application AVPs of
+/// `request` copied into the places the commands list them in:
+/// Vendor-Specific-Application-Id after Session-Id, Auth-Session-State
+/// before Origin-Host. A protocol error (3xxx) gets neither: it is the
+/// generic answer-message of RFC 6733 section 7.2. Returns the answer and the
+/// `(code, vendor)` of what was copied.
+pub fn build_handler_answer(
+    request: &DiameterMsg,
+    origin_host: &str,
+    origin_realm: &str,
+    result_code: u32,
+    error_message: Option<&str>,
+) -> (DiameterMsg, Vec<(u32, u32)>) {
+    let mut answer = build_answer(
+        request,
+        origin_host,
+        origin_realm,
+        result_code,
+        error_message,
+    );
+    let mut copied = Vec::new();
+    if !(3000..4000).contains(&result_code) {
+        // Sy names its application with Auth-Application-Id, which every
+        // one of its answers lists as mandatory (TS 29.219 clauses 5.6.3,
+        // 5.6.5 and 5.6.7); it has no Auth-Session-State or
+        // Vendor-Specific-Application-Id to copy.
+        let sy = [avp::AUTH_APPLICATION_ID];
+        let application_avps: &[u32] = if request.application_id == dictionary::SY_APP_ID {
+            &sy
+        } else {
+            &APPLICATION_AVPS
+        };
+        for &code in application_avps {
+            let Some(found) = request.find(code, 0) else {
+                continue;
+            };
+            let before = if code == avp::AUTH_SESSION_STATE || code == avp::AUTH_APPLICATION_ID {
+                avp::ORIGIN_HOST
+            } else {
+                avp::RESULT_CODE
+            };
+            let position = answer
+                .avps
+                .iter()
+                .position(|existing| existing.code == before && existing.vendor == 0)
+                .unwrap_or(answer.avps.len());
+            answer.avps.insert(position, found.clone());
+            copied.push((code, 0));
+        }
+    }
+    (answer, copied)
+}
+
+/// Give `answer_avp` the flags it has in an answer where those differ from a
+/// request. TS 29.229 clause 7.2.1: Supported-Features "within an answer
+/// application message ... shall never have the 'M' bit set".
+pub fn answer_avp_flags(answer_avp: &mut Avp) {
+    if answer_avp.code == avp::SUPPORTED_FEATURES && answer_avp.vendor == dictionary::VENDOR_3GPP {
+        answer_avp.flags &= !AVP_FLAG_MANDATORY;
+    }
+}
+
+/// Bounded metric label for the Result-Code of an answer siphon is *emitting*.
+///
+/// The lossless-tree extractor. The precedence rule itself is shared with the
+/// client side in [`dictionary::answer_result_label`], so an answer siphon sends
+/// and an answer siphon receives can never be labelled by two different rules.
+///
+/// Read from the final wire rather than from the answer tree earlier in the
+/// build, because `@diameter.on_reply` is explicitly allowed to rewrite the
+/// Result-Code on its way upstream — labelling before that would report what
+/// siphon decided rather than what the peer was told.
+///
+/// AVPs are matched on code alone, not `(code, vendor)`: `Experimental-Result`
+/// is a base-protocol grouped AVP whose *contents* are vendor-specific, and
+/// peers differ on whether they set the V-bit on the group itself.
+pub fn emitted_answer_result_label(wire: &[u8]) -> &'static str {
+    let Ok(answer) = DiameterMsg::from_wire(wire) else {
+        return "none";
+    };
+    let (base, experimental) = answer.answer_result_codes();
+    dictionary::answer_result_label(base, experimental)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::diameter::codec::FLAG_REQUEST;
-    use crate::diameter::dictionary;
 
     fn sample_request() -> DiameterMsg {
         DiameterMsg {

@@ -29,6 +29,11 @@ impl PyScriptConfig {
     pub fn new(store: Arc<ScriptConfigStore>) -> Self {
         Self { store }
     }
+
+    /// The store this namespace reads.
+    pub(crate) fn store(&self) -> &Arc<ScriptConfigStore> {
+        &self.store
+    }
 }
 
 #[pymethods]
@@ -346,6 +351,93 @@ else:
             std::fs::write(&path, "gateway: [unterminated\n").unwrap();
             store.reload();
             assert_eq!(read(python), "carrier-b", "the last good document serves");
+        });
+    }
+
+    /// What Rust code reads through `script_config::current` is what the
+    /// script reads through `config`: the same snapshot before a reload, the
+    /// same new one after it, and the last good one after a reload that
+    /// failed. In a process of its own, since the store is set once.
+    #[test]
+    fn rust_reads_the_generation_the_script_reads() {
+        crate::own_process::run(
+            concat!(
+                module_path!(),
+                "::rust_reads_the_generation_the_script_reads"
+            ),
+            rust_and_script_read_one_generation,
+        );
+    }
+
+    fn rust_and_script_read_one_generation() {
+        use crate::script::script_config::{current, ReloadOutcome};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("routes.yaml");
+        std::fs::write(&path, "routes:\n  default: backend-a\n").unwrap();
+        let store = Arc::new(ScriptConfigStore::from_file(&path).unwrap());
+
+        assert!(current().is_none(), "nothing before the server sets it");
+
+        Python::initialize();
+        Python::attach(|python| {
+            // The way the server hands the namespace to the script.
+            crate::script::api::set_config_singleton(
+                python,
+                PyScriptConfig::new(Arc::clone(&store)),
+            )
+            .unwrap();
+            let config = Py::new(python, PyScriptConfig::new(Arc::clone(&store))).unwrap();
+            let script_reads = |python: Python<'_>| -> String {
+                config
+                    .bind(python)
+                    .call_method1("require", ("routes.default",))
+                    .unwrap()
+                    .extract()
+                    .unwrap()
+            };
+            let rust_reads = || -> String {
+                let snapshot = current().expect("the store is set");
+                lookup(&snapshot, "routes.default")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            };
+
+            let first = current().expect("the store is set");
+            assert!(
+                Arc::ptr_eq(&first, &store.snapshot()),
+                "the script's snapshot"
+            );
+            assert_eq!(rust_reads(), "backend-a");
+            assert_eq!(script_reads(python), "backend-a");
+
+            std::fs::write(&path, "routes:\n  default: backend-b\n").unwrap();
+            assert_eq!(store.reload(), ReloadOutcome::Reloaded);
+            let second = current().expect("the store is set");
+            assert!(!Arc::ptr_eq(&first, &second), "a new generation");
+            assert!(Arc::ptr_eq(&second, &store.snapshot()));
+            assert_eq!(rust_reads(), "backend-b");
+            assert_eq!(script_reads(python), "backend-b");
+            // A snapshot taken earlier is still the whole old document.
+            assert_eq!(
+                lookup(&first, "routes.default").unwrap().as_str(),
+                Some("backend-a")
+            );
+
+            std::fs::write(&path, "routes: [unterminated\n").unwrap();
+            assert!(matches!(store.reload(), ReloadOutcome::Failed(_)));
+            assert!(Arc::ptr_eq(&second, &current().expect("the store is set")));
+            assert_eq!(rust_reads(), script_reads(python));
+
+            // A second namespace does not replace the store Rust reads.
+            crate::script::api::set_config_singleton(
+                python,
+                PyScriptConfig::new(Arc::new(ScriptConfigStore::empty())),
+            )
+            .unwrap();
+            assert_eq!(rust_reads(), "backend-b");
         });
     }
 }

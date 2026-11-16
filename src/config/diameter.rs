@@ -151,7 +151,7 @@ pub struct DiameterConfig {
     /// case omits this and uses the flat `clients` / `servers` / `connect_to`
     /// fields above instead.
     #[serde(default)]
-    pub tenants: std::collections::HashMap<String, DiameterTenant>,
+    pub tenants: indexmap::IndexMap<String, DiameterTenant>,
     /// Generic event sink for Python-emitted signalling events.
     #[serde(default)]
     pub event_sink: Option<EventSinkConfig>,
@@ -167,7 +167,7 @@ impl DiameterConfig {
     /// of the server runs through exactly the same path either way. Pure
     /// client-mode NFs (no identity, no peer lists) yield an empty map and
     /// never reach the server bootstrap.
-    pub fn effective_tenants(&self) -> std::collections::HashMap<String, DiameterTenant> {
+    pub fn effective_tenants(&self) -> indexmap::IndexMap<String, DiameterTenant> {
         if !self.tenants.is_empty() {
             return self.tenants.clone();
         }
@@ -175,9 +175,9 @@ impl DiameterConfig {
         // alone is set by pure client-mode NFs too, so it must not by itself
         // conjure a server tenant.
         if self.clients.is_empty() && self.servers.is_empty() && self.connect_to.is_empty() {
-            return std::collections::HashMap::new();
+            return indexmap::IndexMap::new();
         }
-        let mut tenants = std::collections::HashMap::new();
+        let mut tenants = indexmap::IndexMap::new();
         tenants.insert(
             "default".to_string(),
             DiameterTenant {

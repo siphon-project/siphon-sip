@@ -6,6 +6,7 @@
 mod admin_start;
 mod bootstrap;
 pub mod config_reload;
+mod diameter_native;
 mod python_thread;
 pub(crate) mod shutdown_sequence;
 use shutdown_sequence::run_shutdown_sequence;
@@ -91,6 +92,7 @@ pub struct SiphonServer {
     extension_tasks: Vec<ExtensionTask>,
     control_adapters: Vec<ControlAdapterHandle>,
     lifecycle_participants: Vec<Arc<dyn crate::lifecycle::LifecycleParticipant>>,
+    diameter_handlers: Vec<crate::diameter::native::NativeHandlers>,
     /// What `run` did to `RLIMIT_NOFILE`, logged once logging is up.
     nofile_limit: Option<crate::fd_limit::RaiseOutcome>,
 }
@@ -111,6 +113,7 @@ impl SiphonServer {
             extension_tasks: Vec::new(),
             control_adapters: Vec::new(),
             lifecycle_participants: Vec::new(),
+            diameter_handlers: Vec::new(),
             nofile_limit: None,
         }
     }
@@ -463,6 +466,7 @@ impl SiphonServer {
         )
         .shared();
 
+        self.install_diameter_handlers();
         // --- Initialise structured logging ---
         let _log_guards = if self.skip_logging_init {
             Vec::new()
