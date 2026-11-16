@@ -1719,7 +1719,6 @@ impl SiphonServer {
         // Created before TCP/TLS listeners so outbound messages on those
         // transports can fall back to the pool when no inbound connection
         // matches the requested `ConnectionId`.
-        let pool_tos = global_dscp.filter(|&d| d > 0).map(config::dscp_to_tos);
         let pool_local_addr = first_listen_addr.unwrap_or_else(|| "0.0.0.0:5060".parse().unwrap());
         // Outbound client-certificate (mutual TLS): when `tls.client_certificate`
         // + `tls.client_private_key` are configured, siphon presents that client
@@ -1801,13 +1800,13 @@ impl SiphonServer {
                 Arc::clone(&tcp_connection_map),
                 inbound_tx.clone(),
                 pool_local_addr,
-                pool_tos,
+                global_dscp.filter(|&d| d > 0).map(config::dscp_to_tos),
                 Some(stream_connections.clone()),
                 crlf_pong_tracker.clone(),
                 Arc::clone(&tls_client_configs.unverified),
             )
             .with_tls_configs(tls_client_configs)
-            .with_tcp_source(outbound_tcp_source(&listen_addrs)),
+            .with_listen_addrs(&listen_addrs),
         );
 
         // Hot-reload the outbound client certificate alongside the inbound

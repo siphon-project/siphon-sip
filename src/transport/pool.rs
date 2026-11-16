@@ -14,7 +14,7 @@
 //!     never closed for idleness ([`crate::transport::pool_writer`])
 //!   - Connections are removed on error and recreated on next use
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1089,13 +1089,17 @@ impl ConnectionPool {
         self.connect_timeout = connect_timeout;
     }
 
-    /// Bind default outbound TCP connections to `source` (with an ephemeral
-    /// port) instead of the pool's `local_addr`, at construction. The server
-    /// passes the first TCP listener's IP, so a node whose UDP and TCP
-    /// listeners sit on different addresses does not source its TCP from the
-    /// UDP one.
-    pub fn with_tcp_source(mut self, source: Option<IpAddr>) -> Self {
-        self.tcp_source = source;
+    /// Bind default outbound TCP connections to the first TCP listener's IP
+    /// (with an ephemeral port) instead of the pool's `local_addr`, at
+    /// construction. A node whose UDP and TCP listeners sit on different
+    /// addresses then does not source its TCP from the UDP one. A wildcard
+    /// listener names no address, and no TCP listener leaves none: the pool
+    /// keeps its `local_addr` for both.
+    pub fn with_listen_addrs(mut self, listen_addrs: &HashMap<Transport, SocketAddr>) -> Self {
+        self.tcp_source = listen_addrs
+            .get(&Transport::Tcp)
+            .map(SocketAddr::ip)
+            .filter(|ip| !ip.is_unspecified());
         self
     }
 
@@ -1553,7 +1557,10 @@ mod tests {
             None,
             build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
         )
-        .with_tcp_source(Some("127.0.0.3".parse().unwrap()));
+        .with_listen_addrs(&HashMap::from([
+            (Transport::Udp, "127.0.0.2:5061".parse().unwrap()),
+            (Transport::Tcp, "127.0.0.3:5060".parse().unwrap()),
+        ]));
 
         pool.send_tcp(
             server_addr,
@@ -1591,12 +1598,48 @@ mod tests {
             None,
             build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
         )
-        .with_tcp_source(None);
+        .with_listen_addrs(&HashMap::from([(
+            Transport::Udp,
+            "127.0.0.2:5061".parse().unwrap(),
+        )]));
         pool.send_tcp(server_addr, Bytes::from_static(b"x"))
             .await
             .expect("send_tcp must succeed");
         let peer = server_task.await.unwrap();
         assert_eq!(peer.ip(), "127.0.0.2".parse::<IpAddr>().unwrap());
+    }
+
+    /// The default TCP source is the first TCP listener's IP; a wildcard or
+    /// absent TCP listener leaves the pool's own choice.
+    #[test]
+    fn tcp_source_is_the_tcp_listeners_ip() {
+        ensure_crypto_provider();
+        let source = |addrs: &[(Transport, &str)]| {
+            let (inbound_tx, _inbound_rx) = flume::unbounded();
+            ConnectionPool::new(
+                Arc::new(DashMap::new()),
+                inbound_tx,
+                "127.0.0.2:5061".parse().unwrap(),
+                None,
+                None,
+                None,
+                build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
+            )
+            .with_listen_addrs(
+                &addrs
+                    .iter()
+                    .map(|(transport, addr)| (*transport, addr.parse().unwrap()))
+                    .collect(),
+            )
+            .tcp_source
+        };
+        assert_eq!(source(&[]), None);
+        assert_eq!(source(&[(Transport::Udp, "127.0.0.2:5061")]), None);
+        assert_eq!(
+            source(&[(Transport::Tcp, "127.0.0.3:5060")]),
+            Some("127.0.0.3".parse().unwrap())
+        );
+        assert_eq!(source(&[(Transport::Tcp, "0.0.0.0:5060")]), None);
     }
 
     #[tokio::test]

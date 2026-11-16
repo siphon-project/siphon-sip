@@ -1494,15 +1494,3 @@ pub(super) async fn init_gateway_allow_set(
     crate::firewall::gateways::install(Arc::clone(&allow_set));
     tokio::spawn(allow_set.run());
 }
-
-/// The IP default outbound TCP connections bind: the first TCP listener's.
-/// A wildcard listener names no address (the pool then keeps its own default)
-/// and no TCP listener leaves none.
-pub(super) fn outbound_tcp_source(
-    listen_addrs: &std::collections::HashMap<transport::Transport, std::net::SocketAddr>,
-) -> Option<std::net::IpAddr> {
-    listen_addrs
-        .get(&transport::Transport::Tcp)
-        .map(std::net::SocketAddr::ip)
-        .filter(|ip| !ip.is_unspecified())
-}
