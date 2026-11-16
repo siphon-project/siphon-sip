@@ -522,6 +522,8 @@ pub enum DiameterApplication {
     Rx,
     /// Gx (TS 29.212) — policy and charging control, PCEF ↔ PCRF.
     Gx,
+    /// Sy (TS 29.219) — spending limits, PCRF ↔ OCS.
+    Sy,
     /// S6c (TS 29.336) — SMSC ↔ HSS for SMS-over-Diameter.
     S6c,
     /// SGd (TS 29.338) — SMSC ↔ MME/SGSN for SMS-over-NAS delivery.
@@ -547,6 +549,7 @@ impl DiameterApplication {
             Self::Sh => (dictionary::VENDOR_3GPP, dictionary::SH_APP_ID),
             Self::Rx => (dictionary::VENDOR_3GPP, dictionary::RX_APP_ID),
             Self::Gx => (dictionary::VENDOR_3GPP, dictionary::GX_APP_ID),
+            Self::Sy => (dictionary::VENDOR_3GPP, dictionary::SY_APP_ID),
             Self::Ro => (0, dictionary::RO_APP_ID),
             Self::Rf => (0, dictionary::RF_APP_ID),
             Self::S6c => (dictionary::VENDOR_3GPP, dictionary::S6C_APP_ID),

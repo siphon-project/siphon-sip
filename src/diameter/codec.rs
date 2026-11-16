@@ -441,6 +441,24 @@ pub fn encode_vendor_specific_app_id(vendor_id: u32, auth_app_id: u32) -> Vec<u8
     )
 }
 
+/// The AVPs that tell a peer which application, and which session state, a
+/// message is on. Most applications state NO_STATE_MAINTAINED with
+/// Auth-Session-State and, when vendor-specific, name themselves in a
+/// Vendor-Specific-Application-Id. Sy keeps its session state, so the
+/// client and the server "shall not include the Auth-Session-State AVP"
+/// (TS 29.219 clause 5.2), and every command lists Auth-Application-Id on
+/// its own (clauses 5.6.2 to 5.6.7).
+pub fn encode_application_identity(vendor_id: u32, application_id: u32) -> Vec<u8> {
+    if application_id == dictionary::SY_APP_ID {
+        return encode_avp_u32(dictionary::avp::AUTH_APPLICATION_ID, application_id);
+    }
+    let mut identity = encode_avp_u32(dictionary::avp::AUTH_SESSION_STATE, 1);
+    if vendor_id != 0 {
+        identity.extend_from_slice(&encode_vendor_specific_app_id(vendor_id, application_id));
+    }
+    identity
+}
+
 // ── Full message encoding ──────────────────────────────────────────────────
 
 /// Build a generic Diameter answer carrying the standard mandatory AVPs
@@ -469,17 +487,13 @@ pub fn encode_generic_answer(
         dictionary::avp::ORIGIN_REALM,
         origin_realm,
     ));
-    avp_buf.extend_from_slice(&encode_avp_u32(dictionary::avp::AUTH_SESSION_STATE, 1));
     // Apps with a 3GPP-vendor application-id (Cx, Sh, Gx, Rx, S6c, SGd) need
-    // Vendor-Specific-Application-Id; base apps (Ro, Rf) don't. Match
-    // dictionary::app_name_by_id to detect the vendor side.
-    if let Some(name) = dictionary::app_name_by_id(application_id) {
-        if let Some((vendor, _)) = dictionary::app_id_by_name(name) {
-            if vendor != 0 {
-                avp_buf.extend_from_slice(&encode_vendor_specific_app_id(vendor, application_id));
-            }
-        }
-    }
+    // Vendor-Specific-Application-Id; base apps (Ro, Rf) don't. Sy names
+    // its application with Auth-Application-Id alone.
+    let vendor = dictionary::app_name_by_id(application_id)
+        .and_then(dictionary::app_id_by_name)
+        .map_or(0, |(vendor, _)| vendor);
+    avp_buf.extend_from_slice(&encode_application_identity(vendor, application_id));
     avp_buf.extend_from_slice(&encode_avp_u32(dictionary::avp::RESULT_CODE, result_code));
 
     encode_diameter_message(
@@ -979,6 +993,11 @@ pub fn command_name(code: u32, is_request: bool) -> &'static str {
         (323, false) => "NOA",
         (324, true) => "ECR",
         (324, false) => "ECA",
+        // Sy (TS 29.219)
+        (8388635, true) => "SLR",
+        (8388635, false) => "SLA",
+        (8388636, true) => "SNR",
+        (8388636, false) => "SNA",
         _ => "Unknown",
     }
 }
@@ -1417,6 +1436,78 @@ mod tests {
         assert!(ro
             .find(dictionary::avp::VENDOR_SPECIFIC_APPLICATION_ID, 0)
             .is_none());
+    }
+
+    /// Auth-Application-Id 258, M, length 12, 16777302 (0x01000056), written
+    /// out from RFC 6733 section 6.8 and TS 29.219 clause 5.1.5.
+    const SY_AUTH_APPLICATION_ID: [u8; 12] = [
+        0x00, 0x00, 0x01, 0x02, 0x40, 0x00, 0x00, 0x0c, 0x01, 0x00, 0x00, 0x56,
+    ];
+
+    #[test]
+    fn a_sy_answer_names_its_application_and_keeps_no_state_avp() {
+        // TS 29.219 clause 5.2: the client and server "shall not include the
+        // Auth-Session-State AVP", and every command lists a mandatory
+        // Auth-Application-Id (clauses 5.6.2 to 5.6.7), not a
+        // Vendor-Specific-Application-Id.
+        for command_code in [
+            dictionary::CMD_SPENDING_LIMIT,
+            dictionary::CMD_SPENDING_STATUS_NOTIFICATION,
+            dictionary::CMD_SESSION_TERMINATION,
+        ] {
+            let wire = encode_generic_answer(
+                "ocs.example.org",
+                "example.org",
+                "pcrf.example.org;1;1",
+                command_code,
+                dictionary::SY_APP_ID,
+                dictionary::DIAMETER_SUCCESS,
+                10,
+                20,
+            );
+            assert!(
+                wire.windows(12)
+                    .any(|window| window == SY_AUTH_APPLICATION_ID),
+                "no Auth-Application-Id in {}",
+                hex::encode(&wire)
+            );
+            let decoded = DiameterMsg::from_wire(&wire).expect("decode");
+            assert_eq!(decoded.application_id, 16_777_302);
+            assert_eq!(decoded.command_code, command_code);
+            assert!(decoded
+                .find(dictionary::avp::AUTH_SESSION_STATE, 0)
+                .is_none());
+            assert!(decoded
+                .find(dictionary::avp::VENDOR_SPECIFIC_APPLICATION_ID, 0)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn the_application_identity_of_a_request_is_the_applications_own() {
+        // Sy: just the Auth-Application-Id. Gx and the rest: Auth-Session-State
+        // NO_STATE_MAINTAINED then the Vendor-Specific-Application-Id.
+        assert_eq!(
+            encode_application_identity(dictionary::VENDOR_3GPP, dictionary::SY_APP_ID),
+            SY_AUTH_APPLICATION_ID
+        );
+        let mut gx = encode_avp_u32(dictionary::avp::AUTH_SESSION_STATE, 1);
+        gx.extend_from_slice(&encode_vendor_specific_app_id(
+            dictionary::VENDOR_3GPP,
+            dictionary::GX_APP_ID,
+        ));
+        assert_eq!(
+            encode_application_identity(dictionary::VENDOR_3GPP, dictionary::GX_APP_ID),
+            gx
+        );
+    }
+
+    #[test]
+    fn the_sy_commands_have_their_short_names() {
+        assert_eq!(command_name(8_388_635, true), "SLR");
+        assert_eq!(command_name(8_388_635, false), "SLA");
+        assert_eq!(command_name(8_388_636, true), "SNR");
+        assert_eq!(command_name(8_388_636, false), "SNA");
     }
 
     #[test]

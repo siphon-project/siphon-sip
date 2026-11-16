@@ -508,3 +508,38 @@ def test_set_overload_records_the_reported_reduction_and_validates_the_range():
     assert diameter.overload_reduction == 0
     with pytest.raises(ValueError):
         d.set_overload(101)
+
+
+def test_originate_takes_the_sy_application_by_name():
+    import asyncio
+    diameter = _fresh_diameter()
+    report = ('Policy-Counter-Status-Report', [
+        ('Policy-Counter-Identifier', 'gold'),
+        ('Policy-Counter-Status', 'EXHAUSTED'),
+        ('Pending-Policy-Counter-Information', [
+            ('Policy-Counter-Status', 'VALID'),
+            ('Pending-Policy-Counter-Change-Time', 1700000000),
+        ]),
+    ])
+    answer = asyncio.run(diameter.originate(
+        'SNR', 'Sy', [('Auth-Application-Id', 16777302), report, ('SN-Request-Type', 1)],
+        'epc.example', destination_host='pcrf.epc.example',
+        session_id='pcrf.epc.example;5;5'))
+    assert answer.result_code == 2001
+    sent = diameter.originated[-1]
+    assert sent['application'] == 'Sy'
+    assert sent['session_id'] == 'pcrf.epc.example;5;5'
+    assert sent['avps'][1] == report
+
+
+def test_a_sy_answer_starts_with_the_requests_auth_application_id():
+    # TS 29.219 clause 5.2 keeps Auth-Session-State out of Sy, and clauses
+    # 5.6.3, 5.6.5 and 5.6.7 list Auth-Application-Id as mandatory.
+    req = mock_module.MockDiameterRequest(
+        application_name="Sy", application_id=16777302,
+        command_name="SLR", command_code=8388635,
+        avps={(258, 0): 16777302, (277, 0): 1})
+    answer = req.answer(2001)
+    assert [key for key, _ in answer._avps] == [(258, 0)]
+    assert answer.get_avp(258) == 16777302
+    assert answer.get_avp(277) is None

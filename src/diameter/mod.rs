@@ -49,6 +49,8 @@ pub mod s6c;
 pub mod server;
 pub mod sgd;
 pub mod sh;
+#[cfg(test)]
+pub(crate) mod sy_test_vectors;
 pub mod transport;
 pub mod unknown_avp;
 pub mod watchdog;

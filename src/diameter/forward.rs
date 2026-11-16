@@ -227,11 +227,21 @@ pub fn build_handler_answer(
     );
     let mut copied = Vec::new();
     if !(3000..4000).contains(&result_code) {
-        for code in APPLICATION_AVPS {
+        // Sy names its application with Auth-Application-Id, which every
+        // one of its answers lists as mandatory (TS 29.219 clauses 5.6.3,
+        // 5.6.5 and 5.6.7); it has no Auth-Session-State or
+        // Vendor-Specific-Application-Id to copy.
+        let sy = [avp::AUTH_APPLICATION_ID];
+        let application_avps: &[u32] = if request.application_id == dictionary::SY_APP_ID {
+            &sy
+        } else {
+            &APPLICATION_AVPS
+        };
+        for &code in application_avps {
             let Some(found) = request.find(code, 0) else {
                 continue;
             };
-            let before = if code == avp::AUTH_SESSION_STATE {
+            let before = if code == avp::AUTH_SESSION_STATE || code == avp::AUTH_APPLICATION_ID {
                 avp::ORIGIN_HOST
             } else {
                 avp::RESULT_CODE

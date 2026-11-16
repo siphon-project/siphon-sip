@@ -31,14 +31,14 @@ pub(crate) struct Destination<'a> {
 }
 
 /// A command given by name (as `send_request` takes it) or by code.
-fn command_code(command: &Bound<'_, PyAny>) -> PyResult<u32> {
+fn command_code(command: &Bound<'_, PyAny>, application_id: u32) -> PyResult<u32> {
     if let Ok(code) = command.extract::<u32>() {
         return Ok(code);
     }
     let name: String = command.extract().map_err(|_| {
         pyo3::exceptions::PyTypeError::new_err("command must be a str name or an int code")
     })?;
-    dictionary::command_code_by_name(&name).ok_or_else(|| {
+    dictionary::command_code_in_application(application_id, &name).ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err(format!("unknown Diameter command name: {name}"))
     })
 }
@@ -67,12 +67,12 @@ pub(crate) fn originate<'py>(
     proxiable: bool,
     timeout: std::time::Duration,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let command_code = command_code(command)?;
     let (_, application_id) = dictionary::app_id_by_name(application).ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err(format!(
             "unknown Diameter application name: {application}"
         ))
     })?;
+    let command_code = command_code(command, application_id)?;
     let avps = caller_avps(avps)?;
     let connection = originate::connection(
         manager,
@@ -128,6 +128,10 @@ pub(crate) fn originate<'py>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diameter::codec::hex;
+    use crate::diameter::sy_test_vectors::{
+        SLA_REPORT, SLR_INITIAL, SNR_ABORT, SNR_REPORT, STR_FINAL,
+    };
     use pyo3::types::PyTuple;
 
     #[test]
@@ -187,16 +191,26 @@ mod tests {
                 .unwrap_err()
                 .is_instance_of::<pyo3::exceptions::PyValueError>(python));
             assert_eq!(
-                command_code(&"CLR".into_pyobject(python).unwrap().into_any()).unwrap(),
+                command_code(
+                    &"CLR".into_pyobject(python).unwrap().into_any(),
+                    dictionary::S6A_APP_ID
+                )
+                .unwrap(),
                 317
             );
             assert_eq!(
-                command_code(&322u32.into_pyobject(python).unwrap().into_any()).unwrap(),
+                command_code(
+                    &322u32.into_pyobject(python).unwrap().into_any(),
+                    dictionary::S6A_APP_ID
+                )
+                .unwrap(),
                 322
             );
-            assert!(
-                command_code(&"Not-A-Command".into_pyobject(python).unwrap().into_any()).is_err()
-            );
+            assert!(command_code(
+                &"Not-A-Command".into_pyobject(python).unwrap().into_any(),
+                dictionary::S6A_APP_ID
+            )
+            .is_err());
         });
     }
 
@@ -466,8 +480,255 @@ mod tests {
         )
     }
 
+    /// One Sy session (TS 29.219): the PCRF's initial SLR and final STR, and
+    /// the OCS's notification of a counter and its request to end the session,
+    /// as the AVP lists a script passes.
+    const SY_SESSION: &str = "pcrf.epc.mnc001.mcc001.3gppnetwork.org;5;5";
+    const SY_SLR: &str = r#"[
+        ("Auth-Application-Id", 16777302),
+        ("SL-Request-Type", 0),
+        ("Subscription-Id", [("Subscription-Id-Type", 1), ("Subscription-Id-Data", "001010000000001")]),
+        ("Policy-Counter-Identifier", "gold"),
+        ("Policy-Counter-Identifier", "silver"),
+    ]"#;
+    const SY_SNR: &str = r#"[
+        ("Auth-Application-Id", 16777302),
+        ("Policy-Counter-Status-Report", [
+            ("Policy-Counter-Identifier", "gold"),
+            ("Policy-Counter-Status", "EXHAUSTED"),
+            ("Pending-Policy-Counter-Information", [
+                ("Policy-Counter-Status", "VALID"),
+                ("Pending-Policy-Counter-Change-Time", 1700000000),
+            ]),
+        ]),
+        ("SN-Request-Type", 1),
+    ]"#;
+    const SY_ABORT: &str = r#"[("Auth-Application-Id", 16777302), ("SN-Request-Type", 2)]"#;
+    const SY_STR: &str = r#"[("Auth-Application-Id", 16777302), ("Termination-Cause", 1)]"#;
+
+    /// The command name is read in the application it is sent on: Sy's SNR is
+    /// 8388636, Sh's is 308 (TS 29.219 table 5.6.1, TS 29.329 clause 6.1).
+    #[test]
+    fn snr_is_read_in_the_application_it_is_sent_on() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let name = |text: &str| text.into_pyobject(python).unwrap().into_any();
+            for (application_id, command, code) in [
+                (dictionary::SY_APP_ID, "SNR", 8_388_636),
+                (
+                    dictionary::SY_APP_ID,
+                    "Spending-Status-Notification",
+                    8_388_636,
+                ),
+                (dictionary::SY_APP_ID, "SLR", 8_388_635),
+                (dictionary::SY_APP_ID, "STR", 275),
+                (dictionary::SH_APP_ID, "SNR", 308),
+            ] {
+                assert_eq!(
+                    command_code(&name(command), application_id).unwrap(),
+                    code,
+                    "{command} on {application_id}"
+                );
+            }
+        });
+    }
+
+    /// The hop-by-hop and end-to-end identifiers are the connection's own, so
+    /// the octets after the 20-octet header are what a known answer fixes.
+    fn originated_body(
+        from: &crate::diameter::peer::DiameterPeer,
+        command_code: u32,
+        avps: &str,
+        host: Option<&str>,
+    ) -> Vec<u8> {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let request = Request {
+                command_code,
+                application_id: dictionary::SY_APP_ID,
+                proxiable: true,
+                session_id: Some(SY_SESSION),
+                destination_host: host,
+                destination_realm: EPC_REALM,
+                avps: caller_avps(&script_avps(python, avps)).unwrap(),
+            };
+            let wire = originate::wire(from, request).unwrap();
+            let message = crate::diameter::codec::DiameterMsg::from_wire(&wire).unwrap();
+            assert_eq!(message.command_code, command_code);
+            assert_eq!(message.application_id, 16_777_302);
+            assert_eq!(
+                wire[4], 0xC0,
+                "R and P, as clauses 5.6.2, 5.6.4 and 5.6.6 give"
+            );
+            wire[20..].to_vec()
+        })
+    }
+
+    use crate::diameter::sy_test_vectors::{OCS_HOST, PCRF_HOST};
+
+    /// An OCS sends an SNR on the connection the PCRF opened, in the Sy
+    /// session the PCRF started: the Session-Id is the PCRF's, the grouped
+    /// report is built from nested lists, and SN-Request-Type goes without
+    /// the M bit (TS 29.219 table 5.3.0.1).
+    #[test]
+    fn a_server_originates_an_snr_with_a_policy_counter_report() {
+        let ocs = node(OCS_HOST, EPC_REALM);
+        let report = originated_body(
+            &ocs,
+            dictionary::CMD_SPENDING_STATUS_NOTIFICATION,
+            SY_SNR,
+            Some(PCRF_HOST),
+        );
+        assert_eq!(hex::encode(&report), SNR_REPORT);
+        let abort = originated_body(
+            &ocs,
+            dictionary::CMD_SPENDING_STATUS_NOTIFICATION,
+            SY_ABORT,
+            Some(PCRF_HOST),
+        );
+        assert_eq!(hex::encode(&abort), SNR_ABORT);
+    }
+
+    /// A PCRF sends the initial SLR and the final STR of one Sy session.
+    #[test]
+    fn a_client_originates_an_slr_and_an_str() {
+        let pcrf = node(PCRF_HOST, EPC_REALM);
+        let slr = originated_body(&pcrf, dictionary::CMD_SPENDING_LIMIT, SY_SLR, None);
+        assert_eq!(hex::encode(&slr), SLR_INITIAL);
+        let termination = originated_body(&pcrf, dictionary::CMD_SESSION_TERMINATION, SY_STR, None);
+        assert_eq!(hex::encode(&termination), STR_FINAL);
+    }
+
+    /// A `DiameterAvp` as `name=value`, a grouped one as `name[member,...]`.
+    /// A Time reads back as the octets it came in (seconds since 1900).
+    fn render(avp: &Bound<'_, PyAny>) -> String {
+        let name: String = avp.getattr("name").unwrap().extract().unwrap();
+        let value = avp.getattr("value").unwrap();
+        if let Ok(members) = value.cast::<pyo3::types::PyList>() {
+            let members: Vec<String> = members.iter().map(|member| render(&member)).collect();
+            return format!("{name}[{}]", members.join(","));
+        }
+        match value.extract::<Vec<u8>>() {
+            Ok(octets) if value.is_instance_of::<pyo3::types::PyBytes>() => {
+                format!("{name}={}", hex::encode(&octets))
+            }
+            _ => format!("{name}={value}"),
+        }
+    }
+
+    /// An SLA as an OCS sends it, read by a script: the grouped report and
+    /// its pending information come back as nested `DiameterAvp`s.
+    #[test]
+    fn a_script_reads_the_grouped_policy_counters_of_an_sla() {
+        let mut wire = vec![
+            0x01, 0, 0, 0, 0x40, 0x80, 0x00, 0x1b, 0x01, 0x00, 0x00, 0x56,
+        ];
+        wire.extend_from_slice(&[0, 0, 0, 5, 0, 0, 0, 6]);
+        wire.extend_from_slice(&hex::decode(SLA_REPORT).unwrap());
+        let length = (wire.len() as u32).to_be_bytes();
+        wire[1..4].copy_from_slice(&length[1..]);
+        let message = crate::diameter::codec::DiameterMsg::from_wire(&wire).unwrap();
+        assert_eq!(message.command_code, 8_388_635);
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            // As a script sees it: through the Python object.
+            let answer = Bound::new(python, PyDiameterAnswer::from_msg(message)).unwrap();
+            assert_eq!(
+                answer
+                    .getattr("result_code")
+                    .unwrap()
+                    .extract::<u32>()
+                    .unwrap(),
+                2001
+            );
+            let reports: Vec<_> = answer
+                .call_method0("avps")
+                .unwrap()
+                .try_iter()
+                .unwrap()
+                .map(|item| item.unwrap())
+                .filter(|item| {
+                    item.getattr("name")
+                        .and_then(|name| name.extract::<String>())
+                        .is_ok_and(|name| name == "Policy-Counter-Status-Report")
+                })
+                .collect();
+            assert_eq!(reports.len(), 2);
+            let reports: Vec<String> = reports.iter().map(render).collect();
+            assert_eq!(
+                reports[0],
+                "Policy-Counter-Status-Report[Policy-Counter-Identifier=gold,\
+                 Policy-Counter-Status=EXHAUSTED,\
+                 Pending-Policy-Counter-Information[Policy-Counter-Status=VALID,\
+                 Pending-Policy-Counter-Change-Time=e8fe6f80]]"
+            );
+            assert_eq!(
+                reports[1],
+                "Policy-Counter-Status-Report[Policy-Counter-Identifier=silver,Policy-Counter-Status=VALID]"
+            );
+        });
+    }
+
+    /// From, command, application, AVPs, Session-Id, Destination-Host,
+    /// Destination-Realm.
+    type Message<'a> = (
+        &'a crate::diameter::peer::DiameterPeer,
+        u32,
+        u32,
+        String,
+        Option<&'a str>,
+        Option<&'a str>,
+        &'a str,
+    );
+
+    /// The requests of one Sy session (TS 29.219): the PCRF's initial SLR and
+    /// final STR, and the OCS's two SNRs.
+    fn sy_messages<'a>(
+        pcrf: &'a crate::diameter::peer::DiameterPeer,
+        ocs: &'a crate::diameter::peer::DiameterPeer,
+    ) -> Vec<Message<'a>> {
+        vec![
+            (
+                pcrf,
+                dictionary::CMD_SPENDING_LIMIT,
+                dictionary::SY_APP_ID,
+                SY_SLR.into(),
+                Some(SY_SESSION),
+                None,
+                EPC_REALM,
+            ),
+            (
+                ocs,
+                dictionary::CMD_SPENDING_STATUS_NOTIFICATION,
+                dictionary::SY_APP_ID,
+                SY_SNR.into(),
+                Some(SY_SESSION),
+                Some(PCRF_HOST),
+                EPC_REALM,
+            ),
+            (
+                ocs,
+                dictionary::CMD_SPENDING_STATUS_NOTIFICATION,
+                dictionary::SY_APP_ID,
+                SY_ABORT.into(),
+                Some(SY_SESSION),
+                Some(PCRF_HOST),
+                EPC_REALM,
+            ),
+            (
+                pcrf,
+                dictionary::CMD_SESSION_TERMINATION,
+                dictionary::SY_APP_ID,
+                SY_STR.into(),
+                Some(SY_SESSION),
+                None,
+                EPC_REALM,
+            ),
+        ]
+    }
+
     /// Writes each request `diameter.originate` would send for the commands
-    /// of TS 29.229, TS 29.329, TS 29.214, TS 29.212 and TS 29.272 that start
+    /// of TS 29.229, TS 29.329, TS 29.214, TS 29.212, TS 29.219 and TS 29.272 that start
     /// at the node, built from the AVP lists a script passes, as one
     /// `text2pcap` hex dump for `scripts/validate_diameter_originate.sh`.
     /// tshark reads them back with its own dictionary.
@@ -480,6 +741,7 @@ mod tests {
         let hss = node("hss.ims.mnc001.mcc001.3gppnetwork.org", IMS_REALM);
         let pcrf = node("pcrf.epc.mnc001.mcc001.3gppnetwork.org", EPC_REALM);
         let pgw = node("pgw.epc.mnc001.mcc001.3gppnetwork.org", EPC_REALM);
+        let ocs = node(OCS_HOST, EPC_REALM);
         let pcscf = node("pcscf.ims.mnc001.mcc001.3gppnetwork.org", IMS_REALM);
         let impi = "001010000000001@ims.mnc001.mcc001.3gppnetwork.org";
         let rtr = format!(
@@ -588,18 +850,7 @@ mod tests {
             ("AF-Signalling-Protocol", 1),
             ("Required-Access-Info", 0),
         ]"#;
-        // From, command, application, AVPs, Session-Id, Destination-Host,
-        // Destination-Realm.
-        type Message<'a> = (
-            &'a crate::diameter::peer::DiameterPeer,
-            u32,
-            u32,
-            String,
-            Option<&'a str>,
-            Option<&'a str>,
-            &'a str,
-        );
-        let messages: Vec<Message<'_>> = vec![
+        let mut messages: Vec<Message<'_>> = vec![
             (
                 &hss,
                 304,
@@ -727,6 +978,7 @@ mod tests {
                 EPC_REALM,
             ),
         ];
+        messages.extend(sy_messages(&pcrf, &ocs));
         pyo3::Python::initialize();
         let dump = pyo3::Python::attach(|python| {
             let mut dump = String::new();

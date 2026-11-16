@@ -82,7 +82,12 @@ impl RetryPolicy {
                 commands: entry
                     .commands
                     .iter()
-                    .filter_map(|name| dictionary::command_code_by_name(name))
+                    .filter_map(|name| {
+                        dictionary::command_code_in_application(
+                            entry.application.to_app_id().1,
+                            name,
+                        )
+                    })
                     .collect(),
                 too_busy: entry.on.is_empty() || entry.on.iter().any(|on| on == "too_busy"),
                 unable_to_deliver: entry.on.is_empty()
@@ -385,6 +390,24 @@ mod tests {
         policy.divert_abated = true;
         // It never left this node, so even a state-changing command is safe.
         assert!(policy.allows(S6A, CCR, Failure::Abated));
+    }
+
+    #[test]
+    fn a_sy_retry_rule_reads_snr_as_the_sy_command() {
+        // Sh's SNR is 308; on Sy the same name is the Spending-Status-
+        // Notification 8388636 (TS 29.219 table 5.6.1).
+        let config: crate::config::DiameterConfig = serde_saphyr::from_str(
+            "retry:\n  - {application: sy, commands: [SNR, SLR]}\n  - {application: sh, commands: [SNR]}\n",
+        )
+        .unwrap();
+        let policy = RetryPolicy::from_config(&config);
+        let sy = dictionary::SY_APP_ID;
+        let sh = dictionary::SH_APP_ID;
+        assert!(policy.allows(sy, 8_388_636, Failure::TooBusy));
+        assert!(policy.allows(sy, 8_388_635, Failure::TooBusy));
+        assert!(!policy.allows(sy, 308, Failure::TooBusy));
+        assert!(policy.allows(sh, 308, Failure::TooBusy));
+        assert!(!policy.allows(sh, 8_388_636, Failure::TooBusy));
     }
 
     #[test]

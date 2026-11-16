@@ -57,6 +57,7 @@ They are case-insensitive in a script and lowercase in `siphon.yaml`.
 | `Sh` | 16777217 | 10415 | TS 29.329 |
 | `Rx` | 16777236 | 10415 | TS 29.214 |
 | `Gx` | 16777238 | 10415 | TS 29.212 |
+| `Sy` | 16777302 | 10415 | TS 29.219 |
 | `S6a` | 16777251 | 10415 | TS 29.272 |
 | `S13` | 16777252 | 10415 | TS 29.272 |
 | `S6c` | 16777312 | 10415 | TS 29.338 |
@@ -68,7 +69,11 @@ They are case-insensitive in a script and lowercase in `siphon.yaml`.
 
 Some command codes belong to more than one application: Credit-Control (272)
 is both Ro and Gx, Re-Auth (258) both Rx and Gx, Multimedia-Auth (303) both Cx
-and Zh. A bare `"CCR"` filter matches
+and Zh. Subscribe-Notifications on Sh (308) and Spending-Status-Notification on
+Sy (8388636) are both abbreviated SNR (and SNA), so a bare `"SNR"` stays Sh's
+and `"Sy:SNR"` is Sy's; the same goes for `send_request`, `originate` and the
+`commands` of a `retry` entry, which read the abbreviation in the application
+they are given. A bare `"CCR"` filter matches
 the command on any application; `"Gx:CCR"` and `"Ro:CCR"` match only their own
 Application-Id, so one script can serve both without either handler seeing the
 other's requests.
@@ -111,7 +116,7 @@ diameter:
     tcp: "0.0.0.0:3868"
   origin_host: "hss.epc.mnc001.mcc001.3gppnetwork.org"
   origin_realm: "epc.mnc001.mcc001.3gppnetwork.org"
-  applications: [s6a, cx]      # cx, sh, rx, gx, ro, rf, s6a, s13, s6c, sgd, zh, zn, or relay
+  applications: [s6a, cx]      # cx, sh, rx, gx, sy, ro, rf, s6a, s13, s6c, sgd, zh, zn, or relay
   clients:
     - name: mme
       allowed_ips: ["192.0.2.0/24"]
@@ -610,6 +615,119 @@ SIP-Forking-Indication or Acceptable-Service-Info by name. Left out are the
 four Float32 AVPs (Max-PLR-DL/UL, Desired-Max-Latency/Loss), a type the
 dictionary does not encode, and the Gxx, Sd and St AVPs.
 
+## Sy: spending limits (TS 29.219)
+
+A PCRF or PCF script is the Sy client of an online charging system, and an
+OCS or CHF script is its server. Sy is application 16777302 with vendor 10415,
+advertised in the capabilities exchange the way the other 3GPP applications
+are (`Vendor-Specific-Application-Id` with `Vendor-Id` 10415 and the
+`Auth-Application-Id`, and `Supported-Vendor-Id` 10415). Name it as `Sy` in a
+filter, a `send_request` or `originate` call and `diameter.routes`
+(`application: sy`).
+
+| Command | Code | Filter |
+|---|---|---|
+| Spending-Limit-Request / Answer (SLR, SLA) | 8388635 | `"Sy:SLR"` |
+| Spending-Status-Notification-Request / Answer (SNR, SNA) | 8388636 | `"Sy:SNR"` |
+| Session-Termination-Request / Answer (STR, STA) | 275 | `"Sy:STR"` |
+
+The AVPs are in the dictionary, all 3GPP vendor-specific and sent with the
+flags table 5.3.0.1 gives: Policy-Counter-Identifier (2901),
+Policy-Counter-Status (2902), Policy-Counter-Status-Report (2903, grouped),
+SL-Request-Type (2904), Pending-Policy-Counter-Information (2905, grouped),
+Pending-Policy-Counter-Change-Time (2906, a Time: given as Unix seconds, read
+back as the four octets of seconds since 1900 it came in, as every Time AVP is) and
+SN-Request-Type (2907, an Unsigned32 bit mask: bit 0 normal request, bit 1
+abort session request). All carry M and V except SN-Request-Type, which has
+V only. DIAMETER_ERROR_UNKNOWN_POLICY_COUNTERS (5570) and
+DIAMETER_ERROR_NO_AVAILABLE_POLICY_COUNTERS (4241) are Experimental-Result
+codes.
+
+Sy keeps its session state: neither side sends Auth-Session-State (clause
+5.2), and every command names its application with `Auth-Application-Id`
+rather than `Vendor-Specific-Application-Id`. `send_request(..., "Sy")` and the
+generic answer siphon sends for a request nothing handled follow that, and so
+does `request.answer()` on a Sy request, which carries the request's
+`Auth-Application-Id`. With `originate` the script lists
+`("Auth-Application-Id", 16777302)` itself, as for every application.
+
+The client sends the initial SLR (SL-Request-Type 0), later SLRs (1) and the
+final STR on one Sy session. `originate` takes the `session_id`, so every
+request after the first is on the session the first opened; a client-mode
+peer is named with `peer`:
+
+```python
+# PCRF: ask the OCS for two counters, then close the session (clauses 4.5.1, 4.5.3).
+session_id = "pcrf.epc.mnc001.mcc001.3gppnetwork.org;1;1"
+answer = await diameter.originate("SLR", "Sy", [
+    ("Auth-Application-Id", 16777302),
+    ("SL-Request-Type", 0),
+    ("Subscription-Id", [("Subscription-Id-Type", 1), ("Subscription-Id-Data", "001010000000001")]),
+    ("Policy-Counter-Identifier", "gold"),
+    ("Policy-Counter-Identifier", "silver"),
+], destination_realm="epc.mnc001.mcc001.3gppnetwork.org", peer="ocs", session_id=session_id)
+for avp in answer.avps():
+    if avp.name == "Policy-Counter-Status-Report":
+        report = {member.name: member.value for member in avp.value}
+
+await diameter.originate("STR", "Sy", [
+    ("Auth-Application-Id", 16777302),
+    ("Termination-Cause", 1),                  # DIAMETER_LOGOUT
+], destination_realm="epc.mnc001.mcc001.3gppnetwork.org", peer="ocs", session_id=session_id)
+```
+
+`send_request("SLR", "Sy", peer="ocs", **avps)` sends the first SLR the same
+way, on a new session, and returns the answer as a dict keyed by snake_case AVP
+name: `answer["session_id"]` for the requests after it,
+`answer["policy_counter_status_report"]` a dict, or a list of dicts when the
+OCS reports several counters, with a group's members nested the same way and
+the Time as Unix seconds.
+
+The server answers the SLR from a handler and starts the notifications
+itself: an SNR goes to the PCRF on the connection that carried its SLR, in the
+Sy session the SLR opened, with the Destination-Host the SLR came from
+(clause 5.6.4).
+
+```python
+@diameter.on_request("Sy:SLR")
+def spending_limit(request):
+    answer = request.answer(2001)
+    answer.insert_avp("Policy-Counter-Status-Report", [
+        ("Policy-Counter-Identifier", "gold"),
+        ("Policy-Counter-Status", "VALID"),
+    ])
+    return answer
+
+@diameter.on_request("Sy:STR")
+def final_report(request):
+    return request.answer(2001)
+
+# Later, from any handler or task: the counter ran out, and a status change is pending.
+answer = await diameter.originate("SNR", "Sy", [
+    ("Auth-Application-Id", 16777302),
+    ("Policy-Counter-Status-Report", [
+        ("Policy-Counter-Identifier", "gold"),
+        ("Policy-Counter-Status", "EXHAUSTED"),
+        ("Pending-Policy-Counter-Information", [
+            ("Policy-Counter-Status", "VALID"),
+            ("Pending-Policy-Counter-Change-Time", 1767225600),
+        ]),
+    ]),
+    ("SN-Request-Type", 1),
+], destination_realm="epc.mnc001.mcc001.3gppnetwork.org",
+   destination_host="pcrf.epc.mnc001.mcc001.3gppnetwork.org",
+   session_id=session_id)
+```
+
+To end a Sy session from the OCS, send the SNR with `("SN-Request-Type", 2)`
+(bit 1, Abort Session Request) when the PCRF agreed to the ASR feature in the
+Supported-Features of the first SLR and SLA (feature bit 0 of Feature-List-ID
+1, clause 5.1.6); the PCRF answers it and sends the STR. siphon does not
+negotiate the feature or hold the session: the script does.
+
+`scripts/validate_diameter_originate.sh` reads the SLR, both SNRs and the STR
+back with Wireshark's Diameter dissector.
+
 ## `DiameterAnswer`
 
 The value a handler returns via `request.answer(...)` / `request.reject(...)`.
@@ -823,7 +941,7 @@ the script decides whether to repeat.
 `scripts/validate_diameter_originate.sh` reads the requests built from these
 AVP lists back with Wireshark's Diameter dissector: Cx RTR, Sh PNR, Rx ASR
 and RAR, Gx RAR with a rule installation, Gx CCR-I, -U and -T on one
-session, and S6a CLR, IDR and DSR.
+session, S6a CLR, IDR and DSR, and the Sy SLR, SNR and STR.
 
 ### DNS address groups
 

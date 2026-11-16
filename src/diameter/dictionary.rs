@@ -1960,6 +1960,8 @@ pub const CX_APP_ID: u32 = 16777216;
 pub const SH_APP_ID: u32 = 16777217;
 /// Gx Application-Id (TS 29.212) — Policy and Charging Control
 pub const GX_APP_ID: u32 = 16777238;
+/// Sy Application-Id (TS 29.219 clause 5.1.5) — spending limits, PCRF ↔ OCS
+pub const SY_APP_ID: u32 = 16777302;
 /// Rx Application-Id (TS 29.214) — QoS/policy (P-CSCF ↔ PCRF/PCF)
 pub const RX_APP_ID: u32 = 16777236;
 /// Ro Application-Id (RFC 4006 / TS 32.299) — Online Charging
@@ -1987,14 +1989,15 @@ pub const VENDOR_3GPP: u32 = 10415;
 
 /// Resolve an application name (case-insensitive) to its
 /// `(vendor_id, app_id)` tuple. Accepts the canonical short form
-/// (`"Cx"`, `"Sh"`, `"Gx"`, `"Rx"`, `"Ro"`, `"Rf"`, `"S6c"`, `"SGd"`, `"S6a"`,
-/// `"S13"`, `"Zh"`, `"Zn"`).
+/// (`"Cx"`, `"Sh"`, `"Gx"`, `"Sy"`, `"Rx"`, `"Ro"`, `"Rf"`, `"S6c"`, `"SGd"`,
+/// `"S6a"`, `"S13"`, `"Zh"`, `"Zn"`).
 pub fn app_id_by_name(name: &str) -> Option<(u32, u32)> {
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
         "cx" => Some((VENDOR_3GPP, CX_APP_ID)),
         "sh" => Some((VENDOR_3GPP, SH_APP_ID)),
         "gx" => Some((VENDOR_3GPP, GX_APP_ID)),
+        "sy" => Some((VENDOR_3GPP, SY_APP_ID)),
         "rx" => Some((VENDOR_3GPP, RX_APP_ID)),
         "ro" => Some((0, RO_APP_ID)),
         "rf" => Some((0, RF_APP_ID)),
@@ -2012,7 +2015,7 @@ pub fn app_id_by_name(name: &str) -> Option<(u32, u32)> {
 /// advertised in the CER/CEA via `Acct-Application-Id (259)` rather than
 /// `Auth-Application-Id (258)` (RFC 6733 §2.4 / §6.9). Today only base
 /// accounting — Rf (id 3) — is an accounting application; every other app
-/// SIPhon speaks (Cx/Sh/Gx/Rx/Ro/S6a/S13/S6c/SGd/Zh/Zn) is an auth application. Advertising
+/// SIPhon speaks (Cx/Sh/Gx/Sy/Rx/Ro/S6a/S13/S6c/SGd/Zh/Zn) is an auth application. Advertising
 /// an accounting app as an auth app makes strict peers (freeDiameter,
 /// go-diameter/CGRateS) answer `DIAMETER_NO_COMMON_APPLICATION`.
 pub fn is_accounting_application(app_id: u32) -> bool {
@@ -2027,6 +2030,7 @@ pub fn app_name_by_id(app_id: u32) -> Option<&'static str> {
         CX_APP_ID => Some("Cx"),
         SH_APP_ID => Some("Sh"),
         GX_APP_ID => Some("Gx"),
+        SY_APP_ID => Some("Sy"),
         RX_APP_ID => Some("Rx"),
         RO_APP_ID => Some("Ro"),
         RF_APP_ID => Some("Rf"),
@@ -2065,6 +2069,10 @@ pub fn command_code_by_name(name: &str) -> Option<u32> {
         "user-data" | "udr" | "uda" => Some(CMD_SH_USER_DATA),
         "profile-update" | "pur" | "pua" => Some(CMD_SH_PROFILE_UPDATE),
         "subscribe-notifications" | "snr" | "sna" => Some(CMD_SH_SUBSCRIBE_NOTIFICATIONS),
+        // Sy (TS 29.219). SNR and SNA name Sh's command here; on Sy they are
+        // read by `command_code_in_application`.
+        "spending-limit" | "slr" | "sla" => Some(CMD_SPENDING_LIMIT),
+        "spending-status-notification" => Some(CMD_SPENDING_STATUS_NOTIFICATION),
         "push-notification" | "pnr" | "pna" => Some(CMD_SH_PUSH_NOTIFICATION),
         // Gx / Rx / charging
         "credit-control" | "ccr" | "cca" => Some(CMD_CREDIT_CONTROL),
@@ -2101,6 +2109,20 @@ pub fn command_code_by_name(name: &str) -> Option<u32> {
     }
 }
 
+/// [`command_code_by_name`] for a command sent or served on `application_id`.
+///
+/// Two applications abbreviate different commands the same way: Sh's
+/// Subscribe-Notifications (308) and Sy's Spending-Status-Notification
+/// (8388636) are both SNR and SNA. The bare name keeps meaning Sh, so no
+/// configuration or script written before Sy changes; on the Sy application
+/// the abbreviation is the Sy command. Every other name is the same in both.
+pub fn command_code_in_application(application_id: u32, name: &str) -> Option<u32> {
+    if application_id == SY_APP_ID && matches!(name.to_ascii_lowercase().as_str(), "snr" | "sna") {
+        return Some(CMD_SPENDING_STATUS_NOTIFICATION);
+    }
+    command_code_by_name(name)
+}
+
 /// Reverse of [`command_code_by_name`] — returns the canonical
 /// long-form name (without suffix) for a command code. Used when
 /// building the dispatch key for inbound `@diameter.on_command`.
@@ -2116,6 +2138,8 @@ pub fn command_name_by_code(code: u32) -> Option<&'static str> {
         CMD_SH_PROFILE_UPDATE => "Profile-Update",
         CMD_SH_SUBSCRIBE_NOTIFICATIONS => "Subscribe-Notifications",
         CMD_SH_PUSH_NOTIFICATION => "Push-Notification",
+        CMD_SPENDING_LIMIT => "Spending-Limit",
+        CMD_SPENDING_STATUS_NOTIFICATION => "Spending-Status-Notification",
         CMD_CREDIT_CONTROL => "Credit-Control",
         CMD_RE_AUTH => "Re-Auth",
         CMD_ABORT_SESSION => "Abort-Session",
@@ -2135,6 +2159,13 @@ pub fn command_name_by_code(code: u32) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+// ── Sy Command Codes (TS 29.219 table 5.6.1) ───────────────────────────
+
+/// Spending-Limit-Request/Answer
+pub const CMD_SPENDING_LIMIT: u32 = 8388635;
+/// Spending-Status-Notification-Request/Answer
+pub const CMD_SPENDING_STATUS_NOTIFICATION: u32 = 8388636;
 
 // ── Cx/Dx Command Codes (TS 29.228) ────────────────────────────────────
 
@@ -2340,6 +2371,7 @@ const KNOWN_EXPERIMENTAL_RESULT_CODES: &[(u32, &str)] = &[
     (4100, "exp:4100"), // USER_DATA_NOT_AVAILABLE (Sh)
     (4101, "exp:4101"), // PRIOR_UPDATE_IN_PROGRESS (Sh)
     (4181, "exp:4181"), // AUTHENTICATION_DATA_UNAVAILABLE (S6a)
+    (4241, "exp:4241"), // ERROR_NO_AVAILABLE_POLICY_COUNTERS (Sy)
     (4182, "exp:4182"), // ERROR_CAMEL_SUBSCRIPTION_PRESENT (S6a)
     (5001, "exp:5001"), // ERROR_USER_UNKNOWN
     (5002, "exp:5002"), // ERROR_IDENTITIES_DONT_MATCH
@@ -2367,6 +2399,7 @@ const KNOWN_EXPERIMENTAL_RESULT_CODES: &[(u32, &str)] = &[
     (5421, "exp:5421"), // ERROR_RAT_NOT_ALLOWED (S6a)
     (5422, "exp:5422"), // ERROR_EQUIPMENT_UNKNOWN (S6a, S13)
     (5423, "exp:5423"), // ERROR_UNKNOWN_SERVING_NODE (S6a)
+    (5570, "exp:5570"), // ERROR_UNKNOWN_POLICY_COUNTERS (Sy)
 ];
 
 /// The class bucket an unlisted Result-Code falls into (RFC 6733 §7.1:
@@ -3193,5 +3226,143 @@ mod tests {
     #[test]
     fn command_code_by_name_returns_none_for_unknown() {
         assert!(command_code_by_name("Bogus-Request").is_none());
+    }
+
+    // ── Sy (TS 29.219 Rel-18) ───────────────────────────────────────────
+
+    #[test]
+    fn sy_resolves_to_the_3gpp_application_id() {
+        // TS 29.219 clause 5.1.5: application identifier 16777302, with the
+        // 3GPP vendor identifier 10415.
+        for name in ["Sy", "sy", "SY", "sY"] {
+            assert_eq!(app_id_by_name(name), Some((10415, 16_777_302)), "{name}");
+        }
+        assert_eq!(SY_APP_ID, 16_777_302);
+        assert_eq!(app_name_by_id(16_777_302), Some("Sy"));
+        assert!(!is_accounting_application(SY_APP_ID));
+        // The neighbouring ids are other applications or none.
+        assert_eq!(app_name_by_id(16_777_301), None);
+        assert_eq!(app_name_by_id(16_777_303), None);
+    }
+
+    #[test]
+    fn sy_command_codes_follow_table_5_6_1() {
+        // TS 29.219 table 5.6.1: SLR/SLA 8388635, SNR/SNA 8388636; STR/STA are
+        // the base command 275 re-used.
+        assert_eq!(CMD_SPENDING_LIMIT, 8_388_635);
+        assert_eq!(CMD_SPENDING_STATUS_NOTIFICATION, 8_388_636);
+        for name in [
+            "SLR",
+            "sla",
+            "Spending-Limit",
+            "Spending-Limit-Request",
+            "Spending-Limit-Answer",
+        ] {
+            assert_eq!(command_code_by_name(name), Some(8_388_635), "{name}");
+            assert_eq!(
+                command_code_in_application(SY_APP_ID, name),
+                Some(8_388_635),
+                "{name}"
+            );
+        }
+        for name in [
+            "Spending-Status-Notification",
+            "Spending-Status-Notification-Request",
+            "Spending-Status-Notification-Answer",
+        ] {
+            assert_eq!(command_code_by_name(name), Some(8_388_636), "{name}");
+        }
+        assert_eq!(command_name_by_code(8_388_635), Some("Spending-Limit"));
+        assert_eq!(
+            command_name_by_code(8_388_636),
+            Some("Spending-Status-Notification")
+        );
+        assert_eq!(
+            command_code_in_application(SY_APP_ID, "STR"),
+            Some(CMD_SESSION_TERMINATION)
+        );
+        assert_eq!(
+            command_code_in_application(SY_APP_ID, "Session-Termination-Answer"),
+            Some(275)
+        );
+    }
+
+    #[test]
+    fn snr_and_sna_mean_sy_on_sy_and_sh_everywhere_else() {
+        // Sh's Subscribe-Notifications (TS 29.329) is also abbreviated SNR/SNA
+        // and is command 308. The name alone keeps meaning Sh; only the Sy
+        // application reads it as the Sy command.
+        for name in ["SNR", "snr", "SNA", "sna"] {
+            assert_eq!(command_code_by_name(name), Some(308), "{name}");
+            assert_eq!(
+                command_code_in_application(SH_APP_ID, name),
+                Some(308),
+                "{name}"
+            );
+            assert_eq!(
+                command_code_in_application(SY_APP_ID, name),
+                Some(8_388_636),
+                "{name}"
+            );
+        }
+        // Applications Sy does not define still resolve as before.
+        assert_eq!(command_code_in_application(GX_APP_ID, "CCR"), Some(272));
+        assert_eq!(command_code_in_application(SY_APP_ID, "bogus"), None);
+        // SLR and SLA name nothing on Sh, so they resolve to Sy wherever asked.
+        assert_eq!(
+            command_code_in_application(SH_APP_ID, "SLR"),
+            Some(8_388_635)
+        );
+    }
+
+    /// TS 29.219 table 5.3.0.1, AVP by AVP: code, type, and the flags. Every
+    /// one is 3GPP vendor-specific; all but SN-Request-Type are "M,V" and
+    /// SN-Request-Type is "V" with M under "Must not".
+    #[test]
+    fn the_sy_avps_follow_table_5_3_0_1() {
+        use AvpType::{Enumerated, Grouped, Time, UTF8String, Unsigned32};
+        let table: [(u32, &str, AvpType, bool); 7] = [
+            (2901, "Policy-Counter-Identifier", UTF8String, true),
+            (2902, "Policy-Counter-Status", UTF8String, true),
+            (2903, "Policy-Counter-Status-Report", Grouped, true),
+            (2904, "SL-Request-Type", Enumerated, true),
+            (2905, "Pending-Policy-Counter-Information", Grouped, true),
+            (2906, "Pending-Policy-Counter-Change-Time", Time, true),
+            (2907, "SN-Request-Type", Unsigned32, false),
+        ];
+        for (code, name, data_type, mandatory) in table {
+            let definition = lookup_avp(code, VENDOR_3GPP)
+                .unwrap_or_else(|| panic!("{name} ({code}) is not in the dictionary"));
+            assert_eq!(definition.name, name);
+            assert_eq!(definition.data_type, data_type, "{name}");
+            assert_eq!(avp_is_mandatory(code, VENDOR_3GPP), mandatory, "{name}");
+            assert_eq!(lookup_by_name(name).map(|found| found.code), Some(code));
+            assert!(
+                lookup_avp(code, 0).is_none(),
+                "{name} is vendor-specific, never a base AVP"
+            );
+        }
+        // 2900 and 2908 are not Sy AVPs.
+        assert!(lookup_avp(2900, VENDOR_3GPP).is_none());
+        assert!(lookup_avp(2908, VENDOR_3GPP).is_none());
+        // A kwarg finds them by their Python spelling.
+        assert_eq!(
+            lookup_avp_by_python_name("policy_counter_identifier").map(|found| found.code),
+            Some(2901)
+        );
+        assert_eq!(
+            lookup_avp_by_python_name("sl_request_type").map(|found| found.code),
+            Some(2904)
+        );
+    }
+
+    #[test]
+    fn the_sy_experimental_result_codes_have_their_own_label() {
+        // TS 29.219 clause 5.5: DIAMETER_ERROR_UNKNOWN_POLICY_COUNTERS (5570)
+        // and DIAMETER_ERROR_NO_AVAILABLE_POLICY_COUNTERS (4241).
+        assert_eq!(result_code_label(5570, true), "exp:5570");
+        assert_eq!(result_code_label(4241, true), "exp:4241");
+        // The base namespace is untouched.
+        assert_eq!(result_code_label(5570, false), "5xxx_other");
     }
 }

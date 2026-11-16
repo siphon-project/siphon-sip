@@ -971,8 +971,10 @@ impl PyDiameterRequest {
     /// carries the request's Vendor-Specific-Application-Id and
     /// Auth-Session-State when the request has them, which the answers of
     /// the 3GPP applications list, unless `result_code` is a protocol error
-    /// (3xxx). Setting either yourself replaces the copy. Add the other
-    /// application AVPs (including grouped ones) with `set_avp`, or with
+    /// (3xxx). Setting either yourself replaces the copy. A Sy request
+    /// (application 16777302) has neither: its answer starts with the
+    /// request's Auth-Application-Id, which Sy lists as mandatory in every
+    /// answer. Add the other application AVPs (including grouped ones) with `set_avp`, or with
     /// `insert_avp` for an AVP the answer carries more than once.
     #[pyo3(signature = (result_code=2001, error_message=None))]
     fn answer(
@@ -2140,6 +2142,113 @@ mod tests {
         });
     }
 
+    /// A Sy Spending-Limit-Request as TS 29.219 clause 5.6.2 lists it: no
+    /// Auth-Session-State (clause 5.2) and a bare Auth-Application-Id.
+    fn py_sy_spending_limit_request() -> PyDiameterRequest {
+        PyDiameterRequest::new(
+            DiameterMsg {
+                flags: FLAG_REQUEST | FLAG_PROXIABLE,
+                command_code: dictionary::CMD_SPENDING_LIMIT,
+                application_id: dictionary::SY_APP_ID,
+                hop_by_hop: 0x1111,
+                end_to_end: 0x2222,
+                avps: vec![
+                    Avp::utf8(
+                        dictionary::avp::SESSION_ID,
+                        0,
+                        "pcrf.epc.mnc001.mcc001.3gppnetwork.org;7;7",
+                    ),
+                    Avp::u32(
+                        dictionary::avp::AUTH_APPLICATION_ID,
+                        0,
+                        dictionary::SY_APP_ID,
+                    ),
+                    Avp::utf8(
+                        dictionary::avp::ORIGIN_HOST,
+                        0,
+                        "pcrf.epc.mnc001.mcc001.3gppnetwork.org",
+                    ),
+                    Avp::u32(2904, dictionary::VENDOR_3GPP, 0),
+                ],
+            },
+            PyInboundPeer {
+                name: "pcrf".into(),
+                tenant: "default".into(),
+                addr: "192.0.2.5:5000".into(),
+                transport: "tcp".into(),
+                host: String::new(),
+            },
+            "ocs.epc.mnc001.mcc001.3gppnetwork.org".into(),
+            "epc.mnc001.mcc001.3gppnetwork.org".into(),
+        )
+    }
+
+    #[test]
+    fn a_sy_answer_carries_the_auth_application_id_and_no_session_state() {
+        // TS 29.219 clause 5.6.3 makes Auth-Application-Id mandatory in the
+        // SLA; the request's own is the application it answers.
+        pyo3::Python::initialize();
+        Python::attach(|_| {
+            let answer = py_sy_spending_limit_request().answer(2001, None).unwrap();
+            let msg = DiameterMsg::from_wire(&answer.to_wire().unwrap()).unwrap();
+            assert_eq!(msg.application_id, 16_777_302);
+            let identifiers: Vec<u32> = msg
+                .find_all(dictionary::avp::AUTH_APPLICATION_ID, 0)
+                .filter_map(Avp::as_u32)
+                .collect();
+            assert_eq!(identifiers, vec![dictionary::SY_APP_ID]);
+            assert!(msg.find(dictionary::avp::AUTH_SESSION_STATE, 0).is_none());
+            assert!(msg
+                .find(dictionary::avp::VENDOR_SPECIFIC_APPLICATION_ID, 0)
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn a_sy_answer_takes_a_nested_policy_counter_status_report() {
+        // TS 29.219 clauses 5.3.3 and 5.3.5: the report holds the identifier,
+        // the status and the pending information, itself a group.
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let answer = py_sy_spending_limit_request().answer(2001, None).unwrap();
+            let report = py
+                .eval(
+                    c"[('Policy-Counter-Identifier', 'gold'),\
+                       ('Policy-Counter-Status', 'EXHAUSTED'),\
+                       ('Pending-Policy-Counter-Information', [\
+                           ('Policy-Counter-Status', 'VALID'),\
+                           ('Pending-Policy-Counter-Change-Time', 1_700_000_000)])]",
+                    None,
+                    None,
+                )
+                .unwrap();
+            let name = "Policy-Counter-Status-Report"
+                .into_pyobject(py)
+                .unwrap()
+                .into_any();
+            answer.insert_avp(&name, &report, 0).unwrap();
+            let msg = DiameterMsg::from_wire(&answer.to_wire().unwrap()).unwrap();
+            let group = msg
+                .find(2903, dictionary::VENDOR_3GPP)
+                .expect("Policy-Counter-Status-Report on the wire");
+            assert_eq!(group.flags & 0xC0, 0xC0, "V and M");
+            let AvpData::Grouped(children) = &group.value else {
+                panic!("a Policy-Counter-Status-Report is grouped");
+            };
+            let codes: Vec<u32> = children.iter().map(|child| child.code).collect();
+            assert_eq!(codes, vec![2901, 2902, 2905]);
+            let AvpData::Grouped(pending) = &children[2].value else {
+                panic!("a Pending-Policy-Counter-Information is grouped");
+            };
+            assert_eq!(
+                pending.iter().map(|child| child.code).collect::<Vec<_>>(),
+                vec![2902, 2906]
+            );
+            // Unix seconds go out as seconds since 1900 (RFC 6733 clause 4.3.1).
+            assert_eq!(pending[1].as_u32(), Some(1_700_000_000 + 2_208_988_800));
+        });
+    }
+
     #[test]
     fn answer_insert_avp_takes_a_code_and_a_vendor_like_set_avp() {
         pyo3::Python::initialize();
@@ -2538,5 +2647,46 @@ mod tests {
             dump.push('\n');
         }
         std::fs::write(&path, dump).expect("hex dump must be writable");
+    }
+
+    /// Emit the Sy SLA a handler builds with `request.answer()` and
+    /// `insert_avp`, for `scripts/validate_diameter_originate.sh` to feed to
+    /// tshark.
+    #[test]
+    fn emit_sy_answer_for_external_dissection() {
+        let Ok(path) = std::env::var("SIPHON_DIAMETER_SY_ANSWER_HEX_OUT") else {
+            return;
+        };
+        pyo3::Python::initialize();
+        let wire = Python::attach(|py| {
+            let answer = py_sy_spending_limit_request().answer(2001, None).unwrap();
+            let name = "Policy-Counter-Status-Report"
+                .into_pyobject(py)
+                .unwrap()
+                .into_any();
+            let gold = py
+                .eval(
+                    c"[('Policy-Counter-Identifier', 'gold'),\
+                       ('Policy-Counter-Status', 'EXHAUSTED'),\
+                       ('Pending-Policy-Counter-Information', [\
+                           ('Policy-Counter-Status', 'VALID'),\
+                           ('Pending-Policy-Counter-Change-Time', 1_700_000_000)])]",
+                    None,
+                    None,
+                )
+                .unwrap();
+            let silver = py
+                .eval(
+                    c"[('Policy-Counter-Identifier', 'silver'), ('Policy-Counter-Status', 'VALID')]",
+                    None,
+                    None,
+                )
+                .unwrap();
+            answer.insert_avp(&name, &gold, 0).unwrap();
+            answer.insert_avp(&name, &silver, 0).unwrap();
+            answer.to_wire().unwrap()
+        });
+        std::fs::write(&path, crate::diameter::cx_test_support::hex_dump(&wire))
+            .expect("hex dump must be writable");
     }
 }
