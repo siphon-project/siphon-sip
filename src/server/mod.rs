@@ -1806,7 +1806,8 @@ impl SiphonServer {
                 crlf_pong_tracker.clone(),
                 Arc::clone(&tls_client_configs.unverified),
             )
-            .with_tls_configs(tls_client_configs),
+            .with_tls_configs(tls_client_configs)
+            .with_tcp_source(outbound_tcp_source(&listen_addrs)),
         );
 
         // Hot-reload the outbound client certificate alongside the inbound

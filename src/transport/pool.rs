@@ -15,7 +15,7 @@
 //!   - Connections are removed on error and recreated on next use
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -134,6 +134,9 @@ pub struct ConnectionPool {
     inbound_tx: flume::Sender<InboundMessage>,
     /// Local address to use as source in InboundMessage.
     local_addr: SocketAddr,
+    /// The IP a default outbound TCP connection binds: the first TCP
+    /// listener's. `None` (no TCP listener) falls back to `local_addr`.
+    tcp_source: Option<IpAddr>,
     /// Pre-computed TOS byte (DSCP << 2) for DSCP/DiffServ marking.
     tos: Option<u32>,
     /// TLS connector for outbound TLS connections. Live-swappable so a renewed
@@ -287,6 +290,7 @@ impl ConnectionPool {
             connection_map,
             inbound_tx,
             local_addr,
+            tcp_source: None,
             tos,
             tls_connector: ArcSwap::from_pointee(TlsConnector::from(tls_client_config)),
             verified_tls_connector: ArcSwapOption::empty(),
@@ -993,7 +997,7 @@ impl ConnectionPool {
     /// The bind address of a default outbound TCP connection: the local IP
     /// (so the right interface is used) with an ephemeral port.
     fn default_tcp_bind(&self) -> SocketAddr {
-        SocketAddr::new(self.local_addr.ip(), 0)
+        SocketAddr::new(self.tcp_source.unwrap_or_else(|| self.local_addr.ip()), 0)
     }
 
     /// Replace the set of destinations whose pooled connection must not be
@@ -1083,6 +1087,16 @@ impl ConnectionPool {
     #[cfg(test)]
     pub(crate) fn set_connect_timeout(&mut self, connect_timeout: Duration) {
         self.connect_timeout = connect_timeout;
+    }
+
+    /// Bind default outbound TCP connections to `source` (with an ephemeral
+    /// port) instead of the pool's `local_addr`, at construction. The server
+    /// passes the first TCP listener's IP, so a node whose UDP and TCP
+    /// listeners sit on different addresses does not source its TCP from the
+    /// UDP one.
+    pub fn with_tcp_source(mut self, source: Option<IpAddr>) -> Self {
+        self.tcp_source = source;
+        self
     }
 
     /// Install the verifying and non-verifying client configs and the
@@ -1511,6 +1525,78 @@ mod tests {
 
         // Different connection (reconnected)
         assert_ne!(id1, id2);
+    }
+
+    /// A node whose UDP and TCP listeners sit on different addresses sources
+    /// its default outbound TCP from the TCP listener's address, whatever the
+    /// pool's own `local_addr` (the first listener of any transport) is.
+    #[tokio::test]
+    async fn default_tcp_send_binds_the_tcp_listener_address() {
+        ensure_crypto_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (socket, peer_addr) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(socket);
+            peer_addr
+        });
+
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+        // `local_addr` is the UDP listener, as start-up picks it.
+        let pool = ConnectionPool::new(
+            Arc::new(DashMap::new()),
+            inbound_tx,
+            "127.0.0.2:5061".parse().unwrap(),
+            None,
+            None,
+            None,
+            build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
+        )
+        .with_tcp_source(Some("127.0.0.3".parse().unwrap()));
+
+        pool.send_tcp(
+            server_addr,
+            Bytes::from_static(b"OPTIONS sip:x SIP/2.0\r\n\r\n"),
+        )
+        .await
+        .expect("send_tcp must succeed");
+        let peer = server_task.await.unwrap();
+        assert_eq!(peer.ip(), "127.0.0.3".parse::<IpAddr>().unwrap());
+        assert!(
+            pool.has_live(server_addr, Transport::Tcp),
+            "has_live looks under the same default bind"
+        );
+    }
+
+    /// With no TCP listener the pool keeps binding its `local_addr`.
+    #[tokio::test]
+    async fn default_tcp_send_without_a_tcp_listener_binds_local_addr() {
+        ensure_crypto_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (socket, peer_addr) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(socket);
+            peer_addr
+        });
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+        let pool = ConnectionPool::new(
+            Arc::new(DashMap::new()),
+            inbound_tx,
+            "127.0.0.2:5061".parse().unwrap(),
+            None,
+            None,
+            None,
+            build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
+        )
+        .with_tcp_source(None);
+        pool.send_tcp(server_addr, Bytes::from_static(b"x"))
+            .await
+            .expect("send_tcp must succeed");
+        let peer = server_task.await.unwrap();
+        assert_eq!(peer.ip(), "127.0.0.2".parse::<IpAddr>().unwrap());
     }
 
     #[tokio::test]

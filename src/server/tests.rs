@@ -559,3 +559,18 @@ fn registration_events_carry_the_release_18_register_causes() {
         -3
     );
 }
+
+#[test]
+fn outbound_tcp_source_is_the_tcp_listeners_ip() {
+    let mut listen_addrs = std::collections::HashMap::new();
+    assert_eq!(outbound_tcp_source(&listen_addrs), None);
+    listen_addrs.insert(transport::Transport::Udp, "127.0.0.2:5061".parse().unwrap());
+    assert_eq!(outbound_tcp_source(&listen_addrs), None);
+    listen_addrs.insert(transport::Transport::Tcp, "127.0.0.3:5060".parse().unwrap());
+    assert_eq!(
+        outbound_tcp_source(&listen_addrs),
+        Some("127.0.0.3".parse().unwrap())
+    );
+    listen_addrs.insert(transport::Transport::Tcp, "0.0.0.0:5060".parse().unwrap());
+    assert_eq!(outbound_tcp_source(&listen_addrs), None);
+}
