@@ -633,8 +633,8 @@ mod tests {
                 }
             }
         });
-        for generation in 0..GENERATIONS.len() {
-            assert_eq!(global.uncollectable[generation].get(), 0);
+        for counter in global.uncollectable.iter().take(GENERATIONS.len()) {
+            assert_eq!(counter.get(), 0);
         }
     }
 
