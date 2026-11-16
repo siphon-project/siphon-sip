@@ -10502,10 +10502,14 @@ class MockDiameterRequest:
         The answer starts with the request's Vendor-Specific-Application-Id
         (260) and Auth-Session-State (277) when the request has them, which
         the answers of the 3GPP applications list, unless ``result_code`` is a
-        protocol error (3xxx). Setting either yourself replaces the copy."""
+        protocol error (3xxx). Setting either yourself replaces the copy. A Sy
+        request (application 16777302) has neither: its answer starts with the
+        request's Auth-Application-Id (258), which Sy lists as mandatory in
+        every answer."""
         answer = MockDiameterAnswer(result_code=result_code, command_code=self.command_code)
         if not 3000 <= result_code < 4000:
-            for key in ((260, 0), (277, 0)):
+            keys = ((258, 0),) if self.application_id == 16777302 else ((260, 0), (277, 0))
+            for key in keys:
                 if key in self._avps:
                     answer._avps.append((key, self._avps[key]))
                     answer._copied_from_request.add(key)
@@ -10530,7 +10534,7 @@ class MockDiameterRequest:
 _DIAMETER_APPLICATION_IDS = {
     "cx": 16777216, "sh": 16777217, "gx": 16777238, "rx": 16777236,
     "ro": 4, "rf": 3, "s6c": 16777312, "sgd": 16777313, "s6a": 16777251,
-    "zh": 16777221, "zn": 16777220, "s13": 16777252,
+    "zh": 16777221, "zn": 16777220, "s13": 16777252, "sy": 16777302,
 }
 
 # AVPs `diameter.reauthorize` sets itself.
@@ -15145,6 +15149,15 @@ _numbers = MockNumbersNamespace()
 
 
 # ---------------------------------------------------------------------------
+# tasks namespace: several awaitables of one handler at the same time
+# ---------------------------------------------------------------------------
+
+from siphon_sdk.tasks import MockTasksNamespace
+
+_tasks = MockTasksNamespace()
+
+
+# ---------------------------------------------------------------------------
 # config namespace: operator-supplied script configuration (script_config:)
 # ---------------------------------------------------------------------------
 
@@ -15636,6 +15649,7 @@ def install() -> ModuleType:
     mod.stir = _stir  # type: ignore[attr-defined]
     mod.sdp = _sdp  # type: ignore[attr-defined]
     mod.numbers = _numbers  # type: ignore[attr-defined]
+    mod.tasks = _tasks  # type: ignore[attr-defined]
     mod.qos = _qos  # type: ignore[attr-defined]
     mod.config = _script_config  # type: ignore[attr-defined]
     # LCR namespace (B2BUA-only) + the Route / LcrDecision types (mirrors the
@@ -15699,6 +15713,7 @@ def reset() -> None:
     _ipsec.clear()
     _stir.clear()
     _numbers.clear()
+    _tasks.clear()
     _script_config.clear()
     _smpp.clear()
     _http.clear()

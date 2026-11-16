@@ -4334,6 +4334,56 @@ fn a_listening_node_can_advertise_zh_and_zn() {
 }
 
 #[test]
+fn diameter_route_accepts_the_sy_application() {
+    let yaml = concat!(
+        "listen:\n",
+        "  udp:\n",
+        "    - \"0.0.0.0:5060\"\n",
+        "domain:\n",
+        "  local:\n",
+        "    - \"example.org\"\n",
+        "script:\n",
+        "  path: \"scripts/proxy_default.py\"\n",
+        "diameter:\n",
+        "  origin_host: \"siphon.example.org\"\n",
+        "  origin_realm: \"example.org\"\n",
+        "  peers:\n",
+        "    - name: \"ocs1\"\n",
+        "      host: \"ocs1.example.org\"\n",
+        "      destination_realm: \"example.org\"\n",
+        "  routes:\n",
+        "    - application: sy\n",
+        "      peers: [\"ocs1\"]\n",
+    );
+    let config = Config::from_str(yaml).unwrap();
+    let diameter = config.diameter.as_ref().unwrap();
+    assert_eq!(diameter.routes[0].application, DiameterApplication::Sy);
+
+    // TS 29.219 clause 5.1.5: 3GPP vendor 10415, application 16777302.
+    assert_eq!(DiameterApplication::Sy.to_app_id(), (10415, 16_777_302));
+
+    let ocs = diameter.to_peer_config(&diameter.peers[0], "SIPhon", "1.2.3");
+    assert_eq!(
+        ocs.application_ids,
+        vec![DiameterApplication::Sy.to_app_id()]
+    );
+    let peers = diameter.peers_for_application(&DiameterApplication::Sy, None);
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].name, "ocs1");
+
+    // A server-mode `applications:` list takes it as well.
+    let advertised: Vec<DiameterAdvertisedApplication> =
+        serde_saphyr::from_str("[sy, gx]").unwrap();
+    assert_eq!(
+        advertised,
+        vec![
+            DiameterAdvertisedApplication::Application(DiameterApplication::Sy),
+            DiameterAdvertisedApplication::Application(DiameterApplication::Gx),
+        ]
+    );
+}
+
+#[test]
 fn diameter_absent_when_not_configured() {
     let config = Config::from_str(minimal_yaml()).unwrap();
     assert!(config.diameter.is_none());

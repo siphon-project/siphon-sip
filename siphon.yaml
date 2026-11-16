@@ -377,18 +377,24 @@ script:
   #                                # trip (30 s), so reaching it means something
   #                                # is never going to arrive. The handler is
   #                                # named in the log.
-  # direct_dispatch: off           # off | on. With `on`, an async handler an
-  #                                # extension calls through the script handle
-  #                                # (HTTP route, SMPP/GTP-C handler) is stepped
-  #                                # on its asyncio driver without an asyncio
-  #                                # task while it awaits only siphon's own
-  #                                # awaitables: less CPU per await. A handler
-  #                                # that uses asyncio itself (asyncio.sleep, a
-  #                                # foreign future) becomes a normal task the
-  #                                # first time it does and starts as one from
-  #                                # then on. Each driver takes at most 4096
-  #                                # such handlers in flight; past that a call
-  #                                # fails at once and counts in
+  # direct_dispatch: off           # off | on. With `on`, an async
+  #                                # @proxy.on_request handler, the Diameter
+  #                                # server handlers and a handler an extension
+  #                                # calls through the script handle (HTTP
+  #                                # route, SMPP/GTP-C handler) are stepped on
+  #                                # their asyncio driver without an asyncio
+  #                                # task while they await only siphon's own
+  #                                # awaitables: less CPU per await. Use
+  #                                # tasks.gather, not asyncio.gather, to keep
+  #                                # a handler there. A handler that uses
+  #                                # asyncio itself (asyncio.sleep, a foreign
+  #                                # future) becomes a normal task the first
+  #                                # time it does and starts as one from then
+  #                                # on. Each driver takes at most 4096 such
+  #                                # handlers in flight; past that a new
+  #                                # request is refused at once (SIP 503,
+  #                                # Diameter 3004, Err to an extension) and
+  #                                # counts in
   #                                # siphon_runner_admission_rejected_total.
   #                                # SIP request and Diameter handlers are not
   #                                # affected. Default off.

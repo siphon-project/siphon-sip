@@ -123,6 +123,7 @@ mod tests {
             super::super::stir::StirResult,
             super::super::subscribe_state::PySubscribeHandle,
             super::super::subscribe_state::PySubscribeState,
+            super::super::tasks::PyTasksNamespace,
             super::super::timer::PyTimerHandle,
             super::super::timer::PyTimerNamespace,
         ]

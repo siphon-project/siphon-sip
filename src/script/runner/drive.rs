@@ -48,12 +48,19 @@ use pyo3::prelude::*;
 use tokio::sync::oneshot;
 use tracing::{debug, error};
 
-use super::awaitable::{Registered, SiphonAwaitable};
+use super::awaitable::{Registered, SiphonAwaitable, Waiter};
+use super::gather;
+
+mod children;
+mod slab;
 use super::python::{cancelled_error, helpers, Helpers};
 use super::switch::{admission_limit, count_rejection, demote, enabled, is_demoted, DemotionKey};
 use super::task::{DirectTask, HandoverCoroutine, HandoverDone};
 use super::{Fate, Message, RunnerShared, Work};
 use crate::script::async_pool::{AsyncPool, PendingCount};
+pub(super) use children::{force_close, insert_child, note_gather, start_child};
+pub(super) use slab::DriveKey;
+use slab::Slab;
 
 /// Lock a mutex whose critical sections are a few moves of plain data: a
 /// poisoned one is still consistent, and failing here would strand a
@@ -67,25 +74,6 @@ pub(super) fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 // ---------------------------------------------------------------------------
 // The slab.
 // ---------------------------------------------------------------------------
-
-/// A slab index and the generation of the slot when the coroutine took it,
-/// packed so that it fits an atomic and is never 0.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) struct DriveKey(pub(super) u64);
-
-impl DriveKey {
-    fn new(index: usize, generation: u32) -> Self {
-        Self((u64::from(generation) << 32) | index as u64)
-    }
-
-    fn index(self) -> usize {
-        (self.0 & u64::from(u32::MAX)) as usize
-    }
-
-    fn generation(self) -> u32 {
-        (self.0 >> 32) as u32
-    }
-}
 
 /// What the step that ended a coroutine's direct phase produced, replayed by
 /// the [`HandoverCoroutine`] to the task that takes over.
@@ -120,79 +108,23 @@ struct Entry {
     cancel_pending: bool,
     /// What `Task.cancel(msg)` was called with, for that `CancelledError`.
     cancel_message: Option<Py<PyAny>>,
-    outcome: Arc<Outcome>,
+    completion: Completion,
     demotion: DemotionKey,
-    // Given back when the entry goes: the coroutine has unwound.
-    _admission: Admission,
-    _pending: PendingCount,
+    /// The gathers made in this coroutine's steps, which end with it at the
+    /// latest.
+    gathers: Vec<u64>,
+    // Given back when the entry goes: the coroutine has unwound. A gather's
+    // child has neither: it runs within its handler's place.
+    _admission: Option<Admission>,
+    _pending: Option<PendingCount>,
 }
 
-struct Slot<T> {
-    generation: u32,
-    entry: Option<T>,
-}
-
-/// Slots reused under a fresh generation, so that a key held past its
-/// coroutine's end never reaches the coroutine that took the slot next.
-struct Slab<T> {
-    slots: Vec<Slot<T>>,
-    free: Vec<usize>,
-}
-
-impl<T> Default for Slab<T> {
-    fn default() -> Self {
-        Self {
-            slots: Vec::new(),
-            free: Vec::new(),
-        }
-    }
-}
-
-impl<T> Slab<T> {
-    fn insert(&mut self, entry: T) -> DriveKey {
-        match self.free.pop() {
-            Some(index) => {
-                let slot = &mut self.slots[index];
-                slot.entry = Some(entry);
-                DriveKey::new(index, slot.generation)
-            }
-            None => {
-                self.slots.push(Slot {
-                    generation: 1,
-                    entry: Some(entry),
-                });
-                DriveKey::new(self.slots.len() - 1, 1)
-            }
-        }
-    }
-
-    fn get_mut(&mut self, key: DriveKey) -> Option<&mut T> {
-        let slot = self.slots.get_mut(key.index())?;
-        if slot.generation != key.generation() {
-            return None;
-        }
-        slot.entry.as_mut()
-    }
-
-    fn remove(&mut self, key: DriveKey) -> Option<T> {
-        let slot = self.slots.get_mut(key.index())?;
-        if slot.generation != key.generation() {
-            return None;
-        }
-        let entry = slot.entry.take()?;
-        // Never 0, so a key is never 0 either.
-        slot.generation = slot.generation.checked_add(1).unwrap_or(1);
-        self.free.push(key.index());
-        Some(entry)
-    }
-
-    fn drain(&mut self) -> Vec<T> {
-        self.free.clear();
-        std::mem::take(&mut self.slots)
-            .into_iter()
-            .filter_map(|slot| slot.entry)
-            .collect()
-    }
+/// Who learns how a coroutine ended.
+enum Completion {
+    /// The caller of a handler.
+    Waiter(Arc<Outcome>),
+    /// The gather the coroutine is argument `index` of.
+    Gather { gather: u64, index: usize },
 }
 
 /// What a driver thread owns for direct dispatch. Touched only on that
@@ -206,6 +138,8 @@ pub(super) struct Owner {
     /// its awaitable by, since the future carries no Python object.
     awaitables: HashMap<u64, Py<SiphonAwaitable>>,
     next_awaitable: u64,
+    /// The gathers with a child still running, by their awaitable's id.
+    pub(super) gathers: HashMap<u64, gather::Gather>,
 }
 
 thread_local! {
@@ -260,6 +194,7 @@ pub(super) fn install_owner(
                 slab: Slab::default(),
                 awaitables: HashMap::new(),
                 next_awaitable: 1,
+                gathers: HashMap::new(),
             });
         }
     });
@@ -296,13 +231,21 @@ pub(super) fn close_owner(python: Python<'_>) {
                 debug!(%error, "closing a handler coroutine at shutdown raised");
             }
         }
-        entry.outcome.deliver(Err(shut_down()));
+        if let Completion::Waiter(outcome) = &entry.completion {
+            outcome.deliver(Err(shut_down()));
+        }
         drop(entry);
     }
     for (_, awaitable) in owner.awaitables.drain() {
         owner.runner.awaitables.fetch_sub(1, Ordering::Relaxed);
         awaitable.get().abandon(python);
     }
+    // Their children went with the slab; what they collected goes here.
+    owner
+        .runner
+        .gathers
+        .fetch_sub(owner.gathers.len(), Ordering::Relaxed);
+    drop(std::mem::take(&mut owner.gathers));
     drop(owner);
 }
 
@@ -573,11 +516,24 @@ pub(crate) fn start(
     python: Python<'_>,
     coroutine: &Bound<'_, PyAny>,
     handler: Option<&Arc<Py<PyAny>>>,
+    admit: Admit,
 ) -> PyResult<Option<DriveHandle>> {
     if !enabled() {
         return Ok(None);
     }
-    start_unchecked(pool, python, coroutine, handler)
+    start_unchecked(pool, python, coroutine, handler, admit)
+}
+
+/// Whether a coroutine has to find room on a runner.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Admit {
+    /// New work: refused when every runner is at its limit.
+    Bounded,
+    /// A later handler of work that was admitted already (a request's next
+    /// handler, the hooks that follow its answer). It is never refused: the
+    /// request has been accepted and must be finished, and it holds one place
+    /// at a time, so such work is bounded by what was admitted.
+    Accepted,
 }
 
 pub(super) fn start_unchecked(
@@ -585,6 +541,7 @@ pub(super) fn start_unchecked(
     python: Python<'_>,
     coroutine: &Bound<'_, PyAny>,
     handler: Option<&Arc<Py<PyAny>>>,
+    admit: Admit,
 ) -> PyResult<Option<DriveHandle>> {
     let demotion = match handler {
         Some(handler) => DemotionKey::new(Arc::clone(handler)),
@@ -597,7 +554,10 @@ pub(super) fn start_unchecked(
     if is_demoted(&demotion) {
         return Ok(None);
     }
-    let limit = admission_limit();
+    let limit = match admit {
+        Admit::Bounded => admission_limit(),
+        Admit::Accepted => usize::MAX,
+    };
     let Some(admission) = pool.admit(limit) else {
         count_rejection(limit);
         // Never started: closed so it is not reported as never awaited.
@@ -720,10 +680,11 @@ fn run_start(python: Python<'_>, fate: Fate, request: StartRequest) {
         first: None,
         cancel_pending: false,
         cancel_message: None,
-        outcome: Arc::clone(&outcome),
+        completion: Completion::Waiter(Arc::clone(&outcome)),
         demotion,
-        _admission: admission,
-        _pending: pending,
+        gathers: Vec::new(),
+        _admission: Some(admission),
+        _pending: Some(pending),
     };
     let Some(key) = on_owner(|owner| {
         owner.runner.drives.fetch_add(1, Ordering::Relaxed);
@@ -1040,8 +1001,13 @@ pub(super) fn complete_awaitable(
         return;
     };
     let waiter = awaitable.get().settle(python, build);
-    if let Some(key) = waiter {
-        wake(python, key, id);
+    match waiter {
+        Some(Waiter::Drive(key)) => wake(python, key, id),
+        Some(Waiter::Gather { gather, index }) => {
+            let result = awaitable.get().result(python);
+            gather::child_done(python, gather, index, result);
+        }
+        None => {}
     }
     drop(awaitable);
 }
@@ -1089,10 +1055,18 @@ pub(super) fn finish(python: Python<'_>, key: DriveKey, result: PyResult<Py<PyAn
         });
         task.get().mark_done(cancelled);
     }
-    entry.outcome.deliver(result);
+    // What it gathered and left running ends with it.
+    for id in &entry.gathers {
+        gather::reap(python, *id);
+    }
+    match &entry.completion {
+        Completion::Waiter(outcome) => outcome.deliver(result),
+        Completion::Gather { gather, index } => {
+            gather::child_done(python, *gather, *index, result);
+        }
+    }
     // The coroutine, its context and its task go here: attached, on the
     // thread that ran them.
-    let _ = python;
     drop(entry);
 }
 
@@ -1443,72 +1417,6 @@ fn send_none<'py>(coroutine: &Bound<'py, PyAny>) -> Sent<'py> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_key_packs_its_index_and_generation_and_is_never_zero() {
-        let key = DriveKey::new(7, 3);
-        assert_eq!((key.index(), key.generation()), (7, 3));
-        assert_ne!(DriveKey::new(0, 1).0, 0);
-        let wide = DriveKey::new(u32::MAX as usize, u32::MAX);
-        assert_eq!(
-            (wide.index(), wide.generation()),
-            (u32::MAX as usize, u32::MAX)
-        );
-    }
-
-    #[test]
-    fn a_slab_hands_out_and_takes_back_entries() {
-        let mut slab = Slab::default();
-        let first = slab.insert("first");
-        let second = slab.insert("second");
-        assert_ne!(first, second);
-        assert_eq!(slab.get_mut(first).copied(), Some("first"));
-        assert_eq!(slab.remove(first), Some("first"));
-        assert_eq!(slab.remove(first), None, "removed once");
-        assert_eq!(slab.get_mut(first), None);
-        assert_eq!(slab.get_mut(second).copied(), Some("second"));
-    }
-
-    /// The key of a coroutine that has finished must not reach whichever
-    /// coroutine takes its slot next: a late wake or cancel would otherwise
-    /// step or cancel a stranger.
-    #[test]
-    fn a_stale_key_does_not_reach_the_slot_s_next_entry() {
-        let mut slab = Slab::default();
-        let old = slab.insert(1);
-        assert_eq!(slab.remove(old), Some(1));
-        let new = slab.insert(2);
-        assert_eq!(new.index(), old.index(), "the slot is reused");
-        assert_ne!(new, old);
-        assert_eq!(slab.get_mut(old), None);
-        assert_eq!(slab.remove(old), None);
-        assert_eq!(slab.get_mut(new).copied(), Some(2));
-    }
-
-    #[test]
-    fn a_generation_wraps_past_zero() {
-        let mut slab = Slab::default();
-        let key = slab.insert(0u8);
-        slab.slots[key.index()].generation = u32::MAX;
-        let last = DriveKey::new(key.index(), u32::MAX);
-        assert_eq!(slab.remove(last), Some(0));
-        let next = slab.insert(1);
-        assert_eq!(next.generation(), 1);
-        assert_ne!(next.0, 0);
-    }
-
-    #[test]
-    fn draining_a_slab_returns_every_live_entry() {
-        let mut slab = Slab::default();
-        let gone = slab.insert(1);
-        slab.insert(2);
-        slab.insert(3);
-        slab.remove(gone);
-        let mut left = slab.drain();
-        left.sort_unstable();
-        assert_eq!(left, vec![2, 3]);
-        assert!(slab.drain().is_empty());
-    }
 
     #[test]
     fn admission_is_bounded_and_given_back() {

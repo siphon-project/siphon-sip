@@ -17,6 +17,10 @@
 //! every tenant.
 
 mod backend;
+mod shed;
+use shed::shed_too_busy;
+#[cfg(test)]
+mod direct_tests;
 #[cfg(test)]
 use backend::spawn_backend_connection;
 
@@ -39,11 +43,11 @@ use crate::diameter::server::{CerDecision, ServerHandshake, ServerIdentity, Tena
 use crate::diameter::transport::DiameterListener;
 use crate::diameter::{forward, DiameterClient, DiameterManager};
 use crate::script::api::diameter_server::{PyDiameterAnswer, PyDiameterRequest, PyInboundPeer};
-use crate::script::async_pool::PendingCoroutine;
 use crate::script::engine::{
     run_coroutine_value, HandlerEntry, HandlerKind, ScriptEngine, ScriptState,
 };
-use crate::script::inline_dispatch::{start_coroutine, CoroutineStart};
+use crate::script::inline_dispatch::{start_handler_coroutine, HandlerStart, PendingHandler};
+use crate::script::runner::Admit;
 
 /// Global cap on concurrently in-flight inbound requests being relayed.
 const MAX_INFLIGHT: usize = 512;
@@ -695,6 +699,7 @@ pub(crate) async fn dispatch_request(
             &inbound_peer,
             &incoming,
             (&local_origin_host, &local_origin_realm),
+            "admission_limit",
             start,
         )
         .await;
@@ -724,12 +729,30 @@ pub(crate) async fn dispatch_request(
                 AnswerStart::Awaiting(pending, suspended) => {
                     DispatchStep::AwaitingRequestHandler { pending, suspended }
                 }
+                AnswerStart::Refused => DispatchStep::Refused {
+                    incoming,
+                    origin: (local_origin_host, local_origin_realm),
+                },
             }
         })
     })
     .await;
 
     let mut step = match join {
+        // Every asyncio driver was full (`script.direct_dispatch`): the
+        // handler never ran, and the request is answered 3004 as one the
+        // admission limit sheds.
+        Ok(DispatchStep::Refused { incoming, origin }) => {
+            shed_too_busy(
+                &inbound_peer,
+                &incoming,
+                (&origin.0, &origin.1),
+                "runner_admission",
+                start,
+            )
+            .await;
+            return;
+        }
         Ok(step) => step,
         Err(_panic) => {
             warn!("Diameter server: dispatch task panicked");
@@ -739,6 +762,8 @@ pub(crate) async fn dispatch_request(
     let outcome = loop {
         let resumed = match step {
             DispatchStep::Answered(outcome) => break outcome,
+            // Only the request handler is refused, and that was answered above.
+            DispatchStep::Refused { .. } => return,
             DispatchStep::AwaitingRequestHandler { pending, suspended } => {
                 let result = pending.wait().await;
                 let engine = Arc::clone(&engine);
@@ -845,14 +870,21 @@ pub(crate) async fn dispatch_request(
 /// async handler's coroutine on an asyncio driver.
 enum DispatchStep {
     Answered(AnswerOutcome),
+    /// `@diameter.on_request` could not be started: no asyncio driver had
+    /// room for it. The request comes back, with the identity to answer as,
+    /// to be answered 3004.
+    Refused {
+        incoming: IncomingRequest,
+        origin: (String, String),
+    },
     /// `@diameter.on_request` is awaiting.
     AwaitingRequestHandler {
-        pending: PendingCoroutine,
+        pending: PendingHandler,
         suspended: SuspendedAnswer,
     },
     /// The `@diameter.on_reply` handler before `next` is awaiting.
     AwaitingReplyHandler {
-        pending: PendingCoroutine,
+        pending: PendingHandler,
         /// The script the handlers come from, so a reload while one awaits
         /// neither changes nor frees the handlers still to run.
         script: Arc<ScriptState>,
@@ -906,7 +938,7 @@ enum CompletedStep {
     Done,
     /// The handler before `next` is awaiting.
     Awaiting {
-        pending: PendingCoroutine,
+        pending: PendingHandler,
         script: Arc<ScriptState>,
         hook: CompletedHook,
         next: usize,
@@ -929,18 +961,24 @@ fn run_on_request_completed(
             hook.latency_us,
         ));
         match call {
-            Ok(value) if handler.is_async => match start_coroutine(python, &value) {
-                Ok(CoroutineStart::Finished(_)) => {}
-                Ok(CoroutineStart::Suspended(pending)) => {
-                    return CompletedStep::Awaiting {
-                        pending,
-                        script: Arc::clone(script),
-                        hook,
-                        next: index + 1,
-                    };
+            // The request was admitted and answered: its hooks are never
+            // refused a place.
+            Ok(value) if handler.is_async => {
+                match start_handler_coroutine(python, &value, &handler.callable, Admit::Accepted) {
+                    Ok(HandlerStart::Finished(_)) => {}
+                    Ok(HandlerStart::Suspended(pending)) => {
+                        return CompletedStep::Awaiting {
+                            pending,
+                            script: Arc::clone(script),
+                            hook,
+                            next: index + 1,
+                        };
+                    }
+                    Ok(HandlerStart::Refused(error)) | Err(error) => {
+                        warn!(%error, "Diameter server: async on_request_completed failed")
+                    }
                 }
-                Err(error) => warn!(%error, "Diameter server: async on_request_completed failed"),
-            },
+            }
             Ok(_) => {}
             Err(error) => warn!(%error, "Diameter server: on_request_completed failed"),
         }
@@ -968,31 +1006,6 @@ fn emitted_answer_result_label(wire: &[u8]) -> &'static str {
     };
     let (base, experimental) = answer.answer_result_codes();
     dictionary::answer_result_label(base, experimental)
-}
-
-/// Answer `incoming` DIAMETER_TOO_BUSY (3004) without running the script, as
-/// `diameter.overload.reporting.admission_limit` asks, with the overload this
-/// node reports (RFC 7683) for a requester that advertised DOIC.
-async fn shed_too_busy(
-    inbound_peer: &DiameterPeer,
-    incoming: &IncomingRequest,
-    local_origin: (&str, &str),
-    start: Instant,
-) {
-    let Some(wire) =
-        crate::diameter::overload::too_busy_answer(&incoming.raw, local_origin, "admission_limit")
-    else {
-        warn!("Diameter server: shed a request that does not parse, no answer sent");
-        return;
-    };
-    if let Err(error) = inbound_peer.send_response(wire).await {
-        warn!(%error, "Diameter server: failed to send the 3004 of the admission limit");
-    }
-    crate::metrics::record_diameter_inbound(
-        incoming.command_code,
-        dictionary::answer_result_label(Some(dictionary::DIAMETER_TOO_BUSY), None),
-        start.elapsed(),
-    );
 }
 
 /// The answer bytes plus optional Py handles for the completed hook.
@@ -1109,22 +1122,28 @@ fn build_answer_via_handler(
 
     let handler_callable = handler.callable.bind(python);
     let resolved = match handler_callable.call1((request_py.bind(python),)) {
-        Ok(value) if handler.is_async => match start_coroutine(python, &value) {
-            Ok(CoroutineStart::Finished(resolved)) => Ok(resolved),
-            Ok(CoroutineStart::Suspended(pending)) => {
-                return AnswerStart::Awaiting(
-                    pending,
-                    SuspendedAnswer {
-                        request_msg,
-                        request_py,
-                        handler_callable: handler_callable.clone().unbind(),
-                        local_origin_host: local_origin_host.to_string(),
-                        local_origin_realm: local_origin_realm.to_string(),
-                    },
-                );
+        Ok(value) if handler.is_async => {
+            match start_handler_coroutine(python, &value, &handler.callable, Admit::Bounded) {
+                Ok(HandlerStart::Finished(resolved)) => Ok(resolved),
+                Ok(HandlerStart::Refused(refused)) => {
+                    tracing::debug!(%refused, "Diameter server: on_request handler refused; answering 3004");
+                    return AnswerStart::Refused;
+                }
+                Ok(HandlerStart::Suspended(pending)) => {
+                    return AnswerStart::Awaiting(
+                        pending,
+                        SuspendedAnswer {
+                            request_msg,
+                            request_py,
+                            handler_callable: handler_callable.clone().unbind(),
+                            local_origin_host: local_origin_host.to_string(),
+                            local_origin_realm: local_origin_realm.to_string(),
+                        },
+                    );
+                }
+                Err(error) => Err(HandlerFailure::Coroutine(error)),
             }
-            Err(error) => Err(HandlerFailure::Coroutine(error)),
-        },
+        }
         Ok(value) => Ok(value.unbind()),
         Err(error) => Err(HandlerFailure::Call(error)),
     };
@@ -1143,7 +1162,10 @@ fn build_answer_via_handler(
 /// asyncio driver.
 enum AnswerStart {
     Done(AnswerOutcome),
-    Awaiting(PendingCoroutine, SuspendedAnswer),
+    Awaiting(PendingHandler, SuspendedAnswer),
+    /// No asyncio driver had room for the handler: the request is to be
+    /// answered DIAMETER_TOO_BUSY.
+    Refused,
 }
 
 #[cfg(test)]
@@ -1154,6 +1176,7 @@ impl AnswerStart {
         match self {
             AnswerStart::Done(outcome) => outcome,
             AnswerStart::Awaiting(..) => panic!("a handler suspended off an executor worker"),
+            AnswerStart::Refused => panic!("a handler was refused off an executor worker"),
         }
     }
 }
@@ -1310,7 +1333,7 @@ enum ReplyRun {
     Done { ran: bool },
     /// The handler before `next` is awaiting.
     Awaiting {
-        pending: PendingCoroutine,
+        pending: PendingHandler,
         next: usize,
     },
 }
@@ -1336,18 +1359,21 @@ fn run_on_reply(
             .bind(python)
             .call1((request_py.bind(python), answer_py.bind(python)))
         {
-            Ok(value) if handler.is_async => match start_coroutine(python, &value) {
-                Ok(CoroutineStart::Finished(_)) => {}
-                Ok(CoroutineStart::Suspended(pending)) => {
-                    return ReplyRun::Awaiting {
-                        pending,
-                        next: index + 1,
-                    };
+            // The request was admitted: its reply handlers are never refused.
+            Ok(value) if handler.is_async => {
+                match start_handler_coroutine(python, &value, &handler.callable, Admit::Accepted) {
+                    Ok(HandlerStart::Finished(_)) => {}
+                    Ok(HandlerStart::Suspended(pending)) => {
+                        return ReplyRun::Awaiting {
+                            pending,
+                            next: index + 1,
+                        };
+                    }
+                    Ok(HandlerStart::Refused(error)) | Err(error) => {
+                        warn!(error = %crate::script::error_report::describe(python, &error), "Diameter server: async on_reply failed");
+                    }
                 }
-                Err(error) => {
-                    warn!(error = %crate::script::error_report::describe(python, &error), "Diameter server: async on_reply failed");
-                }
-            },
+            }
             Ok(_) => {}
             Err(error) => {
                 warn!(error = %crate::script::error_report::describe(python, &error), "Diameter server: on_reply handler raised")
@@ -1413,19 +1439,23 @@ fn request_filter_score(
         return Some(0); // catch-all
     };
     let (app_token, commands) = split_request_filter(filter);
-    let command_matches = commands
-        .split('|')
-        .any(|token| dictionary::command_code_by_name(token.trim()) == Some(command_code));
+    // A name is read in the application the filter names: "Sy:SNR" is Sy's
+    // Spending-Status-Notification, a bare "SNR" is Sh's.
+    let filter_application = match app_token {
+        Some(app) => match dictionary::app_id_by_name(app) {
+            Some((_, app_id)) if app_id == application_id => app_id,
+            _ => return None,
+        },
+        None => 0,
+    };
+    let command_matches = commands.split('|').any(|token| {
+        dictionary::command_code_in_application(filter_application, token.trim())
+            == Some(command_code)
+    });
     if !command_matches {
         return None;
     }
-    match app_token {
-        Some(app) => match dictionary::app_id_by_name(app) {
-            Some((_, app_id)) if app_id == application_id => Some(2),
-            _ => None,
-        },
-        None => Some(1),
-    }
+    Some(if app_token.is_some() { 2 } else { 1 })
 }
 
 /// Split a `@diameter.on_request` filter into the application it names, if
@@ -1515,6 +1545,19 @@ mod served_applications_tests {
             "    return request.answer(2001)\n",
         );
         assert_eq!(served(&[], handlers), vec![(10415, 16_777_220)]);
+    }
+
+    #[test]
+    fn a_sy_filter_makes_the_node_a_sy_server_or_client() {
+        let handlers = concat!(
+            "@on_request('sy:SNR')\n",
+            "def on_snr(request):\n",
+            "    return request.answer(2001)\n",
+            "@on_request('Sy:SLR|STR')\n",
+            "def on_slr(request):\n",
+            "    return request.answer(2001)\n",
+        );
+        assert_eq!(served(&[], handlers), vec![(10415, 16_777_302)]);
     }
 
     #[test]
@@ -1700,6 +1743,42 @@ mod filter_tests {
     }
 
     #[test]
+    fn request_filter_score_reads_snr_by_its_application() {
+        let sy = dictionary::SY_APP_ID;
+        let sh = dictionary::SH_APP_ID;
+        let sy_snr = dictionary::CMD_SPENDING_STATUS_NOTIFICATION;
+        let sh_snr = dictionary::CMD_SH_SUBSCRIBE_NOTIFICATIONS;
+        assert_eq!((sy_snr, sh_snr), (8_388_636, 308));
+
+        assert_eq!(request_filter_score(Some("Sy:SNR"), sy, sy_snr), Some(2));
+        assert_eq!(request_filter_score(Some("sy:snr"), sy, sy_snr), Some(2));
+        assert_eq!(request_filter_score(Some("Sy:SNR"), sh, sh_snr), None);
+        assert_eq!(request_filter_score(Some("Sy:SNR"), sy, sh_snr), None);
+        assert_eq!(request_filter_score(Some("Sh:SNR"), sh, sh_snr), Some(2));
+        assert_eq!(request_filter_score(Some("Sh:SNR"), sy, sy_snr), None);
+        // A bare SNR is still Sh's.
+        assert_eq!(request_filter_score(Some("SNR"), sh, sh_snr), Some(1));
+        assert_eq!(request_filter_score(Some("SNR"), sy, sy_snr), None);
+        // The other Sy commands, alone and in a list.
+        assert_eq!(
+            request_filter_score(Some("sy:SLR"), sy, dictionary::CMD_SPENDING_LIMIT),
+            Some(2)
+        );
+        assert_eq!(
+            request_filter_score(Some("sy:STR"), sy, dictionary::CMD_SESSION_TERMINATION),
+            Some(2)
+        );
+        assert_eq!(
+            request_filter_score(Some("Sy:SLR|SNR|STR"), sy, sy_snr),
+            Some(2)
+        );
+        assert_eq!(
+            request_filter_score(Some("sy:STR"), dictionary::GX_APP_ID, 275),
+            None
+        );
+    }
+
+    #[test]
     fn request_filter_score_specificity() {
         let s6a = dictionary::S6A_APP_ID;
         let ulr = dictionary::CMD_UPDATE_LOCATION;
@@ -1792,7 +1871,14 @@ mod handler_failure_tests {
 
     /// An inbound Credit-Control-Request on the given application.
     fn incoming_credit_control(application_id: u32) -> crate::diameter::peer::IncomingRequest {
-        let command_code = dictionary::CMD_CREDIT_CONTROL;
+        incoming_request(application_id, dictionary::CMD_CREDIT_CONTROL)
+    }
+
+    /// An inbound request of the given application and command.
+    fn incoming_request(
+        application_id: u32,
+        command_code: u32,
+    ) -> crate::diameter::peer::IncomingRequest {
         crate::diameter::peer::IncomingRequest {
             command_code,
             application_id,
@@ -2107,6 +2193,66 @@ mod handler_failure_tests {
         );
         assert_eq!(
             answer_result_code_for(gx_only, &incoming_credit_control(dictionary::RO_APP_ID)),
+            dictionary::DIAMETER_UNABLE_TO_DELIVER,
+        );
+    }
+
+    /// A script serving Sy: the three commands of TS 29.219 table 5.6.1 and
+    /// clause 5.6.6, each answering a Result-Code of its own.
+    const SY_HANDLERS: &str = concat!(
+        "import _siphon_registry\n",
+        "\n",
+        "def spending_limit(request):\n",
+        "    return request.answer(2001)\n",
+        "\n",
+        "def spending_status_notification(request):\n",
+        "    return request.answer(2002)\n",
+        "\n",
+        "def session_termination(request):\n",
+        "    return request.answer(2003)\n",
+        "\n",
+        "_siphon_registry.register('diameter.on_request', 'sy:SLR', spending_limit, False)\n",
+        "_siphon_registry.register('diameter.on_request', 'sy:SNR', spending_status_notification, False)\n",
+        "_siphon_registry.register('diameter.on_request', 'sy:STR', session_termination, False)\n",
+    );
+
+    #[test]
+    fn each_sy_command_reaches_its_own_handler() {
+        for (command_code, expected) in [
+            (dictionary::CMD_SPENDING_LIMIT, 2001),
+            (dictionary::CMD_SPENDING_STATUS_NOTIFICATION, 2002),
+            (dictionary::CMD_SESSION_TERMINATION, 2003),
+        ] {
+            assert_eq!(
+                answer_result_code_for(
+                    SY_HANDLERS,
+                    &incoming_request(dictionary::SY_APP_ID, command_code),
+                ),
+                expected,
+                "command {command_code}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_sh_subscribe_notifications_does_not_reach_the_sy_snr_handler() {
+        // Same abbreviation, different application and command code (308).
+        assert_eq!(
+            answer_result_code_for(
+                SY_HANDLERS,
+                &incoming_request(
+                    dictionary::SH_APP_ID,
+                    dictionary::CMD_SH_SUBSCRIBE_NOTIFICATIONS,
+                ),
+            ),
+            dictionary::DIAMETER_UNABLE_TO_DELIVER,
+        );
+        // And an STR on another application does not reach Sy's STR handler.
+        assert_eq!(
+            answer_result_code_for(
+                SY_HANDLERS,
+                &incoming_request(dictionary::GX_APP_ID, dictionary::CMD_SESSION_TERMINATION),
+            ),
             dictionary::DIAMETER_UNABLE_TO_DELIVER,
         );
     }

@@ -20,10 +20,15 @@
 #   frame 12  Gx CCR-U reporting PS Data Off      (TS 29.212 clause 4.5.32)
 #   frame 13  Gx RAR with a revalidation time     (TS 29.212 clause 4.5.8)
 #   frame 14  Rx AA-Request with RTCP bandwidths  (TS 29.214 clause 5.6.1)
+#   frame 15  Sy SLR, initial                     (TS 29.219 clause 5.6.2)
+#   frames 16-17 Sy SNR, a counter report and an abort (TS 29.219 clauses 5.6.4, 5.3.7)
+#   frame 18  Sy STR                              (TS 29.219 clause 5.6.6)
 #
-# The M and V bits of the policy AVPs are checked against TS 29.212 and
-# TS 29.214 table 5.3.0.1 and TS 29.061 table 9a (Rel-18), not against
-# Wireshark's dictionary, which has some of them wrong.
+# The M and V bits of the policy AVPs are checked against TS 29.212, TS 29.214
+# and TS 29.219 table 5.3.0.1 and TS 29.061 table 9a (Rel-18), not against
+# Wireshark's dictionary, which has some of them wrong. Its dictionary does not
+# hold SN-Request-Type (2907) at all, so the two SNRs that carry it raise the one
+# "Unknown AVP 2907" warning; that AVP is read from its flags and its octets.
 #
 #   scripts/validate_diameter_originate.sh
 #
@@ -318,12 +323,112 @@ for code in 534 535 529 536; do
   expect_flags 14 "$code" "0x80"
 done
 
-if [[ -n "$(tshark -r "$PCAP" -Y '_ws.malformed || _ws.expert' 2>/dev/null)" ]]; then
-  echo "  FAIL tshark flagged a request as malformed or raised expert info:" >&2
-  tshark -r "$PCAP" -Y '_ws.malformed || _ws.expert' -T fields -e frame.number -e _ws.expert.message 2>/dev/null >&2
+SY_SESSION="$PCRF;5;5"
+OCS="ocs.$EPC"
+
+echo "Sy SLR, initial"
+envelope 15 8388635 16777302 "$PCRF" "$EPC" "" "$EPC"
+expect 15 diameter.Session-Id "$SY_SESSION"
+expect 15 diameter.Auth-Application-Id 16777302
+expect 15 diameter.SL-Request-Type 0
+expect 15 diameter.Subscription-Id-Type 1
+expect 15 diameter.Subscription-Id-Data 001010000000001
+expect 15 diameter.Policy-Counter-Identifier "gold|silver"
+# TS 29.219 clause 5.2: no Auth-Session-State, and no Vendor-Specific-Application-Id.
+expect 15 diameter.Auth-Session-State ""
+expect 15 diameter.Vendor-Specific-Application-Id ""
+# Table 5.3.0.1: M,V.
+expect_flags 15 2904 "0xc0"
+expect_flags 15 2901 "0xc0"
+
+echo "Sy SNR, a counter report"
+envelope 16 8388636 16777302 "$OCS" "$EPC" "$PCRF" "$EPC"
+expect 16 diameter.Session-Id "$SY_SESSION"
+expect 16 diameter.Auth-Application-Id 16777302
+expect 16 diameter.Policy-Counter-Identifier gold
+expect 16 diameter.Policy-Counter-Status "EXHAUSTED|VALID"
+expect 16 diameter.Auth-Session-State ""
+for code in 2903 2905 2906 2901 2902; do
+  expect_flags 16 "$code" "0xc0"
+done
+change="$(tshark -r "$PCAP" -Y 'frame.number == 16' -V -O diameter 2>/dev/null | grep -m1 'Pending-Policy-Counter-Change-Time: ' || true)"
+if [[ "$change" == *"Nov 14, 2023 22:13:20"* ]]; then
+  echo "  ok   frame 16 Pending-Policy-Counter-Change-Time is 2023-11-14 22:13:20 UTC (Unix 1700000000)"
+else
+  echo "  FAIL frame 16 Pending-Policy-Counter-Change-Time read as '$change'" >&2
+  status=1
+fi
+# SN-Request-Type 2907: V must, M must not (table 5.3.0.1), value 1 (bit 0).
+expect_flags 16 2907 "0x80"
+expect 16 diameter.avp.unknown "00000001"
+
+echo "Sy SNR, abort session request"
+envelope 17 8388636 16777302 "$OCS" "$EPC" "$PCRF" "$EPC"
+expect 17 diameter.Session-Id "$SY_SESSION"
+expect 17 diameter.Auth-Application-Id 16777302
+expect_flags 17 2907 "0x80"
+expect 17 diameter.avp.unknown "00000002"
+
+echo "Sy STR"
+envelope 18 275 16777302 "$PCRF" "$EPC" "" "$EPC"
+expect 18 diameter.Session-Id "$SY_SESSION"
+expect 18 diameter.Auth-Application-Id 16777302
+expect 18 diameter.Termination-Cause 1
+expect 18 diameter.Auth-Session-State ""
+
+# The SLA a handler builds with request.answer() and insert_avp (TS 29.219
+# clause 5.6.3): the request's Auth-Application-Id, no Auth-Session-State, two
+# reports of which the first has pending information.
+SY_ANSWER_HEX="$WORK/sy-answer.hex"
+SY_ANSWER_PCAP="$WORK/sy-answer.pcap"
+rm -f "$SY_ANSWER_HEX" "$SY_ANSWER_PCAP"
+SIPHON_DIAMETER_SY_ANSWER_HEX_OUT="$SY_ANSWER_HEX" \
+  PYO3_PYTHON="${PYO3_PYTHON:-python3}" \
+  cargo test --lib -- --exact \
+  script::api::diameter_server::tests::emit_sy_answer_for_external_dissection >/dev/null
+text2pcap -q -T "3868,3868" "$SY_ANSWER_HEX" "$SY_ANSWER_PCAP"
+answer_field() {
+  tshark -r "$SY_ANSWER_PCAP" -T fields -E occurrence=a -E aggregator='|' -e "$1" 2>/dev/null | head -1
+}
+expect_answer() {
+  local name="$1" want="$2" got
+  got="$(answer_field "$name")"
+  if [[ "$got" != "$want" ]]; then
+    echo "  FAIL Sy SLA $name: tshark read '$got', we meant '$want'" >&2
+    status=1
+    return
+  fi
+  echo "  ok   Sy SLA $name = $got"
+}
+echo "Sy SLA built by a handler"
+expect_answer diameter.cmd.code 8388635
+expect_answer diameter.applicationId 16777302
+expect_answer diameter.flags.request False
+expect_answer diameter.flags.proxyable True
+expect_answer diameter.Session-Id "$PCRF;7;7"
+expect_answer diameter.Result-Code 2001
+expect_answer diameter.Auth-Application-Id 16777302
+expect_answer diameter.Auth-Session-State ""
+expect_answer diameter.Vendor-Specific-Application-Id ""
+expect_answer diameter.Policy-Counter-Identifier "gold|silver"
+expect_answer diameter.Policy-Counter-Status "EXHAUSTED|VALID|VALID"
+if [[ -n "$(tshark -r "$SY_ANSWER_PCAP" -Y '_ws.malformed || _ws.expert' 2>/dev/null)" ]]; then
+  echo "  FAIL tshark flagged the Sy SLA as malformed or raised expert info" >&2
   status=1
 else
-  echo "  ok   nothing malformed, no expert info, no unknown AVP"
+  echo "  ok   the Sy SLA is not malformed and holds no unknown AVP"
+fi
+
+# Wireshark's dictionary does not know SN-Request-Type: that one warning, on the
+# two SNRs, is not siphon's.
+flagged="$(tshark -r "$PCAP" -Y '_ws.malformed || _ws.expert' -T fields -e frame.number -e _ws.expert.message 2>/dev/null |
+  grep -v -E '^(16|17)'$'\t''Unknown AVP 2907 \(vendor=3GPP\)' || true)"
+if [[ -n "$flagged" ]]; then
+  echo "  FAIL tshark flagged a request as malformed or raised expert info:" >&2
+  echo "$flagged" >&2
+  status=1
+else
+  echo "  ok   nothing malformed, no expert info, no unknown AVP beyond SN-Request-Type"
 fi
 
 if [[ $status -ne 0 ]]; then

@@ -425,8 +425,12 @@ _r.register("beta.kind",  None, beta_only, False, None)
 
     /// `call_handler_with` builds the arguments and reads the outcome inside
     /// the executor jobs, for sync and async handlers and for a raise.
+    #[allow(clippy::await_holding_lock)] // a test-only serialising guard
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn call_handler_with_keeps_every_python_touch_in_the_job() {
+        // An async handler goes through the shared drivers, whose switch and
+        // admission limit other tests set: one at a time.
+        let _serial = crate::script::async_pool::pool_test_guard();
         let engine = engine_with_source(
             r#"
 import asyncio
@@ -567,8 +571,12 @@ _r.register("ext.echo", None, echo, False, None)
         });
     }
 
+    #[allow(clippy::await_holding_lock)] // a test-only serialising guard
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn call_handler_dispatches_async_handler() {
+        // An async handler goes through the shared drivers, whose switch and
+        // admission limit other tests set: one at a time.
+        let _serial = crate::script::async_pool::pool_test_guard();
         let engine = engine_with_source(
             r#"
 import asyncio

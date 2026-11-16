@@ -218,6 +218,8 @@ mod dialog_state_events_tests;
 #[cfg(test)]
 mod dialog_state_transfer_tests;
 #[cfg(test)]
+mod direct_request_handler_tests;
+#[cfg(test)]
 mod early_dial_tests;
 #[cfg(test)]
 mod early_dialog_route_set_tests;

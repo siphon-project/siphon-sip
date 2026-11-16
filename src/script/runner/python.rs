@@ -9,6 +9,7 @@ use tracing::error;
 /// crossings.
 const SOURCE: &str = r#"
 import asyncio
+import inspect
 
 
 def make_task(loop, coroutine, context, done):
@@ -53,6 +54,44 @@ async def self_test(awaitable, report):
         raise
 
 
+async def _await(awaitable):
+    return await awaitable
+
+
+def as_coroutine(awaitable):
+    # A coroutine around something a gather was given that is neither a
+    # coroutine nor a siphon awaitable: an asyncio future, a task, an object
+    # with `__await__`.
+    if not inspect.isawaitable(awaitable):
+        raise TypeError("An asyncio.Future, a coroutine or an awaitable is required")
+    return _await(awaitable)
+
+
+def gather_as_tasks(awaitables, return_exceptions):
+    # `tasks.gather` where the runner does not step the caller: asyncio's
+    # gather, with the one difference the runner's has. A child that raises
+    # cancels the others.
+    for awaitable in awaitables:
+        # Refused before anything is started, so nothing is left running.
+        if not inspect.isawaitable(awaitable):
+            raise TypeError("An asyncio.Future, a coroutine or an awaitable is required")
+    futures = {}
+    children = []
+    for awaitable in awaitables:
+        # An argument passed twice is one child.
+        if id(awaitable) not in futures:
+            futures[id(awaitable)] = asyncio.ensure_future(awaitable)
+        children.append(futures[id(awaitable)])
+    outer = asyncio.gather(*children, return_exceptions=return_exceptions)
+    if children and not return_exceptions:
+        def cancel_the_rest(done):
+            if done.cancelled() or done.exception() is not None:
+                for child in children:
+                    child.cancel()
+        outer.add_done_callback(cancel_the_rest)
+    return outer
+
+
 def settle(future, ok, value):
     if future.done():
         return
@@ -73,6 +112,10 @@ pub(super) struct Helpers {
     pub(super) make_task: Py<PyAny>,
     pub(super) start_task: Py<PyAny>,
     pub(super) has_task_factory: Py<PyAny>,
+    /// `as_coroutine(awaitable)`: a coroutine that awaits it.
+    pub(super) as_coroutine: Py<PyAny>,
+    /// `gather_as_tasks(awaitables, return_exceptions)`.
+    pub(super) gather_as_tasks: Py<PyAny>,
     /// `self_test(awaitable, report)`, a coroutine function.
     pub(super) self_test: Py<PyAny>,
     pub(super) self_test_awaitable: Py<PyAny>,
@@ -123,6 +166,8 @@ fn build(python: Python<'_>) -> PyResult<Helpers> {
         make_task: get("make_task")?,
         start_task: get("start_task")?,
         has_task_factory: get("has_task_factory")?,
+        as_coroutine: get("as_coroutine")?,
+        gather_as_tasks: get("gather_as_tasks")?,
         self_test: get("self_test")?,
         self_test_awaitable: pyo3::wrap_pyfunction!(self_test_awaitable, python)?
             .into_any()

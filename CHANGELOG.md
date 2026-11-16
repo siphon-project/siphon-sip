@@ -15,6 +15,22 @@ entry, but a working config keeps working.
 
 ### Changed
 
+- **Script custom metric updates (`counter.inc()`, `gauge.set()`, `histogram.observe()`) are cheaper.** An update to a label combination the metric has already seen used to allocate the label values and take a per-metric lock on every call; it is now one lookup and an atomic update, with no lock and no allocation. A counter increment with two labels goes from 263 ns to about 57 ns, and with one label from 158 ns to about 60 ns. The limit of 128 label combinations per metric and its error are unchanged, and now hold exactly when several threads create combinations at once.
+- **An `async def` handler a host extension calls through `ScriptHandle`, and that awaits only siphon's own awaitable APIs, no longer goes through asyncio.** The executor runs the coroutine up to the await and resumes it when the Rust side finishes: no event-loop task, no async driver thread. In the dispatch-cost bench a handler with one await costs 27 µs of CPU per call instead of 147 µs at one caller and 70 µs instead of 222 µs at 1000 calls/s, and one with ten awaits 147 µs instead of 438 µs. A handler that uses asyncio itself (`asyncio.sleep`, `create_task`, `gather`, `wait_for`, `timeout`, `TaskGroup`, `to_thread`, a third-party asyncio client) is moved to a driver where it stands, as the same task with the same context variables, and starts on a driver from then on, so it costs what it did before. Applies to the handlers an extension registers under its own kind (HTTP routes, GTP-C messages, peer events); every other handler kind is unchanged. Two things a script can see: between awaits such a handler runs on sync-pool workers, and `asyncio.current_task()` and what an awaitable API returns are a `SiphonHandlerTask` and a `SiphonAwaitable`, which have the task and future interfaces but are not `asyncio.Task` / `asyncio.Future` instances. Handlers bound to a driver loop that has a task factory or is in asyncio debug mode start on the driver as before, and the direct path stays off altogether if its start-up self-test fails (both logged). The cost per handler shape is measured by `script::dispatch_cost_bench_tests::dispatch_cost` (an ignored test, run in a release build). See `docs/handler-execution-model.md`, "What an await costs".
+- **`@proxy.on_request` and the Diameter server handlers no longer go through asyncio for awaits of siphon's own awaitable APIs.** They are driven as the handlers called through `ScriptHandle` already are: the executor runs the coroutine up to the await and resumes it when the Rust side finishes, and a handler that uses asyncio itself is moved to a driver where it stands and starts on one from then on. The same two things are visible to a script: between awaits such a handler runs on sync-pool workers, and `asyncio.current_task()` and what an awaitable API returns are a `SiphonHandlerTask` and a `SiphonAwaitable`, not `asyncio.Task` / `asyncio.Future` instances. The handler kinds that hold their worker until the coroutine settles are unchanged. See `docs/handler-execution-model.md`, "What an await costs".
+- **`script.direct_dispatch: on` now also covers `@proxy.on_request` and the
+  Diameter server handlers** (`@diameter.on_request`, `@diameter.on_reply`,
+  `@diameter.on_request_completed`). An awaiting one is stepped on its asyncio
+  driver thread without an asyncio task while it awaits only siphon's own
+  awaitables, and the reply, relay or answer that follows runs as one
+  executor job per call. A new request that finds every driver at its limit
+  of handlers in flight is not run: SIP answers `503 Service Unavailable`
+  with `Retry-After: 5`, Diameter answers `3004 DIAMETER_TOO_BUSY`, and both
+  count in `siphon_runner_admission_rejected_total`. The later handlers of a
+  request that was admitted are never refused. Replies, relays, answers,
+  error answers and the coroutine timeout are the same as with the switch
+  off, and `def` handlers are not touched. Default still `off`.
+
 - **A `script.sync_pool_max` below the core pool size is now warned about at
   startup.** The ceiling has always been raised to the core
   (`sync_pool_size`, default `max(8, 2 x CPUs)`), so `sync_pool_max: 8` on a
@@ -80,6 +96,21 @@ entry, but a working config keeps working.
   CPython does not expose how many objects the collector tracks without a walk
   of the heap, so there is no gauge of that.
 
+- **Diameter Sy (TS 29.219 Rel-18).** Application `Sy` (16777302, vendor 10415)
+  is accepted by `@diameter.on_request("Sy:SLR")`, `"Sy:SNR"` and `"Sy:STR"`,
+  by `send_request` and `originate`, by `diameter.routes`, `retry` and the
+  server `applications` list (`sy`), and advertised in the capabilities
+  exchange. The seven AVPs (2901 to 2907) are in the dictionary with the flags
+  of table 5.3.0.1 (SN-Request-Type goes without the M bit), and experimental
+  results 5570 and 4241 have metric labels. A PCRF script sends SLR and STR,
+  an OCS script answers them and originates the SNR on the connection that
+  carried the SLR, in its session; answers read back with the grouped
+  Policy-Counter-Status-Report decoded. SNR and SNA are Sh's command (308) on
+  their own and Sy's (8388636) on the Sy application: filters, `send_request`,
+  `originate` and `retry` read the abbreviation in the application they are
+  given, so nothing written for Sh changes. Sy keeps its session state, so its
+  requests and answers carry `Auth-Application-Id` and no
+  `Auth-Session-State` or `Vendor-Specific-Application-Id`.
 - **`script.direct_dispatch: off | on`, default `off`.** With `on`, an
   `async def` handler that a host extension calls through the script handle
   (an HTTP route, an SMPP or GTP-C handler) is stepped on its asyncio driver
@@ -95,9 +126,21 @@ entry, but a working config keeps working.
   coroutine timeout are the same in both modes. Each driver takes at most
   4096 such handlers in flight; with every driver full a call fails at once
   (`Err` from `call_handler_with`) and is counted in
-  `siphon_runner_admission_rejected_total`. SIP request and Diameter handlers
-  are not affected by the switch yet. Off, dispatch is unchanged. See
+  `siphon_runner_admission_rejected_total`. Off, dispatch is unchanged. See
   `docs/handler-execution-model.md`.
+- **`tasks.gather(*awaitables, return_exceptions=False)`**, a new `tasks`
+  namespace. It runs several awaitables of one handler at the same time and
+  returns their results in argument order, like `asyncio.gather`, but with
+  `script.direct_dispatch: on` it keeps the handler off asyncio: a coroutine
+  argument is stepped on the same asyncio driver thread as the handler, and a
+  siphon awaitable is waited on as it is. No asyncio task is made for either
+  (`asyncio.gather` makes one per coroutine and turns the handler into a
+  task). One difference from `asyncio.gather`, in every mode: when an argument
+  raises, the others are cancelled before the exception reaches the handler.
+  `return_exceptions=True` collects exceptions as results and cancels
+  nothing. A handler's cancellation or timeout cancels what it gathered. With
+  the switch off, or in a handler that runs as an asyncio task, it is
+  `asyncio.gather` with that same rule. Mirrored in the SDK mock.
 - `siphon_accept_errors_total{transport,listener,reason}`, `reason` one of
   `emfile`, `enfile`, `enobufs`, `enomem`, `other`, counted on every accept
   error. Alert on `process_open_fds / process_max_fds > 0.8` for the warning
