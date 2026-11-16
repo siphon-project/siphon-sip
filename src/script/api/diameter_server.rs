@@ -516,17 +516,6 @@ pub struct PyDiameterAnswer {
     copied_from_request: Mutex<Vec<(u32, u32)>>,
 }
 
-/// The AVPs an answer takes from its request. Every answer of the 3GPP
-/// applications lists Vendor-Specific-Application-Id and Auth-Session-State,
-/// with the values of the request: both as required on Cx and Sh (TS 29.229
-/// clause 6.1, TS 29.329 clause 6.1), Auth-Session-State as required and the
-/// other as optional on S6a, S6c and SGd (TS 29.272 clause 7.2, TS 29.338
-/// clauses 5.3.2 and 6.3.2).
-const APPLICATION_AVPS: [u32; 2] = [
-    dictionary::avp::VENDOR_SPECIFIC_APPLICATION_ID,
-    dictionary::avp::AUTH_SESSION_STATE,
-];
-
 impl PyDiameterAnswer {
     pub(crate) fn from_msg(msg: DiameterMsg) -> Self {
         Self {
@@ -535,44 +524,9 @@ impl PyDiameterAnswer {
         }
     }
 
-    /// An answer a handler is about to fill in, with the application AVPs of
-    /// `request` copied into the places the commands list them in:
-    /// Vendor-Specific-Application-Id after Session-Id, Auth-Session-State
-    /// before Origin-Host. A protocol error (3xxx) gets neither: it is the
-    /// generic answer-message of RFC 6733 section 7.2.
-    fn for_handler(request: &DiameterMsg, mut answer: DiameterMsg, result_code: u32) -> Self {
-        let mut copied = Vec::new();
-        if !(3000..4000).contains(&result_code) {
-            // Sy names its application with Auth-Application-Id, which every
-            // one of its answers lists as mandatory (TS 29.219 clauses 5.6.3,
-            // 5.6.5 and 5.6.7); it has no Auth-Session-State or
-            // Vendor-Specific-Application-Id to copy.
-            let sy = [dictionary::avp::AUTH_APPLICATION_ID];
-            let application_avps: &[u32] = if request.application_id == dictionary::SY_APP_ID {
-                &sy
-            } else {
-                &APPLICATION_AVPS
-            };
-            for &code in application_avps {
-                let Some(avp) = request.find(code, 0) else {
-                    continue;
-                };
-                let before = if code == dictionary::avp::AUTH_SESSION_STATE
-                    || code == dictionary::avp::AUTH_APPLICATION_ID
-                {
-                    dictionary::avp::ORIGIN_HOST
-                } else {
-                    dictionary::avp::RESULT_CODE
-                };
-                let position = answer
-                    .avps
-                    .iter()
-                    .position(|existing| existing.code == before && existing.vendor == 0)
-                    .unwrap_or(answer.avps.len());
-                answer.avps.insert(position, avp.clone());
-                copied.push((code, 0));
-            }
-        }
+    /// An answer a handler is about to fill in, `copied` naming the AVPs it
+    /// took from the request ([`forward::build_handler_answer`]).
+    fn for_handler(answer: DiameterMsg, copied: Vec<(u32, u32)>) -> Self {
         Self {
             msg: Arc::new(Mutex::new(answer)),
             copied_from_request: Mutex::new(copied),
@@ -696,11 +650,7 @@ impl PyDiameterAnswer {
         let (code, name_vendor) = resolve_code(code_or_name)?;
         let vendor = if vendor != 0 { vendor } else { name_vendor };
         let mut avp = build_avp(code, vendor, value)?;
-        // TS 29.229 §7.2.1: Supported-Features "within an answer application
-        // message ... shall never have the 'M' bit set" (in a request it has).
-        if code == dictionary::avp::SUPPORTED_FEATURES && vendor == dictionary::VENDOR_3GPP {
-            avp.flags &= !crate::diameter::codec::AVP_FLAG_MANDATORY;
-        }
+        forward::answer_avp_flags(&mut avp);
         self.take_copied(code, vendor)?;
         let mut msg = self.lock_mut()?;
         msg.remove(code, vendor);
@@ -1033,14 +983,14 @@ impl PyDiameterRequest {
         error_message: Option<String>,
     ) -> PyResult<PyDiameterAnswer> {
         let request = self.lock()?;
-        let answer = forward::build_answer(
+        let (answer, copied) = forward::build_handler_answer(
             &request,
             &self.local_origin_host,
             &self.local_origin_realm,
             result_code,
             error_message.as_deref(),
         );
-        Ok(PyDiameterAnswer::for_handler(&request, answer, result_code))
+        Ok(PyDiameterAnswer::for_handler(answer, copied))
     }
 
     /// Build an answer that refuses this request (alias of `answer` kept for
@@ -1075,70 +1025,29 @@ impl PyDiameterRequest {
     ) -> PyResult<Bound<'py, PyAny>> {
         // Snapshot everything out of `self` before the async block (no Python
         // objects may be held across the await).
-        let mut tree = self.lock()?.clone();
-        let local_origin_host = self.local_origin_host.clone();
-        let local_origin_realm = self.local_origin_realm.clone();
-        let inbound_hbh = self.inbound_hbh;
-        let inbound_e2e = self.inbound_e2e;
-        let previous_hop = self.peer.host.clone();
-        let client = Arc::clone(&peer.client);
-        let alternates = peer.alternates.clone();
-        let configured = peer.configured;
-        let timeout = Duration::from_secs_f64(timeout_secs.max(0.1));
+        let tree = self.lock()?.clone();
+        let inbound = crate::diameter::relay::Inbound {
+            hop_by_hop: self.inbound_hbh,
+            end_to_end: self.inbound_e2e,
+            previous_hop: self.peer.host.clone(),
+            local_origin: (
+                self.local_origin_host.clone(),
+                self.local_origin_realm.clone(),
+            ),
+        };
+        let backends = crate::diameter::relay::Backends {
+            first: Arc::clone(&peer.client),
+            alternates: peer.alternates.clone(),
+            configured: peer.configured,
+        };
+        let options = crate::diameter::relay::RelayOptions {
+            identity,
+            timeout: Duration::from_secs_f64(timeout_secs.max(0.1)),
+            retransmitted,
+        };
 
         crate::script::awaitable(py, async move {
-            // Every identity this node uses on the request: its own and the
-            // one it may put in the request's place (topology hiding).
-            let mut identities = vec![local_origin_host.clone()];
-            if let Some((origin_host, origin_realm)) = identity {
-                forward::rewrite_origin(&mut tree, &origin_host, &origin_realm);
-                identities.push(origin_host);
-            }
-            // The peer it came from; for a connection whose peer gave no
-            // identity, the request's own origin.
-            let previous_hop = if previous_hop.is_empty() {
-                tree.get_str(dictionary::avp::ORIGIN_HOST)
-                    .unwrap_or_default()
-            } else {
-                previous_hop
-            };
-
-            // Loop detection + Route-Record append.
-            let identities: Vec<&str> = identities.iter().map(String::as_str).collect();
-            if let Err(error) = forward::prepare_forward(&mut tree, &identities, &previous_hop) {
-                let answer = forward::build_error_answer(
-                    &tree,
-                    &local_origin_host,
-                    &local_origin_realm,
-                    error.result_code(),
-                    &error.to_string(),
-                );
-                return Ok(PyDiameterAnswer::from_msg(answer));
-            }
-
-            // Fresh outbound hop-by-hop; End-to-End is preserved. Every answer
-            // this node makes from here on goes back with the inbound one
-            // (RFC 6733 section 6.2).
-            // A retransmission keeps its T bit on the relayed copy (RFC 6733
-            // section 3); answers mask it off (forward::answer_in keeps only P).
-            if retransmitted {
-                tree.flags |= crate::diameter::codec::FLAG_RETRANSMITTED;
-            }
-            tree.hop_by_hop = inbound_hbh;
-            tree.end_to_end = inbound_e2e;
-            let policy = crate::diameter::retry::current();
-            let answer = crate::diameter::overload_agent::relay(
-                &policy,
-                &mut tree,
-                crate::diameter::overload_agent::Target {
-                    first: &client,
-                    alternates: &alternates,
-                    configured,
-                },
-                timeout,
-                (&local_origin_host, &local_origin_realm),
-            )
-            .await;
+            let answer = crate::diameter::relay::relay(tree, inbound, backends, options).await;
             Ok(PyDiameterAnswer::from_msg(answer))
         })
     }

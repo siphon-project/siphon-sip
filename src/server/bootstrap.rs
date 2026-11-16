@@ -845,10 +845,7 @@ pub(super) fn init_diameter(config: &Config) -> Option<Arc<crate::diameter::Diam
     // Only built when the deployment opts into Diameter server mode (listen/tenants set).
     let server_enabled =
         diameter_config.listen.is_some() || !diameter_config.effective_tenants().is_empty();
-    let event_sink = diameter_config
-        .event_sink
-        .as_ref()
-        .map(|cfg| Arc::new(crate::diameter::event_sink::EventSink::spawn(cfg)));
+    let event_sink = crate::diameter::native::install_runtime(diameter_config);
     // Snapshot the fields scripts read via `diameter.config` — both the flat
     // single-domain shape (origin/clients/servers/connect_to) and the explicit
     // multi-tenant map, so a flat-config script's `diameter.config["origin_host"]`

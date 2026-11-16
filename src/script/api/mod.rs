@@ -470,6 +470,8 @@ pub fn set_numbers_singleton(python: Python<'_>) -> Result<()> {
 ///
 /// Always called at startup, with the store built from `script_config:`.
 pub fn set_config_singleton(python: Python<'_>, py_config: config::PyScriptConfig) -> Result<()> {
+    // The same store for Rust readers (`script_config::current`).
+    crate::script::script_config::install(Arc::clone(py_config.store()));
     let config_py: Py<PyAny> = Py::new(python, py_config)
         .map_err(|error| SiphonError::Script(format!("Py::new(config): {error}")))?
         .into_any();
