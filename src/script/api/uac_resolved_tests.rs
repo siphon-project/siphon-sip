@@ -361,8 +361,9 @@ async fn a_next_hop_without_tcp_gets_the_request_over_udp() {
     let node = Node::new(1500);
     let uri = peer.uri();
     let egress = ResolvedEgress::resolved(&uri, peer.addr, Transport::Udp);
-    let before = counted(OverMtuPath::Script);
 
+    // The moved-request counter is process-wide and other tests move requests
+    // in parallel, so it cannot be compared for equality here.
     for index in 0..3 {
         egress
             .send_and_forget(
@@ -376,7 +377,6 @@ async fn a_next_hop_without_tcp_gets_the_request_over_udp() {
         assert!(via_of(&sent.data).starts_with("SIP/2.0/UDP "));
         assert!(sent.data.len() > 1500, "the whole request");
     }
-    assert_eq!(counted(OverMtuPath::Script), before, "not counted as moved");
     crate::dispatcher::forget_tcp_probe(peer.addr);
 }
 
