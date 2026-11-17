@@ -556,25 +556,61 @@ impl PyB2buaControl {
     /// caller's dialog (on a call siphon answered itself, its only dialog), or
     /// with `leg="callee"` in the answered callee's, carrying `sdp`, or the
     /// session in force toward that party when `sdp` is `None`. siphon puts its
-    /// own `o=` on it at the dialog's next version (RFC 3264 §8). The other
-    /// party is told nothing, and neither is the media engine where the call
-    /// is anchored: the offer is the session in force, and the party's answer
-    /// to it does not move the media.
+    /// own `o=` on `sdp`; the session in force keeps the `o=` it was sent
+    /// with. Either goes out at the dialog's next `o=` version (RFC 3264 §8).
+    /// The other party is told nothing.
     ///
     /// For telling a party something about the session it did not ask about:
-    /// RFC 7866's `a=record`, when a recording starts or stops on its own.
+    /// RFC 7866's `a=record` when a recording starts or stops on its own, or a
+    /// change that is not in the media at all, such as a call's priority,
+    /// carried in `headers` and `body`.
     ///
-    /// Awaitable: resolves to the final status code (an int), `491` without
-    /// anything sent when an INVITE toward that party is already in progress
-    /// (RFC 3261 §14.1: wait and send again), or `None` when no final response
-    /// arrives within `timeout_ms`. Raises `ValueError` when the call is
+    /// `body` (str or bytes) with its `content_type` is sent with the offer
+    /// (RFC 5621 §3): a single part of any type as the second part of a
+    /// `multipart/mixed` body after the SDP, under a boundary siphon draws; a
+    /// `multipart/*` body without an `application/sdp` part with the SDP part
+    /// put first under its own boundary. A `multipart/*` body with an SDP
+    /// part, or an `application/sdp` body, is the offer itself, as `sdp` is.
+    ///
+    /// `headers` is a `{name: value}` mapping added to the re-INVITE, in its
+    /// order. The headers siphon writes on it raise `ValueError`: `Via`,
+    /// `From`, `To`, `Call-ID`, `CSeq`, `Max-Forwards`, `Contact`, `Route`,
+    /// `Record-Route`, `Content-Length`, `Content-Type`, `Require`,
+    /// `Supported`, `Session-Expires`, `Min-SE`, `RAck`, `RSeq` and
+    /// `User-Agent`.
+    ///
+    /// The media engine: with no `sdp`, on a call the engine answered itself
+    /// (it is the far side of the party's session), an answer that changes
+    /// the party's media is given to the engine. In every other case the
+    /// engine is told nothing: an offer with the script's own `sdp` is not
+    /// the engine's session, a session that relays to a second party is not
+    /// answered for one side, and a conference seat takes no new description.
+    ///
+    /// A `491 Request Pending` (RFC 3261 §14.1), from the party or because an
+    /// INVITE toward it was already in progress, is waited out and the
+    /// re-INVITE sent again: after a random 0 to 2 seconds on a dialog whose
+    /// Call-ID the party generated, 2.1 to 4 seconds on one siphon generated,
+    /// up to three times within `timeout_ms`.
+    ///
+    /// Awaitable: resolves to the final status code (an int), `491` when the
+    /// glare outlasted the retries or the time left, or `None` when no final
+    /// response arrives within `timeout_ms`. A 2xx is ACKed and makes the
+    /// offer the session in force. Raises `ValueError` when the call is
     /// unknown (`not_found`), the party's dialog is not established or no
-    /// session was ever sent it (`invalid_state`).
+    /// session was ever sent it (`invalid_state`), for a header siphon
+    /// writes, `body` without `content_type` or the reverse, an empty `body`,
+    /// an offer given both in `sdp` and in the body, or a `multipart/*` body
+    /// without a `boundary` or a part delimited by it; `TypeError` for a
+    /// header name or value that is not a str. Nothing is sent when it raises.
     ///
     /// ```python
     /// status = await b2bua.reoffer(call_id, sdp=session + "a=record:off\r\n")
+    /// status = await b2bua.reoffer(call_id, body=service_info_xml,
+    ///                              content_type="application/vnd.example.info+xml",
+    ///                              headers={"Resource-Priority": "example.0"})
     /// ```
-    #[pyo3(signature = (call_id, sdp=None, leg="caller", timeout_ms=32000))]
+    #[pyo3(signature = (call_id, sdp=None, leg="caller", timeout_ms=32000, body=None, content_type=None, headers=None))]
+    #[allow(clippy::too_many_arguments)]
     fn reoffer<'py>(
         &self,
         python: Python<'py>,
@@ -582,8 +618,11 @@ impl PyB2buaControl {
         sdp: Option<String>,
         leg: &str,
         timeout_ms: u64,
+        body: Option<&Bound<'py, PyAny>>,
+        content_type: Option<&str>,
+        headers: Option<&Bound<'py, pyo3::types::PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        use pyo3::exceptions::PyValueError;
+        use pyo3::exceptions::{PyTypeError, PyValueError};
         let on_a_leg = match leg {
             "caller" => true,
             "callee" => false,
@@ -593,24 +632,45 @@ impl PyB2buaControl {
                 )))
             }
         };
-        let reoffered =
-            crate::dispatcher::b2bua_reoffer(call_id, on_a_leg, sdp.map(String::into_bytes))
-                .map_err(|refusal| PyValueError::new_err(format!("b2bua.reoffer(): {refusal}")))?;
+        let mut extra = Vec::new();
+        if let Some(headers) = headers {
+            for (name, value) in headers.iter() {
+                let (Ok(name), Ok(value)) = (name.extract::<String>(), value.extract::<String>())
+                else {
+                    return Err(PyTypeError::new_err(
+                        "b2bua.reoffer(headers=…) takes a mapping of str header names to str values",
+                    ));
+                };
+                extra.push((name, value));
+            }
+        }
+        crate::dispatcher::check_reoffer_headers(&extra).map_err(|refusal| {
+            PyValueError::new_err(format!("b2bua.reoffer(headers=…): {refusal}"))
+        })?;
+        let body = match (body, content_type) {
+            (None, None) => None,
+            (Some(body), Some(content_type)) => Some((
+                content_type.to_string(),
+                crate::script::api::request::extract_body_bytes(body)?,
+            )),
+            _ => {
+                return Err(PyValueError::new_err(
+                    "b2bua.reoffer(body=…) and content_type=… go together",
+                ))
+            }
+        };
+        let (sdp, extras) = crate::b2bua::reoffer::AnswerExtras::checked(sdp, body, extra)
+            .map_err(|why| PyValueError::new_err(format!("b2bua.reoffer(): {why}")))?;
+        let settled = crate::dispatcher::b2bua_reoffer(
+            call_id,
+            on_a_leg,
+            sdp.map(String::into_bytes),
+            extras,
+            std::time::Duration::from_millis(timeout_ms),
+        )
+        .map_err(|refusal| PyValueError::new_err(format!("b2bua.reoffer(): {refusal}")))?;
         crate::script::awaitable(python, async move {
-            let status = match reoffered {
-                crate::dispatcher::Reoffered::Crossing => Some(491),
-                crate::dispatcher::Reoffered::Sent { branch, status } => {
-                    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), status)
-                        .await
-                    {
-                        Ok(Ok(code)) => Some(code),
-                        _ => {
-                            crate::dispatcher::forget_reoffer(&branch);
-                            None
-                        }
-                    }
-                }
-            };
+            let status = settled.await;
             Ok(crate::script::Deferred::build(
                 move |python| -> PyResult<Py<PyAny>> {
                     Ok(match status {

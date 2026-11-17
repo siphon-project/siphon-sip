@@ -185,9 +185,11 @@ fn the_public_surface_is_pinned() {
     // crate-internal entry points an anchored `answer` / `progress` carries the
     // call's `media_flags` through (the published `b2bua_answer_call_anchored`
     // / `b2bua_progress_call_anchored` keep their signatures and send none),
-    // plus the 4 crate-internal items `b2bua.reoffer()` and
-    // `b2bua.session_sdp()` go through: the two entry points, `Reoffered`, and
-    // `forget_reoffer` for a script that stops waiting, plus the 2
+    // plus the 3 crate-internal items `b2bua.reoffer()` and
+    // `b2bua.session_sdp()` go through: the two entry points and the check of
+    // the headers a script puts on its re-INVITE (the wait for the status,
+    // its retries and its timeout are inside the entry point now, which took
+    // `Reoffered` and `forget_reoffer` off this list), plus the 2
     // crate-internal items `b2bua.adopt_replaced()` goes through: its entry
     // point and `AdoptRequest`, plus the crate-internal `network_deregister`
     // `registrar.network_deregister()` ends a registration through, plus the 3
@@ -201,9 +203,9 @@ fn the_public_surface_is_pinned() {
     // is the tripwire.
     assert_eq!(
         declared + re_exported,
-        123,
+        122,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 123. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 122. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

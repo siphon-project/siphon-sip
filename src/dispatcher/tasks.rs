@@ -229,6 +229,7 @@ pub(crate) fn spawn_timer_sweep(
                         post_script_turn(&state, &ack_lane, |state| {
                             sweep_unacked_uas_2xx(state);
                             sweep_owed_reinvite_acks(state);
+                            sweep_ended_reoffers(state);
                         });
                     }
                     _ = answer_timeout_interval.tick() => {

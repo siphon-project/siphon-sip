@@ -38,8 +38,9 @@ media:
 - **Stopping by itself.** A recording that reaches its cap, or fails, ends with
   `@rtpengine.on_recording_finished`. The caller is then re-offered the session
   in force with `a=record:off`: `b2bua.session_sdp()` reads it, and
-  `b2bua.reoffer()` sends it and resolves to the caller's final status, so a
-  crossing offer's `491` can be retried after RFC 3261 §14.1's 2.1 to 4 s.
+  `b2bua.reoffer()` sends it and resolves to the caller's final status,
+  waiting out a crossing offer's `491` and sending again itself
+  (RFC 3261 §14.1).
 - **Asked for by routing.** A routing answer that sets `"record": true` on a
   route has the call recorded whichever party asked, read off
   `call.active_route.record` in `@b2bua.on_answer`.
@@ -47,9 +48,6 @@ media:
 ## The script
 
 ```python
-import asyncio
-import random
-
 from siphon import b2bua, log, rtpengine, sdp
 
 SPOOL = "/var/spool/siphon/recordings"
@@ -150,10 +148,7 @@ async def recording_closed(call_id, from_tag, recording_id, path, reason, durati
         session = b2bua.session_sdp(call_id)
         if session is None:
             return
-        for _ in range(2):
-            if await b2bua.reoffer(call_id, sdp=with_record(session, "off")) != 491:
-                break
-            await asyncio.sleep(random.uniform(2.1, 4.0))
+        await b2bua.reoffer(call_id, sdp=with_record(session, "off"))
 
 
 @b2bua.on_bye
@@ -175,10 +170,11 @@ Call-ID, the key the call's CDR carries.
   address) is acted on, but the offer is relayed to the callee as usual and the
   answer comes back from there without `a=record`. The state reaches the caller
   in the next answer siphon gives it.
-- **A crossing offer.** `b2bua.reoffer()` resolves to `491` without sending
-  anything when an INVITE toward the caller is already in progress, and to the
-  caller's own `491` when its offer crossed ours. Either way the session is
-  unchanged; send again after the wait.
+- **A crossing offer.** When an INVITE toward the caller is already in
+  progress, or the caller answers `491` because its offer crossed ours,
+  `b2bua.reoffer()` waits the random interval of RFC 3261 §14.1 and sends
+  again, up to three times within its `timeout_ms`. It resolves to `491` only
+  when the glare outlasted that, and the session is then unchanged.
 - **The recipe tracks its calls in a module dict**, which is fine for one
   siphon process. A fleet that moves calls between nodes needs it somewhere
   shared.

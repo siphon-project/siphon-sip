@@ -99,6 +99,81 @@ pub fn b2bua_send_reinvite_on_leg_then(
     )
 }
 
+/// A re-INVITE a script sends one leg (`b2bua.reoffer()`), with what the
+/// script put beside the offer. Its body rides with the SDP as a part of a
+/// `multipart/*` body (RFC 5621 §3), its headers follow the dialog's own, and
+/// the offer kept for the 2xx is the SDP alone. `Err` says why the script's
+/// body could not take the SDP part; nothing is sent then.
+///
+/// `sdp` is the script's own description, re-originated under siphon's
+/// identity as [`b2bua_send_reinvite_on_leg_then`] does, or with
+/// `session_in_force` the description the leg was last sent, which goes out
+/// as it was at the dialog's next `o=` version ([`advance_sdp_version`]).
+#[allow(clippy::too_many_arguments)]
+pub fn b2bua_send_script_reinvite(
+    call_id: &str,
+    on_a_leg: bool,
+    sdp: Vec<u8>,
+    session_in_force: bool,
+    extras: &crate::b2bua::reoffer::AnswerExtras,
+    tracking_target: &str,
+    before_send: impl FnOnce(&str),
+    state: &DispatcherState,
+) -> Result<bool, String> {
+    let Some(leg) = state.call_actors.clone_leg(call_id, on_a_leg) else {
+        return Ok(false);
+    };
+    // Framed first, on a copy: a body that cannot take the part costs the
+    // dialog no `o=` version.
+    extras.body_with(Some(&sdp))?;
+    let mut sdp = sdp;
+    if session_in_force {
+        if let Some((_, version)) = state.call_actors.reserve_leg_sdp_version(call_id, on_a_leg) {
+            advance_sdp_version(&mut sdp, version);
+        }
+        if !state.sdp_strip_attributes.is_empty() {
+            crate::media::sdp::strip_attributes(&mut sdp, &state.sdp_strip_attributes);
+        }
+    } else {
+        let host = state.a_leg_advertised_host(leg.transport.local_addr, &leg.transport.transport);
+        own_sdp_toward_leg(
+            &mut sdp,
+            "application/sdp",
+            state,
+            call_id,
+            on_a_leg,
+            Some(&host),
+        );
+    }
+    let framed = match &extras.body {
+        Some(_) => extras.body_with(Some(&sdp))?,
+        None => None,
+    };
+    // A re-INVITE is a session refresh of its dialog (RFC 4028 §7.4).
+    let (timer_headers, requested_session_expires) =
+        session_timer_headers_for_leg(call_id, on_a_leg, state);
+    let mut headers: Vec<(&str, String)> = extras
+        .headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.clone()))
+        .collect();
+    headers.extend(timer_headers);
+    Ok(send_in_dialog_request_framed(
+        call_id,
+        on_a_leg,
+        InDialogRequest {
+            method: Method::Invite,
+            body: Some(sdp),
+            extra_headers: &headers,
+            tracking_target,
+            requested_session_expires,
+        },
+        framed,
+        before_send,
+        state,
+    ))
+}
+
 /// Send a re-INVITE siphon originates on one leg's own dialog (the A-leg, or the
 /// winning B-leg), with `offer` as its SDP body and `extra_headers` on top of
 /// what the dialog gives it. The offer is sent as given; shaping it is the
@@ -173,6 +248,21 @@ pub fn send_in_dialog_request(
     before_send: impl FnOnce(&str),
     state: &DispatcherState,
 ) -> bool {
+    send_in_dialog_request_framed(call_id, on_a_leg, request, None, before_send, state)
+}
+
+/// [`send_in_dialog_request`] whose SDP goes out inside `framed`, a
+/// `Content-Type` and a body that carries it as one part (RFC 5621 §3). The
+/// request's own `body` stays the SDP: what becomes the session in force when
+/// the leg accepts it.
+pub fn send_in_dialog_request_framed(
+    call_id: &str,
+    on_a_leg: bool,
+    request: InDialogRequest<'_>,
+    framed: Option<(String, Vec<u8>)>,
+    before_send: impl FnOnce(&str),
+    state: &DispatcherState,
+) -> bool {
     let InDialogRequest {
         method,
         body,
@@ -187,14 +277,13 @@ pub fn send_in_dialog_request(
         return false;
     };
     let method_name = method.as_str().to_string();
-    let Some(message) = build_b2bua_in_dialog_request(
-        &leg,
-        state,
-        method,
-        cseq,
-        extra_headers,
-        body.clone().map(|body| ("application/sdp", body)),
-    ) else {
+    let wire_body = match &framed {
+        Some((content_type, framed)) => Some((content_type.as_str(), framed.clone())),
+        None => body.clone().map(|body| ("application/sdp", body)),
+    };
+    let Some(message) =
+        build_b2bua_in_dialog_request(&leg, state, method, cseq, extra_headers, wire_body)
+    else {
         return false;
     };
 

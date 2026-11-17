@@ -29,10 +29,10 @@ use crate::rtpengine::test_native_engine::{
 };
 use crate::siprec::multipart::parse_multipart;
 
-const CALLER: &str = "192.0.2.10:5060";
+pub(super) const CALLER: &str = "192.0.2.10:5060";
 
 /// The answer the script gave the participant: the room's seat.
-const SEAT_ANSWER: &str = concat!(
+pub(super) const SEAT_ANSWER: &str = concat!(
     "v=0\r\n",
     "o=- 5 5 IN IP4 203.0.113.7\r\n",
     "s=-\r\n",
@@ -46,7 +46,7 @@ const SEAT_ANSWER: &str = concat!(
 
 /// The participant holds: its first offer (`caller_invite`'s), new version,
 /// `a=sendonly`.
-const HOLD: &str = concat!(
+pub(super) const HOLD: &str = concat!(
     "v=0\r\n",
     "o=- 1 2 IN IP4 192.0.2.10\r\n",
     "s=-\r\n",
@@ -59,14 +59,14 @@ const HOLD: &str = concat!(
 );
 
 /// The participant's first offer again at a new `o=` version: a refresh.
-fn refresh() -> String {
+pub(super) fn refresh() -> String {
     HOLD.replace("a=sendonly\r\n", "")
 }
 
 /// The part a mission-critical push-to-talk client sends beside its offer
 /// (TS 24.379 annex F.1).
-const INFO_TYPE: &str = "application/vnd.3gpp.mcptt-info+xml";
-const INFO: &str = concat!(
+pub(super) const INFO_TYPE: &str = "application/vnd.3gpp.mcptt-info+xml";
+pub(super) const INFO: &str = concat!(
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n",
     "<mcpttinfo xmlns=\"urn:3gpp:ns:mcpttInfo:1.0\">",
     "<mcptt-Params><emergency-ind type=\"Normal\">",
@@ -124,7 +124,7 @@ const KEYED_SESSION: &str = concat!(
     "a=rtpmap:111 opus/48000/2\r\n",
 );
 
-fn script(handler: &str) -> String {
+pub(super) fn script(handler: &str) -> String {
     format!(
         concat!(
             "from siphon import b2bua\n",
@@ -138,17 +138,17 @@ fn script(handler: &str) -> String {
     )
 }
 
-struct Seat {
-    dispatcher: TestDispatcher,
-    internal_call_id: String,
+pub(super) struct Seat {
+    pub(super) dispatcher: TestDispatcher,
+    pub(super) internal_call_id: String,
     answer: SipMessage,
-    call_id: String,
-    engine: NativeTestEngine,
+    pub(super) call_id: String,
+    pub(super) engine: NativeTestEngine,
 }
 
 /// A participant the script answered with the seat's SDP, ACKed, on a
 /// dispatcher with a media engine that holds no session for it.
-async fn seated(call_id: &str, source: &str) -> Seat {
+pub(super) async fn seated(call_id: &str, source: &str) -> Seat {
     seated_with(call_id, source, None, SEAT_ANSWER).await
 }
 
@@ -224,7 +224,7 @@ async fn seated_with(call_id: &str, source: &str, offer: Option<&str>, answer: &
 
 /// A caller the media engine answered itself (`answer_local`), ACKed: the
 /// engine is the far side of its session, and answers its re-offers.
-async fn engine_answered(call_id: &str, source: &str) -> Seat {
+pub(super) async fn engine_answered(call_id: &str, source: &str) -> Seat {
     let engine = NativeTestEngine::start().await;
     let dispatcher = focus_running(&engine, source);
     let caller = answered_caller(&dispatcher, call_id);
@@ -238,7 +238,7 @@ async fn engine_answered(call_id: &str, source: &str) -> Seat {
 }
 
 impl Seat {
-    fn sends(&self, method: &str, cseq: u32, body: Option<&str>) -> Vec<Sent> {
+    pub(super) fn sends(&self, method: &str, cseq: u32, body: Option<&str>) -> Vec<Sent> {
         self.sends_with(method, cseq, body.map(|body| ("application/sdp", body)), "")
     }
 
@@ -303,7 +303,7 @@ impl Seat {
 
     /// What the participant's dialog holds: the description it last gave, and
     /// the session in force toward it.
-    fn descriptions(&self) -> (Option<String>, Option<String>) {
+    pub(super) fn descriptions(&self) -> (Option<String>, Option<String>) {
         let text = |sdp: &Option<Vec<u8>>| {
             sdp.as_ref()
                 .map(|sdp| String::from_utf8_lossy(sdp).into_owned())
@@ -323,7 +323,7 @@ impl Seat {
 }
 
 /// The parts of a multipart response: each one's `Content-Type` and content.
-fn parts(message: &SipMessage) -> Vec<(String, String)> {
+pub(super) fn parts(message: &SipMessage) -> Vec<(String, String)> {
     let content_type = message.headers.get("Content-Type").expect("a Content-Type");
     assert_eq!(
         message.headers.get("Content-Length").map(String::as_str),
@@ -342,7 +342,7 @@ fn parts(message: &SipMessage) -> Vec<(String, String)> {
 }
 
 /// The one final response among `sent`.
-fn final_response(sent: &[Sent]) -> SipMessage {
+pub(super) fn final_response(sent: &[Sent]) -> SipMessage {
     let finals: Vec<_> = sent
         .iter()
         .filter(|frame| frame.message.status_code().is_some_and(|code| code >= 200))

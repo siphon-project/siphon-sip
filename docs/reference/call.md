@@ -704,6 +704,63 @@ drive both handlers:
 
 ::: siphon_sdk.reoffer.Reoffer
 
+## Re-offering a party: `b2bua.reoffer()`
+
+`await b2bua.reoffer(call_id, sdp=None, leg="caller", timeout_ms=32000,
+body=None, content_type=None, headers=None)` sends one party of a call a
+re-INVITE in its own dialog, from any context: the caller's (on a call siphon
+answered itself, its only dialog) or with `leg="callee"` the answered
+callee's. It is how a script tells a party something it did not ask about:
+RFC 7866's `a=record` when a recording ends by itself, or a change that is not
+in the media at all, such as the priority of a call.
+
+- **The offer** is `sdp` under siphon's `o=`, or with none the session in
+  force toward that party (the media engine's description on a call it
+  anchors) exactly as it was sent, its `o=` line included. Either goes out at
+  the dialog's next `o=` version (RFC 3264 §8). The other party is told
+  nothing.
+- **`body` with `content_type`** is sent with the offer (RFC 5621 §3), by the
+  rules of `offer.answer()`: a single part goes out as the second part of a
+  `multipart/mixed` body after the SDP, a `multipart/*` body without an SDP
+  part gets the SDP part first under its own boundary, and one with an SDP
+  part (or an `application/sdp` body) is the offer itself.
+- **`headers`** are added to the re-INVITE in the mapping's order. The headers
+  siphon writes on it raise `ValueError`: `Via`, `From`, `To`, `Call-ID`,
+  `CSeq`, `Max-Forwards`, `Contact`, `Route`, `Record-Route`,
+  `Content-Length`, `Content-Type`, `Require`, `Supported`, `Session-Expires`,
+  `Min-SE`, `RAck`, `RSeq` and `User-Agent`.
+- **The answer.** A 2xx is ACKed and makes the offer the session in force.
+  With no `sdp`, on a call the media engine answered itself (it is the far
+  side of the party's session), an answer that changes the party's media (an
+  address, a port, a direction, a key) is given to the engine as the party's
+  new description. In every other case the engine is told nothing: an offer
+  with the script's own `sdp` is not the engine's session, a session that
+  relays to a second party is not answered for one side, and a conference seat
+  takes no new description (an answer that moves a seat's media is logged and
+  the seat keeps the media it had).
+- **Glare** (RFC 3261 §14.1). A `491`, from the party or because an INVITE
+  toward it was already in progress, is waited out and the re-INVITE sent
+  again as a new request: after a random 0 to 2 seconds on a dialog whose
+  Call-ID the party generated, 2.1 to 4 seconds on one siphon generated, up to
+  three times within `timeout_ms`. While siphon's re-INVITE is in progress on
+  a call with no second party, a re-INVITE or an UPDATE with an offer from
+  that party is answered `491` (§14.2, RFC 3311 §5.2) without the script.
+
+It resolves to the final status code, `491` when the glare outlasted the
+retries or the time left, or `None` when no final response came within
+`timeout_ms`. `b2bua.session_sdp(call_id, leg="caller")` reads the session in
+force, for a script that re-offers it with one attribute changed.
+
+```python
+# Raise the priority of a call toward every other participant: the media is
+# unchanged, the service's part and Resource-Priority (RFC 4412) say what is.
+for participant in others:
+    status = await b2bua.reoffer(
+        participant, body=service_info_xml,
+        content_type="application/vnd.example.info+xml",
+        headers={"Resource-Priority": "example.0"})
+```
+
 ## An announcement, then the callee
 
 A caller that hears a prompt in early media and is then put through to the

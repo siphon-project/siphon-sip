@@ -15,9 +15,7 @@ right, in Ogg Opus. Config this runs with: `media.backend: siphon-rtp` and
 caller's preference.
 """
 
-import asyncio
 import os
-import random
 
 from siphon import b2bua, log, rtpengine, sdp
 
@@ -138,12 +136,9 @@ async def recording_closed(call_id, from_tag, recording_id, path, reason, durati
         session = b2bua.session_sdp(call_id)
         if session is None:
             return
-        for _ in range(2):
-            status = await b2bua.reoffer(call_id, sdp=with_record(session, "off"))
-            if status != 491:
-                break
-            # RFC 3261 §14.1: the owner of the Call-ID waits 2.1 to 4 s.
-            await asyncio.sleep(random.uniform(2.1, 4.0))
+        # A crossing offer's 491 is waited out and sent again by siphon
+        # (RFC 3261 §14.1).
+        await b2bua.reoffer(call_id, sdp=with_record(session, "off"))
 
 
 @b2bua.on_bye

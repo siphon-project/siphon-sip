@@ -122,6 +122,13 @@ pub fn handle_b2bua_reinvite(
     if from_a_leg && relay_bridged_offer(&inbound, &message, &call_id, state) {
         return;
     }
+    // RFC 3261 §14.2: an INVITE received while one siphon sent on the same
+    // dialog is in progress is answered 491. With no second party nothing
+    // else stands in for that check when a script has siphon re-INVITE this
+    // party.
+    if from_a_leg && refuse_crossing_own_offer(&inbound, &message, &call_id, state) {
+        return;
+    }
     // A leg with no second party and no session the engine answers for it: a
     // leg parted from its bridge. Before its offer is taken for its media.
     if from_a_leg && answer_unanchored_reoffer(&inbound, &message, &call_id, state) {
@@ -761,6 +768,49 @@ pub fn handle_b2bua_reinvite(
 
     // Reset session timer on successful re-INVITE (timer reset happens on 200 OK
     // via handle_b2bua_response which calls set_state — we reset the timer there)
+}
+
+/// Answer `491 Request Pending` to a re-INVITE or an UPDATE from the caller of
+/// a call with no second party while a re-INVITE a script had siphon send
+/// that caller is still in progress (RFC 3261 §14.2; RFC 3311 §5.2 for an
+/// UPDATE that crosses an offer siphon has outstanding). The caller retries
+/// after the wait of §14.1, and so does siphon when its own re-INVITE draws a
+/// 491. Returns whether the request was answered here.
+///
+/// Keyed on the re-offer itself ([`script_reoffer_in_progress`]), which ends
+/// with its final response, and not on the leg's `pending_reinvite` flag:
+/// bridges claim that flag for a pairing as a whole, for longer than an
+/// INVITE of theirs is outstanding on this dialog.
+pub fn refuse_crossing_own_offer(
+    inbound: &InboundMessage,
+    message: &SipMessage,
+    call_id: &str,
+    state: &DispatcherState,
+) -> bool {
+    let no_second_party = state
+        .call_actors
+        .get_call(call_id)
+        .is_some_and(|call| call.winner.is_none());
+    if !no_second_party || !script_reoffer_in_progress(call_id, true) {
+        return false;
+    }
+    debug!(call_id = %call_id, "B2BUA: a request crossing a re-INVITE siphon has in progress on the dialog: 491");
+    let response = build_response(
+        message,
+        491,
+        "Request Pending",
+        state.identity.load().server.as_deref(),
+        &[],
+    );
+    send_message_from(
+        response,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        Some(inbound.local_addr),
+        state,
+    );
+    true
 }
 
 /// Answer an in-dialog re-offer on a call siphon terminates itself.
