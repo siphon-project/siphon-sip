@@ -87,6 +87,19 @@ check_flags() {
   echo "  ok   $label"
 }
 
+# The vendor line closes the header of the AVP, eleven lines under its code
+# line: the flags line and its eight bits, then the length.
+check_vendor() {
+  local label="$1" code_line="$2" vendor_line="$3" got
+  got="$(grep -A11 -F "$code_line" <<<"$tree" | grep -cF "$vendor_line" || true)"
+  if [[ "$got" != "1" ]]; then
+    echo "  FAIL $label: no '$vendor_line' under '$code_line'" >&2
+    status=1
+    return
+  fi
+  echo "  ok   $label"
+}
+
 echo "reading it back with tshark"
 expect diameter.cmd.code 265
 expect diameter.applicationId 16777236
@@ -138,6 +151,38 @@ check_flags "Specific-Action flags M+V" "AVP Code: 513 Specific-Action" \
 check_flags "Service-URN flags M+V" "AVP Code: 525 Service-URN" \
   "AVP Flags: 0xc0, Vendor-Specific: Set, Mandatory: Set" 1
 check_flags "Rx-Request-Type flags V only" "AVP Code: 533 Rx-Request-Type" \
+  "AVP Flags: 0x80, Vendor-Specific: Set" 1
+
+# A mission critical session. TS 29.214 table 5.3.0.1: MCPTT-Identifier (547)
+# and MCVideo-Identifier (562) are OctetStrings with V and without M;
+# "mcpttp" and "mcpttq" are the namespaces of RFC 8101.
+expect diameter.MCPTT-Identifier 6d6370747470
+expect diameter.MCVideo-Identifier 6d6370747471
+check_flags "MCPTT-Identifier flags V only" "AVP Code: 547 MCPTT-Identifier" \
+  "AVP Flags: 0x80, Vendor-Specific: Set" 1
+check_flags "MCVideo-Identifier flags V only" "AVP Code: 562 MCVideo-Identifier" \
+  "AVP Flags: 0x80, Vendor-Specific: Set" 1
+check_vendor "MCPTT-Identifier under the 3GPP vendor" "AVP Code: 547 MCPTT-Identifier" \
+  "AVP Vendor Id: 3GPP (10415)"
+check_vendor "MCVideo-Identifier under the 3GPP vendor" "AVP Code: 562 MCVideo-Identifier" \
+  "AVP Vendor Id: 3GPP (10415)"
+
+# Reservation-Priority is an ETSI AVP (TS 183 017 table 7.3.1: 458, V without
+# M, vendor 13019), which TS 29.214 table 5.4.0.1 takes over with that vendor.
+expect diameter.Reservation-Priority 15
+check_tree "Reservation-Priority is PRIORITY-FIFTEEN" \
+  'Reservation-Priority: PRIORITY-FIFTEEN \(15\)'
+check_vendor "Reservation-Priority under the ETSI vendor" \
+  "AVP Code: 458 Reservation-Priority" "AVP Vendor Id: ETSI (13019)"
+check_flags "Reservation-Priority flags V only" "AVP Code: 458 Reservation-Priority" \
+  "AVP Flags: 0x80, Vendor-Specific: Set" 1
+
+# TS 29.214 clause 5.4.1: the first AAR of a session names the features it is
+# built with. Table 5.4.1.1: MCPTT is bit 17 and MCVideo bit 22 of
+# Feature-List-ID 1, 0x00020000 | 0x00400000 = 4325376.
+expect diameter.Feature-List-ID 1
+expect diameter.Feature-List 4325376
+check_flags "Supported-Features flags V only" "AVP Code: 628 Supported-Features" \
   "AVP Flags: 0x80, Vendor-Specific: Set" 1
 
 if grep -q "Unknown AVP" <<<"$tree"; then

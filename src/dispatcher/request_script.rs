@@ -645,7 +645,13 @@ fn send_scripted_reply(
             inbound.transport,
         )
         .into_iter()
-        .map(|deferred| Bytes::from(deferred.message.to_bytes()))
+        .map(|deferred| {
+            let frame = Bytes::from(deferred.message.to_bytes());
+            // Retransmitted like any request siphon originates until it is
+            // answered (RFC 3261 §17.1.2.2).
+            track_reply_followup(&deferred.message, &frame, inbound, state);
+            frame
+        })
         .collect();
 
     // Feed response into server transaction so it can cache it for

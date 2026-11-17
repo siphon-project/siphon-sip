@@ -100,6 +100,7 @@ mod sweep;
 mod target;
 mod tasks;
 mod timers;
+mod uac_transactions;
 #[cfg(test)]
 mod unprotected_response_tests;
 
@@ -396,6 +397,8 @@ mod stop_the_world_tests;
 #[cfg(test)]
 mod subscribe_notify_before_2xx_tests;
 #[cfg(test)]
+mod subscribe_notify_response_tests;
+#[cfg(test)]
 mod subscribe_reply_order_tests;
 #[cfg(test)]
 mod subscribe_test_harness;
@@ -515,6 +518,7 @@ use sweep::*;
 use target::*;
 use tasks::*;
 use timers::*;
+use uac_transactions::*;
 
 /// RTPEngine wiring produced by [`init_rtpengine`]: the media-control backend
 /// (rtpengine NG or native siphon-rtp), the media session store, and the
@@ -872,6 +876,9 @@ pub async fn run(
     if let Some(registrant) = state.registrant_manager.as_ref() {
         registrant.attach_transactions(Arc::new(RegisterTransactionLayer::of(&state)));
     }
+    // So does every other non-INVITE request siphon originates as a UAC, for a
+    // script or for itself (RFC 3261 §17.1.2.2).
+    attach_uac_transactions(&state);
 
     // Published now as well as on the sweep, so the limit gauges are right
     // from the first scrape rather than thirty seconds in.
