@@ -10190,6 +10190,138 @@ services:
     profiles:
       - b2bua-early-dial
 
+  # ── SIPREC recording server (RFC 7866) against a REAL siphon-rtp ──────────
+  # An SRC (SIPp) sends a SIPREC INVITE with two sendonly streams. siphon, as
+  # the SRS, answers recvonly and terminates each stream on the engine, which
+  # records it to a WAV file. A second scenario omits the two RFC 7866 markers
+  # (Require: siprec, +sip.src) and must be refused with 400.
+  #   172.20.0.149  siphon-rtp engine
+  #   172.20.0.229  siphon (SRS)
+  #   172.20.0.253  SRC, accepted session
+  #   172.20.0.254  SRC, no markers
+  # The recordings volume is mounted at the same path in the engine and in
+  # siphon: the engine writes the files at the path siphon sends it.
+  #
+  # Usage: scripts/run-tests.sh --srs
+  srs-engine:
+    image: ghcr.io/siphon-project/siphon-rtp:0.19.1
+    container_name: srs-engine
+    command:
+      - "--control"
+      - "0.0.0.0:8080"
+      # Load-bearing: the UDP backend binds loopback by default, which no RTP
+      # on this network could reach.
+      - "--relay-bind-ip"
+      - "172.20.0.149"
+      - "--port-min"
+      - "30000"
+      - "--port-max"
+      - "30200"
+      - "--metrics-addr"
+      - "0.0.0.0:9091"
+    volumes:
+      - srs-recordings:/var/lib/siphon/recordings
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.149
+    # Distroless image: the binary probes itself.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/siphon-rtp", "--healthcheck", "127.0.0.1:9091"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 2s
+    profiles:
+      - srs
+
+  siphon-srs:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
+    build:
+      context: ..
+    container_name: siphon-srs-test
+    depends_on:
+      srs-engine:
+        condition: service_healthy
+    volumes:
+      - ./configs/siphon.srs-test.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - srs-recordings:/var/lib/siphon/recordings
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.229
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - srs
+
+  # Accepted session: both markers present, two streams, RTP on stream 1.
+  sipp-srs-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-srs:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.253
+    entrypoint:
+      - sipp
+      - "172.20.0.229:5060"
+      - -sf
+      - /sipp/scenarios/srs_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - srs
+
+  # Not a recording session: no Require: siprec, no +sip.src -> 400.
+  sipp-srs-no-markers-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-srs:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.254
+    entrypoint:
+      - sipp
+      - "172.20.0.229:5060"
+      - -sf
+      - /sipp/scenarios/srs_no_markers_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - srs
+
+  # Lists the WAV files the engine wrote for the accepted session.
+  srs-recordings-check:
+    image: python:3.12-slim
+    volumes:
+      - srs-recordings:/recordings:ro
+      - ./srs_check_recordings.py:/check.py:ro
+    command: ["python3", "/check.py", "/recordings", "rs-sipp-test", "2"]
+    profiles:
+      - srs-check
+
 # ── Volumes ────────────────────────────────────────────────────────────────
 volumes:
   # siphon's CDR file, shared with the assertion one-shot. Removed by
@@ -10198,6 +10330,8 @@ volumes:
   bridge-cdr:
   # The same, for the b2bua-early-dial profile.
   early-dial-cdr:
+  # WAV files the siphon-rtp engine records for the srs profile, shared with siphon.
+  srs-recordings:
 
 # ── Network ────────────────────────────────────────────────────────────────
 networks:

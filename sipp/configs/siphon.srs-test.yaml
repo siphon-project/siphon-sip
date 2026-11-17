@@ -1,0 +1,40 @@
+# siphon.srs-test.yaml — SIPREC recording server (RFC 7866) acceptance test
+#
+# Used with: sipp/docker-compose.yaml (srs profile)
+# Scenarios: sipp/srs_uac.xml, sipp/srs_no_markers_uac.xml
+# Media:     REAL siphon-rtp engine; it records each stream to a WAV file under
+#            srs.recording_dir, a volume shared with the engine container
+#            at the same path.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.229"
+    - "127.0.0.1"
+
+advertised_address: "172.20.0.229"
+
+script:
+  path: "scripts/proxy_default.py"
+  reload: auto
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "172.20.0.149:8080"
+    timeout_ms: 2000
+
+srs:
+  enabled: true
+  recording_dir: "/var/lib/siphon/recordings"
+  max_sessions: 16
+  backend: file
+  rtpengine_profile: "srs_recording"
+
+log:
+  level: debug
+  format: pretty

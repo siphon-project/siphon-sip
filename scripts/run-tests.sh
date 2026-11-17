@@ -13,6 +13,7 @@
 #   ./scripts/run-tests.sh --b2bua-fork        # Also run the parallel-fork cases
 #   ./scripts/run-tests.sh --b2bua-on-failure  # Also run the @b2bua.on_failure decision cases
 #   ./scripts/run-tests.sh --b2bua-lcr         # Also run the LCR route-sequence cases
+#   ./scripts/run-tests.sh --srs        # Also run the SIPREC recording server (RFC 7866) tests
 #   ./scripts/run-tests.sh --originate         # Also run the control-plane originate test
 set -euo pipefail
 
@@ -64,6 +65,7 @@ RUN_SECURITY=false
 RUN_RFC4475=false
 RUN_WEBRTC=false
 RUN_LI=false
+RUN_SRS=false
 SKIP_RUST=false
 
 # Scenario modes selected on this invocation.  Exactly one is allowed — see the
@@ -105,6 +107,7 @@ for arg in "$@"; do
     --rfc4475)    RUN_RFC4475=true;    SELECTED_MODES+=("$arg") ;;
     --webrtc)     RUN_WEBRTC=true;     SELECTED_MODES+=("$arg") ;;
     --li)         RUN_LI=true;         SELECTED_MODES+=("$arg") ;;
+    --srs)        RUN_SRS=true;        SELECTED_MODES+=("$arg") ;;
     --skip-rust)  SKIP_RUST=true ;;
     --help|-h)
       echo "Usage: $0 [<one scenario mode>] [--skip-rust]"
@@ -116,7 +119,7 @@ for arg in "$@"; do
       echo "  --b2bua --b2bua-auth --b2bua-invite-auth --gateway --auto100 --http-auth"
       echo "  --b2bua-fork --b2bua-on-failure --b2bua-lcr --originate"
       echo "  --wedge --nohandler --banscan --reload --shutdown"
-      echo "  --security --rfc4475 --webrtc"
+      echo "  --security --rfc4475 --webrtc --srs"
       echo
       echo "  --skip-rust   skip the Rust test step (combines with any mode)"
       echo
@@ -1104,6 +1107,26 @@ if [[ "$RUN_WEBRTC" == true ]]; then
     siphon-webrtc-b2bua webrtc-b2bua-client
   docker compose -f "$COMPOSE_FILE" --profile webrtc rm -sf \
     siphon-webrtc-b2bua webrtc-b2bua-client 2>/dev/null || true
+fi
+
+if [[ "$RUN_SRS" == true ]]; then
+  # SIPREC recording server (RFC 7866) against a REAL siphon-rtp engine. The
+  # engine records each stream to a WAV file in a volume shared with siphon.
+  # Start from nothing: `down -v` drops the recordings volume so a file left by
+  # an earlier run can never be what satisfies the assertion.
+  docker compose -f "$COMPOSE_FILE" --profile srs --profile srs-check down -v --remove-orphans 2>/dev/null || true
+  docker compose -f "$COMPOSE_FILE" --profile srs up -d --wait srs-engine siphon-srs
+
+  echo "=== SIPREC SRS: not a recording session (no Require: siprec / +sip.src) -> 400 ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile srs up --abort-on-container-exit --exit-code-from sipp-srs-no-markers-uac sipp-srs-no-markers-uac
+
+  echo "=== SIPREC SRS: accepted session (200 +sip.srs, recvonly + labels, RTP, BYE) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile srs up --abort-on-container-exit --exit-code-from sipp-srs-uac sipp-srs-uac
+
+  echo "=== SIPREC SRS: two WAV files recorded in the session directory ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile srs-check run --rm srs-recordings-check
+
+  docker compose -f "$COMPOSE_FILE" --profile srs --profile srs-check down -v --remove-orphans 2>/dev/null || true
 fi
 
 if [[ "$RUN_LI" == true ]]; then
