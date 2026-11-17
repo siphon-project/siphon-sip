@@ -608,9 +608,22 @@ pub(super) fn ack_next_hop_uri(headers: &SipHeaders, start_line: &StartLine) -> 
 /// absorbed by the transaction layer), this ACK has a new Via branch and must
 /// be matched by Call-ID.
 pub(super) fn handle_ack_via_session(
-    _inbound: InboundMessage,
+    inbound: InboundMessage,
     message: SipMessage,
     session_arc: Arc<RwLock<ProxySession>>,
+    state: &DispatcherState,
+) {
+    let from_protected_ue =
+        crate::ipsec::runtime::is_protected_local_port(inbound.local_addr.port());
+    relay_ack_via_session(message, session_arc, from_protected_ue, state);
+}
+
+/// [`handle_ack_via_session`] with the one fact it reads from the inbound
+/// socket given: whether the ACK came over an IPsec-protected Gm port.
+pub(super) fn relay_ack_via_session(
+    message: SipMessage,
+    session_arc: Arc<RwLock<ProxySession>>,
+    from_protected_ue: bool,
     state: &DispatcherState,
 ) {
     // The ACK ends the 2xx's retransmissions (RFC 3261 §13.3.1.4).
@@ -641,6 +654,16 @@ pub(super) fn handle_ack_via_session(
     for client_key in &session.client_keys {
         if let Some(client_branch) = session.get_client_branch(client_key) {
             let mut ack_downstream = message.clone();
+
+            // An ACK over a protected Gm port ends the UE's security agreement
+            // there (RFC 3329 §2.3.1, TS 24.229 §5.2.6): its Security-Verify
+            // and `sec-agree` tags, and the identity it asked for, are for this
+            // proxy alone. The script strips the same from every other request
+            // of the dialog, but never sees this one.
+            if from_protected_ue {
+                crate::ipsec::sec_agree::strip_sec_agree(&mut ack_downstream.headers, |_| false);
+                ack_downstream.headers.remove("P-Preferred-Identity");
+            }
 
             // Consume our own Route entries (loose routing — RFC 3261 §16.4 /
             // §16.12), mirroring the script-side loose_route() that the
@@ -742,10 +765,25 @@ pub(super) fn handle_ack_via_session(
                 }
             };
 
+            // The socket the script made the INVITE leave from (`send_socket=`,
+            // a UDP flow) is the one the ACK leaves from, while it goes to the
+            // same remote target: a UE answers only the address it has been
+            // talking to. An IPsec-protected destination keeps the SA's own
+            // source, which the send resolves from the destination.
+            let pinned_source = client_branch
+                .egress_local_addr
+                .filter(|_| destination == client_branch.destination)
+                .filter(|_| {
+                    crate::script::api::ipsec::outbound_for(destination, out_transport).is_none()
+                });
+
             // Add our Via on top (preserving existing Vias), reflecting the
             // transport we will actually send over.
             let transport_str = format!("{out_transport}");
-            let (via_host, via_port) = state.unpinned_sent_by(out_transport, destination);
+            let (via_host, via_port) = match pinned_source {
+                Some(local) => state.listener_sent_by(out_transport, local),
+                None => state.unpinned_sent_by(out_transport, destination),
+            };
             core::add_via(
                 &mut ack_downstream.headers,
                 &transport_str,
@@ -786,7 +824,7 @@ pub(super) fn handle_ack_via_session(
                 &target,
                 client_branch.transport,
                 ack_connection_id,
-                None,
+                pinned_source,
                 state,
             );
         }
