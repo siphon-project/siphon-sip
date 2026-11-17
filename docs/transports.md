@@ -1039,6 +1039,42 @@ async def route(request):
     request.relay("sip:trunk.example.com:5060;transport=udp")
 ```
 
+### Large requests over UDP (`listen.mtu`)
+
+RFC 3261 §18.1.1 says a request within 200 bytes of the path MTU must go over
+a congestion-controlled transport, because a UDP datagram that size is
+fragmented and a lost fragment loses the request. siphon applies it when
+`listen.mtu` is set, and leaves every request on the transport it was routed to
+when it is not (the default).
+
+```yaml
+listen:
+  mtu: 1500        # switch above 1300 bytes; 1280 for IPv6-minimum paths
+  udp:
+    - "0.0.0.0:5060"
+```
+
+With it set, a request built for UDP whose serialised length is over
+`mtu - 200`:
+
+- goes over **TCP** when the next hop accepts a TCP connection (tried for at
+  most one second), with `TCP` in its top Via. The response comes back on that
+  connection.
+- goes over **UDP as before** when it does not. siphon logs one warning for
+  that next hop and does not try it again for 30 seconds.
+
+This covers requests siphon relays or forks, B2BUA B-legs, and requests a script
+originates: `proxy.send_request`, the NOTIFYs and SUBSCRIBEs of
+`proxy.subscribe_state`, and `presence.notify`. Each request is decided by its
+own size, so a dialog can send a large NOTIFY over TCP and the next small one
+over UDP; the dialog's Contact does not change. For a request a script
+originates, `;transport=udp` on the URI it is routed by keeps it on UDP. A node
+with no `listen.tcp` can still send this way; it only cannot be reached over
+TCP itself.
+
+`siphon_mtu_tcp_upgrade_total{path}` counts the requests moved, by `path`:
+`relay`, `b_leg`, `script`, `notify`, `subscribe`.
+
 ---
 
 ## IPv4 / IPv6

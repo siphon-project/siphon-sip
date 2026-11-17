@@ -35,17 +35,28 @@ pub(super) fn test_dispatcher() -> TestDispatcher {
 /// [`test_dispatcher`] running `source` as its script, for a test that needs a
 /// handler (`@b2bua.on_failure`, say) to run.
 pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
+    test_dispatcher_with_uac_mtu(source, None).0
+}
+
+/// [`test_dispatcher_with_script`] whose UAC sender has `listen.mtu` set to
+/// `mtu`, with the receiving end of the TCP egress a request it moves off UDP
+/// (RFC 3261 §18.1.1) is handed to.
+pub(super) fn test_dispatcher_with_uac_mtu(
+    source: &str,
+    mtu: Option<u16>,
+) -> (TestDispatcher, flume::Receiver<OutboundMessage>) {
     // The connection pool's TLS client config needs a process-wide provider.
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 
     let local_addr: SocketAddr = "192.0.2.1:5060".parse().expect("a literal address");
     let (udp_sender, udp) = flume::unbounded();
+    let (tcp_sender, tcp) = flume::unbounded();
     let (stream_sender, _) = flume::unbounded();
     let outbound = Arc::new(OutboundRouter {
         udp: udp_sender.into(),
         udp_by_local: HashMap::new(),
         udp_dynamic: None,
-        tcp: stream_sender.clone(),
+        tcp: tcp_sender,
         tls: stream_sender.clone(),
         ws: stream_sender.clone(),
         wss: stream_sender.clone(),
@@ -90,15 +101,18 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         session_store: Arc::new(ProxySessionStore::new()),
         dns_resolver: Arc::new(SipResolver::from_system().expect("a system resolver")),
         hep_sender: None,
-        uac_sender: Arc::new(UacSender::new(
-            outbound,
-            local_addr,
-            HashMap::new(),
-            HashMap::new(),
-            None,
-            None,
-            identity,
-        )),
+        uac_sender: Arc::new(
+            UacSender::new(
+                outbound,
+                local_addr,
+                HashMap::new(),
+                HashMap::new(),
+                None,
+                None,
+                identity,
+            )
+            .with_over_mtu(Arc::clone(&connection_pool), mtu),
+        ),
         rtpengine_set: None,
         rtpengine_sessions: None,
         rtpengine_profiles: None,
@@ -160,5 +174,5 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         parse_error_log: Arc::new(ParseErrorLimiter::default()),
         li_manager: None,
     };
-    TestDispatcher { state, udp }
+    (TestDispatcher { state, udp }, tcp)
 }

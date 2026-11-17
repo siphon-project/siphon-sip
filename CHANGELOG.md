@@ -53,6 +53,8 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A request a script originates that is over `listen.mtu` now leaves over TCP, not as one oversized UDP datagram.** RFC 3261 §18.1.1 asks for a congestion-controlled transport once a request is within 200 bytes of the path MTU. With `listen.mtu` set siphon did that for the requests it relays and for B2BUA B-legs, but `proxy.send_request`, the NOTIFYs of `proxy.subscribe_state` (the initial one, later ones, and the one that ends an expired subscription), `proxy.subscribe_state.send()` with its refresh and unsubscribe, and `presence.notify()` went out over UDP whatever their size, so a 1.6 kB MESSAGE or a reg-event NOTIFY with several contacts was fragmented and could reach the next hop truncated. These now take the relay's decision, through the same function and the same negative cache: over `mtu - 200` and built for UDP, the request goes over TCP when the next hop accepts a connection (inside 1 s), with a TCP top Via and its response read on that connection; otherwise it goes over UDP as before, with one warning per next hop per 30 s. A dialog learned over UDP with no route set is tried at the address it was learned from (§18.2.1). A target URI that names `;transport=udp` keeps UDP. Each request decides by its own size and the dialog's Contact is unchanged. A node with no `listen.tcp` now starts a TCP sender when `listen.mtu` is set. New counter `siphon_mtu_tcp_upgrade_total{path}` (`relay`, `b_leg`, `script`, `notify`, `subscribe`). Nothing changes while `listen.mtu` is unset, which stays the default.
+- **A `proxy.subscribe_state` subscription the subscriber stopped refreshing now ends when its duration runs out, in the cache as well, and a failed NOTIFY removes it (RFC 6665 §4.2.1.4, §4.2.2).** With `subscribe_state.cache` set, every write of a dialog stored its key with the whole granted duration again, and each NOTIFY is a write (the CSeq), so a resource that changed state more often than the subscription lasted kept the key alive for good. `proxy.subscribe_state.get(id)` then read the expired dialog back, the script sent it a NOTIFY, and the expiry sweep sent a terminating one and left the key, on every state change, however often the subscriber answered 481. Now the key is stored for what is left of the duration (only a SUBSCRIBE refresh extends it), a dialog with nothing left is not stored, `get()` deletes an expired key and returns `None`, and the sweep deletes the key of every dialog it reaps. Keys left by an earlier release go on their first lookup or write. The notifier also reads the final response of every NOTIFY it sends (`handle.notify()`, `handle.terminate()`, the expiry NOTIFY): a 404, 405, 410, 416, 480-485, 489, 501 or 604, a 408, or no final response before Timer F removes the subscription from the node and the cache, logged once at `info`. From then on the handle raises `LookupError`, `await handle.reload()` is `False` and `for_resource()` no longer lists it. Any other failure keeps the subscription, and so does a SUBSCRIBE refresh that lands while the NOTIFY is out. `await handle.notify()` still resolves `True` once the NOTIFY is handed on and does not wait for the answer. Every NOTIFY that ends without a 2xx counts in the new `siphon_subscribe_notify_failures_total{code}` (the status, or `timeout`). The SDK mock answers NOTIFYs with `proxy.subscribe_state.set_notify_response(status)`.
 - **A node whose UDP and TCP listeners sit on different addresses now sources outbound TCP from the TCP listener, and names it in the Via host.** The default outbound TCP bind (unpinned INVITE, ACK, BYE, OPTIONS probes, registrations) and the Via host of a transport with no `advertise` took the first listener of any transport, so with `listen.udp` on one address and `listen.tcp` on another the peer saw the UDP address as the TCP source. Each now uses its own transport's first listener. Single-address configs, wildcard listeners and nodes without a TCP listener behave as before.
 - **A listener out of file descriptors no longer spins.** `accept()` failing
   with `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM` leaves the connection in the
@@ -67,8 +69,36 @@ entry, but a working config keeps working.
 - **The Diameter server listener survives running out of file descriptors.**
   Its accept loop ended on any accept error, so a single `EMFILE` stopped it
   accepting peers until restart. It now backs off the same way.
+- **A request a script originates over UDP is now retransmitted until it is answered (RFC 3261 §17.1.2.2).** `proxy.send_request`, the NOTIFYs of `proxy.subscribe_state` (the initial one behind the 200, later ones, the terminating one and the one that ends an expired subscription), `proxy.subscribe_state.send()` with its refresh and unsubscribe, `presence.notify()` and the in-dialog OPTIONS of the proxy's dialog probe went out as one datagram, so a single lost packet read as no answer at all. Each now runs as a non-INVITE client transaction of the transaction layer relayed requests use: over UDP Timer E re-sends the same bytes (same branch, same CSeq) to the same address from the same socket after 0.5 s, 1 s, 2 s, then every 4 s (T1 doubling to T2), every T2 once a provisional response has come, until the final response or Timer F (`transaction.timeout_secs`, default 64*T1 = 32 s), which is the timeout a caller waiting for the final response sees. After the final response the transaction stays for Timer K (T4, 5 s) so a repeated response is absorbed. Over TCP, TLS, WS, WSS and SCTP the request is still written exactly once. A caller that stops waiting on purpose (the dialog probe at `probe_timeout_secs`) ends the retransmissions with its wait; `proxy.send_request(wait_for_response=True)` returning `None` at `timeout_ms` does not, the request is retransmitted until Timer F as the RFC has it. A UAC request to a UE's protected client port on a P-CSCF that was sent without waiting for its response now leaves over the security association, as one waited on already did (TS 33.203 clause 7.1). Unchanged, one datagram each: the OPTIONS of the NAT keepalive, the gateway health probe and the registrar liveness check, which count a miss and probe again on their own schedule, and an INVITE or ACK sent with `proxy.send_request`. These transactions do not hold a drain at shutdown.
 
 ### Added
+
+- **Mission critical identifiers and reservation priority on Rx and N5.** A
+  P-CSCF had no way to give the PCRF or PCF the MCPTT or MCVideo identifier
+  and the priority of a session, which TS 29.214 annex A.13 and TS 29.514
+  annex B.13 have it send for a mission critical call. `diameter.rx_aar` takes `mcptt_identifier=` (MCPTT-Identifier, TS
+  29.214 clause 5.3.45), `mcvideo_identifier=` (MCVideo-Identifier, clause
+  5.3.45A) and `reservation_priority=` (Reservation-Priority at command level,
+  an int from 0 to 15, ETSI TS 183 017 clause 7.3.9), on the initial AAR and
+  on a modification, which is how a priority change reaches the PCRF (clause
+  4.4.2). `sbi.create_session` and `sbi.update_session` take `mcptt_id=`,
+  `mc_video_id=` and `res_prio=` (`mcpttId`, `mcVideoId`, `resPrio` of TS
+  29.514). `res_prio` is the same int, sent as `PRIO_<n+1>` (0 is `PRIO_1`, 15
+  is `PRIO_16`: both scales are pinned to the Resource-Priority value by TS
+  29.214 clause A.13.2 and TS 29.514 clause B.13.2), or a `"PRIO_1"` to
+  `"PRIO_16"` string. An empty string is an absent argument, a priority out of
+  range raises `ValueError` and a wrong type `TypeError`. An initial AAR with
+  an identifier names the MCPTT or MCVideo feature in Supported-Features
+  (clause 5.4.1), and a create names it in `suppFeat` (`"100"`, `"200"`),
+  which was always `"0"`. Reservation-Priority is an ETSI AVP (vendor 13019),
+  so a peer that advertises Rx now also sends Supported-Vendor-Id 13019 in its
+  CER and CEA, as TS 29.214 table 5.4.0.1 requires. `Reservation-Priority` is
+  a dictionary name for `get_avp` now; the two identifiers already were. The
+  Rust `rx::RxSessionRequest` has three new fields, and
+  `npcf::AppSessionContextReqData` and `AppSessionContextUpdateData` have
+  three each. The AAR is checked against Wireshark's Diameter dissector by
+  `scripts/validate_rx_aar.sh`. Mirrored in the SDK mock, which records each
+  AAR in `diameter.aar_requests`.
 
 - **`script.gc`: freeze startup objects and raise the collection threshold.**
   On free-threaded Python every garbage collection stops all threads and
