@@ -52,9 +52,9 @@ pub(super) fn handle_response(
         return;
     }
 
-    // Check if this response matches a UAC request (keepalive, health probe)
-    if state.uac_sender.match_response(&message) {
-        debug!(status_code = status_code, "UAC response matched");
+    // A response to a request siphon originated as a UAC (keepalive, health
+    // probe, a script's request): its transaction, then whoever waits on it.
+    if uac_response(&message, status_code, state) {
         return;
     }
 

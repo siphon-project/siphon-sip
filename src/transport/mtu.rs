@@ -1,6 +1,11 @@
 //! The RFC 3261 §18.1.1 size threshold, shared by every sender that may move a
 //! UDP request to TCP: the dispatcher's relay and B-leg paths and the
-//! registrant's REGISTER over an IMS UE's security associations.
+//! registrant's REGISTER over an IMS UE's security associations, and the
+//! requests siphon originates for a script.
+
+/// The counter of requests moved to TCP, by the path that sent them.
+pub mod upgrade_metrics;
+pub use upgrade_metrics::OverMtuPath;
 
 /// RFC 3261 §18.1.1: a UDP request whose serialised length exceeds `mtu - 200`
 /// bytes must be sent over a congestion-controlled transport (TCP). The 200

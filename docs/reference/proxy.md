@@ -156,6 +156,29 @@ later, from a timer or a background task, goes out immediately.
 The notifier tag is available as `handle.local_tag`. Expiry sends a terminating
 NOTIFY automatically; scripts still own package content and change notifications.
 
+A subscription lasts until its duration runs out unless the subscriber refreshes
+it (RFC 6665 §4.2.1.4). With `subscribe_state.cache` set its key in the cache
+expires at the same moment: a NOTIFY does not extend it, only a refresh does,
+and `await proxy.subscribe_state.get(id)` returns `None` for a subscription
+whose time is up.
+
+`await handle.notify()` resolves once the NOTIFY is handed to the transport.
+siphon reads the subscriber's answer afterwards, and removes the subscription
+when RFC 6665 §4.2.2 says a failed NOTIFY does:
+
+| The NOTIFY gets | The subscription |
+|---|---|
+| a 2xx | stays |
+| 404, 405, 410, 416, 480-485, 489, 501 or 604 (a subscriber that lost the dialog answers 481) | is removed |
+| a 408, or no final response before Timer F | is removed |
+| anything else (401, 5xx, ...) | stays: only the transaction failed |
+
+A removed subscription is gone from the node and from the cache: its handle
+raises `LookupError`, `await handle.reload()` is `False`, and `for_resource()`
+no longer lists it. A SUBSCRIBE refresh that arrives while the NOTIFY is out
+keeps the subscription. Failed NOTIFYs count in
+`siphon_subscribe_notify_failures_total{code}`.
+
 Direct subscriptions remember the received peer and transport. Background NOTIFY
 uses that exact live stream, never another phone sharing the same proxy address;
 a closed stream fails visibly. The Contact remains the NOTIFY Request-URI.

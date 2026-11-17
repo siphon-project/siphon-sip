@@ -16,6 +16,10 @@ use tracing::{debug, warn};
 
 use crate::hep::HepSender;
 
+mod transactions;
+
+pub use transactions::{is_uac_branch, uac_branch, UacTransactions, UAC_BRANCH_PREFIX};
+
 /// Resolve the effective source address for a given transport, replacing
 /// unspecified (0.0.0.0 / ::) with the configured advertised address.
 ///
@@ -130,6 +134,21 @@ struct PendingRequest {
     /// Deliver the final response only: a provisional one is absorbed and
     /// the entry kept for the response that ends the transaction.
     final_only: bool,
+    /// The client transaction the request was sent under, once it is on the
+    /// wire ([`UacSender::track_request`]): what a caller that stops waiting
+    /// ends ([`UacSender::expire_branch`]).
+    transaction: Option<crate::transaction::key::TransactionKey>,
+}
+
+impl PendingRequest {
+    fn new(sender: oneshot::Sender<UacResult>, final_only: bool) -> Self {
+        Self {
+            sender,
+            inserted_at: Instant::now(),
+            final_only,
+            transaction: None,
+        }
+    }
 }
 
 /// UAC sender — generates and sends outbound SIP requests.
@@ -169,6 +188,10 @@ pub struct UacSender {
     /// is over the MTU moves to TCP with (RFC 3261 clause 18.1.1, see
     /// [`crate::registrant::OverMtuTcp`]). `None` without an MTU.
     over_mtu: Option<(Arc<crate::transport::pool::ConnectionPool>, u16)>,
+    /// The transaction layer a request is sent under
+    /// ([`attach_transactions`](Self::attach_transactions)). Unset in a fixture
+    /// that wires none: every request then goes out once.
+    transactions: std::sync::OnceLock<Arc<dyn UacTransactions>>,
 }
 
 impl UacSender {
@@ -196,6 +219,7 @@ impl UacSender {
             cseq_counter: std::sync::atomic::AtomicU32::new(1),
             ipsec_egress: None,
             over_mtu: None,
+            transactions: std::sync::OnceLock::new(),
         }
     }
 
@@ -233,6 +257,31 @@ impl UacSender {
         self.over_mtu
             .as_ref()
             .map(|(pool, mtu)| (pool.as_ref(), *mtu))
+    }
+
+    /// What the over-MTU switch of a request to a resolved destination decides
+    /// with (RFC 3261 clause 18.1.1): the relay's decision, read from this
+    /// sender. `None` without `listen.mtu`.
+    pub(crate) fn originated_over_mtu<'a>(
+        &'a self,
+        resolver: &'a crate::dns::SipResolver,
+    ) -> Option<crate::dispatcher::OriginatedOverMtu<'a>> {
+        let (pool, mtu) = self.over_mtu()?;
+        Some(crate::dispatcher::OriginatedOverMtu {
+            mtu,
+            pool,
+            ipsec: self
+                .ipsec_egress
+                .as_ref()
+                .map(|(manager, _)| manager.as_ref()),
+            resolver,
+        })
+    }
+
+    /// Whether this node has a listener of its own for `transport`, whose
+    /// identity a Via over that transport can name.
+    pub fn listens_on(&self, transport: Transport) -> bool {
+        self.listen_addrs.contains_key(&transport)
     }
 
     /// `(destination, source_local_addr)` a send really uses.
@@ -645,14 +694,8 @@ impl UacSender {
         };
 
         let (sender, receiver) = oneshot::channel();
-        self.pending.insert(
-            branch.clone(),
-            PendingRequest {
-                sender,
-                inserted_at: Instant::now(),
-                final_only: false,
-            },
-        );
+        self.pending
+            .insert(branch.clone(), PendingRequest::new(sender, false));
 
         debug!(
             destination = %destination,
@@ -675,38 +718,27 @@ impl UacSender {
     ///
     /// Returns `true` if the response was consumed (matched a UAC branch).
     pub fn match_response(&self, message: &SipMessage) -> bool {
-        // Extract branch from topmost Via
-        let branch = match message
-            .headers
-            .get("Via")
-            .or_else(|| message.headers.get("v"))
-        {
-            Some(via_raw) => match crate::sip::headers::via::Via::parse_multi(via_raw) {
-                Ok(vias) => vias.first().and_then(|v| v.branch.clone()),
-                Err(_) => None,
-            },
-            None => None,
-        };
+        uac_branch(message).is_some_and(|branch| self.deliver_response(&branch, message))
+    }
 
-        let branch = match branch {
-            Some(b) if b.starts_with("z9hG4bK-uac-") => b,
-            _ => return false,
-        };
-
+    /// Hand `message`, a response on the UAC branch `branch`
+    /// ([`uac_branch`]), to whoever waits on that branch. `false` when nobody
+    /// does.
+    pub fn deliver_response(&self, branch: &str, message: &SipMessage) -> bool {
         // A provisional response to a request that waits for its final one
         // is ours, but it does not end the transaction (RFC 3261 §17.1.2.2).
         let provisional = message.status_code().is_some_and(|status| status < 200);
         if provisional
             && self
                 .pending
-                .get(&branch)
+                .get(branch)
                 .is_some_and(|pending| pending.final_only)
         {
             debug!(branch = %branch, "UAC absorbed a provisional response");
             return true;
         }
 
-        if let Some((_, pending)) = self.pending.remove(&branch) {
+        if let Some((_, pending)) = self.pending.remove(branch) {
             debug!(branch = %branch, "UAC matched response");
             let _ = pending
                 .sender
@@ -750,57 +782,18 @@ impl UacSender {
     ) -> oneshot::Receiver<UacResult> {
         let (sender, receiver) = oneshot::channel();
 
-        // Extract branch from the topmost Via.  If absent or not UAC-shaped,
-        // we can't correlate — signal timeout immediately.
-        let branch = message
-            .headers
-            .get("Via")
-            .or_else(|| message.headers.get("v"))
-            .and_then(|via_raw| {
-                crate::sip::headers::via::Via::parse_multi(via_raw)
-                    .ok()
-                    .and_then(|vias| vias.into_iter().next())
-                    .and_then(|v| v.branch)
-            });
-
-        let branch = match branch {
-            Some(b) if b.starts_with("z9hG4bK-uac-") => b,
-            _ => {
-                warn!("send_request_with_response: message has no z9hG4bK-uac- branch");
-                let _ = sender.send(UacResult::Timeout);
-                return receiver;
-            }
+        // Without a UAC-shaped branch on the topmost Via we can't correlate:
+        // signal timeout immediately.
+        let Some(branch) = uac_branch(&message) else {
+            warn!("send_request_with_response: message has no z9hG4bK-uac- branch");
+            let _ = sender.send(UacResult::Timeout);
+            return receiver;
         };
 
-        let data = Bytes::from(message.to_bytes());
-        let (destination, source_local_addr) =
-            self.egress(transport, destination, source_local_addr);
-
-        if let Some(ref hep) = self.hep_sender {
-            // The pinned socket is the one the request leaves from.
-            let addr = source_local_addr.unwrap_or_else(|| self.addr_for(&transport));
-            hep.capture_outbound(addr, destination, transport, &data);
-        }
-
-        let outbound_message = OutboundMessage {
-            followups: None,
-            connection_id,
-            transport,
-            destination,
-            data,
-            source_local_addr,
-            server_name: None,
-            verify_server: None,
-        };
-
-        self.pending.insert(
-            branch.clone(),
-            PendingRequest {
-                sender,
-                inserted_at: Instant::now(),
-                final_only: false,
-            },
-        );
+        // Registered before the request can leave, so an answer that overtakes
+        // the rest of this function still finds it.
+        self.pending
+            .insert(branch.clone(), PendingRequest::new(sender, false));
 
         debug!(
             destination = %destination,
@@ -809,7 +802,13 @@ impl UacSender {
             "UAC send_request_with_response"
         );
 
-        if let Err(error) = self.outbound.send(outbound_message) {
+        if let Err(error) = self.put_on_wire(
+            &message,
+            destination,
+            transport,
+            connection_id,
+            source_local_addr,
+        ) {
             warn!("UAC send_request_with_response failed: {error}");
             if let Some((_, pending)) = self.pending.remove(&branch) {
                 let _ = pending.sender.send(UacResult::Timeout);
@@ -850,32 +849,19 @@ impl UacSender {
         connection_id: ConnectionId,
         source_local_addr: Option<SocketAddr>,
     ) {
-        let data = Bytes::from(message.to_bytes());
-
-        // HEP capture — outbound fire-and-forget
-        if let Some(ref hep) = self.hep_sender {
-            let addr = source_local_addr.unwrap_or_else(|| self.addr_for(&transport));
-            hep.capture_outbound(addr, destination, transport, &data);
-        }
-
-        let outbound_message = OutboundMessage {
-            followups: None,
-            connection_id,
-            transport,
-            destination,
-            data,
-            source_local_addr,
-            server_name: None,
-            verify_server: None,
-        };
-
         debug!(
             destination = %destination,
             transport = %transport,
             "UAC fire-and-forget send"
         );
 
-        if let Err(error) = self.outbound.send(outbound_message) {
+        if let Err(error) = self.put_on_wire(
+            &message,
+            destination,
+            transport,
+            connection_id,
+            source_local_addr,
+        ) {
             warn!("UAC send_request failed: {error}");
         }
     }
@@ -965,14 +951,8 @@ impl UacSender {
     /// is what [`match_response`](Self::match_response) keys on.
     pub fn expect_response(&self, branch: &str) -> oneshot::Receiver<UacResult> {
         let (sender, receiver) = oneshot::channel();
-        self.pending.insert(
-            branch.to_string(),
-            PendingRequest {
-                sender,
-                inserted_at: Instant::now(),
-                final_only: false,
-            },
-        );
+        self.pending
+            .insert(branch.to_string(), PendingRequest::new(sender, false));
         receiver
     }
 
@@ -982,20 +962,18 @@ impl UacSender {
     /// [`UacResult::Timeout`] once the sweep expires it at Timer F.
     pub fn expect_final_response(&self, branch: &str) -> oneshot::Receiver<UacResult> {
         let (sender, receiver) = oneshot::channel();
-        self.pending.insert(
-            branch.to_string(),
-            PendingRequest {
-                sender,
-                inserted_at: Instant::now(),
-                final_only: true,
-            },
-        );
+        self.pending
+            .insert(branch.to_string(), PendingRequest::new(sender, true));
         receiver
     }
 
-    /// Expire a specific pending request by branch (called on timeout).
+    /// Expire a specific pending request by branch: its Timer F fired, or the
+    /// caller stopped waiting before that. Either way nobody is left to hear a
+    /// response, so the client transaction the request went out under ends
+    /// with the wait and the request is not retransmitted again.
     pub fn expire_branch(&self, branch: &str) {
         if let Some((_, pending)) = self.pending.remove(branch) {
+            self.abandon_transaction(pending.transaction.as_ref());
             let _ = pending.sender.send(UacResult::Timeout);
         }
     }

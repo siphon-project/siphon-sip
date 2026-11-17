@@ -9,7 +9,7 @@
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use super::test_dispatcher::{test_dispatcher_with_script, TestDispatcher};
+use super::test_dispatcher::{test_dispatcher_with_uac_mtu, TestDispatcher};
 use super::*;
 use crate::subscribe_state::SubscribeStore;
 
@@ -23,8 +23,9 @@ const SCRIPT: &str = concat!(
     "@proxy.on_request(\"SUBSCRIBE\")\n",
     "async def subscribe(request):\n",
     "    handle = proxy.subscribe_state.accept(request, expires=60)\n",
+    "    # X-Pad grows the NOTIFY by that many bytes.\n",
     "    await handle.notify(\n",
-    "        body=\"Messages-Waiting: no\\r\\n\",\n",
+    "        body=\"Messages-Waiting: no\\r\\n\" + \"x\" * int(request.get_header(\"X-Pad\") or 0),\n",
     "        content_type=\"application/simple-message-summary\",\n",
     "    )\n",
     "\n",
@@ -94,9 +95,16 @@ const SCRIPT: &str = concat!(
     "    request.reply(200, \"OK\")\n",
 );
 
+/// The `listen.mtu` of the harness's UAC sender: a request it originates over
+/// UDP that is more than 1300 bytes moves to TCP when its next hop listens
+/// for it (RFC 3261 §18.1.1).
+pub(super) const UAC_MTU: u16 = 1500;
+
 pub(super) struct SubscribeHarness {
     pub(super) state: Arc<DispatcherState>,
     pub(super) udp: flume::Receiver<OutboundMessage>,
+    /// What the UAC sender hands to TCP.
+    pub(super) tcp: flume::Receiver<OutboundMessage>,
     /// The store behind the script's `proxy.subscribe_state`, which is also the
     /// one the dispatcher reaches, as in a running server.
     pub(super) store: Arc<SubscribeStore>,
@@ -124,17 +132,22 @@ pub(super) fn subscribe_harness() -> (MutexGuard<'static, ()>, &'static Subscrib
         })
         .expect("the namespace was just installed");
         crate::subscribe_state::set_global_store(Arc::clone(&store));
-        let TestDispatcher { state, udp } = test_dispatcher_with_script(SCRIPT);
+        let (TestDispatcher { state, udp }, tcp) =
+            test_dispatcher_with_uac_mtu(SCRIPT, Some(UAC_MTU));
         crate::script::api::subscribe_state::set_uac_sender(Arc::clone(&state.uac_sender));
         crate::script::api::subscribe_state::set_resolver(Arc::clone(&state.dns_resolver));
+        // As `dispatcher::run` does: what the UAC sends is retransmitted.
+        attach_uac_transactions(&state);
         SubscribeHarness {
             state: Arc::new(state),
             udp,
+            tcp,
             store,
         }
     });
     // Whatever an earlier test left unread is not this test's traffic.
     while harness.udp.try_recv().is_ok() {}
+    while harness.tcp.try_recv().is_ok() {}
     (turn, harness)
 }
 
