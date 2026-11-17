@@ -1,7 +1,8 @@
 //! The policy and charging control AVPs: every AVP TS 29.212 (Gx), TS
 //! 29.214 (Rx) and TS 29.219 (Sy) define, in their tables 5.3.0.1 (Rel-18),
 //! and the 3GPP-* attributes of TS 29.061 their re-used tables take over. All
-//! of them are 3GPP vendor-specific (10415).
+//! of them are 3GPP vendor-specific (10415), except the one ETSI AVP Rx takes
+//! over ([`ETSI_AVPS`]).
 //!
 //! Each entry carries its M bit as the table gives it: `MANDATORY` where M is
 //! under "Must", `NOT_MANDATORY` where it is under "Must not" or under no
@@ -462,10 +463,42 @@ pub(super) static POLICY_AVPS: &[PolicyAvp] = &[
     policy_avp(2907, "SN-Request-Type", Unsigned32, NOT_MANDATORY),
 ];
 
-/// The entry for `code`, all of them being 3GPP vendor-specific.
-pub(super) fn lookup(code: u32) -> Option<&'static PolicyAvp> {
+/// ETSI Vendor-Id (IANA enterprise number 13019), the vendor of the AVPs of
+/// ETSI TS 183 017.
+pub const VENDOR_ETSI: u32 = 13019;
+
+/// The ETSI AVPs Rx takes over (TS 29.214 table 5.4.0.1): Reservation-Priority,
+/// of which the table says "The vendor-id shall be set to ETSI (13019)". ETSI
+/// TS 183 017 table 7.3.1 gives it code 458, type Enumerated, V under "Must"
+/// and M under "Must not". Its code is that of the base User-Equipment-Info
+/// (RFC 4006), which only the vendor tells it from.
+pub(super) static ETSI_AVPS: &[PolicyAvp] = &[PolicyAvp {
+    definition: AvpDef {
+        code: 458,
+        vendor_id: VENDOR_ETSI,
+        name: "Reservation-Priority",
+        data_type: Enumerated,
+    },
+    mandatory: NOT_MANDATORY,
+}];
+
+/// The entry for `code` of `vendor_id`: 3GPP for the tables, ETSI for the AVP
+/// Rx takes over.
+pub(super) fn lookup(code: u32, vendor_id: u32) -> Option<&'static PolicyAvp> {
+    match vendor_id {
+        VENDOR_3GPP => POLICY_AVPS
+            .binary_search_by(|entry| entry.definition.code.cmp(&code))
+            .ok()
+            .map(|index| &POLICY_AVPS[index]),
+        VENDOR_ETSI => ETSI_AVPS.iter().find(|entry| entry.definition.code == code),
+        _ => None,
+    }
+}
+
+/// Every definition of this module.
+pub(super) fn definitions() -> impl Iterator<Item = &'static AvpDef> {
     POLICY_AVPS
-        .binary_search_by(|entry| entry.definition.code.cmp(&code))
-        .ok()
-        .map(|index| &POLICY_AVPS[index])
+        .iter()
+        .chain(ETSI_AVPS)
+        .map(|entry| &entry.definition)
 }

@@ -195,7 +195,7 @@ impl OverMtuTcp {
 
 /// `via` with its transport token `UDP` replaced by `TCP`; anything else is
 /// returned unchanged.
-fn tcp_via(via: &str) -> String {
+pub(crate) fn tcp_via(via: &str) -> String {
     let (protocol, rest) = via.split_once(char::is_whitespace).unwrap_or((via, ""));
     let Some((version, transport)) = protocol.rsplit_once('/') else {
         return via.to_string();

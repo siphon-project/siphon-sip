@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use super::custom::CustomMetrics;
 use super::{
     accept, admission, enum_servers, event_lag, ipsec, log_writer, pool_connect, rate_limit,
-    send_queue, stale_shed, timer, SiphonMetrics, CUSTOM_METRICS, METRICS, STARTED_AT,
+    send_queue, stale_shed, subscribe_notify, timer, SiphonMetrics, CUSTOM_METRICS, METRICS,
+    STARTED_AT,
 };
 
 /// Initialize the global metrics. Call once at startup.
@@ -33,8 +34,10 @@ pub fn init() -> Result<(), prometheus::Error> {
     rate_limit::init(&metrics.registry)?;
     send_queue::init(&metrics.registry)?;
     pool_connect::init(&metrics.registry)?;
+    crate::transport::mtu::upgrade_metrics::init(&metrics.registry)?;
     crate::presence::metrics::init(&metrics.registry)?;
     stale_shed::init(&metrics.registry)?;
+    subscribe_notify::init(&metrics.registry)?;
     timer::init(&metrics.registry)?;
     crate::script::blocking_metrics::register(&metrics.registry)?;
     crate::script::gc_metrics::register(&metrics.registry)?;

@@ -305,16 +305,14 @@ pub(super) fn send_message_from(
 /// Enqueueing is not the same as leaving — on UDP the workers share the outbound
 /// channel and each owns its own socket — which is why that ordering is done by
 /// pairing the frames rather than by send order (see `OutboundMessage::followups`).
-pub(super) fn flush_deferred_sends(_state: &DispatcherState) {
-    let deferred = crate::script::api::proxy_utils::drain_deferred_sends();
-    if deferred.is_empty() {
-        return;
-    }
-    if let Some(uac_sender) = crate::script::api::proxy_utils::uac_sender() {
-        for msg in deferred {
-            uac_sender.send_request(msg.message, msg.destination, msg.transport);
-        }
-    } else {
-        warn!("deferred sends queued but UAC sender not available");
+pub(super) fn flush_deferred_sends(state: &DispatcherState) {
+    // Through this dispatcher's own UAC sender, the one the script API sends
+    // through in a running node. A message that was moved to TCP for its size
+    // (RFC 3261 §18.1.1) while it was held is one of these: it goes to the
+    // peer the reply went to, but not over the reply's transport.
+    for msg in crate::script::api::proxy_utils::drain_deferred_sends() {
+        state
+            .uac_sender
+            .send_request(msg.message, msg.destination, msg.transport);
     }
 }

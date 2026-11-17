@@ -842,6 +842,7 @@ mod tests {
             registrant_flow: None,
             body: None,
             local_contact: None,
+            generation: 0,
         }
     }
 

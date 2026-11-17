@@ -25,6 +25,8 @@ use super::proxy_utils::ReplyGate;
 
 #[path = "subscribe_in_dialog.rs"]
 mod in_dialog;
+#[path = "subscribe_notify.rs"]
+mod notify;
 use super::request::PyRequest;
 #[cfg(test)]
 use in_dialog::send_in_dialog;
@@ -32,6 +34,8 @@ use in_dialog::{
     is_single_value_header, resolved_transport, send_in_dialog_subscribe,
     send_in_dialog_subscribe_with_timeout,
 };
+pub(crate) use notify::notify_expired;
+use notify::send_notify;
 
 static UAC_SENDER: OnceLock<Arc<UacSender>> = OnceLock::new();
 static SEND_RESOLVER: OnceLock<Arc<SipResolver>> = OnceLock::new();
@@ -566,11 +570,19 @@ impl PySubscribeHandle {
     /// explicitly for ``pending``, ``active;expires=N;reason=...``, or
     /// to override the expiry.
     ///
-    /// Returns ``True`` on success.  Raises ``LookupError`` when the dialog is
-    /// unknown — terminated, or reaped on expiry — since sending a NOTIFY in a
-    /// dialog that no longer exists is a script bug, not a quiet no-op.  The
-    /// ``False`` return is the narrow race where it went away between the
-    /// lookup and the CSeq bump.
+    /// Returns ``True`` once the NOTIFY is handed to the transport; the
+    /// subscriber's answer is not waited for.  Raises ``LookupError`` when the
+    /// dialog is unknown — terminated, reaped on expiry, or removed after a
+    /// failed NOTIFY — since sending a NOTIFY in a dialog that no longer exists
+    /// is a script bug, not a quiet no-op.  The ``False`` return is the narrow
+    /// race where it went away between the lookup and the CSeq bump.
+    ///
+    /// siphon reads the final response afterwards (RFC 6665 §4.2.2).  A 404,
+    /// 405, 410, 416, 480-485, 489, 501 or 604 (a subscriber that lost the
+    /// dialog answers 481), a 408, or no final response before Timer F
+    /// removes the subscription, here and in the cache; any other failure
+    /// keeps it, and so does a SUBSCRIBE refresh that arrives while the NOTIFY
+    /// is out.  Counted in ``siphon_subscribe_notify_failures_total{code}``.
     #[pyo3(signature = (body=None, content_type=None, state=None))]
     fn notify<'py>(
         &self,
@@ -595,9 +607,11 @@ impl PySubscribeHandle {
             .unwrap_or_else(|| format!("active;expires={}", dialog.remaining_secs()));
         let content_type = content_type.map(str::to_string);
         let gate = self.reply_gate.clone();
+        let store = Arc::clone(&self.store);
 
         crate::script::awaitable(python, async move {
             send_notify(
+                &store,
                 &dialog,
                 &subscription_state,
                 content_type.as_deref(),
@@ -660,6 +674,7 @@ impl PySubscribeHandle {
             } else {
                 // Notifier role — send the final NOTIFY.
                 send_notify(
+                    &store,
                     &dialog,
                     &subscription_state,
                     content_type.as_deref(),
@@ -756,11 +771,11 @@ impl PySubscribeHandle {
     /// to, and it is still a *live* read — the same entry a SUBSCRIBE refresh
     /// mutates, not a snapshot taken at construction.
     ///
-    /// What it gives up is the implicit revival: once the sweeper reaps the
-    /// local entry (expired or terminated) this raises instead of fetching a
-    /// copy the cache may still hold on its own TTL — a copy the sweeper has
-    /// already sent the terminating NOTIFY for. Scripts that genuinely want the
-    /// cache re-read ask for it with `await handle.reload()`.
+    /// What it gives up is the implicit re-read: once the local entry is gone
+    /// (reaped by the sweeper, or removed after a failed NOTIFY) this raises
+    /// instead of asking the cache. Scripts that genuinely want the cache
+    /// re-read, for a dialog another replica holds, ask for it with
+    /// `await handle.reload()`.
     fn load_local(&self) -> PyResult<SubscribeDialog> {
         self.store.get_local(&self.id).ok_or_else(|| {
             pyo3::exceptions::PyLookupError::new_err(format!(
@@ -877,6 +892,7 @@ fn capture_incoming(
         registrant_flow: None,
         body: None,
         local_contact: None,
+        generation: 0,
     };
 
     drop(message);
@@ -887,18 +903,6 @@ fn capture_incoming(
 // Wire helpers — borrowed from proxy_utils / presence patterns
 // ---------------------------------------------------------------------------
 
-/// Finish expired notifier dialogs outside the dispatcher task: DNS resolution
-/// must not stall SIP dispatch. State has already been removed by the sweep.
-pub(crate) async fn notify_expired(mut dialog: SubscribeDialog) {
-    if dialog.terminated || dialog.is_outbound {
-        return;
-    }
-    dialog.next_cseq();
-    if let Err(error) = send_notify(&dialog, "terminated;reason=timeout", None, None, None).await {
-        tracing::error!(id = %dialog.id, %error, "failed to notify subscription expiry");
-    }
-}
-
 fn received_transport(name: &str) -> Transport {
     match name {
         "tls" => Transport::Tls,
@@ -908,177 +912,6 @@ fn received_transport(name: &str) -> Transport {
         "sctp" => Transport::Sctp,
         _ => Transport::Udp,
     }
-}
-
-async fn send_notify(
-    dialog: &SubscribeDialog,
-    subscription_state: &str,
-    content_type: Option<&str>,
-    body: Option<&[u8]>,
-    gate: Option<&ReplyGate>,
-) -> PyResult<()> {
-    let uac_sender = UAC_SENDER.get().ok_or_else(|| {
-        pyo3::exceptions::PyRuntimeError::new_err(
-            "subscribe_state.notify() unavailable: UAC sender not initialized",
-        )
-    })?;
-    let resolver = SEND_RESOLVER.get().ok_or_else(|| {
-        pyo3::exceptions::PyRuntimeError::new_err(
-            "subscribe_state.notify() unavailable: DNS resolver not initialized",
-        )
-    })?;
-
-    // Determine transport destination: first Route URI or remote_target.
-    let ruri = parse_uri_standalone(&dialog.remote_target).map_err(|error| {
-        pyo3::exceptions::PyValueError::new_err(format!("invalid remote target: {error}"))
-    })?;
-    let (destination, transport) = if let (true, Some(address), Some(transport)) = (
-        dialog.route_set.is_empty(),
-        dialog.received_address,
-        dialog.received_transport.as_deref(),
-    ) {
-        let transport = received_transport(transport);
-        (address, transport)
-    } else {
-        let resolve_target: String = dialog
-            .route_set
-            .first()
-            .map(|route| {
-                route
-                    .trim()
-                    .trim_start_matches('<')
-                    .trim_end_matches('>')
-                    .to_string()
-            })
-            .unwrap_or_else(|| dialog.remote_target.clone());
-
-        let resolve_uri = parse_uri_standalone(&resolve_target).map_err(|error| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "invalid route/target URI '{resolve_target}': {error}"
-            ))
-        })?;
-
-        let transport_hint = resolve_uri
-            .get_param("transport")
-            .map(|s: &str| s.to_string());
-        let resolver_clone = Arc::clone(resolver);
-        let host = resolve_uri.host.clone();
-        let port = resolve_uri.port;
-        let scheme = resolve_uri.scheme.clone();
-
-        let destination = resolver_clone
-            .resolve(&host, port, scheme.as_str(), transport_hint.as_deref())
-            .await;
-
-        let target = destination.into_iter().next().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "cannot resolve destination for '{resolve_target}'"
-            ))
-        })?;
-
-        let transport = match target.transport.as_deref().or(transport_hint.as_deref()) {
-            Some(hint) => match hint.to_lowercase().as_str() {
-                "tcp" => Transport::Tcp,
-                "tls" => Transport::Tls,
-                "ws" => Transport::WebSocket,
-                "wss" => Transport::WebSocketSecure,
-                "sctp" => Transport::Sctp,
-                _ => Transport::Udp,
-            },
-            None => {
-                if scheme == "sips" {
-                    Transport::Tls
-                } else {
-                    Transport::Udp
-                }
-            }
-        };
-
-        (target.address, transport)
-    };
-
-    // The listener of the subscriber's connection, when known, names us.
-    let connection = dialog
-        .received_connection_id
-        .map(crate::transport::ConnectionId);
-    let (local_host, local_port) =
-        uac_sender.sent_by_for(transport, Some(destination), connection.unwrap_or_default());
-    let branch = format!("z9hG4bK-uac-py-{}", Uuid::new_v4());
-    let via = format!("SIP/2.0/{transport} {local_host}:{local_port};branch={branch}");
-    let cseq_str = format!("{} NOTIFY", dialog.cseq);
-
-    // NOTIFY tag orientation (RFC 6665 §4.4.1): From = notifier (us),
-    // To = subscriber (peer).
-    let from_header = format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag);
-    let to_header = format!("<{}>;tag={}", dialog.remote_uri, dialog.remote_tag);
-
-    let mut builder = SipMessageBuilder::new()
-        .request(Method::Notify, ruri)
-        .via(via)
-        .call_id(dialog.call_id.clone())
-        .cseq(cseq_str)
-        .max_forwards(70)
-        .from(from_header)
-        .to(to_header)
-        .header(
-            "Contact",
-            format_default_contact(&local_host, local_port, transport),
-        )
-        .header("Event", dialog.event.clone())
-        .header("Subscription-State", subscription_state.to_string());
-
-    for route in &dialog.route_set {
-        builder = builder.header("Route", route.clone());
-    }
-
-    if let Some(ct) = content_type {
-        builder = builder.header("Content-Type", ct.to_string());
-    }
-
-    if let Some(body_bytes) = body {
-        builder = builder.body(body_bytes.to_vec());
-    } else {
-        builder = builder.content_length(0);
-    }
-
-    let message = builder.build().map_err(|error| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build NOTIFY: {error}"))
-    })?;
-
-    // Sent from the handler that accepted the subscription: hold it behind the
-    // SUBSCRIBE's reply, which the dispatcher sends once the handler returns
-    // (RFC 6665 §4.1.2.3). Once the gate has closed it goes out now.
-    let message = match gate {
-        Some(gate) => match gate.hold(message, destination, transport) {
-            None => return Ok(()),
-            Some(message) => message,
-        },
-        None => message,
-    };
-    if dialog.route_set.is_empty()
-        && dialog.received_address.is_some()
-        && transport != Transport::Udp
-    {
-        // Exact match only: IP-only reuse can select another subscriber's
-        // connection when several phones share one front proxy.
-        let connection_id = super::stream_connections()
-            .and_then(|registry| registry.get(&destination, transport))
-            .filter(|connection_id| {
-                dialog
-                    .received_connection_id
-                    .is_none_or(|expected| connection_id.0 == expected)
-            })
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "SUBSCRIBE transport flow is no longer connected",
-                )
-            })?;
-        uac_sender.send_request_on_connection(message, destination, transport, connection_id);
-    } else {
-        uac_sender.send_request(message, destination, transport);
-    }
-    debug!(id = %dialog.id, "subscribe_state: NOTIFY sent");
-    Ok(())
 }
 
 /// The UAC and resolver `send()` originates through.
@@ -1438,12 +1271,19 @@ impl PySubscribeState {
                     })
             }),
             local_contact: message.headers.get("Contact").cloned(),
+            generation: 0,
             body,
         });
 
         let mut receiver = match &flow_egress {
             Some(egress) => egress.send(uac_sender, message).await,
-            None => uac_sender.send_request_with_response(message, destination, transport),
+            // Over the MTU and built for UDP, over TCP (RFC 3261 §18.1.1).
+            None => {
+                let next_hop = super::uac_resolved::next_hop_uri(pre_loaded_route.first(), ruri);
+                super::uac_resolved::ResolvedEgress::resolved(next_hop, destination, transport)
+                    .send(uac_sender, resolver, message)
+                    .await
+            }
         };
 
         let timeout = std::time::Duration::from_millis(timeout_ms);
@@ -1726,6 +1566,7 @@ mod tests {
             registrant_flow: None,
             body: None,
             local_contact: None,
+            generation: 0,
         };
         dialog.event_version = 2;
         let json = serde_json::to_string(&dialog).expect("serialize dialog");
