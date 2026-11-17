@@ -431,3 +431,60 @@ fn notify_from_a_script_survives_forced_collections() {
     // The watcher removes the subscription before it resolves the outcome.
     assert!(!notifier.listed(), "the 481 ended the subscription");
 }
+
+/// `presence.notify()` with a body over `listen.mtu` leaves over TCP when the
+/// watcher listens for it, with a TCP top Via, and one under it over UDP (RFC
+/// 3261 §18.1.1). The response is still the NOTIFY's: same branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_notify_over_the_mtu_goes_tcp_and_a_small_one_udp() {
+    use crate::script::api::uac_resolved_tests::{via_of, Node, Peer};
+    use crate::transport::mtu::{upgrade_metrics, OverMtuPath};
+
+    let peer = Peer::listening().await;
+    let node = Node::new(1500);
+    let store = Arc::new(PresenceStore::new());
+    let subscription_id = PyPresence::new(Arc::clone(&store))
+        .subscribe_dialog(
+            &format!("sip:watcher@{}", peer.addr),
+            AOR,
+            "reg",
+            600,
+            "notify-over-mtu-call",
+            "ftag-watcher",
+            "notifier-tag",
+            None,
+            Some(AOR.to_string()),
+            Some(AOR.to_string()),
+            0,
+            0,
+        )
+        .expect("a subscription");
+    upgrade_metrics::init_for_tests();
+    let before = upgrade_metrics::count(OverMtuPath::Notify);
+
+    for (body, expect_tcp) in [("x".repeat(1500), true), ("x".repeat(600), false)] {
+        let outcome = PyPresence::notify_inner(
+            Arc::clone(&store),
+            Arc::clone(&node.uac.sender),
+            Arc::clone(&node.resolver),
+            &subscription_id,
+            Some(&body),
+            Some("application/reginfo+xml"),
+            "active;expires=600",
+        )
+        .await
+        .expect("the NOTIFY is sent");
+        let (over_tcp, sent) = node.sent().await;
+        assert_eq!(over_tcp, expect_tcp, "a {} byte body", body.len());
+        assert_eq!(sent.destination, peer.addr);
+        let via = via_of(&sent.data);
+        let transport = if expect_tcp { "TCP" } else { "UDP" };
+        assert!(via.starts_with(&format!("SIP/2.0/{transport} ")), "{via}");
+        let notify = parse_sip_message_bytes(&sent.data).expect("a NOTIFY");
+        assert_eq!(notify.body.len(), body.len(), "the whole body");
+        assert!(node.uac.sender.match_response(&response_to(&notify, 200)));
+        assert_eq!(outcome_of(outcome).await, Some(200));
+    }
+    // Other tests in the process count NOTIFYs of their own meanwhile.
+    assert!(upgrade_metrics::count(OverMtuPath::Notify) > before);
+}

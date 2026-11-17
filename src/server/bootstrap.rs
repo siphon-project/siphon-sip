@@ -1041,17 +1041,16 @@ pub(super) fn registrant_ue_sockets(
 /// TCP from an address of their own, and the pool their own connections go
 /// through. A process with no `listen.tcp` has no TCP distributor (each TCP
 /// listener spawns one), so with a registrant one is spawned here, or a TCP
-/// UE's REGISTER would wait in the channel for a reader that never comes.
+/// UE's REGISTER would wait in the channel for a reader that never comes. So
+/// would, with `listen.mtu`, a request the UAC sender moves to TCP for its
+/// size (RFC 3261 §18.1.1), so that spawns one too.
 pub(super) fn attach_registrant_tcp(
     ue_sockets: Option<&Arc<transport::ue_sockets::UeSockets>>,
     config: &Config,
     context: transport::ue_streams::UeTcpContext,
     tcp_outbound_rx: &flume::Receiver<transport::OutboundMessage>,
 ) {
-    let Some(ue_sockets) = ue_sockets else {
-        return;
-    };
-    if config.listen.tcp.is_empty() {
+    if transport::stream::listenerless_tcp_egress(&config.listen, ue_sockets.is_some()) {
         transport::stream::spawn_outbound_distributor(
             tcp_outbound_rx.clone(),
             Arc::clone(&context.connection_map),
@@ -1059,7 +1058,9 @@ pub(super) fn attach_registrant_tcp(
             Some(Arc::clone(&context.pool)),
         );
     }
-    ue_sockets.attach_tcp(context);
+    if let Some(ue_sockets) = ue_sockets {
+        ue_sockets.attach_tcp(context);
+    }
 }
 
 /// Wire the config entries + background refresh loop onto the registrant

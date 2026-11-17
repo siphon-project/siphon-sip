@@ -11,6 +11,11 @@ pub(super) use over_mtu::{flow_over_mtu_upgrade, fork_branch_over_mtu, over_mtu_
 /// Next hops whose TCP path just failed, not probed again for a while.
 mod probe_cache;
 pub(super) use probe_cache::probe_cache;
+/// The same decision for a request siphon originates as a UAC, awaited.
+mod originated;
+#[cfg(test)]
+pub(crate) use originated::forget_tcp_probe;
+pub(crate) use originated::{OriginatedOverMtu, OriginatedTcp};
 
 /// Resolve a SIP URI string to a socket address using DNS (RFC 3263).
 ///
@@ -165,7 +170,7 @@ pub(super) fn resolve_target(uri_string: &str, resolver: &SipResolver) -> Option
 /// RFC 3261 §18.1.1: a UDP request whose serialised length exceeds `mtu - 200`
 /// bytes must be sent over a congestion-controlled transport (TCP).  Shared
 /// with the registrant's over-MTU REGISTER, see [`crate::transport::mtu`].
-pub(super) use crate::transport::mtu::over_mtu;
+pub(super) use crate::transport::mtu::{over_mtu, upgrade_metrics, OverMtuPath};
 
 /// Time budget for the §18.1.1 TCP-reachability probe (below).  Kept short so a
 /// blackholed TCP port on the (rare) over-MTU path adds only bounded latency; a
@@ -191,17 +196,9 @@ pub(super) fn resolve_tcp_path(
     udp_destination: SocketAddr,
     resolver: &SipResolver,
 ) -> Option<SocketAddr> {
-    let candidate = if uri_string.parse::<SocketAddr>().is_ok() {
-        udp_destination
-    } else {
-        let uri = parse_uri_standalone(uri_string).ok()?;
-        if crate::sip::uri::strip_ipv6_brackets(&uri.host)
-            .parse::<std::net::IpAddr>()
-            .is_ok()
-        {
-            // Numeric host (v4 or bracketed v6) — same address, TCP.
-            udp_destination
-        } else {
+    let candidate = match tcp_candidate(uri_string)? {
+        TcpCandidate::SameAddress => udp_destination,
+        TcpCandidate::Lookup(uri) => {
             let results = crate::script::blocking::block_on_released(resolver.resolve(
                 &uri.host,
                 uri.port,
@@ -216,6 +213,32 @@ pub(super) fn resolve_tcp_path(
         std::net::TcpStream::connect_timeout(&candidate, TCP_PROBE_TIMEOUT).is_ok()
     });
     reachable.then_some(candidate)
+}
+
+/// Where the TCP path of a next hop named by `uri_string` is looked for.
+pub(super) enum TcpCandidate {
+    /// A numeric next hop: the UDP destination itself, over TCP.
+    SameAddress,
+    /// A hostname: its `_sip._tcp` SRV / A/AAAA result.
+    Lookup(SipUri),
+}
+
+/// The [`TcpCandidate`] of `uri_string`, a bare `ip:port` or a SIP URI; `None`
+/// when it is neither.
+pub(super) fn tcp_candidate(uri_string: &str) -> Option<TcpCandidate> {
+    if uri_string.parse::<SocketAddr>().is_ok() {
+        return Some(TcpCandidate::SameAddress);
+    }
+    let uri = parse_uri_standalone(uri_string).ok()?;
+    if crate::sip::uri::strip_ipv6_brackets(&uri.host)
+        .parse::<std::net::IpAddr>()
+        .is_ok()
+    {
+        // Numeric host (v4 or bracketed v6) — same address, TCP.
+        Some(TcpCandidate::SameAddress)
+    } else {
+        Some(TcpCandidate::Lookup(uri))
+    }
 }
 
 /// Whether a B-leg INVITE routes over the binding's captured inbound flow, or
@@ -482,42 +505,83 @@ pub(super) fn mtu_tcp_upgrade(
     destination: SocketAddr,
     resolver: &SipResolver,
 ) -> Option<(Transport, SocketAddr)> {
-    let mtu = mtu?;
-    if outbound_transport != Transport::Udp || !over_mtu(serialized_len, mtu) {
-        return None;
-    }
-    // One probe per next hop at a time, and none for a window after one
-    // failed: a peer that stopped accepting would otherwise cost every
-    // over-MTU request its own blocking connect timeout (see `probe_cache`).
-    let probe = match probe_cache().claim(destination, std::time::Instant::now()) {
-        Ok(probe) => probe,
-        Err(skip) => {
-            debug!(
-                serialized_len, mtu, %destination, ?skip,
-                "transport: forced UDP over-MTU send (TCP path not probed: it failed recently, \
-                 or is being probed)"
-            );
+    let probe = TcpProbe::claim(mtu, outbound_transport, serialized_len, destination)?;
+    let path = resolve_tcp_path(target_uri_string, destination, resolver);
+    probe.conclude(path)
+}
+
+/// One over-MTU request's right to probe its next hop for a TCP path: the
+/// parts of [`mtu_tcp_upgrade`] on either side of the probe itself, shared with
+/// the awaited probe of a request siphon originates
+/// ([`OriginatedOverMtu::upgrade`]), so both decide, cache and log alike.
+pub(super) struct TcpProbe {
+    probe: probe_cache::Probe<'static>,
+    mtu: u16,
+    serialized_len: usize,
+    destination: SocketAddr,
+}
+
+impl TcpProbe {
+    /// `Some` when the request is a UDP one over the threshold (RFC 3261
+    /// §18.1.1) and its next hop may be probed now: one probe per next hop at
+    /// a time, and none for a window after one failed, since a peer that
+    /// stopped accepting would otherwise cost every over-MTU request its own
+    /// connect timeout (see `probe_cache`).
+    pub(super) fn claim(
+        mtu: Option<u16>,
+        outbound_transport: Transport,
+        serialized_len: usize,
+        destination: SocketAddr,
+    ) -> Option<Self> {
+        let mtu = mtu?;
+        if outbound_transport != Transport::Udp || !over_mtu(serialized_len, mtu) {
             return None;
         }
-    };
-    let path = resolve_tcp_path(target_uri_string, destination, resolver);
-    probe.finish(path.is_some(), std::time::Instant::now());
-    match path {
-        Some(tcp_addr) => {
-            debug!(
-                serialized_len, mtu, %destination,
-                "RFC 3261 §18.1.1: over-MTU UDP request → TCP"
-            );
-            Some((Transport::Tcp, tcp_addr))
+        match probe_cache().claim(destination, std::time::Instant::now()) {
+            Ok(probe) => Some(Self {
+                probe,
+                mtu,
+                serialized_len,
+                destination,
+            }),
+            Err(skip) => {
+                debug!(
+                    serialized_len, mtu, %destination, ?skip,
+                    "transport: forced UDP over-MTU send (TCP path not probed: it failed recently, \
+                     or is being probed)"
+                );
+                None
+            }
         }
-        None => {
-            warn!(
-                serialized_len, mtu, %destination,
-                skip_secs = probe_cache::UNREACHABLE_WINDOW.as_secs(),
-                "transport: forced UDP over-MTU send (no reachable TCP path); this next hop is \
-                 not probed again for skip_secs seconds"
-            );
-            None
+    }
+
+    /// Record what the probe found: the switch to TCP at `path`, or the forced
+    /// UDP send, warned about once per window.
+    pub(super) fn conclude(self, path: Option<SocketAddr>) -> Option<(Transport, SocketAddr)> {
+        let Self {
+            probe,
+            mtu,
+            serialized_len,
+            destination,
+        } = self;
+        probe.finish(path.is_some(), std::time::Instant::now());
+        match path {
+            Some(tcp_addr) => {
+                debug!(
+                    serialized_len, mtu, %destination,
+                    "RFC 3261 §18.1.1: over-MTU UDP request → TCP"
+                );
+                Some((Transport::Tcp, tcp_addr))
+            }
+            None => {
+                warn!(
+                    serialized_len, mtu, %destination,
+                    skip_secs = probe_cache::UNREACHABLE_WINDOW.as_secs(),
+                    "transport: forced UDP over-MTU send (no reachable TCP path); this next hop is \
+                     not probed again for skip_secs seconds"
+                );
+                None
+            }
         }
     }
 }

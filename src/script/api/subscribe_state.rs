@@ -1044,6 +1044,17 @@ async fn send_notify(
     let message = builder.build().map_err(|error| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build NOTIFY: {error}"))
     })?;
+    // A stream subscriber keeps its connection; else over the MTU goes TCP (RFC 3261 §18.1.1).
+    let stream_flow = dialog.route_set.is_empty()
+        && dialog.received_address.is_some()
+        && transport != Transport::Udp;
+    let super::uac_resolved::Routed {
+        message,
+        destination,
+        transport,
+    } = super::uac_resolved::ResolvedEgress::of_dialog(dialog, destination, transport)
+        .route(uac_sender, resolver, message)
+        .await;
 
     // Sent from the handler that accepted the subscription: hold it behind the
     // SUBSCRIBE's reply, which the dispatcher sends once the handler returns
@@ -1055,10 +1066,7 @@ async fn send_notify(
         },
         None => message,
     };
-    if dialog.route_set.is_empty()
-        && dialog.received_address.is_some()
-        && transport != Transport::Udp
-    {
+    if stream_flow {
         // Exact match only: IP-only reuse can select another subscriber's
         // connection when several phones share one front proxy.
         let connection_id = super::stream_connections()
@@ -1443,7 +1451,13 @@ impl PySubscribeState {
 
         let mut receiver = match &flow_egress {
             Some(egress) => egress.send(uac_sender, message).await,
-            None => uac_sender.send_request_with_response(message, destination, transport),
+            // Over the MTU and built for UDP, over TCP (RFC 3261 §18.1.1).
+            None => {
+                let next_hop = super::uac_resolved::next_hop_uri(pre_loaded_route.first(), ruri);
+                super::uac_resolved::ResolvedEgress::resolved(next_hop, destination, transport)
+                    .send(uac_sender, resolver, message)
+                    .await
+            }
         };
 
         let timeout = std::time::Duration::from_millis(timeout_ms);

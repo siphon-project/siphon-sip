@@ -287,6 +287,7 @@ pub fn b2bua_dial_b_leg(
     let flow_transport = outbound_transport;
     if flow_over_mtu_upgrade(state, flow, original_request) {
         outbound_transport = Transport::Tcp;
+        upgrade_metrics::record(OverMtuPath::BLeg);
     }
     if state.mtu.is_some() && flow.is_none() {
         if let Some((tcp_transport, tcp_addr)) = over_mtu_upgrade(
@@ -298,6 +299,7 @@ pub fn b2bua_dial_b_leg(
         ) {
             outbound_transport = tcp_transport;
             destination = tcp_addr;
+            upgrade_metrics::record(OverMtuPath::BLeg);
         }
     }
 

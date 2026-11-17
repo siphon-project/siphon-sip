@@ -1000,7 +1000,15 @@ impl PyProxyUtils {
             // exists only so the dispatcher's `UacSender::match_response`
             // silently consumes the matching response — without it, every
             // legitimate response logs "response for unknown branch (not ours)".
-            let receiver = uac.send_request_with_response(message, target.address, transport);
+            // A request over the MTU built for UDP leaves over TCP when the
+            // next hop takes it (RFC 3261 §18.1.1, `ResolvedEgress`).
+            let receiver = super::uac_resolved::ResolvedEgress::resolved(
+                &resolve_target,
+                target.address,
+                transport,
+            )
+            .send(&uac, &resolver_clone, message)
+            .await;
             await_send_request_reply(uac, receiver, branch, wait_for_response, timeout).await
         })
     }
