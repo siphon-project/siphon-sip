@@ -411,6 +411,8 @@ pub fn deserialize_shards<'de, D: Deserializer<'de>>(
 #[cfg(feature = "redis-backend")]
 mod connection;
 #[cfg(feature = "redis-backend")]
+pub(crate) use connection::recoverable as is_link_failure;
+#[cfg(feature = "redis-backend")]
 pub use connection::RedisConnection;
 
 #[cfg(test)]
