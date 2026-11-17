@@ -514,10 +514,47 @@ class MockSubscribeHandle:
 
     def notify(self, body=None, content_type: Optional[str] = None,
                state: Optional[str] = None) -> bool:
+        """Send an in-dialog NOTIFY.  Awaitable; recorded on the parent's
+        ``notifies``.
+
+        ``state`` is the whole ``Subscription-State`` value; left out, siphon
+        sends ``active;expires=<what is left>``.
+
+        Resolves ``True`` as soon as the NOTIFY is handed to the transport;
+        it does not wait for the subscriber's answer.  siphon reads that
+        answer in the background.  A subscriber that lost the dialog answers
+        481; that, any other of the responses RFC 6665 §4.2.2 names (404,
+        405, 410, 416, 480-485, 489, 501, 604), a 408, or no final response
+        before Timer F removes the subscription, here and in the Redis cache.
+        From then on the handle raises ``LookupError``, ``await
+        handle.reload()`` is ``False`` and
+        ``proxy.subscribe_state.for_resource()`` no longer lists it, so a
+        state change stops sending NOTIFYs to a subscriber that is gone.  Any
+        other failure (a 401, a 5xx) only failed the transaction and keeps
+        the subscription.  A SUBSCRIBE refresh that arrives while the NOTIFY
+        is out keeps it too: the subscriber still holds the dialog.  Every
+        NOTIFY that did not get a 2xx is counted in
+        ``siphon_subscribe_notify_failures_total{code}`` (the status, or
+        ``timeout``).
+
+        Raises ``LookupError`` when the dialog is gone (terminated, expired,
+        or removed after a failed NOTIFY)::
+
+            for handle in proxy.subscribe_state.for_resource(aor, "reg"):
+                try:
+                    await handle.notify(body=xml,
+                                        content_type="application/reginfo+xml")
+                except LookupError:
+                    pass            # removed meanwhile
+
+        In the mock the NOTIFY is answered with the status set by
+        :meth:`MockSubscribeState.set_notify_response` (200 unless set), and a
+        removal takes effect at once.
+        """
         async def _run():
             # Raises like the native handle: a NOTIFY in a dialog that is gone
             # is a script bug, and a False return would hide it.
-            self._live()
+            dialog = self._live()
             entry = {
                 "id": self._id,
                 "body": body,
@@ -525,6 +562,10 @@ class MockSubscribeHandle:
                 "state": state or f"active;expires={self.expires}",
             }
             self._parent.notifies.append(entry)
+            if not dialog.get("is_outbound") and _notify_ends_subscription(
+                self._parent._notify_response
+            ):
+                self._parent._dialogs.pop(self._id, None)
             return True
 
         return _run()
@@ -634,6 +675,22 @@ class MockSubscribeState:
         self._dialogs: dict[str, dict] = {}
         self.notifies: list[dict] = []
         self.terminates: list[dict] = []
+        self._notify_response: Optional[int] = 200
+
+    def set_notify_response(self, status: Optional[int]) -> None:
+        """Answer the NOTIFYs that follow with ``status`` (test helper).
+
+        ``None`` models a subscriber that never answers: Timer F expires.
+        A status RFC 6665 §4.2.2 names (404, 405, 410, 416, 480-485, 489,
+        501, 604), a 408 or ``None`` removes the subscription the NOTIFY was
+        sent in, as siphon does; any other status keeps it::
+
+            handle = proxy.subscribe_state.accept(request)
+            proxy.subscribe_state.set_notify_response(481)
+            await handle.notify(body="...")      # True: it was sent
+            assert proxy.subscribe_state.local_count == 0
+        """
+        self._notify_response = status
 
     @staticmethod
     def _event_identity(value: str) -> tuple[str, Optional[str]]:
@@ -978,6 +1035,7 @@ class MockSubscribeState:
         self._dialogs.clear()
         self.notifies.clear()
         self.terminates.clear()
+        self._notify_response = 200
         if hasattr(self, "sends"):
             self.sends.clear()
 
