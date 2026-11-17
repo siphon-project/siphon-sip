@@ -309,6 +309,21 @@ class MockProxy:
         by default; when ``wait_for_response=True``, the awaitable resolves to
         a configured mock ``Reply`` (or ``None`` on timeout).
 
+        Transport: the request leaves over the transport its next hop
+        resolves to, UDP unless the URI says otherwise. With ``listen.mtu``
+        set, a request built for UDP that is over ``mtu - 200`` bytes (RFC
+        3261 18.1.1), a large MESSAGE for instance, leaves over TCP when the
+        next hop accepts a TCP connection, with a TCP top Via, and over UDP
+        when it does not. ``;transport=udp`` on the URI the request is routed
+        by (``next_hop``, else the first ``Route``, else ``ruri``) keeps it on
+        UDP whatever its size::
+
+            # Over TCP when it is over the MTU and the AS listens for TCP.
+            await proxy.send_request("MESSAGE", "sip:as.example.com", body=text)
+            # Always UDP.
+            await proxy.send_request(
+                "MESSAGE", "sip:as.example.com;transport=udp", body=text)
+
         Args:
             method: SIP method name (e.g. "NOTIFY", "OPTIONS", "MESSAGE").
             ruri: Request-URI string (e.g. "sip:alice@10.0.0.1:5060").
@@ -848,7 +863,10 @@ class MockSubscribeState:
         each of those requests that is over the threshold (RFC 3261 18.1.1)
         goes over TCP from the UE's protected client port to the P-CSCF's
         protected server port, each by its own size, and over UDP when the
-        connection cannot be opened. ``route`` cannot be
+        connection cannot be opened. Without a flow the same holds toward the
+        resolved next hop: a SUBSCRIBE or refresh over the threshold goes over
+        TCP when the next hop accepts a TCP connection, unless the URI it is
+        routed by names ``;transport=udp``. ``route`` cannot be
         combined with ``target_uri`` or a ``Route`` in ``headers``.
 
         ``body`` (``str`` or ``bytes``) and ``content_type`` put a body on the
@@ -13136,7 +13154,10 @@ class MockPresence:
         that, any other of the responses RFC 6665 §4.2.2 names (404, 405, 410,
         416, 480-485, 489, 501, 604), a 408, or no final response before
         Timer F removes the subscription, in the background, so the next
-        :meth:`subscribers` no longer lists it.  It is counted in
+        :meth:`subscribers` no longer lists it.  With ``listen.mtu`` set, a
+        NOTIFY over ``mtu - 200`` bytes leaves over TCP when the watcher
+        accepts a TCP connection, and over UDP when it does not (RFC 3261
+        18.1.1).  It is counted in
         ``siphon_presence_subscriptions_removed_total{reason}``
         (``notify_rejected`` / ``notify_timeout``).  A refresh that arrives
         while the NOTIFY is out keeps the subscription: the subscriber still

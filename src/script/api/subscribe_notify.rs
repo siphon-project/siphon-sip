@@ -205,6 +205,17 @@ pub(super) async fn send_notify_through(
     let message = builder.build().map_err(|error| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build NOTIFY: {error}"))
     })?;
+    // A stream subscriber keeps its connection; else over the MTU goes TCP (RFC 3261 §18.1.1).
+    let stream_flow = dialog.route_set.is_empty()
+        && dialog.received_address.is_some()
+        && transport != Transport::Udp;
+    let super::super::uac_resolved::Routed {
+        message,
+        destination,
+        transport,
+    } = super::super::uac_resolved::ResolvedEgress::of_dialog(dialog, destination, transport)
+        .route(uac_sender, resolver, message)
+        .await;
 
     // The final response is watched (RFC 6665 §4.2.2), from a registration
     // made before the NOTIFY can leave, so an answer that overtakes the rest
@@ -224,10 +235,7 @@ pub(super) async fn send_notify_through(
         },
         None => message,
     };
-    if dialog.route_set.is_empty()
-        && dialog.received_address.is_some()
-        && transport != Transport::Udp
-    {
+    if stream_flow {
         // Exact match only: IP-only reuse can select another subscriber's
         // connection when several phones share one front proxy.
         let Some(connection_id) = super::super::stream_connections()

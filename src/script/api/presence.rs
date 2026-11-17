@@ -755,11 +755,20 @@ impl PyPresence {
         // initial NOTIFY follows the 2xx). This future runs on a tokio worker,
         // so the request's gate is found by the dialog's Call-ID rather than
         // the handler thread's queue, which it cannot see.
-        super::proxy_utils::hold_or_send(
-            &call_id_for_gate,
-            message,
+        // Over the MTU and built for UDP, it leaves over TCP when the next hop
+        // takes it (RFC 3261 §18.1.1).
+        let routed = super::uac_resolved::ResolvedEgress::resolved(
+            &resolve_target,
             target.address,
             transport,
+        )
+        .route(&uac_sender, &resolver, message)
+        .await;
+        super::proxy_utils::hold_or_send(
+            &call_id_for_gate,
+            routed.message,
+            routed.destination,
+            routed.transport,
             |message, destination, transport| {
                 uac_sender.send_request(message, destination, transport)
             },

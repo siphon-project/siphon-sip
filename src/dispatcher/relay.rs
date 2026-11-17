@@ -398,6 +398,7 @@ pub(super) fn relay_request(
     let flow_transport = outbound_transport;
     if flow_over_mtu_upgrade(state, flow, &relayed) {
         outbound_transport = Transport::Tcp;
+        upgrade_metrics::record(OverMtuPath::Relay);
     }
     if state.mtu.is_some() && flow.is_none() {
         if let Some((tcp_transport, tcp_addr)) = over_mtu_upgrade(
@@ -414,6 +415,7 @@ pub(super) fn relay_request(
             } else {
                 outbound_transport = tcp_transport;
                 destination = tcp_addr;
+                upgrade_metrics::record(OverMtuPath::Relay);
                 if protected.is_some() {
                     protected = protected_request(destination, outbound_transport, state);
                     ipsec_source = protected.map(|protected| protected.source);

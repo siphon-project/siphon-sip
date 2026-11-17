@@ -738,3 +738,104 @@ async fn a_subscription_and_its_refreshes_pick_tcp_or_udp_by_their_own_size() {
     assert_eq!(pool.connections_bound_on(lab.ue_ip), 1, "one connection");
     pool.reconcile_pinned_sources(Default::default(), &Default::default());
 }
+
+/// Without a flow: a SUBSCRIBE over `listen.mtu` to a resolved next hop that
+/// listens for TCP goes over TCP with a TCP top Via, and so does a refresh
+/// that carries the subscription's body. The unsubscribe, which carries none,
+/// is under the threshold and stays UDP, and a remote target that names
+/// `transport=udp` keeps even a large refresh on UDP (RFC 3261 §18.1.1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resolved_subscribe_and_its_refresh_over_the_mtu_go_tcp() {
+    use crate::script::api::uac_resolved_tests::{via_of, Node, Peer};
+    use crate::transport::mtu::{upgrade_metrics, OverMtuPath};
+
+    let peer = Peer::listening().await;
+    let node: &'static Node = Box::leak(Box::new(Node::new(1500)));
+    let store = Arc::new(SubscribeStore::new());
+    let body = crate::subscribe_state::DialogBody {
+        content_type: MCPTT_TYPE.to_string(),
+        bytes: vec![b'x'; 1500],
+    };
+    upgrade_metrics::init_for_tests();
+    let before = upgrade_metrics::count(OverMtuPath::Subscribe);
+
+    let send = SubscribeSend {
+        store: Arc::clone(&store),
+        uac: &node.uac.sender,
+        resolver: &node.resolver,
+        flow: None,
+        route: vec![format!("<sip:{};lr>", peer.addr)],
+    };
+    let attempt = {
+        let body = body.clone();
+        tokio::spawn(async move {
+            PySubscribeState::send_inner(
+                send,
+                "sip:001010000000001@example.com",
+                "reg",
+                600,
+                None,
+                None,
+                Vec::new(),
+                5000,
+                Some(body),
+            )
+            .await
+        })
+    };
+    let (over_tcp, sent) = node.sent().await;
+    assert!(over_tcp, "the SUBSCRIBE over the MTU goes over TCP");
+    assert_eq!(sent.destination, peer.addr);
+    assert!(via_of(&sent.data).starts_with("SIP/2.0/TCP "));
+    let subscribe = parse_sip_message_bytes(&sent.data).unwrap();
+    assert_eq!(subscribe.body.len(), 1500, "the whole body");
+    // Its Contact stays the UDP one: where the dialog's NOTIFYs come.
+    let contact = subscribe.headers.get("Contact").cloned().unwrap();
+    assert!(!contact.contains("transport=tcp"), "{contact}");
+
+    let header = |name: &str| subscribe.headers.get(name).cloned().unwrap();
+    let accepted = format!(
+        "SIP/2.0 200 OK\r\nVia: {}\r\nFrom: {}\r\nTo: {};tag=notifier-1\r\nCall-ID: {}\r\n\
+         CSeq: {}\r\nContact: <sip:notifier@{}>\r\nExpires: 600\r\nContent-Length: 0\r\n\r\n",
+        header("Via"),
+        header("From"),
+        header("To"),
+        header("Call-ID"),
+        header("CSeq"),
+        peer.addr,
+    );
+    let accepted = parse_sip_message_bytes(accepted.as_bytes()).unwrap();
+    assert!(node.uac.sender.match_response(&accepted), "the 2xx is ours");
+    let id = attempt.await.unwrap().expect("subscribed").id;
+    let dialog: SubscribeDialog = store.get_local(&id).expect("the dialog");
+    assert!(dialog.route_set.is_empty());
+
+    // The refresh carries the body: over the MTU, over TCP.
+    send_in_dialog(&node.uac.sender, &node.resolver, None, &dialog, 600, None)
+        .await
+        .expect("sent");
+    let (over_tcp, sent) = node.sent().await;
+    assert!(over_tcp, "a refresh over the MTU goes over TCP");
+    assert_eq!(sent.destination, peer.addr);
+    assert!(via_of(&sent.data).starts_with("SIP/2.0/TCP "));
+
+    // The unsubscribe carries none.
+    send_in_dialog(&node.uac.sender, &node.resolver, None, &dialog, 0, None)
+        .await
+        .expect("sent");
+    let (over_tcp, sent) = node.sent().await;
+    assert!(!over_tcp, "a small unsubscribe stays UDP");
+    assert!(via_of(&sent.data).starts_with("SIP/2.0/UDP "));
+
+    // A remote target that asks for UDP keeps it.
+    let mut pinned = dialog.clone();
+    pinned.remote_target = format!("sip:notifier@{};transport=udp", peer.addr);
+    send_in_dialog(&node.uac.sender, &node.resolver, None, &pinned, 600, None)
+        .await
+        .expect("sent");
+    let (over_tcp, sent) = node.sent().await;
+    assert!(!over_tcp, "transport=udp is honoured");
+    assert!(sent.data.len() > 1500, "the whole refresh");
+
+    assert!(upgrade_metrics::count(OverMtuPath::Subscribe) >= before + 2);
+}
