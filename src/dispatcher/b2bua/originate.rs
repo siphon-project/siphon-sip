@@ -1118,31 +1118,48 @@ pub fn handle_originated_call_response(
             None => None,
         };
 
-        if let Some(mut call) = state.call_actors.get_call_mut(internal_call_id) {
-            call.a_leg.dialog.remote_tag = remote_tag.clone();
-            if remote_contact.is_some() {
-                call.a_leg.dialog.remote_contact = remote_contact.clone();
+        // The dialog is confirmed and the call marked answered under its lock,
+        // against a hangup or ring timeout giving up on it at this moment
+        // (`give_up_on_pending`): either that finds the call answered and
+        // leaves it to a BYE, or it came first and this 2xx crossed its
+        // CANCEL (RFC 3261 §9.1), in which case the call is not answered for
+        // anybody and the dialog the 2xx opened is released below.
+        let confirmed = state
+            .call_actors
+            .confirm_originated_answer(internal_call_id, |call| {
+                call.a_leg.dialog.remote_tag = remote_tag.clone();
+                if remote_contact.is_some() {
+                    call.a_leg.dialog.remote_contact = remote_contact.clone();
+                }
+                if !route_set.is_empty() {
+                    call.a_leg.dialog.route_set = route_set;
+                }
+                if !message.body.is_empty() {
+                    call.a_leg.last_sdp = Some(message.body.clone());
+                }
+                // The answer to siphon's offer, its SDP alone: what the bridge
+                // gives the leg's allocation.
+                if let Some(answer) = offered_answer {
+                    call.a_leg.last_sdp = Some(answer);
+                }
+                // Every later in-dialog request (BYE, re-INVITE) must exceed the
+                // INVITE's CSeq and that of each PRACK sent since (RFC 3261
+                // §12.2.1.1).
+                let counter = call.a_leg.dialog.local_cseq;
+                call.a_leg.dialog.local_cseq = progress::next_cseq_after(message, counter);
+                // Kept for the ACK a retransmitted 2xx is owed, which has to be
+                // this one.
+                call.originate_answer_sdp = anchor_answer.clone();
+                leg = call.a_leg.clone();
+            });
+        if !confirmed {
+            release_answer_of_abandoned_call(&leg, &sip_call_id, message, state);
+            // The group this leg had won is told it has no winner after all,
+            // the way it is told of one whose media could not be anchored.
+            if let Some(win) = group_win {
+                win.media_failed(state, 487, "Request Terminated");
             }
-            if !route_set.is_empty() {
-                call.a_leg.dialog.route_set = route_set;
-            }
-            if !message.body.is_empty() {
-                call.a_leg.last_sdp = Some(message.body.clone());
-            }
-            // The answer to siphon's offer, its SDP alone: what the bridge
-            // gives the leg's allocation.
-            if let Some(answer) = offered_answer {
-                call.a_leg.last_sdp = Some(answer);
-            }
-            // Every later in-dialog request (BYE, re-INVITE) must exceed the
-            // INVITE's CSeq and that of each PRACK sent since (RFC 3261
-            // §12.2.1.1).
-            let counter = call.a_leg.dialog.local_cseq;
-            call.a_leg.dialog.local_cseq = progress::next_cseq_after(message, counter);
-            // Kept for the ACK a retransmitted 2xx is owed, which has to be
-            // this one.
-            call.originate_answer_sdp = anchor_answer.clone();
-            leg = call.a_leg.clone();
+            return;
         }
         originate_answered_session(
             internal_call_id,
@@ -1150,9 +1167,6 @@ pub fn handle_originated_call_response(
             anchor_answer.as_deref().or(answered_early.as_deref()),
             state,
         );
-        state
-            .call_actors
-            .set_state(internal_call_id, CallState::Answered);
         originate_ack_2xx(&leg, message, anchor_answer.as_deref(), state);
         if crate::cdr::auto_emit_enabled() {
             cdr_mark_answer(state, internal_call_id, status_code);
@@ -1268,24 +1282,18 @@ pub fn handle_originated_call_response(
 /// fields, so an originate routed through a binding's Path has its ACK take the
 /// same path. A no-op for an INVITE that carried none.
 pub(super) fn with_invite_route_set(
-    mut ack: SipMessage,
+    ack: SipMessage,
     internal_call_id: &str,
     state: &DispatcherState,
 ) -> SipMessage {
-    let routes = state
+    let invite = state
         .call_actors
         .get_call(internal_call_id)
-        .and_then(|call| call.a_leg_invite.clone())
-        .and_then(|invite| {
-            invite
-                .lock()
-                .ok()
-                .and_then(|invite| invite.headers.get_all("Route").cloned())
-        });
-    if let Some(routes) = routes.filter(|routes| !routes.is_empty()) {
-        ack.headers.set_all("Route", routes);
+        .and_then(|call| call.a_leg_invite.clone());
+    match invite {
+        Some(invite) => ack_with_invite_routes(ack, &invite),
+        None => ack,
     }
-    ack
 }
 
 /// The credentials of the configured gateway an originate is aimed at, if any.

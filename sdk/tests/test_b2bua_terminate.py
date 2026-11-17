@@ -67,6 +67,27 @@ def on_ivr_dtmf(call_id, from_tag, digit, duration_ms, volume):
             {"call_id": "call-abc@example.com", "reason": "Normal Clearing"}
         ]
 
+    def test_terminate_takes_the_call_id_originate_returned(self, harness):
+        # Ringing two of a user's clients and giving up on one while it rings:
+        # the leg is named by the Call-ID b2bua.originate() returned. On a real
+        # node that is a CANCEL of the leg's INVITE (RFC 3261 section 9.1).
+        import siphon
+
+        first = siphon.b2bua.originate("sip:alice@192.0.2.10", media=True)
+        second = siphon.b2bua.originate("sip:alice@192.0.2.11", media=True)
+        assert first != second
+
+        assert siphon.b2bua.terminate(second, reason="answered elsewhere") is True
+        assert harness.b2bua.terminates == [
+            {"call_id": second, "reason": "answered elsewhere"}
+        ]
+
+    def test_docstring_says_what_goes_on_the_wire(self, harness):
+        import siphon
+
+        doc = siphon.b2bua.terminate.__doc__
+        assert "CANCEL" in doc and "BYE" in doc and "9.1" in doc
+
     def test_reset_clears_recorded_terminates(self, harness):
         import siphon
 
