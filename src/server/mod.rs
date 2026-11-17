@@ -649,7 +649,12 @@ impl SiphonServer {
         // Whole-process liveness, which the pool watchdog cannot judge.
         crate::script::liveness::start_from_config(&config.script);
 
-        dispatcher::inject_python_singletons(&config);
+        // One manager for the `cache` namespace, subscribe_state and LCR: one
+        // connection and one reachability state per configured cache.
+        let cache_manager = Arc::new(crate::cache::CacheManager::new(
+            config.cache.as_deref().unwrap_or(&[]),
+        ));
+        dispatcher::inject_python_singletons_with_cache(&config, Arc::clone(&cache_manager));
         // Media-engine async event channel (DTMF, media-timeout). Created before
         // init_rtpengine so the native siphon-rtp backend can forward events from
         // its control connection over the same channel the rtpengine NG event
@@ -1081,9 +1086,6 @@ impl SiphonServer {
         // Source-script apps masked the bug because file-watcher reloads
         // re-run install_siphon_module after the singleton is set.
         {
-            let cache_manager = std::sync::Arc::new(crate::cache::CacheManager::new(
-                config.cache.as_deref().unwrap_or(&[]),
-            ));
             let mut store = crate::subscribe_state::SubscribeStore::new();
             if let Some(ref cfg) = config.subscribe_state {
                 if let Some(ref cache_name) = cfg.cache {
@@ -1173,16 +1175,12 @@ impl SiphonServer {
         // siphon caches it and executes the ordered route set against the
         // gateway health/failover machinery.
         if let Some(ref lcr_config) = config.lcr {
-            // The LCR client keeps its own CacheManager over the same `cache:`
-            // config. Its L2 (Redis) is shared by key with every replica, so a
-            // decision cached on one node is reused fleet-wide; only the L1 LRU
-            // is process-local (fine — the `lcr` cache isn't touched via the
-            // `cache` namespace).
+            // Its L2 (Redis) is shared by key with every replica, so a decision
+            // cached on one node is reused fleet-wide; the L1 LRU is
+            // process-local.
             let (cache_handle, cache_name) = match lcr_config.cache.as_ref() {
                 Some(name) => {
-                    let manager = Arc::new(crate::cache::CacheManager::new(
-                        config.cache.as_deref().unwrap_or(&[]),
-                    ));
+                    let manager = Arc::clone(&cache_manager);
                     if manager.has_cache(name) {
                         (Some(manager), Some(name.clone()))
                     } else {
@@ -2541,6 +2539,8 @@ impl SiphonServer {
         for participant in std::mem::take(&mut self.lifecycle_participants) {
             drain.participants.register(participant);
         }
+        // Probes each cache's Redis; `/admin/ready` is 503 while one is down.
+        cache_manager.watch_backends(&drain.participants);
 
         // --- HTTP admin API (health/readiness probes + registration inspection) ---
         let config_reloader = config_document.map(|(path, document)| {
