@@ -470,6 +470,24 @@ a line break or NUL is refused too. The control plane's `answer`, `ring`,
 `progress` and `reject` verbs take the same `headers` object with the same
 rules ([control plane](control-plane.md)).
 
+The session timer of a call siphon answers itself is asked for with
+`call.session_timer()`, not with those headers. Called before `call.answer()`
+in the same handler, with nothing dialled and nothing handed over, it is
+negotiated against the caller's INVITE (RFC 4028 §9) and runs on the caller's
+dialog, the only one the call has. After
+`call.session_timer(expires=1800, min_se=90, refresher="uac")` a caller that
+lists `timer` in `Supported` and asks for no interval of its own gets
+`Session-Expires: 1800;refresher=uac` and `Require: timer` on the 200, and is
+released with a BYE 32 s before a session it did not refresh runs out (§10);
+with `refresher="uas"` or `"b2bua"` siphon refreshes that caller itself.
+
+What the caller asked for comes first, as §9 has it. A `Session-Expires`
+shorter than `expires` is the interval, and a refresher the caller named
+stands. A caller that does not support the extension cannot refresh: siphon
+refreshes it when it asked for an interval, or when `refresher` is `"uas"` or
+`"b2bua"`, and its dialog runs no session timer at all when it asked for none
+and `refresher` is `"uac"`.
+
 ## The Contact of siphon's own answer: `contact=`
 
 The Contact stays siphon's to build, but a script that answers the call itself

@@ -429,6 +429,8 @@ mod transfer_bye_tests;
 #[cfg(test)]
 mod transfer_ingress_tests;
 #[cfg(test)]
+mod uas_answer_session_timer_tests;
+#[cfg(test)]
 mod uas_bad_extension_tests;
 #[cfg(test)]
 mod uas_contact_tests;
