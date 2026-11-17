@@ -248,7 +248,11 @@ admin:
   mid-drain would make the orchestrator kill the node before it finished draining.
 - **Readiness:** `GET http://<node>:9091/admin/ready` → `200` normally, **`503`
   while draining** (after `SIGTERM`) so a load balancer / Kubernetes pulls the node
-  from rotation before it stops accepting new INVITEs.
+  from rotation before it stops accepting new INVITEs. Also `503` with
+  `{"status": "not_ready", "reason": "cache '<name>': Redis backend unreachable"}`
+  while the Redis of a configured `cache:` entry does not answer (see
+  [Cache backend health](#cache-backend-health)). A node with no `cache:` is
+  not affected.
 
 #### TLS and `protect_reads`
 
@@ -445,6 +449,43 @@ That's enough to run a redundant SIPhon `StatefulSet` behind a `Service`. Scale 
 `replicas`; pair it with subscriber-affinity at your ingress if you need any-pod
 terminating delivery. Anything fancier (HPA on cps, per-pod SRV, Diameter SCTP) is a
 deployment-specific exercise, not something to bake into a starter manifest.
+
+### Cache backend health
+
+Each `cache:` entry keeps one connection to its Redis and probes it with `PING`
+once a second, used or not. When the server goes away (restart, failover,
+network), the connection is redialled; nothing has to be restarted.
+
+- **While it is unreachable**, cache calls fail at once instead of each waiting
+  on a connect: `cache.fetch` returns `None`, `cache.store` / `cache.delete`
+  return `False`. Each is counted in `siphon_cache_errors_total{cache,op}`, the
+  gauge `siphon_cache_backend_up{cache}` reads `0`, and the outage is logged
+  once at `error`, the recovery once at `info`.
+- **Readiness follows it.** `/admin/ready` answers `503` naming the cache, from
+  process start until its Redis first answers and again whenever it is
+  unreachable, so an orchestrator stops sending the node traffic its script
+  would mishandle (a `fetch` that returns `None` for a key that exists).
+  `/admin/health` does not change: restarting the process would not bring Redis
+  back.
+- **Opt a cache out** with `required_for_readiness: false` when the node can
+  serve without it (an optional lookup, a best-effort counter). With one Redis
+  shared by every node, a required cache takes all of them out of rotation
+  together when that Redis is down; decide per cache whether a node without it
+  is better than no node.
+- **A command caught by a dropped connection** is sent again once on the new
+  connection when that is safe: `fetch`, `store`, `delete`, `exists`, `expire`,
+  `list_len`, `list_len_sum`. `list_push` and `list_pop_all` are not repeated
+  (a repeat could queue an item twice, or drop the items the first attempt
+  already removed): they report failure once and the next call works.
+
+```yaml
+cache:
+  - name: flows            # routing state: no Redis, not ready
+    url: "redis://redis.example.com:6379"
+  - name: cnam             # optional lookup: keep serving without it
+    url: "redis://redis.example.com:6379"
+    required_for_readiness: false
+```
 
 ### Redis / Valkey Sentinel
 

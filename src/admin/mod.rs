@@ -1884,6 +1884,43 @@ mod tests {
         assert_eq!(json["reason"], "no upstream peer up");
     }
 
+    /// A configured cache whose Redis refuses takes the node out of rotation
+    /// through the probe an orchestrator reads.
+    #[cfg(feature = "redis-backend")]
+    #[tokio::test]
+    async fn ready_returns_503_while_a_configured_cache_cannot_reach_its_redis() {
+        let (state, drain) = state_with_participants(&[]);
+        let caches = Arc::new(crate::cache::CacheManager::new(&[
+            crate::config::NamedCacheConfig {
+                name: "admin_ready_flows".to_string(),
+                // Nothing listens on port 1: every connect is refused.
+                target: ("redis://127.0.0.1:1".to_string()).into(),
+                local_ttl_secs: None,
+                local_max_entries: None,
+                required_for_readiness: true,
+            },
+        ]));
+        caches.watch_backends(&drain.participants);
+        let mut last = serde_json::Value::Null;
+        for _ in 0..200 {
+            let response = router(state.clone(), None, false)
+                .oneshot(Request::get("/admin/ready").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            last = json_of(response).await;
+            if last["reason"] == "cache 'admin_ready_flows': Redis backend unreachable" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(last["status"], "not_ready");
+        assert_eq!(
+            last["reason"],
+            "cache 'admin_ready_flows': Redis backend unreachable"
+        );
+    }
+
     #[tokio::test]
     async fn ready_is_200_when_every_participant_is_ready() {
         use crate::lifecycle::test_support::FakeParticipant;

@@ -313,7 +313,7 @@ shutdown behave as they always have.
 
 | Where | What siphon does with the participants |
 |---|---|
-| `GET /admin/ready` | 200, unless draining (503 `draining`) or a participant's `ready()` returns `Err`: 503 `{"status": "not_ready", "reason": "<first reason>"}`, polled in registration order |
+| `GET /admin/ready` | 200, unless draining (503 `draining`) or a participant's `ready()` returns `Err`: 503 `{"status": "not_ready", "reason": "<first reason>"}`, polled in registration order. The configured `cache:` entries are one built-in participant, registered after the host's own |
 | `POST /admin/drain`, `DELETE /admin/drain` | `set_draining(true)` / `set_draining(false)` on every participant |
 | SIGTERM / SIGINT | `set_draining(true)` on every participant, then the exit is held while SIP transactions, B2BUA calls and the sum of `outstanding()` are above zero |
 | `server.drain_secs` expires | the calls still up are ended as before, then `force()` is called once on every participant and the process exits. With `drain_secs: 0` the participants are told and forced at once |

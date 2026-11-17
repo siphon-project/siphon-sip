@@ -917,7 +917,24 @@ pub async fn run(
 
 /// Create Rust-backed auth, registrar, log, and proxy utility singletons
 /// and inject them into the Python `siphon` module, replacing the Python stubs.
+///
+/// The `cache` namespace gets a cache manager of its own, which nothing
+/// probes: it finds a lost Redis again through its own commands. The server
+/// shares one manager between the namespace and its other users and watches
+/// it ([`crate::cache::CacheManager::watch_backends`]).
 pub fn inject_python_singletons(config: &Config) {
+    let cache_manager = Arc::new(crate::cache::CacheManager::new(
+        config.cache.as_deref().unwrap_or(&[]),
+    ));
+    inject_python_singletons_with_cache(config, cache_manager);
+}
+
+/// [`inject_python_singletons`] with the cache manager (local LRU + optional
+/// Redis) the `cache` namespace reads and writes through.
+pub(crate) fn inject_python_singletons_with_cache(
+    config: &Config,
+    cache_manager: Arc<crate::cache::CacheManager>,
+) {
     let dns_resolver = Arc::new(match SipResolver::from_system() {
         Ok(resolver) => resolver,
         Err(error) => {
@@ -1033,10 +1050,6 @@ pub fn inject_python_singletons(config: &Config) {
     let py_proxy_utils = crate::script::api::proxy_utils::PyProxyUtils::new(dns_resolver)
         .with_enum_servers(enum_servers);
 
-    // Cache namespace (local LRU + optional Redis)
-    let cache_manager = std::sync::Arc::new(crate::cache::CacheManager::new(
-        config.cache.as_deref().unwrap_or(&[]),
-    ));
     let py_cache = crate::script::api::cache::PyCacheNamespace::new(cache_manager);
 
     // Store singletons in the global so install_siphon_module() will inject

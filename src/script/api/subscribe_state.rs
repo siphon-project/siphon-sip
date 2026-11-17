@@ -1699,6 +1699,7 @@ mod tests {
                 target: ("redis://127.0.0.1:1".to_string()).into(),
                 local_ttl_secs: Some(60),
                 local_max_entries: Some(16),
+                required_for_readiness: true,
             },
         ]));
 
