@@ -137,8 +137,8 @@ impl BackendHealth {
 }
 
 /// The caches as a readiness participant: not ready while the Redis backend of
-/// any cache that counts towards readiness is unreachable or was never
-/// reached. A cache holds no sessions, so it takes no part in drain.
+/// any cache marked `required_for_readiness` is unreachable or was never
+/// reached. Ready whatever their state when none is marked. A cache holds no sessions, so it takes no part in drain.
 pub(super) struct CacheReadiness {
     pub(super) backends: Vec<Arc<BackendHealth>>,
 }

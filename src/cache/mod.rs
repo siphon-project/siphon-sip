@@ -589,10 +589,11 @@ impl CacheManager {
     /// Starts one monitor task per cache, which probes the backend once a
     /// second until the manager is dropped, and registers the caches with
     /// `participants`: `/admin/ready` then answers 503 while the backend of a
-    /// cache that counts towards readiness (`required_for_readiness`, on by
-    /// default) is unreachable or has not answered yet. Does nothing, and
-    /// registers nothing, when no cache is configured. Must be called from
-    /// inside a Tokio runtime.
+    /// cache marked `required_for_readiness` (off by default) is unreachable
+    /// or has not answered yet. A cache not marked is probed and measured the
+    /// same and never holds readiness back. Does nothing, and registers
+    /// nothing, when no cache is configured. Must be called from inside a
+    /// Tokio runtime.
     pub fn watch_backends(&self, participants: &crate::lifecycle::Participants) {
         #[cfg(feature = "redis-backend")]
         {
@@ -731,7 +732,7 @@ mod tests {
             target: ("redis://127.0.0.1:1".to_string()).into(),
             local_ttl_secs: ttl_secs,
             local_max_entries: max_entries,
-            required_for_readiness: true,
+            required_for_readiness: false,
         }
     }
 
@@ -761,7 +762,7 @@ mod tests {
             target: ("redis://127.0.0.1:1".to_string()).into(),
             local_ttl_secs: Some(0), // 0-second TTL = expires immediately
             local_max_entries: Some(100),
-            required_for_readiness: true,
+            required_for_readiness: false,
         }];
         let manager = CacheManager::new(&configs);
 
@@ -903,17 +904,17 @@ mod tests {
     }
 
     #[test]
-    fn a_cache_counts_towards_readiness_unless_configured_not_to() {
+    fn a_cache_counts_towards_readiness_only_when_configured_to() {
         let caches: Vec<NamedCacheConfig> = crate::config::yaml::from_str(concat!(
-            "- name: flows\n",
-            "  url: redis://192.0.2.10:6379\n",
             "- name: cnam\n",
             "  url: redis://192.0.2.10:6379\n",
-            "  required_for_readiness: false\n",
+            "- name: flows\n",
+            "  url: redis://192.0.2.10:6379\n",
+            "  required_for_readiness: true\n",
         ))
         .expect("cache list");
-        assert!(caches[0].required_for_readiness);
-        assert!(!caches[1].required_for_readiness);
+        assert!(!caches[0].required_for_readiness);
+        assert!(caches[1].required_for_readiness);
     }
 
     /// The readiness wiring end to end, with a Redis that refuses: the
@@ -936,18 +937,25 @@ mod tests {
             );
         };
 
-        let mut optional = make_config("mod_tests_optional", None, None);
-        optional.required_for_readiness = false;
+        // As configured by default: probed, found down, readiness untouched.
+        let optional = make_config("mod_tests_optional", None, None);
         let manager = std::sync::Arc::new(CacheManager::new(&[optional]));
         let participants = std::sync::Arc::new(crate::lifecycle::Participants::default());
         manager.watch_backends(&participants);
-        wait(std::sync::Arc::clone(&participants), None).await;
+        assert_eq!(participants.not_ready_reason(), None, "before the probe");
+        for _ in 0..200 {
+            if !manager.caches["mod_tests_optional"].health.admit() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(!manager.caches["mod_tests_optional"].health.admit());
+        assert!(!crate::metrics::cache::backend_up("mod_tests_optional"));
+        assert_eq!(participants.not_ready_reason(), None, "and once it is down");
 
-        let manager = std::sync::Arc::new(CacheManager::new(&[make_config(
-            "mod_tests_required",
-            None,
-            None,
-        )]));
+        let mut required = make_config("mod_tests_required", None, None);
+        required.required_for_readiness = true;
+        let manager = std::sync::Arc::new(CacheManager::new(&[required]));
         let participants = std::sync::Arc::new(crate::lifecycle::Participants::default());
         manager.watch_backends(&participants);
         wait(

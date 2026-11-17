@@ -24,7 +24,7 @@ SIPhon exports built-in gauges/counters; the ones worth alerting on:
 | `siphon_pyexec_pool_size` vs `_pool_max` | pinned equal + all busy for minutes | Pool fully grown and saturated |
 | `siphon_proxy_dialog_sessions` | grows under flat completed-call load | Dialog state not draining |
 | `siphon_rtpengine_instances_up` | drops below your engine count | An RTPEngine is unhealthy |
-| `siphon_cache_backend_up{cache}` | `== 0` | That cache's Redis is unreachable: every `cache.fetch` on it returns `None` and the node reports not ready. `siphon_cache_errors_total{cache,op}` counts the calls that failed |
+| `siphon_cache_backend_up{cache}` | `== 0` | That cache's Redis is unreachable: every `cache.fetch` on it returns `None`. The node stays ready unless the cache is marked `required_for_readiness: true`, so alert on this. `siphon_cache_errors_total{cache,op}` counts the calls that failed |
 | `siphon_diameter_peer_up{peer}` | `== 0` | That named peer is down. The bare `siphon_diameter_peers_connected` count cannot say which one |
 | `siphon_diameter_answers_total{result_code!~"2.*"}` | `rate() > 0` | A peer is reachable and refusing. `siphon_diameter_request_errors_total` counts transport failures only, so this reads zero there |
 | `siphon_ro_denials_total` | `rate() > 0` | Calls being refused credit by the OCS |
@@ -72,7 +72,7 @@ admin:
 | Endpoint | Use |
 |---|---|
 | `GET /admin/health` | liveness — `200` while the process is alive (survives drain) |
-| `GET /admin/ready` | readiness — `200`, or **`503` while draining** (SIGTERM) or while the Redis of a `cache:` entry is unreachable (`required_for_readiness`, on by default) |
+| `GET /admin/ready` | readiness — `200`, or **`503` while draining** (SIGTERM) or while the Redis of a `cache:` entry marked `required_for_readiness: true` is unreachable (no cache is marked by default) |
 | `GET /admin/stats` | uptime + active registration count |
 | `GET /admin/registrations[/{aor}]` | inspect bindings |
 | `DELETE /admin/registrations/{aor}` | force-unregister |

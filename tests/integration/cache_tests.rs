@@ -13,7 +13,7 @@ fn make_config(name: &str, ttl_secs: u64, max_entries: usize) -> NamedCacheConfi
         target: ("redis://127.0.0.1:1".to_string()).into(),
         local_ttl_secs: Some(ttl_secs),
         local_max_entries: Some(max_entries),
-        required_for_readiness: true,
+        required_for_readiness: false,
     }
 }
 

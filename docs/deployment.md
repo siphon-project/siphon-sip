@@ -250,9 +250,9 @@ admin:
   while draining** (after `SIGTERM`) so a load balancer / Kubernetes pulls the node
   from rotation before it stops accepting new INVITEs. Also `503` with
   `{"status": "not_ready", "reason": "cache '<name>': Redis backend unreachable"}`
-  while the Redis of a configured `cache:` entry does not answer (see
-  [Cache backend health](#cache-backend-health)). A node with no `cache:` is
-  not affected.
+  while the Redis of a `cache:` entry marked `required_for_readiness: true`
+  does not answer (see [Cache backend health](#cache-backend-health)). No cache
+  is marked by default, so a node is not affected unless its config says so.
 
 #### TLS and `protect_reads`
 
@@ -461,17 +461,19 @@ network), the connection is redialled; nothing has to be restarted.
   return `False`. Each is counted in `siphon_cache_errors_total{cache,op}`, the
   gauge `siphon_cache_backend_up{cache}` reads `0`, and the outage is logged
   once at `error`, the recovery once at `info`.
-- **Readiness follows it.** `/admin/ready` answers `503` naming the cache, from
-  process start until its Redis first answers and again whenever it is
-  unreachable, so an orchestrator stops sending the node traffic its script
-  would mishandle (a `fetch` that returns `None` for a key that exists).
-  `/admin/health` does not change: restarting the process would not bring Redis
+- **Readiness does not follow it unless you say so.** By default a cache whose
+  Redis is down leaves `/admin/ready` at `200`: the gauge and the error counter
+  are the signal, and the node keeps serving whatever does not need the cache.
+- **Mark a cache the node cannot serve without** with
+  `required_for_readiness: true` (routing state a script reads, where a `fetch`
+  returning `None` for a key that exists means a wrong answer). `/admin/ready`
+  then answers `503` naming the cache, from process start until its Redis first
+  answers and again whenever it is unreachable, so an orchestrator stops
+  sending the node traffic. With one Redis shared by every node, a required
+  cache takes all of them out of rotation together when that Redis is down;
+  decide per cache whether a node without it is better than no node.
+  `/admin/health` never changes: restarting the process would not bring Redis
   back.
-- **Opt a cache out** with `required_for_readiness: false` when the node can
-  serve without it (an optional lookup, a best-effort counter). With one Redis
-  shared by every node, a required cache takes all of them out of rotation
-  together when that Redis is down; decide per cache whether a node without it
-  is better than no node.
 - **A command caught by a dropped connection** is sent again once on the new
   connection when that is safe: `fetch`, `store`, `delete`, `exists`, `expire`,
   `list_len`, `list_len_sum`. `list_push` and `list_pop_all` are not repeated
@@ -482,9 +484,9 @@ network), the connection is redialled; nothing has to be restarted.
 cache:
   - name: flows            # routing state: no Redis, not ready
     url: "redis://redis.example.com:6379"
-  - name: cnam             # optional lookup: keep serving without it
+    required_for_readiness: true
+  - name: cnam             # optional lookup: keep serving without it (default)
     url: "redis://redis.example.com:6379"
-    required_for_readiness: false
 ```
 
 ### Redis / Valkey Sentinel
