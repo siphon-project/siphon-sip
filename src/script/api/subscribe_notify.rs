@@ -32,6 +32,7 @@ pub(crate) async fn notify_expired(store: &Arc<SubscribeStore>, mut dialog: Subs
         None,
         None,
         None,
+        &[],
     )
     .await
     {
@@ -47,6 +48,7 @@ pub(super) async fn send_notify(
     content_type: Option<&str>,
     body: Option<&[u8]>,
     gate: Option<&ReplyGate>,
+    extra_headers: &[(String, String)],
 ) -> PyResult<()> {
     let uac_sender = UAC_SENDER.get().ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(
@@ -67,6 +69,7 @@ pub(super) async fn send_notify(
         content_type,
         body,
         gate,
+        extra_headers,
     )
     .await
 }
@@ -86,6 +89,7 @@ pub(super) async fn send_notify_through(
     content_type: Option<&str>,
     body: Option<&[u8]>,
     gate: Option<&ReplyGate>,
+    extra_headers: &[(String, String)],
 ) -> PyResult<()> {
     // Determine transport destination: first Route URI or remote_target.
     let ruri = parse_uri_standalone(&dialog.remote_target).map_err(|error| {
@@ -190,6 +194,9 @@ pub(super) async fn send_notify_through(
 
     for route in &dialog.route_set {
         builder = builder.header("Route", route.clone());
+    }
+    for (name, value) in extra_headers {
+        builder = builder.header(name, value.clone());
     }
 
     if let Some(ct) = content_type {
