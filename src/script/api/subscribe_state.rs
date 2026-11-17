@@ -564,21 +564,25 @@ impl PySubscribeHandle {
     /// ``state`` is the full ``Subscription-State`` header value.  When
     /// omitted, siphon emits ``active;expires=<remaining>``.  Set it
     /// explicitly for ``pending``, ``active;expires=N;reason=...``, or
-    /// to override the expiry.
+    /// to override the expiry.  ``headers`` is a ``{name: value}`` mapping
+    /// of ``str`` added to the NOTIFY in its order.  A header siphon owns on
+    /// it raises ``ValueError``, a non-``str`` ``TypeError``; nothing is sent.
     ///
     /// Returns ``True`` on success.  Raises ``LookupError`` when the dialog is
     /// unknown — terminated, or reaped on expiry — since sending a NOTIFY in a
     /// dialog that no longer exists is a script bug, not a quiet no-op.  The
     /// ``False`` return is the narrow race where it went away between the
     /// lookup and the CSeq bump.
-    #[pyo3(signature = (body=None, content_type=None, state=None))]
+    #[pyo3(signature = (body=None, content_type=None, state=None, headers=None))]
     fn notify<'py>(
         &self,
         python: Python<'py>,
         body: Option<&Bound<'_, PyAny>>,
         content_type: Option<&str>,
         state: Option<&str>,
+        headers: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let headers = super::notify_headers::from_script("notify", headers)?;
         // Read the body here: a `Bound` cannot cross into the future. The CSeq
         // bump stays here too, so two NOTIFYs a script sends in order keep
         // their order.
@@ -603,6 +607,7 @@ impl PySubscribeHandle {
                 content_type.as_deref(),
                 body_bytes.as_deref(),
                 gate.as_deref(),
+                &headers,
             )
             .await?;
             Ok(true)
@@ -616,7 +621,7 @@ impl PySubscribeHandle {
     /// ``Subscription-State: terminated;reason=<reason>`` (RFC 6665
     /// §4.2.2), and the dialog is marked terminated and removed from the
     /// store. ``reason`` defaults to ``"noresource"`` and is only used on
-    /// this path.
+    /// this path, as is ``headers``, which is as for :meth:`notify`.
     ///
     /// For dialogs we originated as the watcher (the
     /// :meth:`SubscribeStateNamespace.send` flow), this sends a
@@ -627,14 +632,16 @@ impl PySubscribeHandle {
     /// :meth:`SubscribeStateNamespace.find` and answers 200, and siphon
     /// removes it when the handler has returned. If no such NOTIFY comes
     /// within Timer N (32 s), siphon removes it anyway.
-    #[pyo3(signature = (reason=None, body=None, content_type=None))]
+    #[pyo3(signature = (reason=None, body=None, content_type=None, headers=None))]
     fn terminate<'py>(
         &self,
         python: Python<'py>,
         reason: Option<&str>,
         body: Option<&Bound<'_, PyAny>>,
         content_type: Option<&str>,
+        headers: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let headers = super::notify_headers::from_script("terminate", headers)?;
         let body_bytes = match body {
             Some(obj) => Some(super::request::extract_body_bytes(obj)?),
             None => None,
@@ -665,6 +672,7 @@ impl PySubscribeHandle {
                     content_type.as_deref(),
                     body_bytes.as_deref(),
                     gate.as_deref(),
+                    &headers,
                 )
                 .await?;
             }
@@ -894,7 +902,8 @@ pub(crate) async fn notify_expired(mut dialog: SubscribeDialog) {
         return;
     }
     dialog.next_cseq();
-    if let Err(error) = send_notify(&dialog, "terminated;reason=timeout", None, None, None).await {
+    let state = "terminated;reason=timeout";
+    if let Err(error) = send_notify(&dialog, state, None, None, None, &[]).await {
         tracing::error!(id = %dialog.id, %error, "failed to notify subscription expiry");
     }
 }
@@ -916,6 +925,7 @@ async fn send_notify(
     content_type: Option<&str>,
     body: Option<&[u8]>,
     gate: Option<&ReplyGate>,
+    extra_headers: &[(String, String)],
 ) -> PyResult<()> {
     let uac_sender = UAC_SENDER.get().ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(
@@ -1029,6 +1039,9 @@ async fn send_notify(
 
     for route in &dialog.route_set {
         builder = builder.header("Route", route.clone());
+    }
+    for (name, value) in extra_headers {
+        builder = builder.header(name, value.clone());
     }
 
     if let Some(ct) = content_type {

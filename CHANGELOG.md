@@ -70,6 +70,7 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`handle.notify(headers=)` and `handle.terminate(headers=)` on a `proxy.subscribe_state` subscription.** A `{name: value}` mapping of `str` added to the NOTIFY siphon sends as the notifier, in the order the mapping gives them, for what an event package or its profile puts on a notification: the identity it is sent under and the service it belongs to (`P-Asserted-Identity`, RFC 3325 §9.1; `P-Asserted-Service`, RFC 6050 §4.2). The headers that make the NOTIFY a request of the subscription's dialog stay siphon's (RFC 3261 §12.2.1.1, RFC 6665 §4.2.1.2): `Via`, `From`, `To`, `Call-ID`, `CSeq`, `Contact`, `Route`, `Max-Forwards`, `Content-Length`, `Content-Type`, `Event` and `Subscription-State`, in any case or compact form, raise `ValueError` naming the header, and a name or value that is not a `str` raises `TypeError`. Nothing is sent on a refusal, no CSeq is used and a refused `terminate()` leaves the subscription standing. The NOTIFY of an expired subscription carries no script headers. The SDK mock checks the same way and records the headers on `notifies` / `terminates`.
 - **`script.gc`: freeze startup objects and raise the collection threshold.**
   On free-threaded Python every garbage collection stops all threads and
   walks the whole heap, so it takes as long as the heap is large (about 35 ms

@@ -432,6 +432,51 @@ def _resource_uri(value: Any) -> str:
     return text.split(";")[0].strip()
 
 
+# The headers siphon owns on a NOTIFY it sends inside a subscription; mirrors
+# ``src/script/api/notify_headers.rs``. Compact forms fold to their long names.
+_NOTIFIER_OWNED = frozenset((
+    "via", "from", "to", "call-id", "cseq", "contact", "route", "max-forwards",
+    "content-length", "content-type", "event", "subscription-state",
+))
+_NOTIFY_COMPACT_FORMS = {
+    "v": "via", "f": "from", "t": "to", "i": "call-id", "m": "contact",
+    "l": "content-length", "c": "content-type", "o": "event",
+}
+_HEADER_NAME_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-.!%*_+`'~"
+)
+
+
+def _notify_headers(method: str, headers: Optional[dict]) -> dict:
+    """Check the ``headers=`` of ``handle.notify()`` / ``handle.terminate()``
+    the way siphon does, and return them in the order given."""
+    if headers is None:
+        return {}
+    if not isinstance(headers, dict):
+        # siphon takes a dict and nothing else that quacks like one.
+        raise TypeError(
+            f"{method}(headers=…) takes a dict, got {type(headers).__name__}"
+        )
+    for name, value in headers.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise TypeError(
+                f"{method}(headers=…) takes a mapping of str header names to str values"
+            )
+        if not name or any(character not in _HEADER_NAME_CHARACTERS for character in name):
+            raise ValueError(f"{method}(headers=…): '{name}' is not a SIP header name")
+        if any(character in value for character in "\r\n\0"):
+            raise ValueError(
+                f"{method}(headers=…): the value of {name} contains a line break or NUL"
+            )
+        lowered = name.lower()
+        if _NOTIFY_COMPACT_FORMS.get(lowered, lowered) in _NOTIFIER_OWNED:
+            raise ValueError(
+                f"{method}(headers=…): {name} cannot be set by a script on a "
+                f"NOTIFY of a subscription"
+            )
+    return dict(headers)
+
+
 class MockSubscribeHandle:
     """Mock of the Rust ``SubscribeHandle``.
 
@@ -513,7 +558,46 @@ class MockSubscribeHandle:
         return _run()
 
     def notify(self, body=None, content_type: Optional[str] = None,
-               state: Optional[str] = None) -> bool:
+               state: Optional[str] = None,
+               headers: Optional[dict[str, str]] = None) -> bool:
+        """Send a NOTIFY in the subscription. Recorded on the parent's
+        ``notifies`` (``id``, ``body``, ``content_type``, ``state``,
+        ``headers``).
+
+        ``state`` is the whole ``Subscription-State`` value; left out it is
+        ``active;expires=<remaining>``.
+
+        ``headers`` is a ``dict`` of headers added to the NOTIFY, in its
+        order: what the event package or its profile puts on a notification,
+        such as the identity it is sent under (``P-Asserted-Identity``, RFC
+        3325) and the service it belongs to (``P-Asserted-Service``, RFC
+        6050). The order holds among the headers themselves; like every
+        message siphon writes, the NOTIFY keeps its ``Content-*`` headers
+        last, so a ``Content-Language`` goes there wherever the dict has it::
+
+            await handle.notify(
+                body=conference_info,
+                content_type="application/conference-info+xml",
+                headers={
+                    "P-Asserted-Identity": "<sip:group@example.com>",
+                    "P-Asserted-Service": "urn:urn-7:3gpp-service.ims.icsi.mcptt",
+                },
+            )
+
+        siphon owns the headers that make the NOTIFY a request of the
+        subscription's dialog (RFC 3261 section 12.2.1.1, RFC 6665 section
+        4.2.1.2): ``Via``, ``From``, ``To``, ``Call-ID``, ``CSeq``,
+        ``Contact``, ``Route``, ``Max-Forwards``, ``Content-Length``,
+        ``Content-Type`` (pass ``content_type=``), ``Event`` and
+        ``Subscription-State`` (pass ``state=``). Naming one, in any case or
+        compact form, raises ``ValueError`` saying which; a name or value
+        that is not a ``str`` raises ``TypeError``. Nothing is sent and the
+        CSeq is not used up in either case.
+
+        Raises ``LookupError`` when the subscription is gone.
+        """
+        checked = _notify_headers("notify", headers)
+
         async def _run():
             # Raises like the native handle: a NOTIFY in a dialog that is gone
             # is a script bug, and a False return would hide it.
@@ -523,6 +607,7 @@ class MockSubscribeHandle:
                 "body": body,
                 "content_type": content_type,
                 "state": state or f"active;expires={self.expires}",
+                "headers": checked,
             }
             self._parent.notifies.append(entry)
             return True
@@ -530,11 +615,20 @@ class MockSubscribeHandle:
         return _run()
 
     def terminate(self, reason: Optional[str] = None,
-                  body=None, content_type: Optional[str] = None) -> bool:
+                  body=None, content_type: Optional[str] = None,
+                  headers: Optional[dict[str, str]] = None) -> bool:
         """Terminate the subscription. Recorded on the parent's ``terminates``.
 
         A dialog accepted from a SUBSCRIBE (notifier role) gets its final
-        NOTIFY and is removed at once.
+        NOTIFY and is removed at once. ``headers`` adds headers to that
+        NOTIFY, checked as for :meth:`notify`: a header siphon owns raises
+        ``ValueError`` and a non-``str`` raises ``TypeError``, with nothing
+        sent and the subscription left standing::
+
+            await handle.terminate(
+                reason="deactivated",
+                headers={"P-Asserted-Identity": "<sip:group@example.com>"},
+            )
 
         A subscription made with ``send()`` (watcher role) is unsubscribed:
         siphon sends SUBSCRIBE with ``Expires: 0``, and the subscription is
@@ -551,6 +645,8 @@ class MockSubscribeHandle:
         comes; in a test, deliver the NOTIFY or call
         ``proxy.subscribe_state.expire_unanswered()``.
         """
+        checked = _notify_headers("terminate", headers)
+
         async def _run():
             dialog = self._live()
             reason_str = reason or "noresource"
@@ -559,6 +655,7 @@ class MockSubscribeHandle:
                 "reason": reason_str,
                 "body": body,
                 "content_type": content_type,
+                "headers": checked,
             })
             if dialog.get("is_outbound"):
                 dialog["unsubscribed"] = True

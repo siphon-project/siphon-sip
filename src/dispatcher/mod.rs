@@ -264,6 +264,8 @@ mod media_summary_bridge_tests;
 #[cfg(test)]
 mod media_summary_event_tests;
 #[cfg(test)]
+mod notify_headers_tests;
+#[cfg(test)]
 mod on_provisional_tests;
 #[cfg(test)]
 mod originate_ack_retransmit_tests;
