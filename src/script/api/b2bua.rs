@@ -36,6 +36,11 @@ impl PyB2buaControl {
     /// `@rtpengine.on_media_timeout`), a timer, or a normal handler — none of
     /// which give `call.terminate()` a handler-return to act on.
     ///
+    /// A leg placed with `b2bua.originate()` whose INVITE has no final
+    /// response is ended with a CANCEL of that INVITE instead (RFC 3261
+    /// §9.1), sent once the INVITE has drawn a provisional; a 2xx that
+    /// crosses it is ACKed and released with a BYE.
+    ///
     /// Returns True if a matching call was found and torn down, False if the
     /// Call-ID is unknown / already gone (e.g. the caller hung up first) — never
     /// raises, so racing a caller-initiated BYE is a clean no-op.

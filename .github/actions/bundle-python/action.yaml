@@ -1,0 +1,41 @@
+# Stage the free-threaded CPython the packages ship (scripts/bundle-python.sh,
+# pinned by version and SHA-256) and point PyO3, the linker, rustdoc and the
+# loader at it for the rest of the job.
+#
+# Every job that builds or runs siphon uses this, so CI compiles and tests
+# against the one interpreter siphon runs on: never a GIL build, never a
+# nightly, and nothing fetched from a PPA. Run it after Swatinem/rust-cache so
+# a restored target/ cannot overlay the bundle.
+name: Stage the bundled free-threaded CPython
+description: Install the pinned free-threaded CPython into target/python-bundle and export PYO3_PYTHON, RUSTFLAGS, RUSTDOCFLAGS and LD_LIBRARY_PATH.
+
+inputs:
+  extra-rustflags:
+    description: >-
+      Flags to keep in RUSTFLAGS next to the bundle's link flags. Pass them here,
+      not as a job-level `env: RUSTFLAGS`: a job-level env value wins over
+      GITHUB_ENV, which would drop the -L to libpython.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: bundle-python.sh
+      shell: bash
+      env:
+        EXTRA_RUSTFLAGS: ${{ inputs.extra-rustflags }}
+      run: |
+        bundle="$GITHUB_WORKSPACE/target/python-bundle"
+        "$GITHUB_WORKSPACE/scripts/bundle-python.sh" "$bundle"
+        flags="$("$GITHUB_WORKSPACE/scripts/bundle-python.sh" --print-rustflags "$bundle")"
+        flags="${EXTRA_RUSTFLAGS:+$EXTRA_RUSTFLAGS }$flags"
+        {
+          echo "PYO3_PYTHON=$bundle/bin/python3.14t"
+          echo "RUSTFLAGS=$flags"
+          # rustdoc links doctests with RUSTDOCFLAGS, never RUSTFLAGS, so
+          # without this every doctest fails to find -lpython3.14t.
+          echo "RUSTDOCFLAGS=$flags"
+          echo "LD_LIBRARY_PATH=$bundle/lib"
+        } >> "$GITHUB_ENV"
+        echo "$bundle/bin" >> "$GITHUB_PATH"

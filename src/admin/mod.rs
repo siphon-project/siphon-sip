@@ -406,10 +406,10 @@ async fn call_hangup_handler(Path(call_id): Path<String>) -> Response {
         })
         .unwrap_or((false, false));
 
-    let terminated = if answered {
+    // An answered call is BYEd, one siphon placed that has not answered is
+    // CANCELled (RFC 3261 §9.1): the same call decides which, against its 2xx.
+    let terminated = if answered || originated {
         crate::dispatcher::b2bua_terminate_call(&call_id, Some("admin"))
-    } else if originated {
-        crate::dispatcher::b2bua_cancel_originated_call(&call_id, Some("admin"))
     } else {
         crate::dispatcher::b2bua_reject_call(&internal_id, 603, "Decline")
     };

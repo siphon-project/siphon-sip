@@ -697,6 +697,8 @@ pub static B2BUA_CONTROL: std::sync::OnceLock<B2buaControlHandle> = std::sync::O
 
 /// Imperatively tear down a B2BUA call identified by its SIP Call-ID, sending a
 /// BYE to every leg and running the full teardown ([`b2bua_terminate_call_inner`]).
+/// A call siphon placed whose INVITE has no final response yet is CANCELled
+/// instead ([`cancel_originated_call`]).
 ///
 /// Safe to call from any thread/context (event callbacks like `@rtpengine.on_dtmf`,
 /// timers, async handlers) — unlike the deferred `call.terminate()`, which only
@@ -707,27 +709,55 @@ pub fn b2bua_terminate_call(sip_call_id: &str, reason: Option<&str>) -> bool {
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
     };
-    // A controller's channel is bound to its originate group's id while the
-    // group rings; ending it then means CANCELling every leg (RFC 3261 §9.1).
-    if control.state.originate_groups.contains(sip_call_id) {
-        let _enter = control.runtime.enter();
-        return cancel_originated_call(&control.state, sip_call_id, reason);
-    }
-    let Some(internal_call_id) = control.state.call_actors.find_by_sip_call_id(sip_call_id) else {
-        return false;
-    };
     // The caller may be on a thread with no tokio context (async-pool asyncio
     // loop, rtpengine event driver); enter the runtime so the teardown's
     // tokio::spawn calls (RTPEngine delete, Rf ACR-STOP, SIPREC unsubscribe) are
     // valid.
     let _enter = control.runtime.enter();
+    terminate_call(&control.state, sip_call_id, reason)
+}
+
+/// [`b2bua_terminate_call`] on the dispatcher the caller already holds.
+pub(crate) fn terminate_call(
+    state: &DispatcherState,
+    sip_call_id: &str,
+    reason: Option<&str>,
+) -> bool {
+    // A controller's channel is bound to its originate group's id while the
+    // group rings; ending it then means CANCELling every leg (RFC 3261 §9.1).
+    if state.originate_groups.contains(sip_call_id) {
+        return cancel_originated_call(state, sip_call_id, reason);
+    }
+    let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
+        return false;
+    };
+    // RFC 3261 §15: "the caller's UA MAY send a BYE for either confirmed or
+    // early dialogs", but a call siphon placed whose INVITE has no final
+    // response is still a pending request, and §9.1 is how a pending INVITE
+    // is ended: a BYE on the early dialog leaves the INVITE transaction open
+    // and every other early dialog a forking far end opened still ringing.
+    // So that leg is CANCELled, on its first provisional if it has drawn none
+    // yet, its 487 ACKed (§17.1.1.3) and a 2xx that crosses the CANCEL ACKed
+    // and released with a BYE.
+    let pending = || {
+        state
+            .call_actors
+            .awaits_originated_final_response(&internal_call_id)
+    };
+    if pending() {
+        if cancel_originated_call(state, sip_call_id, reason) {
+            return true;
+        }
+        // Refused. Still pending means something else is ending the call (a
+        // rejection being concluded, another hangup): it is not ended twice.
+        // Otherwise its 2xx arrived between the two looks, and the dialog
+        // that confirmed is ended below, with a BYE.
+        if pending() {
+            return false;
+        }
+    }
     let reason_header = reason.map(format_normal_clearing_reason);
-    b2bua_terminate_call_inner(
-        &internal_call_id,
-        reason_header.as_deref(),
-        "b2bua",
-        &control.state,
-    )
+    b2bua_terminate_call_inner(&internal_call_id, reason_header.as_deref(), "b2bua", state)
 }
 
 /// A test-only ordering hook for teardowns that race each other.

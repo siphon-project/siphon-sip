@@ -171,29 +171,68 @@ impl CallActorStore {
         let Some(call) = self.calls.get(call_id) else {
             return Vec::new();
         };
-        let mut pending = Vec::new();
-        if call.originated && matches!(call.state, CallState::Calling | CallState::Ringing) {
-            if let Some(invite) = call.a_leg_invite.as_ref() {
-                let mut leg = call.a_leg.clone();
-                leg.b_leg_invite = Some(Arc::clone(invite));
-                pending.push(leg);
-            }
-        }
-        pending.extend(
-            call.b_legs
-                .iter()
-                .enumerate()
-                .filter(|(index, leg)| {
-                    leg.b_leg_invite.is_some()
-                        && matches!(
-                            call.b_leg_status.get(*index),
-                            Some(BLegStatus::Trying) | Some(BLegStatus::Ringing)
-                        )
-                })
-                .map(|(_, leg)| leg.clone()),
-        );
+        let pending = pending_legs(&call);
         self.keep_answerable(&pending);
         pending
+    }
+
+    /// Give up on a call siphon placed that has not been answered: claim its
+    /// end, and keep its pending leg answerable as
+    /// [`Self::keep_pending_answerable`] does, for the caller to CANCEL.
+    ///
+    /// `None` when the call is not this caller's to give up on: it is gone,
+    /// it has been answered (a confirmed dialog is ended with a BYE, RFC 3261
+    /// §15), or its end is already claimed, by a rejection being concluded or
+    /// by another caller of this.
+    ///
+    /// Decided under the call's lock, with the claim
+    /// [`claim_failure_conclusion`](Self::claim_failure_conclusion) takes, so
+    /// that of a hangup, a ring timeout and a rejection arriving together one
+    /// ends the call and reports it. The 2xx path confirms the dialog under
+    /// the same lock ([`Self::confirm_originated_answer`]): a call is either
+    /// answered before it is given up on, and this returns `None`, or given
+    /// up on first, and its 2xx is released.
+    pub fn give_up_on_pending(&self, call_id: &str) -> Option<Vec<Leg>> {
+        let mut call = self.calls.get_mut(call_id)?;
+        if call.failure_concluding || call.state == CallState::Answered {
+            return None;
+        }
+        call.failure_concluding = true;
+        let pending = pending_legs(&call);
+        self.keep_answerable(&pending);
+        Some(pending)
+    }
+
+    /// The 2xx of a call siphon placed confirms its dialog: run `confirm` on
+    /// the call and mark it answered, under the call's lock. `false`, with
+    /// nothing run, when the call was given up on first
+    /// ([`Self::give_up_on_pending`]) or is gone: the 2xx then belongs to the
+    /// leg kept answerable, which is ACKed and released with a BYE.
+    pub fn confirm_originated_answer(
+        &self,
+        call_id: &str,
+        confirm: impl FnOnce(&mut CallActor),
+    ) -> bool {
+        let Some(mut call) = self.calls.get_mut(call_id) else {
+            return false;
+        };
+        if call.failure_concluding {
+            return false;
+        }
+        confirm(&mut call);
+        call.transition_to(CallState::Answered);
+        true
+    }
+
+    /// Whether `call_id` is a call siphon placed itself (`originate`) whose
+    /// INVITE has had no final response: the leg
+    /// [`Self::keep_pending_answerable`] hands back for a CANCEL. Such a call
+    /// is ended with that CANCEL (RFC 3261 §9.1), and only one past its final
+    /// response with a BYE (§15).
+    pub fn awaits_originated_final_response(&self, call_id: &str) -> bool {
+        self.calls
+            .get(call_id)
+            .is_some_and(|call| originated_invite_pending(&call))
     }
 
     /// Whether `branch` is a leg siphon gave up on and is keeping answerable.
@@ -353,6 +392,40 @@ impl CallActorStore {
     }
 }
 
+/// Whether `call` is one siphon placed itself whose INVITE, carried on its
+/// A-leg, is still waiting for its final response.
+fn originated_invite_pending(call: &CallActor) -> bool {
+    call.originated && matches!(call.state, CallState::Calling | CallState::Ringing)
+}
+
+/// The legs of `call` whose INVITE is on the wire and has no final response:
+/// the B-legs in `Trying` / `Ringing`, and the leg of a call siphon placed
+/// itself, with its INVITE as its `b_leg_invite`.
+fn pending_legs(call: &CallActor) -> Vec<Leg> {
+    let mut pending = Vec::new();
+    if originated_invite_pending(call) {
+        if let Some(invite) = call.a_leg_invite.as_ref() {
+            let mut leg = call.a_leg.clone();
+            leg.b_leg_invite = Some(Arc::clone(invite));
+            pending.push(leg);
+        }
+    }
+    pending.extend(
+        call.b_legs
+            .iter()
+            .enumerate()
+            .filter(|(index, leg)| {
+                leg.b_leg_invite.is_some()
+                    && matches!(
+                        call.b_leg_status.get(*index),
+                        Some(BLegStatus::Trying) | Some(BLegStatus::Ringing)
+                    )
+            })
+            .map(|(_, leg)| leg.clone()),
+    );
+    pending
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +476,101 @@ mod tests {
 
     fn after_lifetime() -> Instant {
         Instant::now() + CANCELLED_BRANCH_LIFETIME
+    }
+
+    /// Only a call siphon placed is ended with a CANCEL of its own INVITE, and
+    /// only until that INVITE has its final response.
+    #[test]
+    fn a_placed_call_awaits_its_final_response_until_it_is_answered() {
+        let (store, call_id, _) = store_with_leg();
+        assert!(
+            !store.awaits_originated_final_response(&call_id),
+            "a call somebody else placed has no INVITE of siphon's on its A-leg"
+        );
+        assert!(!store.awaits_originated_final_response("no-such-call"));
+
+        store.mark_originated(&call_id, "z9hG4bK-placed");
+        assert!(store.awaits_originated_final_response(&call_id));
+        store.set_state(&call_id, CallState::Ringing);
+        assert!(store.awaits_originated_final_response(&call_id));
+        store.set_state(&call_id, CallState::Answered);
+        assert!(
+            !store.awaits_originated_final_response(&call_id),
+            "a 2xx confirmed the dialog: that is ended with a BYE (RFC 3261 §15)"
+        );
+    }
+
+    /// A store holding one call siphon placed, its INVITE on [`BRANCH`].
+    fn store_with_placed_call() -> (CallActorStore, String) {
+        let (store, _, leg) = store_with_leg();
+        let call_id = store.create_call(Leg::new_a_leg(
+            "placed@example.com".to_string(),
+            "siphon-tag".to_string(),
+            BRANCH.to_string(),
+            leg.transport.clone(),
+        ));
+        store.set_a_leg_invite(
+            &call_id,
+            leg.b_leg_invite.clone().expect("the stashed INVITE"),
+        );
+        store.mark_originated(&call_id, BRANCH);
+        (store, call_id)
+    }
+
+    /// Giving up on a placed call is claimed once: the leg is kept for its
+    /// CANCEL, a second hangup or the ring timeout finds the claim taken, and
+    /// a 2xx that arrives afterwards does not answer the call.
+    #[test]
+    fn giving_up_on_a_placed_call_is_claimed_once_and_beats_a_later_answer() {
+        let (store, call_id) = store_with_placed_call();
+        let kept = store.give_up_on_pending(&call_id).expect("given up");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].branch, BRANCH);
+        assert!(kept[0].b_leg_invite.is_some(), "the INVITE to CANCEL");
+        assert!(store.is_cancelled_branch(BRANCH));
+        assert!(store.is_failure_concluding(&call_id));
+
+        assert!(store.give_up_on_pending(&call_id).is_none(), "once");
+        let mut ran = false;
+        assert!(!store.confirm_originated_answer(&call_id, |_| ran = true));
+        assert!(!ran, "a call given up on is not confirmed");
+        assert_eq!(
+            store.get_call(&call_id).map(|call| call.state.clone()),
+            Some(CallState::Calling)
+        );
+        assert!(store.give_up_on_pending("no-such-call").is_none());
+        assert!(!store.confirm_originated_answer("no-such-call", |_| {}));
+    }
+
+    /// A placed call answered first is not given up on: its dialog is
+    /// confirmed, and that is ended with a BYE (RFC 3261 §15).
+    #[test]
+    fn a_placed_call_answered_first_is_not_given_up_on() {
+        let (store, call_id) = store_with_placed_call();
+        assert!(store.confirm_originated_answer(&call_id, |call| {
+            call.a_leg.dialog.remote_tag = Some("callee-tag".to_string());
+        }));
+        let call = store.get_call(&call_id).expect("the call");
+        assert_eq!(call.state, CallState::Answered);
+        assert_eq!(call.a_leg.dialog.remote_tag.as_deref(), Some("callee-tag"));
+        drop(call);
+
+        assert!(store.give_up_on_pending(&call_id).is_none());
+        assert!(!store.is_cancelled_branch(BRANCH), "nothing kept");
+        assert!(!store.is_failure_concluding(&call_id), "nothing claimed");
+    }
+
+    /// A rejection being concluded holds the claim: a hangup arriving with it
+    /// does not end the call a second time.
+    #[test]
+    fn a_placed_call_a_rejection_is_concluding_is_not_given_up_on() {
+        let (store, call_id) = store_with_placed_call();
+        assert!(matches!(
+            store.claim_failure_conclusion(&call_id),
+            FailureConclusion::Claimed { .. }
+        ));
+        assert!(store.give_up_on_pending(&call_id).is_none());
+        assert!(!store.is_cancelled_branch(BRANCH));
     }
 
     #[test]

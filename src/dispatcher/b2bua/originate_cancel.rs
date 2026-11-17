@@ -8,11 +8,13 @@ use crate::dispatcher::*;
 /// cancels, and only once it has drawn a provisional), emit `StasisEnd`, and
 /// tear the call down.
 ///
-/// This is what `hangup` means on an un-answered leg siphon placed. The
+/// This is what `hangup`, and a script's `b2bua.terminate()`, mean on an
+/// un-answered leg siphon placed. The
 /// inbound-call path answers its A-leg with a final non-2xx there, which is
 /// exactly wrong here: siphon is the UAC, and sending a *response* to the party
 /// it is calling is not a thing (RFC 3261 §8.1 — a UAC answers nothing).
-/// Returns `false`, never panics, when the call is already gone.
+/// Returns `false`, never panics, when the call is already gone, has been
+/// answered meanwhile, or is being ended by something else.
 pub fn b2bua_cancel_originated_call(sip_call_id: &str, reason: Option<&str>) -> bool {
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
@@ -77,7 +79,14 @@ pub(crate) fn abandon_originated_call(
     // provisional, and on its first provisional when it has drawn nothing, its
     // INVITE retransmitting until then. Everything else here happens now either
     // way: the call is given up on at this moment, whenever its CANCEL goes.
-    let kept = state.call_actors.keep_pending_answerable(&internal_call_id);
+    //
+    // Giving up is claimed under the call's lock, against the 2xx that would
+    // confirm the dialog, a rejection being concluded and another hangup or
+    // the ring timeout arriving together: one of them ends the call. A call
+    // answered first is not this path's to end (RFC 3261 §15: a BYE).
+    let Some(kept) = state.call_actors.give_up_on_pending(&internal_call_id) else {
+        return false;
+    };
     if kept.is_empty() {
         // Not waiting for a final response any more, so nothing to CANCEL, and
         // nothing that should go on retransmitting.
@@ -113,6 +122,33 @@ pub(crate) fn abandon_originated_call(
     originate_delete_media(sip_call_id, state);
     originate_group_leg_ended(state, &internal_call_id, outcome);
     true
+}
+
+/// Release the dialog the 2xx of a call siphon placed opened when the call was
+/// given up on while that 2xx was being taken (RFC 3261 §9.1: it crossed the
+/// CANCEL, or came before one could be sent): ACK it (§13.2.2.4) and BYE it
+/// (§15) from the leg kept answerable, as for a 2xx that arrives once the call
+/// is gone. Nobody is told: the call's end was reported when it was given up.
+pub fn release_answer_of_abandoned_call(
+    leg: &crate::b2bua::actor::Leg,
+    sip_call_id: &str,
+    response: &SipMessage,
+    state: &DispatcherState,
+) {
+    match state.call_actors.zombie_cancelled_for_2xx(&leg.branch) {
+        Some((kept, first_2xx)) => handle_zombie_cancelled_2xx(kept, first_2xx, response, state),
+        // Gone some other way, with no leg kept: the dialog is nobody's all
+        // the same, and a far end left in it would stay in a call with no one.
+        None => {
+            b2bua_ack_and_bye_answered_leg(leg.clone(), response, true, state);
+        }
+    }
+    info!(
+        %sip_call_id,
+        "originate: answered while being given up on — ACK + BYE"
+    );
+    // What taking the answer allocated, after the call's own was released.
+    originate_delete_media(sip_call_id, state);
 }
 
 /// Release the dialog a leg of an originate group opened by answering after

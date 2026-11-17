@@ -169,11 +169,22 @@ class _B2buaNamespace:
         normal handler, and is cross-worker safe (no reliance on a stashed
         ``call`` object).
 
+        A leg placed with ``b2bua.originate()`` that has not been answered is
+        ended with a CANCEL of its INVITE instead (RFC 3261 section 9.1): at
+        once if it is ringing, on its first provisional response if it has
+        sent none yet, and not at all if the INVITE times out first. The 487
+        is ACKed, and an answer that crosses the CANCEL is ACKed and released
+        with a BYE. The leg is over for the script when this returns, and no
+        handler runs for it (no ``@b2bua.on_failure``, no ``@b2bua.on_answer``
+        for a crossing answer).
+
         Args:
             call_id: the SIP Call-ID of the call to end (e.g. the ``call_id``
-                delivered to an ``@rtpengine.on_dtmf`` handler).
+                delivered to an ``@rtpengine.on_dtmf`` handler, or the one
+                ``b2bua.originate()`` returned).
             reason: free-text hangup reason, carried as an RFC 3326
                 ``Reason: Q.850;cause=16`` header on the BYE and into the CDR.
+                A CANCEL carries no Reason.
 
         Returns:
             bool: True if a matching call was found and torn down, False if the
