@@ -128,7 +128,7 @@
       "reoffer": {
         "doc": "Re-offer one party of a call by its SIP Call-ID: a re-INVITE in the",
         "kind": "method_descriptor",
-        "sig": "($self, call_id, sdp=None, leg=\"caller\", timeout_ms=32000)"
+        "sig": "($self, call_id, sdp=None, leg=\"caller\", timeout_ms=32000, body=None, content_type=None, headers=None)"
       },
       "replace_peer": {
         "doc": "Replace one leg of an answered call with a freshly dialed target,",

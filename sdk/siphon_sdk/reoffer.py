@@ -161,14 +161,14 @@ def _media_type(content_type: str) -> str:
     return content_type.split(";")[0].strip().lower()
 
 
-def _sdp_part(content_type: str, body: bytes) -> Optional[str]:
+def _sdp_part(content_type: str, body: bytes, method: str = "offer.answer") -> Optional[str]:
     """The ``application/sdp`` part of a multipart body, checked the way
     siphon checks one it is to put the SDP part in."""
     match = _BOUNDARY.search(content_type)
     boundary = (match.group(1) or match.group(2)) if match else ""
     if not boundary:
         raise ValueError(
-            "offer.answer(): multipart body cannot take the SDP: "
+            f"{method}(): multipart body cannot take the SDP: "
             "missing boundary parameter in Content-Type"
         )
     delimiter = b"--" + boundary.encode()
@@ -177,7 +177,7 @@ def _sdp_part(content_type: str, body: bytes) -> Optional[str]:
         line.startswith(delimiter) for line in body.splitlines()
     ):
         raise ValueError(
-            "offer.answer(): multipart body cannot take the SDP: no part "
+            f"{method}(): multipart body cannot take the SDP: no part "
             f"delimited by its boundary '{boundary}'"
         )
     for section in sections[1:]:
@@ -191,6 +191,50 @@ def _sdp_part(content_type: str, body: bytes) -> Optional[str]:
             if name.strip().lower() == "content-type" and _media_type(value) == "application/sdp":
                 return content.decode("utf-8", "replace").rstrip("\r\n")
     return None
+
+
+def sdp_and_body(
+    method: str,
+    sdp: Optional[str],
+    body: Optional[Union[str, bytes]],
+    content_type: Optional[str],
+) -> tuple[Optional[str], Optional[tuple[str, bytes]]]:
+    """Sort the ``sdp``, ``body`` and ``content_type`` of ``offer.answer()``
+    or ``b2bua.reoffer()`` into the SDP and the body sent beside it, the way
+    siphon does: a body that is the SDP, or a multipart body with an SDP
+    part, gives the SDP itself.
+
+    Raises:
+        ValueError: ``body`` without ``content_type`` or the reverse, an
+            empty ``body``, a ``content_type`` with a line break, an SDP
+            given both ways, or a ``multipart/*`` body without a
+            ``boundary`` or a part delimited by it.
+        TypeError: a ``body`` that is neither ``str`` nor ``bytes``.
+    """
+    if (body is None) != (content_type is None):
+        raise ValueError(f"{method}(body=…) and content_type=… go together")
+    if body is None or content_type is None:
+        return sdp, None
+    if not isinstance(body, (str, bytes)):
+        raise TypeError("body must be str or bytes")
+    raw = body.encode() if isinstance(body, str) else body
+    if any(character in content_type for character in "\r\n\0"):
+        raise ValueError(f"{method}(): content_type contains a line break or NUL")
+    if not raw:
+        raise ValueError(f"{method}(): body is empty")
+    twice = f"{method}(): the body carries the SDP and sdp= gives another: pass one"
+    media_type = _media_type(content_type)
+    if media_type == "application/sdp":
+        if sdp is not None:
+            raise ValueError(twice)
+        return raw.decode("utf-8", "replace"), None
+    if media_type.startswith("multipart/"):
+        part = _sdp_part(content_type, raw, method)
+        if part is not None:
+            if sdp is not None:
+                raise ValueError(twice)
+            sdp = part
+    return sdp, (content_type, raw)
 
 
 class Reoffer:
@@ -400,34 +444,7 @@ class Reoffer:
         """
         self._still_open("answer")
         checked = _uas_response_headers("offer.answer", headers)
-        if (body is None) != (content_type is None):
-            raise ValueError("offer.answer(body=…) and content_type=… go together")
-        extras_body = None
-        if body is not None and content_type is not None:
-            if not isinstance(body, (str, bytes)):
-                raise TypeError("body must be str or bytes")
-            raw = body.encode() if isinstance(body, str) else body
-            if any(character in content_type for character in "\r\n\0"):
-                raise ValueError("offer.answer(): content_type contains a line break or NUL")
-            if not raw:
-                raise ValueError("offer.answer(): body is empty")
-            twice = (
-                "offer.answer(): the body carries the SDP answer and sdp= "
-                "gives another: pass one"
-            )
-            media_type = _media_type(content_type)
-            if media_type == "application/sdp":
-                if sdp is not None:
-                    raise ValueError(twice)
-                sdp = raw.decode("utf-8", "replace")
-            else:
-                if media_type.startswith("multipart/"):
-                    part = _sdp_part(content_type, raw)
-                    if part is not None:
-                        if sdp is not None:
-                            raise ValueError(twice)
-                        sdp = part
-                extras_body = (content_type, raw)
+        sdp, extras_body = sdp_and_body("offer.answer", sdp, body, content_type)
         self._decision = ("answer", sdp)
         self._answer_extras = {
             "content_type": extras_body[0] if extras_body else None,

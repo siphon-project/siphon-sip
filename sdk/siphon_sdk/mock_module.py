@@ -2289,38 +2289,126 @@ class MockB2bua:
             raise ValueError(f'b2bua.session_sdp(leg=…) is "caller" or "callee" (got {leg!r})')
         return self.session_sdps.get((call_id, leg))
 
+    # The headers siphon writes on a re-INVITE it sends in a dialog; mirrors
+    # ``src/dispatcher/b2bua/script_reoffer.rs``.
+    _REOFFER_OWNED_HEADERS = frozenset({
+        "via", "from", "to", "call-id", "cseq", "max-forwards", "contact",
+        "route", "record-route", "content-length", "content-type", "require",
+        "supported", "session-expires", "min-se", "rack", "rseq", "user-agent",
+    })
+    _REOFFER_COMPACT_FORMS = {
+        "v": "via", "f": "from", "t": "to", "i": "call-id", "m": "contact",
+        "l": "content-length", "c": "content-type", "k": "supported",
+        "x": "session-expires",
+    }
+    _REOFFER_TOKEN = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-.!%*_+`'~"
+    )
+
     async def reoffer(self, call_id: str, sdp: Optional[str] = None,
-                      leg: str = "caller", timeout_ms: int = 32000) -> Optional[int]:
+                      leg: str = "caller", timeout_ms: int = 32000,
+                      body: Optional[Union[str, bytes]] = None,
+                      content_type: Optional[str] = None,
+                      headers: Optional[dict[str, str]] = None) -> Optional[int]:
         """Re-offer one party of a call by its SIP Call-ID: a re-INVITE in the
         caller's dialog (on a call siphon answered itself, its only dialog), or
         with ``leg="callee"`` in the answered callee's, carrying ``sdp``, or the
         session in force toward that party when ``sdp`` is None. siphon puts its
-        own ``o=`` on it. The other party is told nothing.
+        own ``o=`` on ``sdp``; the session in force keeps the ``o=`` it was sent
+        with. Either goes out at the dialog's next ``o=`` version (RFC 3264 §8).
+        The other party is told nothing.
 
         For telling a party something about the session it did not ask about:
-        RFC 7866's ``a=record``, when a recording starts or stops on its own.
+        RFC 7866's ``a=record`` when a recording starts or stops on its own, or
+        a change that is not in the media at all, such as a call's priority,
+        carried in ``headers`` and ``body``.
+
+        Args:
+            call_id: the SIP Call-ID of the call.
+            sdp: the offer; the session in force toward the party when None.
+            leg: ``"caller"`` or ``"callee"``.
+            timeout_ms: how long to wait for the final status, retries of a
+                ``491`` included.
+            body: a body sent with the offer (RFC 5621 §3), with
+                ``content_type``. A single part of any type goes out as the
+                second part of a ``multipart/mixed`` body after the SDP; a
+                ``multipart/*`` body without an ``application/sdp`` part gets
+                the SDP part first under its own boundary; one with an SDP
+                part, or an ``application/sdp`` body, is the offer itself.
+            content_type: the ``Content-Type`` of ``body``.
+            headers: ``{name: value}`` added to the re-INVITE, in order. The
+                headers siphon writes on it are refused: ``Via``, ``From``,
+                ``To``, ``Call-ID``, ``CSeq``, ``Max-Forwards``, ``Contact``,
+                ``Route``, ``Record-Route``, ``Content-Length``,
+                ``Content-Type``, ``Require``, ``Supported``,
+                ``Session-Expires``, ``Min-SE``, ``RAck``, ``RSeq`` and
+                ``User-Agent``.
+
+        With no ``sdp``, on a call the media engine answered itself, an answer
+        that changes the party's media is given to the engine. Otherwise the
+        engine is told nothing.
+
+        A ``491`` (RFC 3261 §14.1), from the party or because an INVITE toward
+        it was already in progress, is waited out and the re-INVITE sent
+        again: after a random 0 to 2 seconds on a dialog whose Call-ID the
+        party generated, 2.1 to 4 seconds on one siphon generated, up to three
+        times within ``timeout_ms``.
 
         Returns:
-            Optional[int]: the final status code, ``491`` without anything sent
-                when an INVITE toward that party is already in progress (wait
-                and send again), or None when no final response arrived in
-                ``timeout_ms``.
+            Optional[int]: the final status code, ``491`` when the glare
+                outlasted the retries or the time left, or None when no final
+                response arrived in ``timeout_ms``.
 
         Raises:
-            ValueError: the call is unknown (``not_found``), or the party's
+            ValueError: the call is unknown (``not_found``), the party's
                 dialog is not established or was never sent a session
-                (``invalid_state``).
+                (``invalid_state``), a header siphon writes, ``body`` without
+                ``content_type`` or the reverse, an empty ``body``, an offer
+                given both in ``sdp`` and in the body, or a ``multipart/*``
+                body without a ``boundary`` or a part delimited by it.
+            TypeError: a header name or value that is not a ``str``.
 
-        In the mock, records ``{"call_id", "sdp", "leg"}`` on ``reoffers`` and
-        returns ``reoffer_status`` (200).
+        In the mock, records ``{"call_id", "sdp", "leg"}`` on ``reoffers``,
+        with ``"body"`` (bytes), ``"content_type"`` and ``"headers"`` when
+        they were given, and returns ``reoffer_status`` (200). The mock does
+        not retry: set ``reoffer_status`` to what the script should see.
 
         Usage::
 
             status = await b2bua.reoffer(call_id, sdp=session + "a=record:off\\r\\n")
+            status = await b2bua.reoffer(
+                call_id, body=service_info_xml,
+                content_type="application/vnd.example.info+xml",
+                headers={"Resource-Priority": "example.0"})
         """
+        from siphon_sdk.reoffer import sdp_and_body
+
         if leg not in ("caller", "callee"):
             raise ValueError(f'b2bua.reoffer(leg=…) is "caller" or "callee" (got {leg!r})')
-        self.reoffers.append({"call_id": call_id, "sdp": sdp, "leg": leg})
+        for name, value in (headers or {}).items():
+            if not isinstance(name, str) or not isinstance(value, str):
+                raise TypeError(
+                    "b2bua.reoffer(headers=…) takes a mapping of str header names to str values"
+                )
+            if not name or any(character not in self._REOFFER_TOKEN for character in name):
+                raise ValueError(f"b2bua.reoffer(headers=…): '{name}' is not a SIP header name")
+            lowered = name.lower()
+            if self._REOFFER_COMPACT_FORMS.get(lowered, lowered) in self._REOFFER_OWNED_HEADERS:
+                raise ValueError(
+                    f"b2bua.reoffer(headers=…): {name} cannot be set by a script on a "
+                    f"re-INVITE siphon sends"
+                )
+            if any(character in value for character in "\r\n\0"):
+                raise ValueError(
+                    f"b2bua.reoffer(headers=…): the value of {name} contains a line break or NUL"
+                )
+        sdp, beside = sdp_and_body("b2bua.reoffer", sdp, body, content_type)
+        record: dict = {"call_id": call_id, "sdp": sdp, "leg": leg}
+        if beside is not None:
+            record["content_type"], record["body"] = beside
+        if headers:
+            record["headers"] = dict(headers)
+        self.reoffers.append(record)
         return self.reoffer_status
 
     def terminate(self, call_id: str, reason: str = "Normal Clearing") -> bool:

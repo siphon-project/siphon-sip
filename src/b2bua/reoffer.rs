@@ -91,8 +91,9 @@ pub enum ReofferDecision {
     },
 }
 
-/// What a script puts on the 2xx siphon answers an offer with, beside the
-/// session description.
+/// What a script puts beside the session description: on the 2xx siphon
+/// answers an offer with (`offer.answer()`), and on a re-INVITE it has siphon
+/// send (`b2bua.reoffer()`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AnswerExtras {
     /// A body to send with the SDP, and its `Content-Type`: a single part of
@@ -139,7 +140,7 @@ impl AnswerExtras {
         if body.is_empty() {
             return Err("body is empty".to_string());
         }
-        let twice = "the body carries the SDP answer and sdp= gives another: pass one";
+        let twice = "the body carries the SDP and sdp= gives another: pass one";
         if is_sdp(&content_type) {
             if sdp.is_some() {
                 return Err(twice.to_string());

@@ -545,10 +545,27 @@ pub fn rewrite_reinvite_answer_sdp(
     //
     // Which leg goes stale depends on who offered the re-INVITE, which is why
     // this only broke transfers initiated from one side.
-    if (200..300).contains(&status_code) && !message.body.is_empty() {
-        state
-            .call_actors
-            .set_leg_last_sdp(call_id, !is_a2b, &message.body);
+    // The SDP part alone of a multipart answer (RFC 5621 §3).
+    let answer = (200..300)
+        .contains(&status_code)
+        .then(|| description_given(message))
+        .flatten();
+    if let Some(answer) = &answer {
+        // A script's re-offer of the session in force to the caller of a call
+        // the engine answered itself: the caller's answer is its description
+        // from now on, and the engine's to know where it changed.
+        if !is_a2b {
+            hand_reoffer_answer_to_engine(
+                call_id,
+                &snapshot.branch,
+                &snapshot.a_leg.dialog.call_id,
+                answer,
+                snapshot.a_leg.last_sdp.as_deref(),
+                response_source.ip(),
+                state,
+            );
+        }
+        state.call_actors.set_leg_last_sdp(call_id, !is_a2b, answer);
     }
 
     // RTPEngine: rewrite re-INVITE 2xx response SDP through answer.

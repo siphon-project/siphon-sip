@@ -159,6 +159,15 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
     {
         return;
     }
+    // An offer that crosses a re-INVITE siphon has in progress on a dialog
+    // with no second party (RFC 3311 §5.2): 491.
+    if from_a_leg
+        && !on_early_dialog
+        && description_given(&message).is_some()
+        && crate::dispatcher::b2bua::refuse_crossing_own_offer(&inbound, &message, &call_id, state)
+    {
+        return;
+    }
     // A leg with no second party and no session the engine answers for it: a
     // leg parted from its bridge. Before its offer is taken for its media.
     if from_a_leg

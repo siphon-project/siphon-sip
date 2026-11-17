@@ -517,6 +517,40 @@ pub(super) fn sdp_in_body(content_type: &str, body: &[u8]) -> Option<Vec<u8>> {
     crate::media::body::sdp_from_body(content_type, body).ok()
 }
 
+/// Give the `o=` line of `body` the `<sess-version>` `version` and leave the
+/// rest of it as it is: the session in force toward a party, offered to it
+/// again. RFC 3264 §8 has the `o=` of a new offer identical to the previous
+/// SDP's but for the version, so the username, session id and address the
+/// party was last sent stay, whoever wrote them (siphon, a script, the media
+/// engine). A malformed `o=` line (not the six fields of RFC 8866 §5.2) is
+/// left untouched.
+pub(super) fn advance_sdp_version(body: &mut Vec<u8>, version: u64) {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return;
+    };
+    let mut result = String::with_capacity(text.len() + 4);
+    let mut changed = false;
+    for line in text.split_inclusive('\n') {
+        let fields: Vec<&str> = line
+            .strip_prefix("o=")
+            .map(|rest| rest.trim_end_matches(['\r', '\n']).split(' ').collect())
+            .unwrap_or_default();
+        if fields.len() == 6 && !changed {
+            let ending = &line[line.trim_end_matches(['\r', '\n']).len()..];
+            result.push_str(&format!(
+                "o={} {} {version} {} {} {}{ending}",
+                fields[0], fields[1], fields[3], fields[4], fields[5]
+            ));
+            changed = true;
+        } else {
+            result.push_str(line);
+        }
+    }
+    if changed {
+        *body = result.into_bytes();
+    }
+}
+
 /// The session description `message` brings as its sender's own, to keep as
 /// that party's (`Leg::last_sdp`): the body under `application/sdp`, or the
 /// SDP part of a `multipart/*` body, where the offer rides beside parts SIP

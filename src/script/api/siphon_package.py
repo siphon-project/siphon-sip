@@ -600,36 +600,68 @@ class _B2buaNamespace:
             return None
         return control.session_sdp(call_id, leg)
 
-    def reoffer(self, call_id, sdp=None, leg="caller", timeout_ms=32000):
+    def reoffer(self, call_id, sdp=None, leg="caller", timeout_ms=32000,
+                body=None, content_type=None, headers=None):
         """Re-offer one party of a call by its SIP Call-ID: a re-INVITE in the
         caller's dialog (on a call siphon answered itself, its only dialog), or
         with ``leg="callee"`` in the answered callee's, carrying ``sdp``, or the
         session in force toward that party when ``sdp`` is ``None``. siphon puts
-        its own ``o=`` on it. The other party is told nothing, and neither is
-        the media engine where the call is anchored: the party's answer to the
-        session in force does not move the media.
+        its own ``o=`` on ``sdp``; the session in force keeps the ``o=`` it was
+        sent with. Either goes out at the dialog's next ``o=`` version
+        (RFC 3264 §8). The other party is told nothing.
 
         For telling a party something about the session it did not ask about:
-        RFC 7866's ``a=record``, when a recording starts or stops on its own.
+        RFC 7866's ``a=record`` when a recording starts or stops on its own, or
+        a change that is not in the media at all, such as a call's priority,
+        carried in ``headers`` and ``body``.
+
+        ``body`` with its ``content_type`` is sent with the offer (RFC 5621
+        §3): a single part of any type as the second part of a
+        ``multipart/mixed`` body after the SDP; a ``multipart/*`` body without
+        an ``application/sdp`` part with the SDP part put first under its own
+        boundary. A ``multipart/*`` body with an SDP part, or an
+        ``application/sdp`` body, is the offer itself, as ``sdp`` is.
+
+        ``headers`` is added to the re-INVITE, in its order. The headers
+        siphon writes on it are refused: ``Via``, ``From``, ``To``,
+        ``Call-ID``, ``CSeq``, ``Max-Forwards``, ``Contact``, ``Route``,
+        ``Record-Route``, ``Content-Length``, ``Content-Type``, ``Require``,
+        ``Supported``, ``Session-Expires``, ``Min-SE``, ``RAck``, ``RSeq`` and
+        ``User-Agent``.
+
+        With no ``sdp``, on a call the media engine answered itself, an answer
+        that changes the party's media is given to the engine. Otherwise the
+        engine is told nothing.
+
+        A ``491`` (RFC 3261 §14.1), from the party or because an INVITE toward
+        it was already in progress, is waited out and the re-INVITE sent
+        again, up to three times within ``timeout_ms``.
 
         Returns:
-            An awaitable of the final status code (int), ``491`` without
-            anything sent when an INVITE toward that party is already in
-            progress (wait and send again), or ``None`` when no final response
-            arrives within ``timeout_ms``.
+            An awaitable of the final status code (int), ``491`` when the
+            glare outlasted the retries or the time left, or ``None`` when no
+            final response arrives within ``timeout_ms``.
 
         Raises:
-            ValueError: the call is unknown (``not_found``), or the party's
+            ValueError: the call is unknown (``not_found``), the party's
                 dialog is not established or was never sent a session
-                (``invalid_state``).
+                (``invalid_state``), a header siphon writes, ``body`` without
+                ``content_type`` or the reverse, an empty ``body``, an offer
+                given both in ``sdp`` and in the body, or a ``multipart/*``
+                body without a ``boundary`` or a part delimited by it.
+            TypeError: a header name or value that is not a ``str``.
 
         Usage:
             status = await b2bua.reoffer(call_id, sdp=session + "a=record:off\\r\\n")
+            status = await b2bua.reoffer(
+                call_id, body=service_info_xml,
+                content_type="application/vnd.example.info+xml",
+                headers={"Resource-Priority": "example.0"})
         """
         control = object.__getattribute__(self, "__dict__").get("_control")
         if control is None:
             raise ValueError("b2bua.reoffer(): not_found: no B2BUA running")
-        return control.reoffer(call_id, sdp, leg, timeout_ms)
+        return control.reoffer(call_id, sdp, leg, timeout_ms, body, content_type, headers)
 
     def replace_peer(
         self,
