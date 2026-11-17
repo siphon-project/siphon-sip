@@ -134,6 +134,10 @@ pub(crate) struct NativeCommand {
     pub(crate) refused: bool,
     /// The `dtmf` a `conference_seat` carried (`events` or `forward`).
     pub(crate) dtmf: Option<String>,
+    /// The further calls a `start_recording` or `attach_ws_tee` takes audio
+    /// from (`additional_sources`), and its `channels`.
+    pub(crate) sources: Vec<String>,
+    pub(crate) channels: Option<String>,
     /// The frame's `scope`: the node's or a per-call one. The engine keys a
     /// call by `(scope, call_id)`.
     pub(crate) scope: Option<String>,
@@ -154,6 +158,8 @@ struct Recorded {
     repeat: Option<String>,
     profile: Option<siphon_rtp_proto::ProfileFlags>,
     dtmf: Option<String>,
+    sources: Vec<String>,
+    channels: Option<String>,
 }
 
 /// What the engine makes of a command on a call `offer_far` grew (or the
@@ -248,6 +254,8 @@ impl Recorded {
             repeat: self.repeat,
             refused,
             dtmf: self.dtmf,
+            sources: self.sources,
+            channels: self.channels,
             scope,
             profile: self.profile,
         }
@@ -262,6 +270,8 @@ impl Recorded {
             repeat: None,
             profile: None,
             dtmf: None,
+            sources: Vec::new(),
+            channels: None,
         }
     }
 }
@@ -374,12 +384,47 @@ fn recording_command(command: &Command) -> (Option<Recorded>, Option<String>, bo
             call_id,
             from_tag,
             path,
+            channels,
+            additional_sources,
             ..
         } => (
             Some(Recorded {
                 detail: path.clone(),
+                sources: additional_sources
+                    .iter()
+                    .map(|source| source.call_id.clone())
+                    .collect(),
+                channels: channels.map(|channels| format!("{channels:?}").to_lowercase()),
                 ..Recorded::new("start_recording", call_id, from_tag)
             }),
+            None,
+            false,
+            true,
+        ),
+        // A tee on a call the engine holds; `detail` is where it streams.
+        Command::AttachWsTee {
+            call_id,
+            from_tag,
+            ws_uri,
+            channels,
+            additional_sources,
+            ..
+        } => (
+            Some(Recorded {
+                detail: Some(ws_uri.clone()),
+                sources: additional_sources
+                    .iter()
+                    .map(|source| source.call_id.clone())
+                    .collect(),
+                channels: channels.map(|channels| channels.to_string()),
+                ..Recorded::new("attach_ws_tee", call_id, from_tag)
+            }),
+            None,
+            false,
+            true,
+        ),
+        Command::DetachWsTee { call_id, from_tag } => (
+            Some(Recorded::new("detach_ws_tee", call_id, from_tag)),
             None,
             false,
             true,
@@ -637,11 +682,11 @@ impl NativeTestEngine {
                             Command::AttachX3 { .. } | Command::DetachX3 { .. } => {
                                 x3_command(&request.command)
                             }
-                            Command::StartRecording { .. } => recording_command(&request.command),
                             Command::ConferenceSeat { .. }
                             | Command::ConferenceJoin { .. }
                             | Command::ConferenceLeave { .. } => seat_command(&request.command),
-                            _ => (None, None, false, false),
+                            // A recording or a tee, or nothing the engine records.
+                            _ => recording_command(&request.command),
                         };
                         let mut refused = false;
                         if let (Some(record), Ok(mut live)) = (record.as_ref(), held.lock()) {

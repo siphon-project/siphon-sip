@@ -1107,6 +1107,14 @@ pub fn check_recording_bitrate(
     Ok(())
 }
 
+/// A further call a recording or a tee takes audio from, beside the one it is
+/// started on: one channel each, in order after that call's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaSource {
+    pub call_id: String,
+    pub from_tag: String,
+}
+
 /// What to record, and when to stop by itself.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RecordingRequest<'a> {
@@ -1122,6 +1130,9 @@ pub struct RecordingRequest<'a> {
     pub silence_ms: Option<u64>,
     /// Explicit output path. The directory must already exist.
     pub path: Option<&'a str>,
+    /// Further calls recorded into the same file, one channel each after the
+    /// call the recording is started on (`record_multi_source` engines).
+    pub additional_sources: &'a [MediaSource],
 }
 
 #[cfg(test)]

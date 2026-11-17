@@ -337,14 +337,14 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     const transport = new RecordingTransport();
     const call = makeCall(transport);
     await call.acceptRecording();
-    await call.acceptRecording({ format: "ogg_opus", bitrateBps: 24000, path: "/srv/tenant-a" });
+    await call.acceptRecording({ format: "ogg_opus", bitrateBps: 24000, channels: "stereo", path: "/srv/tenant-a" });
     expect(transport.calls).toEqual([
       { module: MODULE_SIP, verb: "accept", target: { channel: "ch1" }, args: {} },
       {
         module: MODULE_SIP,
         verb: "accept",
         target: { channel: "ch1" },
-        args: { format: "ogg_opus", bitrate_bps: 24000, path: "/srv/tenant-a" },
+        args: { format: "ogg_opus", bitrate_bps: 24000, channels: "stereo", path: "/srv/tenant-a" },
       },
     ]);
   });

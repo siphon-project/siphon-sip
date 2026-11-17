@@ -55,6 +55,7 @@ mod identity;
 mod per_call;
 mod recording;
 mod scope;
+mod tee;
 mod waiters;
 use connection::connection_manager;
 #[cfg(test)]
@@ -137,6 +138,11 @@ pub(crate) fn profile_flags_from_ng(flags: &NgFlags) -> ProfileFlags {
         // siphon profile carries it: absent, the engine adds nothing.
         floor_fmtp: None,
         floor_keys: Vec::new(),
+        // Floor and transmission control (siphon-rtp 0.20): siphon offers no
+        // MCX floor, so none is configured.
+        media_srtcp_keys: Vec::new(),
+        transmission_control_formats: Vec::new(),
+        floor_channel_label: None,
         key_mgmt: None,
     }
 }
@@ -509,8 +515,13 @@ impl SiphonRtpClient {
         from_tag: &str,
         request: &RecordingRequest<'_>,
     ) -> Result<String, RtpEngineError> {
-        if recording::needs_feature_check(request.format) {
-            recording::require_ogg_opus(self.request_in(None, Command::NodeInfo).await?)?;
+        let features = recording::required_features(request);
+        if !features.is_empty() {
+            recording::require_features(
+                self.request_in(None, Command::NodeInfo).await?,
+                &features,
+                "this recording",
+            )?;
         }
         let result = self
             .request(recording::start_command(call_id, from_tag, request))
@@ -956,6 +967,7 @@ impl SiphonRtpClient {
                 direction: proto_ws_tee_direction(direction),
                 channels,
                 sample_rate,
+                additional_sources: Vec::new(),
             })
             .await?,
         )
@@ -2289,6 +2301,9 @@ mod tests {
             fax_passthrough: false,
             floor_fmtp: None,
             floor_keys: Vec::new(),
+            media_srtcp_keys: Vec::new(),
+            transmission_control_formats: Vec::new(),
+            floor_channel_label: None,
             key_mgmt: None,
         };
 
@@ -2641,6 +2656,7 @@ mod tests {
     #[test]
     fn attach_ws_tee_carries_sample_rate() {
         let json = serde_json::to_value(Command::AttachWsTee {
+            additional_sources: Vec::new(),
             call_id: "call-tee".into(),
             from_tag: "leg-a".into(),
             ws_uri: "wss://asr.invalid/tee".into(),

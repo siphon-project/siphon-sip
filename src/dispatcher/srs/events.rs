@@ -51,11 +51,17 @@ fn recording_report(
     metadata: &RecordingMetadata,
     recording: &crate::rtpengine::events::RecordingFinished,
 ) -> serde_json::Value {
-    let stream_ids: Vec<&str> = metadata
-        .streams
+    // Every stream the file holds, in channel order (left first in stereo).
+    let stream_ids: Vec<&str> = tracked
+        .labels
         .iter()
-        .filter(|stream| Some(stream.label.as_str()) == tracked.label.as_deref())
-        .map(|stream| stream.stream_id.as_str())
+        .filter_map(|label| {
+            metadata
+                .streams
+                .iter()
+                .find(|stream| &stream.label == label)
+                .map(|stream| stream.stream_id.as_str())
+        })
         .collect();
     let participant_ids: Vec<&str> = metadata
         .participant_streams
@@ -78,6 +84,8 @@ fn recording_report(
         "format": format,
         "stream_ids": stream_ids,
         "label": tracked.label,
+        "labels": tracked.labels,
+        "channels": if tracked.labels.len() == 2 { "stereo" } else { "mono" },
         "participant_ids": participant_ids,
         "duration_ms": recording.duration_ms,
         "reason": recording.reason,
@@ -98,7 +106,8 @@ pub(super) fn metadata_updated(call_id: &str, datamode: DataMode, merged: &Recor
     );
 }
 
-/// Close an ended session: end its engine calls, wait (at most
+/// Close a session already held closing ([`super::in_dialog`]'s
+/// `take_session`): end its engine calls, wait (at most
 /// [`CLOSE_WAIT`]) for every file to be reported closed, report
 /// `RecordingSessionEnded` and `StasisEnd`, then store the record.
 pub(super) async fn close_session(
@@ -108,12 +117,7 @@ pub(super) async fn close_session(
     backend: Option<Arc<crate::rtpengine::MediaBackend>>,
     srs_manager: Arc<SrsManager>,
 ) {
-    let done = srs_manager.begin_closing(
-        call_id,
-        reason,
-        ended.record.clone(),
-        ended.metadata.clone(),
-    );
+    let done = Arc::clone(&ended.done);
     if let Some(backend) = backend {
         for stream in &ended.streams {
             if let Some(engine_call_id) = &stream.engine_call_id {

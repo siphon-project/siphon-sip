@@ -65,6 +65,22 @@ pub(super) struct StreamOwner<'a> {
     /// How its streams are recorded; the profile, when it names none, is
     /// `srs.rtpengine_profile`.
     pub(super) recording: &'a crate::srs::RecordingOptions,
+    /// The label of the stream that goes left in a stereo file: the one the
+    /// metadata's first `participantstreamassoc` sends. `None` keeps stream
+    /// order.
+    pub(super) left_label: Option<String>,
+}
+
+/// The stream the first participant sends, by label: the left channel of a
+/// stereo file (RFC 7865 §8.4).
+pub(super) fn left_label(metadata: &crate::siprec::metadata::RecordingMetadata) -> Option<String> {
+    let first = metadata.participant_streams.first()?;
+    let stream_id = first.send.first()?;
+    metadata
+        .streams
+        .iter()
+        .find(|stream| &stream.stream_id == stream_id)
+        .map(|stream| stream.label.clone())
 }
 
 /// An offered m-section with its direction attribute left out: two offers of a
@@ -137,6 +153,7 @@ pub(super) async fn anchor_streams(
         );
     }
 
+    let stereo = owner.recording.channels == RecordingChannels::Stereo;
     let mut streams = Vec::with_capacity(offered.len());
     let mut answers = Vec::with_capacity(offered.len());
     let mut last_refusal = String::from("no stream offered with a port");
@@ -162,16 +179,18 @@ pub(super) async fn anchor_streams(
             continue;
         }
 
-        match answer_stream(backend, owner, stream, &flags).await {
-            Ok((engine_call_id, engine_answer, recording_id, recording_path)) => {
+        match answer_stream(backend, owner, stream, &flags, !stereo).await {
+            Ok((engine_call_id, engine_answer, recording)) => {
+                let (recording_id, recording_path) = recording.unzip();
                 streams.push(SrsStream {
                     index: stream.index,
                     label: stream.label.clone(),
                     engine_call_id: Some(engine_call_id),
-                    recording_id: Some(recording_id),
+                    recording_id,
                     offered_section: identity,
                     engine_answer: Some(engine_answer.clone()),
-                    recording_path: Some(recording_path),
+                    recording_path,
+                    recording_channel: 0,
                 });
                 answers.push((stream.clone(), StreamAnswer::Engine(engine_answer)));
             }
@@ -187,6 +206,10 @@ pub(super) async fn anchor_streams(
                 answers.push((stream.clone(), StreamAnswer::Rejected));
             }
         }
+    }
+
+    if stereo {
+        record_as_stereo(backend, owner, &mut streams).await;
     }
 
     match crate::siprec::srs_sdp::build_answer(&answers) {
@@ -208,30 +231,104 @@ fn rejected(stream: &OfferedStream, identity: String) -> SrsStream {
         offered_section: identity,
         engine_answer: None,
         recording_path: None,
+        recording_channel: 0,
     }
 }
 
-/// Answer one stream on its engine call and start recording it. On a refused
-/// recording the engine call is ended again: a stream the SRS cannot record is
-/// not answered.
-async fn answer_stream(
+/// Record a stereo session: one file, left the stream [`StreamOwner::left_label`]
+/// names (stream order otherwise), right the other, when exactly two streams
+/// are live. A pair already in one file stays as it is. With any other count,
+/// or an engine that cannot record two calls into one file, each live stream
+/// gets a file of its own, so the SRS never answers for media it is not
+/// recording.
+async fn record_as_stereo(
     backend: &crate::rtpengine::MediaBackend,
     owner: &StreamOwner<'_>,
-    stream: &OfferedStream,
-    flags: &crate::rtpengine::NgFlags,
-) -> Result<(String, String, String, String), String> {
-    let engine_call_id = SrsStream::engine_call_id_for(owner.recording_call_id, stream.index);
-    let engine_answer = backend
-        .answer_local(&engine_call_id, owner.from_tag, &stream.sdp, flags)
+    streams: &mut [SrsStream],
+) {
+    let mut live: Vec<usize> = streams
+        .iter()
+        .enumerate()
+        .filter(|(_, stream)| stream.engine_call_id.is_some())
+        .map(|(position, _)| position)
+        .collect();
+    if live.len() == 2 {
+        if owner.left_label.is_some() && streams[live[1]].label == owner.left_label {
+            live.swap(0, 1);
+        }
+        let (left, right) = (live[0], live[1]);
+        let paired = streams[left].recording_id.is_some()
+            && streams[left].recording_id == streams[right].recording_id;
+        if paired {
+            return;
+        }
+        let right_source = [crate::rtpengine::events::MediaSource {
+            call_id: streams[right].engine_call_id.clone().unwrap_or_default(),
+            from_tag: owner.from_tag.to_string(),
+        }];
+        let left_call = streams[left].engine_call_id.clone().unwrap_or_default();
+        match record_file(
+            backend,
+            owner,
+            &left_call,
+            "stereo",
+            RecordingChannels::Stereo,
+            &right_source,
+        )
         .await
-        .map_err(|error| error.to_string())?;
+        {
+            Ok((recording_id, path)) => {
+                for (channel, position) in [left, right].into_iter().enumerate() {
+                    streams[position].recording_id = Some(recording_id.clone());
+                    streams[position].recording_path = Some(path.clone());
+                    streams[position].recording_channel = channel;
+                }
+                return;
+            }
+            Err(error) => warn!(
+                recording_call_id = %owner.recording_call_id,
+                %error,
+                "SRS: the engine cannot record both streams into one file; recording each on its own"
+            ),
+        }
+    }
+    for position in live {
+        if streams[position].recording_id.is_some() {
+            continue;
+        }
+        let call = streams[position].engine_call_id.clone().unwrap_or_default();
+        let name = format!("stream-{}", streams[position].index);
+        match record_file(backend, owner, &call, &name, RecordingChannels::Mono, &[]).await {
+            Ok((recording_id, path)) => {
+                streams[position].recording_id = Some(recording_id);
+                streams[position].recording_path = Some(path);
+            }
+            Err(error) => warn!(
+                recording_call_id = %owner.recording_call_id,
+                stream = streams[position].index,
+                %error,
+                "SRS: recording refused"
+            ),
+        }
+    }
+}
+
+/// Start one file on `engine_call_id` (and `additional_sources`), named
+/// `<name>-<8 hex>.<ext>` in the session's directory.
+async fn record_file(
+    backend: &crate::rtpengine::MediaBackend,
+    owner: &StreamOwner<'_>,
+    engine_call_id: &str,
+    name: &str,
+    channels: RecordingChannels,
+    additional_sources: &[crate::rtpengine::events::MediaSource],
+) -> Result<(String, String), String> {
     let extension = match owner.recording.format {
         RecordingFormat::Wav => "wav",
         RecordingFormat::OggOpus => "ogg",
     };
     let file = owner.recording_dir.join(format!(
-        "stream-{}-{}.{extension}",
-        stream.index,
+        "{name}-{}.{extension}",
         &uuid::Uuid::new_v4().simple().to_string()[..8],
     ));
     let path = file.display().to_string();
@@ -239,16 +336,49 @@ async fn answer_stream(
         format: owner.recording.format,
         bitrate_bps: owner.recording.bitrate_bps,
         direction: RecordingDirection::Ingress,
-        channels: RecordingChannels::Mono,
+        channels,
         max_duration_ms: None,
         silence_ms: None,
         path: Some(&path),
+        additional_sources,
     };
-    match backend
-        .start_recording(&engine_call_id, owner.from_tag, &request)
+    backend
+        .start_recording(engine_call_id, owner.from_tag, &request)
         .await
+        .map(|recording_id| (recording_id, path))
+        .map_err(|error| error.to_string())
+}
+
+/// Answer one stream on its engine call and, when `record`, start recording
+/// it to a file of its own. On a refused recording the engine call is ended
+/// again: a stream the SRS cannot record is not answered.
+async fn answer_stream(
+    backend: &crate::rtpengine::MediaBackend,
+    owner: &StreamOwner<'_>,
+    stream: &OfferedStream,
+    flags: &crate::rtpengine::NgFlags,
+    record: bool,
+) -> Result<(String, String, Option<(String, String)>), String> {
+    let engine_call_id = SrsStream::engine_call_id_for(owner.recording_call_id, stream.index);
+    let engine_answer = backend
+        .answer_local(&engine_call_id, owner.from_tag, &stream.sdp, flags)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !record {
+        return Ok((engine_call_id, engine_answer, None));
+    }
+    let name = format!("stream-{}", stream.index);
+    match record_file(
+        backend,
+        owner,
+        &engine_call_id,
+        &name,
+        RecordingChannels::Mono,
+        &[],
+    )
+    .await
     {
-        Ok(recording_id) => Ok((engine_call_id, engine_answer, recording_id, path)),
+        Ok(recording) => Ok((engine_call_id, engine_answer, Some(recording))),
         Err(error) => {
             let _ = backend.delete(&engine_call_id, owner.from_tag).await;
             Err(format!("recording refused: {error}"))

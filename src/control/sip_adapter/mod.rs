@@ -19,6 +19,8 @@ mod call;
 mod caller_contact;
 mod dial_bridge;
 mod media;
+#[cfg(test)]
+pub(crate) use media::{recording_stream_start_on, recording_stream_stop_on};
 mod media_flags;
 #[cfg(test)]
 mod media_flags_tests;

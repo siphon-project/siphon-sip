@@ -278,6 +278,7 @@ impl PendingInvite {
             source_ip: self.inbound.remote_addr.ip(),
             recording_dir: &recording_dir,
             recording: &recording,
+            left_label: media::left_label(&metadata),
         };
         let anchored = match media::anchor_streams(
             state,

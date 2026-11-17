@@ -694,6 +694,9 @@ impl Call {
         if let Some(bitrate_bps) = recording.bitrate_bps {
             args["bitrate_bps"] = json!(bitrate_bps);
         }
+        if let Some(channels) = recording.channels {
+            args["channels"] = json!(channels.as_str());
+        }
         if let Some(path) = &recording.path {
             args["path"] = json!(path);
         }
@@ -1457,6 +1460,10 @@ pub struct RecordingAccept {
     pub format: Option<crate::recording::RecordFormat>,
     /// Opus target bitrate (`ogg_opus` only).
     pub bitrate_bps: Option<u32>,
+    /// `Stereo` writes a two-stream session as one file, a participant per
+    /// channel (left the first `participantstreamassoc`'s); unset or `Mono`
+    /// is a file per stream.
+    pub channels: Option<crate::recording::RecordChannels>,
     /// An absolute directory siphon writes the files to; it names them.
     pub path: Option<String>,
 }
@@ -1800,6 +1807,7 @@ mod tests {
         call.accept_recording(&RecordingAccept {
             format: Some(crate::recording::RecordFormat::OggOpus),
             bitrate_bps: Some(24000),
+            channels: Some(crate::recording::RecordChannels::Stereo),
             path: Some("/srv/tenant-a".to_string()),
             ..Default::default()
         })
@@ -1810,7 +1818,7 @@ mod tests {
         assert_eq!(recorded[0].args, json!({}));
         assert_eq!(
             recorded[1].args,
-            json!({ "format": "ogg_opus", "bitrate_bps": 24000, "path": "/srv/tenant-a" })
+            json!({ "format": "ogg_opus", "bitrate_bps": 24000, "channels": "stereo", "path": "/srv/tenant-a" })
         );
     }
 

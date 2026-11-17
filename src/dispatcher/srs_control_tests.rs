@@ -17,10 +17,10 @@ use crate::control::protocol::{ControlResult, EventFrame};
 use crate::control::{ConnHandle, ControlBus, OutboundFrame, SlowConsumerPolicy};
 use crate::rtpengine::test_native_engine::NativeTestEngine;
 
-const APP: &str = "recorder";
+pub(super) const APP: &str = "recorder";
 
 /// A bus serving [`APP`], with a handoff deadline of `deadline_ms`.
-fn bus(deadline_ms: u64) -> Arc<ControlBus> {
+pub(super) fn bus(deadline_ms: u64) -> Arc<ControlBus> {
     let (command_tx, _command_rx) = flume::unbounded();
     ControlBus::new(
         command_tx,
@@ -41,7 +41,7 @@ fn bus(deadline_ms: u64) -> Arc<ControlBus> {
 }
 
 /// A dispatcher whose SRS offers every session to [`APP`] on `bus`.
-fn controlled(
+pub(super) fn controlled(
     engine: &NativeTestEngine,
     directory: &std::path::Path,
     bus: &Arc<ControlBus>,
@@ -57,7 +57,7 @@ fn controlled(
 }
 
 /// The next `StasisStart` the application's connection is sent.
-async fn stasis_start(connection: &Arc<ConnHandle>) -> EventFrame {
+pub(super) async fn stasis_start(connection: &Arc<ConnHandle>) -> EventFrame {
     for _ in 0..200 {
         let frames = tokio::time::timeout(Duration::from_millis(10), connection.events.recv_many())
             .await
@@ -72,7 +72,7 @@ async fn stasis_start(connection: &Arc<ConnHandle>) -> EventFrame {
     panic!("no StasisStart");
 }
 
-fn verb(
+pub(super) fn verb(
     state: &Arc<DispatcherState>,
     call_id: &str,
     verb: &str,
@@ -81,7 +81,7 @@ fn verb(
     crate::dispatcher::srs::srs_control_verb_in(state, call_id, verb, &args)
 }
 
-fn ok(result: ControlResult) -> serde_json::Value {
+pub(super) fn ok(result: ControlResult) -> serde_json::Value {
     match result {
         ControlResult::Ok(value) => value,
         ControlResult::Error { message, .. } => panic!("refused: {message}"),
@@ -322,7 +322,7 @@ async fn the_srcs_bye_ends_the_channel() {
 
 /// The engine reports every file of `streams` closed, as it does once their
 /// calls are deleted.
-async fn files_close(state: &DispatcherState, streams: &[crate::srs::SrsStream]) {
+pub(super) async fn files_close(state: &DispatcherState, streams: &[crate::srs::SrsStream]) {
     for stream in streams {
         if let (Some(engine_call_id), Some(recording_id)) =
             (&stream.engine_call_id, &stream.recording_id)

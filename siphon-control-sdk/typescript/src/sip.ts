@@ -1022,6 +1022,11 @@ export interface RecordingAcceptOptions {
   format?: RecordFormat;
   /** Opus target bitrate (`ogg_opus` only). */
   bitrateBps?: number;
+  /**
+   * `"stereo"` writes a two-stream session as one file, a participant per
+   * channel; unset or `"mono"` is a file per stream.
+   */
+  channels?: "mono" | "stereo";
   /** An absolute directory siphon writes the files to; it names them. */
   path?: string;
 }
@@ -1520,6 +1525,9 @@ export class Call {
     }
     if (options.bitrateBps !== undefined) {
       args.bitrate_bps = options.bitrateBps;
+    }
+    if (options.channels !== undefined) {
+      args.channels = options.channels;
     }
     if (options.path !== undefined) {
       args.path = options.path;

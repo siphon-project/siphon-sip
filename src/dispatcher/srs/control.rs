@@ -279,12 +279,10 @@ fn accept_options(
         .map_err(bad)?;
     match args.get("channels").and_then(|value| value.as_str()) {
         None | Some("mono") => {}
+        // One file for a two-stream session, a participant per channel; any
+        // other stream count keeps a file per stream.
         Some("stereo") => {
-            return Err(ControlResult::error(
-                ControlErrorCode::UnsupportedVerb,
-                "channels: stereo is not available on a recording session yet: each stream \
-                 is recorded to a file of its own",
-            ))
+            options.channels = crate::rtpengine::events::RecordingChannels::Stereo;
         }
         Some(other) => {
             return Err(bad(format!(
@@ -300,6 +298,64 @@ fn accept_options(
         options.directory = Some(directory);
     }
     Ok(options)
+}
+
+/// What a media verb on a recording channel acts on: the backend, and the
+/// session's live stream calls, left first (as a stereo file has them), with
+/// the SRC's tag they are keyed on.
+pub(crate) type SrsMediaTarget = (
+    Arc<crate::rtpengine::MediaBackend>,
+    Vec<crate::rtpengine::events::MediaSource>,
+);
+
+/// [`srs_media_target_in`] through the dispatcher published at start-up.
+pub(crate) fn srs_media_target(sip_call_id: &str) -> Result<SrsMediaTarget, &'static str> {
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return Err("dispatcher not running");
+    };
+    srs_media_target_in(&control.state, sip_call_id)
+}
+
+/// The media a recording session's channel streams: every stream the engine
+/// terminates, the one the first participant sends first.
+pub(crate) fn srs_media_target_in(
+    state: &DispatcherState,
+    sip_call_id: &str,
+) -> Result<SrsMediaTarget, &'static str> {
+    let srs_manager = state.srs_manager.as_ref().ok_or("the SRS is not enabled")?;
+    let backend = state.rtpengine_set.clone().ok_or("no media backend")?;
+    let (from_tag, mut streams, metadata) = srs_manager
+        .get_session(sip_call_id)
+        .map(|session| {
+            (
+                session.from_tag.clone(),
+                session.streams.clone(),
+                session.metadata.clone(),
+            )
+        })
+        .ok_or("no such recording session")?;
+    streams.retain(|stream| stream.engine_call_id.is_some());
+    if streams.is_empty() {
+        return Err("the recording session has no live stream");
+    }
+    if let Some(left) = media::left_label(&metadata) {
+        if let Some(position) = streams
+            .iter()
+            .position(|stream| stream.label.as_deref() == Some(left.as_str()))
+        {
+            let first = streams.remove(position);
+            streams.insert(0, first);
+        }
+    }
+    let sources = streams
+        .into_iter()
+        .filter_map(|stream| stream.engine_call_id)
+        .map(|call_id| crate::rtpengine::events::MediaSource {
+            call_id,
+            from_tag: from_tag.clone(),
+        })
+        .collect();
+    Ok((backend, sources))
 }
 
 /// End a recording session from siphon's side (the application's `hangup`,
@@ -440,12 +496,11 @@ mod tests {
                 "{refused}"
             );
         }
-        assert!(matches!(
-            accept_options(&serde_json::json!({ "channels": "stereo" }), &state),
-            Err(ControlResult::Error {
-                code: ControlErrorCode::UnsupportedVerb,
-                ..
-            })
-        ));
+        assert_eq!(
+            accept_options(&serde_json::json!({ "channels": "stereo" }), &state)
+                .map(|options| options.channels)
+                .ok(),
+            Some(crate::rtpengine::events::RecordingChannels::Stereo)
+        );
     }
 }
