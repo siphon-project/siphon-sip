@@ -1186,7 +1186,11 @@ pub(super) async fn on_recording_finished(
         path = recording.path.as_deref().unwrap_or("<none>"),
         "media engine finished a recording"
     );
-    publish_recording_finished(state, &recording);
+    // A recording of a SIPREC session reports to the session's channel, with
+    // the streams and participants it holds.
+    if !srs_recording_finished(state, &recording) {
+        publish_recording_finished(state, &recording);
+    }
     // A tag that names no single party still leaves a closed file somebody has
     // to deal with, so the handlers get the engine's call-id rather than nothing.
     let call_id = engine_event_channel(state, &recording.call_id, &recording.from_tag)

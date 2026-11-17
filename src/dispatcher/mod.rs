@@ -403,6 +403,8 @@ mod spiral_invite_tests;
 #[cfg(test)]
 mod srs_control_tests;
 #[cfg(test)]
+mod srs_events_tests;
+#[cfg(test)]
 mod srs_handshake_tests;
 #[cfg(test)]
 mod stale_in_dialog_request_tests;

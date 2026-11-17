@@ -163,7 +163,7 @@ pub(super) async fn anchor_streams(
         }
 
         match answer_stream(backend, owner, stream, &flags).await {
-            Ok((engine_call_id, engine_answer, recording_id)) => {
+            Ok((engine_call_id, engine_answer, recording_id, recording_path)) => {
                 streams.push(SrsStream {
                     index: stream.index,
                     label: stream.label.clone(),
@@ -171,6 +171,7 @@ pub(super) async fn anchor_streams(
                     recording_id: Some(recording_id),
                     offered_section: identity,
                     engine_answer: Some(engine_answer.clone()),
+                    recording_path: Some(recording_path),
                 });
                 answers.push((stream.clone(), StreamAnswer::Engine(engine_answer)));
             }
@@ -206,6 +207,7 @@ fn rejected(stream: &OfferedStream, identity: String) -> SrsStream {
         recording_id: None,
         offered_section: identity,
         engine_answer: None,
+        recording_path: None,
     }
 }
 
@@ -217,7 +219,7 @@ async fn answer_stream(
     owner: &StreamOwner<'_>,
     stream: &OfferedStream,
     flags: &crate::rtpengine::NgFlags,
-) -> Result<(String, String, String), String> {
+) -> Result<(String, String, String, String), String> {
     let engine_call_id = SrsStream::engine_call_id_for(owner.recording_call_id, stream.index);
     let engine_answer = backend
         .answer_local(&engine_call_id, owner.from_tag, &stream.sdp, flags)
@@ -246,7 +248,7 @@ async fn answer_stream(
         .start_recording(&engine_call_id, owner.from_tag, &request)
         .await
     {
-        Ok(recording_id) => Ok((engine_call_id, engine_answer, recording_id)),
+        Ok(recording_id) => Ok((engine_call_id, engine_answer, recording_id, path)),
         Err(error) => {
             let _ = backend.delete(&engine_call_id, owner.from_tag).await;
             Err(format!("recording refused: {error}"))

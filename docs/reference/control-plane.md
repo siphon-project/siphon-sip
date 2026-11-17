@@ -1284,6 +1284,21 @@ SRC cancelled first, `unacknowledged` when it never ACKed the 200, and
 `owner_lost` when the application's connection is lost and its `on_lost` is
 `hangup`.
 
+While it records, and when it ends, the channel gets:
+
+| event | payload | when |
+|---|---|---|
+| `RecordingFinished` | `{recording_id, path, format, stream_ids, label, participant_ids, duration_ms, reason}` | the engine has closed a file. `label` is the stream's `a=label`. `stream_ids` and `participant_ids` come from the metadata: the `<stream>` with that label, and the participants whose `participantstreamassoc` sends it. `reason` is the engine's (`call_ended`, `stopped`, `max_duration`, `silence`, `error`). |
+| `RecordingMetadataUpdated` | `{session_id, datamode, metadata}` | a re-INVITE or UPDATE carried metadata. `datamode` is the update's own, and `metadata` is the merged snapshot, in the offer's `recording_session` shape. |
+| `RecordingSessionEnded` | `{session_id, sip_session_ids, reason, metadata, recordings}` | every file of an ended session is closed. `recordings` holds the `RecordingFinished` payloads, and `metadata` is the final snapshot. |
+
+An ended session's `StasisEnd` comes after its `RecordingSessionEnded`, so by the
+time a controller sees the channel end, every file it lists is complete. A file
+the engine never reports closed within 10 s is left out, and the session ends
+without it. The `file` and `http` storage backends also run only after the files
+close. `http` retries a failed post three times (after 1, 2 and 4 s) when there
+was no response, a 5xx or a 429.
+
 ## Placing a call: `originate`
 
 Every verb above acts on a call that already arrived. `originate` is the one that

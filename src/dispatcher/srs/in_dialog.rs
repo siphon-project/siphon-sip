@@ -29,7 +29,10 @@ async fn renegotiate(
         (refusal.code, refusal.reason)
     })?;
     if let Some(metadata) = body.metadata {
-        srs_manager.update_session(&call_id, metadata);
+        let datamode = metadata.datamode;
+        if let Some(merged) = srs_manager.update_session(&call_id, metadata) {
+            events::metadata_updated(&call_id, datamode, &merged);
+        }
     }
     let Some(offer) = body.offer else {
         return Ok(Renegotiated::NoOffer);
@@ -160,46 +163,29 @@ pub(super) fn handle_update(
 }
 
 /// A session taken out of the store, its engine calls still to end.
-struct Ended {
-    record: crate::srs::RecordingRecord,
-    streams: Vec<crate::srs::SrsStream>,
-    from_tag: String,
+pub(super) struct Ended {
+    pub(super) record: crate::srs::RecordingRecord,
+    pub(super) metadata: crate::siprec::metadata::RecordingMetadata,
+    pub(super) streams: Vec<crate::srs::SrsStream>,
+    pub(super) from_tag: String,
 }
 
 /// Take a session out of the store and stop the 2xx still waiting for an ACK.
 fn take_session(call_id: &str, srs_manager: &SrsManager, state: &DispatcherState) -> Option<Ended> {
     // Read before the session is removed; the guard ends with the statement.
-    let from_tag = srs_manager
+    let (from_tag, metadata) = srs_manager
         .get_session(call_id)
-        .map(|session| session.from_tag.clone())?;
+        .map(|session| (session.from_tag.clone(), session.metadata.clone()))?;
     let (record, streams) = srs_manager.stop_session(call_id)?;
     if let Some((_, unacked)) = state.uas_2xx_retransmits.remove(call_id) {
         unacked.cancel.notify_one();
     }
     Some(Ended {
         record,
+        metadata,
         streams,
         from_tag,
     })
-}
-
-/// End an ended session's engine calls, which closes its recordings, then
-/// store its record.
-async fn release_and_store(
-    ended: Ended,
-    backend: Option<Arc<crate::rtpengine::MediaBackend>>,
-    srs_manager: Arc<SrsManager>,
-) {
-    if let Some(backend) = backend {
-        for stream in &ended.streams {
-            if let Some(engine_call_id) = &stream.engine_call_id {
-                if let Err(error) = backend.delete(engine_call_id, &ended.from_tag).await {
-                    debug!(%engine_call_id, %error, "SRS: engine call already gone");
-                }
-            }
-        }
-    }
-    crate::srs::storage::store_recording(srs_manager.config(), &ended.record).await;
 }
 
 /// A BYE from the SRC: the recording session is over.
@@ -212,14 +198,20 @@ pub(super) fn handle_bye(
 ) {
     info!(call_id = %call_id, "SRS: received BYE from SRC");
     respond(&inbound, &message, 200, "OK", None, &[], state);
-    control_notify_terminated(&call_id, "bye");
     let Some(ended) = take_session(&call_id, &srs_manager, state) else {
         return;
     };
     let state = Arc::clone(state);
     tokio::spawn(async move {
         script::session_ended(&state, &ended.record, &call_id).await;
-        release_and_store(ended, state.rtpengine_set.clone(), srs_manager).await;
+        events::close_session(
+            &call_id,
+            "bye",
+            ended,
+            state.rtpengine_set.clone(),
+            srs_manager,
+        )
+        .await;
     });
 }
 
@@ -351,15 +343,22 @@ pub(super) fn end_from_siphon(call_id: &str, reason: &str, state: &Arc<Dispatche
     };
     info!(call_id = %call_id, reason, "SRS: ending the recording session");
     send_bye_to_src(call_id, &srs_manager, state);
-    control_notify_terminated(call_id, reason);
     let Some(ended) = take_session(call_id, &srs_manager, state) else {
         return;
     };
+    let reason = reason.to_string();
     let call_id = call_id.to_string();
     let state = Arc::clone(state);
     tokio::spawn(async move {
         script::session_ended(&state, &ended.record, &call_id).await;
-        release_and_store(ended, state.rtpengine_set.clone(), srs_manager).await;
+        events::close_session(
+            &call_id,
+            &reason,
+            ended,
+            state.rtpengine_set.clone(),
+            srs_manager,
+        )
+        .await;
     });
 }
 
@@ -373,7 +372,6 @@ pub(in crate::dispatcher) fn srs_unacked_answer_terminate(call_id: &str, state: 
     };
     warn!(call_id = %call_id, "RFC 3261 §13.3.1.4: the SRC never ACKed the 2xx within 64*T1, ending the recording");
     send_bye_to_src(call_id, &srs_manager, state);
-    control_notify_terminated(call_id, "unacknowledged");
     srs_manager.fail_session(call_id, "2xx never acknowledged");
     let Some(ended) = take_session(call_id, &srs_manager, state) else {
         return;
@@ -391,9 +389,9 @@ pub(in crate::dispatcher) fn srs_unacked_answer_terminate(call_id: &str, state: 
             call_id,
         );
     }
-    tokio::spawn(release_and_store(
-        ended,
-        state.rtpengine_set.clone(),
-        srs_manager,
-    ));
+    let call_id = call_id.to_string();
+    let backend = state.rtpengine_set.clone();
+    tokio::spawn(async move {
+        events::close_session(&call_id, "unacknowledged", ended, backend, srs_manager).await;
+    });
 }
