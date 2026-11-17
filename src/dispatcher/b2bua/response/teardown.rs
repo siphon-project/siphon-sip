@@ -656,12 +656,36 @@ pub fn build_cancelled_leg_ack(
     via_port: u16,
 ) -> Option<SipMessage> {
     let target_uri = invite_ruri?;
-    Some(build_b2bua_ack_for_non2xx(
+    let ack = build_b2bua_ack_for_non2xx(
         response,
         &leg.branch,
         Some(target_uri),
         leg.transport.transport,
         via_host,
         via_port,
-    ))
+    );
+    Some(match leg.b_leg_invite.as_ref() {
+        Some(invite) => ack_with_invite_routes(ack, invite),
+        None => ack,
+    })
+}
+
+/// `ack` with the Route header fields of `invite`, the INVITE it acknowledges.
+///
+/// RFC 3261 §17.1.1.3: "The ACK MUST contain the same Route header fields as
+/// the request whose response it is acknowledging", so the ACK to a final
+/// non-2xx of an INVITE sent through a pre-loaded route set takes the same
+/// path. A no-op for an INVITE that carried none.
+pub fn ack_with_invite_routes(mut ack: SipMessage, invite: &Mutex<SipMessage>) -> SipMessage {
+    let routes = match invite.lock() {
+        Ok(invite) => invite.headers.get_all("Route").cloned(),
+        Err(_) => {
+            error!("B2BUA: stored INVITE mutex poisoned while reading its Route for an ACK");
+            None
+        }
+    };
+    if let Some(routes) = routes.filter(|routes| !routes.is_empty()) {
+        ack.headers.set_all("Route", routes);
+    }
+    ack
 }

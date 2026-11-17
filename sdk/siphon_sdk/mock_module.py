@@ -2501,9 +2501,26 @@ class MockB2bua:
         out-of-band event callback (``@rtpengine.on_dtmf``,
         ``@rtpengine.on_media_timeout``), a timer, or a normal handler.
 
+        What goes on the wire depends on how far the call got (RFC 3261
+        sections 9.1 and 15):
+
+        * An answered call gets an in-dialog BYE on every leg.
+        * A leg placed with ``b2bua.originate()`` that has not been answered
+          gets a CANCEL of its INVITE: at once if it is ringing, on its first
+          provisional response if it has sent none yet, and not at all if the
+          INVITE times out first. The 487 is ACKed. An answer that crosses the
+          CANCEL is ACKed and released with a BYE.
+
+        Either way the call is over for the script when this returns. No
+        handler runs for a leg ended here: no ``@b2bua.on_bye``, no
+        ``@b2bua.on_failure`` for the 487, and no ``@b2bua.on_answer`` for an
+        answer that crossed the CANCEL.
+
         Args:
-            call_id: the SIP Call-ID of the call to end.
+            call_id: the SIP Call-ID of the call to end (for a leg the script
+                placed, the one ``b2bua.originate()`` returned).
             reason: free-text hangup reason (RFC 3326 ``Reason`` on the BYE).
+                A CANCEL carries no Reason.
 
         Returns:
             bool: True if a matching call was found and torn down, False if the
@@ -2518,6 +2535,16 @@ class MockB2bua:
             def on_ivr_dtmf(call_id, from_tag, digit, duration_ms, volume):
                 if digit == "#":
                     b2bua.terminate(call_id)
+
+        Ringing several of a user's clients and keeping the first to answer.
+        Which legs belong together is cross-request state, so it lives in the
+        ``cache`` namespace, not in a module global::
+
+            @b2bua.on_answer
+            async def answered(call, reply):
+                others = await cache.fetch("ring_groups", call.call_id)
+                for leg in (others or "").split():
+                    b2bua.terminate(leg)    # CANCEL while it rings
         """
         self.terminates.append({"call_id": call_id, "reason": reason})
         return True

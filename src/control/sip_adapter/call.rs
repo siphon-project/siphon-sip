@@ -466,14 +466,15 @@ pub(super) fn hangup(channel: &ChannelRef, args: &serde_json::Value) -> ControlR
 
     let ok = match call {
         // Answered: BYE both legs via the full teardown funnel (Rf/Ro/CDR/media).
-        Some((true, _)) => crate::dispatcher::b2bua_terminate_call(&channel.sip_call_id, reason),
-        // A call siphon placed that has not answered: abandon it with a CANCEL on
-        // our own INVITE (RFC 3261 §9.1). The arm below sends a final *response*,
-        // which a UAC has no business sending to the party it is calling.
-        Some((false, true)) => crate::dispatcher::b2bua_cancel_originated_call(
-            &channel.sip_call_id,
-            Some(reason.unwrap_or("cancelled")),
-        ),
+        // A call siphon placed that has not answered: abandoned with a CANCEL
+        // on our own INVITE (RFC 3261 §9.1), which is where the same call
+        // takes it, deciding between the two against the call's 2xx so one
+        // answered since it was read above still gets its BYE. The arm below
+        // sends a final *response*, which a UAC has no business sending to the
+        // party it is calling.
+        Some((true, _)) | Some((false, true)) => {
+            crate::dispatcher::b2bua_terminate_call(&channel.sip_call_id, reason)
+        }
         // Unanswered/parked: send a final non-2xx and tear down (no B-leg to CANCEL
         // in Phase 1's single-CallActor model).
         Some((false, false)) => crate::dispatcher::b2bua_reject_call(
