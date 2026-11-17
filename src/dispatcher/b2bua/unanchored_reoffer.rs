@@ -100,6 +100,7 @@ pub fn answer_unanchored_reoffer(
             call_id,
             offerer,
             false,
+            last_given.as_deref(),
             &hook.decision,
             state,
         );
@@ -108,7 +109,10 @@ pub fn answer_unanchored_reoffer(
     }
 
     let is_invite = message.method() == Some(&Method::Invite);
-    let offered = !message.body.is_empty();
+    // The offer is the SDP the request carries, alone or as a part of a
+    // multipart body (RFC 5621 §3). A body with no SDP offers nothing.
+    let offer = description_given(message);
+    let offered = offer.is_some();
     // Read only now: the call the engine answers for never gets this far.
     let (unchanged, in_force) = match state.call_actors.get_call(call_id) {
         Some(call) => (
@@ -118,7 +122,7 @@ pub fn answer_unanchored_reoffer(
                     .last_sdp
                     .as_deref()
                     .and_then(origin_line)
-                    .is_some_and(|known| origin_line(&message.body) == Some(known)),
+                    .is_some_and(|known| offer.as_deref().and_then(origin_line) == Some(known)),
             call.a_leg.dialog.last_sent_sdp.clone(),
         ),
         None => return false,

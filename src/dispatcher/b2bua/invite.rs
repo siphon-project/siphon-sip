@@ -622,11 +622,11 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     a_leg.stored_from = message.headers.from().cloned();
     a_leg.stored_to = message.headers.to().cloned();
 
-    // Record the A-leg's own raw endpoint SDP (the caller's offer, before any
-    // script/rtpengine rewrite) so a later siphon-terminated transfer where the
-    // A-leg is the survivor can offer its real media to the transfer target.
-    if !message.body.is_empty() {
-        a_leg.last_sdp = Some(message.body.clone());
+    // Record the A-leg's own endpoint SDP (the caller's offer, the SDP part of a
+    // multipart body, before any script/rtpengine rewrite) so a later transfer
+    // where the A-leg is the survivor can offer its real media to the target.
+    if let Some(description) = description_given(&message) {
+        a_leg.last_sdp = Some(description);
     }
 
     let call_id = create_b2bua_call(state, a_leg);

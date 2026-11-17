@@ -157,24 +157,30 @@ const RENEGOTIATING_ATTRIBUTES: [&str; 8] = [
     "mid",
 ];
 
-/// Every renegotiating attribute line of `sdp`, session and media level, in
-/// the order it carries them.
-fn renegotiating(sdp: &SdpBody) -> Vec<&str> {
-    let named = |line: &&str| {
-        let name = line.split(':').next().unwrap_or(line).trim();
-        RENEGOTIATING_ATTRIBUTES
+/// The renegotiating attribute lines of `sdp` by scope: the session level's,
+/// then each stream's, in the order it carries them. Kept apart because an
+/// attribute's scope is part of what it says: a credential that moves from
+/// one stream to another, or from a stream to the session, changes what both
+/// use (RFC 8839 §5.4 has the media level override the session level).
+fn renegotiating(sdp: &SdpBody) -> Vec<Vec<&str>> {
+    fn scoped(lines: &[String]) -> Vec<&str> {
+        lines
             .iter()
-            .any(|renegotiating| name.eq_ignore_ascii_case(renegotiating))
-    };
-    sdp.session_lines
-        .iter()
+            .filter_map(|line| line.strip_prefix("a="))
+            .filter(|line| {
+                let name = line.split(':').next().unwrap_or(line).trim();
+                RENEGOTIATING_ATTRIBUTES
+                    .iter()
+                    .any(|renegotiating| name.eq_ignore_ascii_case(renegotiating))
+            })
+            .collect()
+    }
+    std::iter::once(scoped(&sdp.session_lines))
         .chain(
             sdp.media_sections
                 .iter()
-                .flat_map(|section| section.other_attrs.iter()),
+                .map(|section| scoped(&section.other_attrs)),
         )
-        .filter_map(|line| line.strip_prefix("a="))
-        .filter(named)
         .collect()
 }
 
@@ -576,5 +582,28 @@ mod tests {
         assert_eq!(ReofferKind::Hold.as_str(), "hold");
         assert_eq!(ReofferKind::Resume.as_str(), "resume");
         assert_eq!(ReofferKind::Change.as_str(), "change");
+    }
+
+    /// An ICE credential that moves from one stream to the other changes what
+    /// both streams use, though the description lists the same lines.
+    #[test]
+    fn a_credential_that_changes_scope_is_a_change() {
+        let two_streams = |first: &str, second: &str| {
+            SdpBody::parse(&format!(
+                "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\n\
+                 a=ice-ufrag:sess\r\na=ice-pwd:sessionpassword000000000\r\n\
+                 m=audio 40000 RTP/AVP 0\r\n{first}m=video 40002 RTP/AVP 96\r\n{second}"
+            ))
+        };
+        let own = "a=ice-ufrag:own1\r\n";
+        let in_force = two_streams(own, "");
+        assert_eq!(
+            classify(Some(&two_streams(own, "")), Some(&in_force)),
+            ReofferKind::Refresh
+        );
+        assert_eq!(
+            classify(Some(&two_streams("", own)), Some(&in_force)),
+            ReofferKind::Change
+        );
     }
 }

@@ -21,7 +21,10 @@
 //! What it cannot do is negotiate anything beyond formats and direction for a
 //! party that is not there: a key exchange (`a=crypto:`, `a=fingerprint:`),
 //! ICE, a grouping of streams. A description that needs one is refused rather
-//! than answered wrongly.
+//! than answered wrongly, unless the offer renegotiates none of it: an offer
+//! that repeats what the offerer already had agreed, give or take a direction,
+//! is answered by the description that agreement produced
+//! ([`answer_repeating`]).
 
 use super::direction::{direction_attribute, stated_direction, DIRECTION_ATTRIBUTES};
 use super::sdp::{MediaLine, SdpBody};
@@ -134,6 +137,21 @@ fn accepted(
         answer.remove_attr("rtcp-mux");
     }
 
+    answer_direction(&mut answer, offer, offered, description, own);
+    Some(answer)
+}
+
+/// Give `answer`, a copy of the party's stream `own`, the direction the party
+/// has it in cut down to what the offered stream leaves (RFC 3264 §6.1). The
+/// attribute stays where the party had it, and a stream that runs both ways
+/// and never said so still does not.
+fn answer_direction(
+    answer: &mut MediaLine,
+    offer: &SdpBody,
+    offered: &MediaLine,
+    description: &SdpBody,
+    own: &MediaLine,
+) {
     let (may_send, may_receive) = stated_direction(description, own);
     let (offerer_sends, offerer_receives) = stated_direction(offer, offered);
     let answered = direction_attribute(may_send && offerer_receives, may_receive && offerer_sends);
@@ -153,7 +171,6 @@ fn accepted(
             .min(answer.other_attrs.len());
         answer.other_attrs.insert(position, format!("a={answered}"));
     }
-    Some(answer)
 }
 
 /// `description`, one party's session description, as the answer to `offer`.
@@ -187,9 +204,247 @@ pub fn answer_from(offer: &SdpBody, description: &SdpBody) -> Result<SdpBody, &'
     })
 }
 
+/// The lines of a description, or of one stream of it, that an offer has to
+/// carry unchanged to be a repeat of it: all but the `o=` line, whose version
+/// moves on (RFC 3264 §8), the direction attributes, and ICE candidates, which
+/// trickle in without restarting anything (RFC 8840 §4.4).
+fn repeated_lines(lines: &[String]) -> Vec<&str> {
+    lines
+        .iter()
+        .map(String::as_str)
+        .filter(|line| {
+            let attribute = line.strip_prefix("a=");
+            !line.starts_with("o=")
+                && !attribute.is_some_and(|name| {
+                    DIRECTION_ATTRIBUTES.contains(&name)
+                        || name.starts_with("candidate:")
+                        || name == "end-of-candidates"
+                })
+        })
+        .collect()
+}
+
+/// Whether `offered` is the stream `had` again, whatever its direction.
+fn repeats_stream(offered: &MediaLine, had: &MediaLine) -> bool {
+    offered.media_type.eq_ignore_ascii_case(&had.media_type)
+        && offered.port == had.port
+        && offered.port_count == had.port_count
+        && offered.protocol.eq_ignore_ascii_case(&had.protocol)
+        && offered.formats == had.formats
+        && offered.rtpmap == had.rtpmap
+        && offered.fmtp == had.fmtp
+        && repeated_lines(&offered.other_attrs) == repeated_lines(&had.other_attrs)
+}
+
+/// `description`, the session in force toward a party, as the answer to an
+/// `offer` from that party which renegotiates nothing but a direction.
+///
+/// `previous` is the description the party last gave, the one `description`
+/// was agreed against by whoever could: the media engine holding the keys,
+/// the ICE agent and the bundle. An offer that says what `previous` said,
+/// line for line at the session level and in every stream, asks for none of
+/// that again (RFC 8839 §4.4.1.1.1 restarts ICE only on new credentials,
+/// RFC 8842 §5.5 keeps the DTLS association while fingerprint and transport
+/// are unchanged, RFC 9143 §7.5 keeps the BUNDLE group), so the answer it
+/// had still answers it, with each stream's direction cut down to what the
+/// offer leaves (RFC 3264 §6.1, §8.4). Any other difference (a codec
+/// parameter, `a=rtcp-mux` taken away, an attribute moved from one stream to
+/// another) is a change the answer it had does not answer.
+///
+/// `Err` says why it is not such an offer.
+pub fn answer_repeating(
+    offer: &SdpBody,
+    previous: &SdpBody,
+    description: &SdpBody,
+) -> Result<SdpBody, &'static str> {
+    if offer.media_sections.len() != previous.media_sections.len()
+        || offer.media_sections.len() != description.media_sections.len()
+    {
+        return Err("the offer adds or removes a stream, which takes the other party to answer");
+    }
+    let repeats = repeated_lines(&offer.session_lines) == repeated_lines(&previous.session_lines)
+        && offer
+            .media_sections
+            .iter()
+            .zip(&previous.media_sections)
+            .all(|(offered, had)| repeats_stream(offered, had));
+    if !repeats {
+        return Err(
+            "the offer changes more than a direction of a keyed, ICE or grouped session, which \
+             takes the other party to answer",
+        );
+    }
+    let media_sections = offer
+        .media_sections
+        .iter()
+        .zip(&description.media_sections)
+        .map(|(offered, own)| {
+            let mut answer = own.clone();
+            // A stream either side has at port zero has no direction to state.
+            if offered.port != 0 && own.port != 0 {
+                answer_direction(&mut answer, offer, offered, description, own);
+            }
+            answer
+        })
+        .collect();
+    Ok(SdpBody {
+        session_lines: description.session_lines.clone(),
+        media_sections,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A participant's offer toward a media engine that keys with DTLS, runs
+    /// ICE and bundles (RFC 8842, RFC 8839, RFC 9143).
+    const KEYED_OFFER: &str = concat!(
+        "v=0\r\n",
+        "o=- 4 4 IN IP4 192.0.2.10\r\n",
+        "s=-\r\n",
+        "t=0 0\r\n",
+        "a=group:BUNDLE 0\r\n",
+        "m=audio 50000 UDP/TLS/RTP/SAVPF 111\r\n",
+        "c=IN IP4 192.0.2.10\r\n",
+        "a=mid:0\r\n",
+        "a=rtpmap:111 opus/48000/2\r\n",
+        "a=ice-ufrag:ofrg\r\n",
+        "a=ice-pwd:offererpassword0000000000\r\n",
+        "a=fingerprint:sha-256 AA:BB\r\n",
+        "a=setup:actpass\r\n",
+        "a=rtcp-mux\r\n",
+    );
+
+    /// The engine's answer to it: the session in force toward the participant.
+    const KEYED_SESSION: &str = concat!(
+        "v=0\r\n",
+        "o=- 9 9 IN IP4 203.0.113.7\r\n",
+        "s=-\r\n",
+        "t=0 0\r\n",
+        "a=group:BUNDLE 0\r\n",
+        "m=audio 40000 UDP/TLS/RTP/SAVPF 111\r\n",
+        "c=IN IP4 203.0.113.7\r\n",
+        "a=mid:0\r\n",
+        "a=rtpmap:111 opus/48000/2\r\n",
+        "a=ice-ufrag:efrg\r\n",
+        "a=ice-pwd:enginepassword00000000000\r\n",
+        "a=fingerprint:sha-256 CC:DD\r\n",
+        "a=setup:passive\r\n",
+        "a=rtcp-mux\r\n",
+    );
+
+    #[test]
+    fn a_keyed_offer_that_repeats_itself_is_answered_with_the_session_in_force() {
+        let offer = SdpBody::parse(&KEYED_OFFER.replace("o=- 4 4", "o=- 4 5"));
+        let previous = SdpBody::parse(KEYED_OFFER);
+        let session = SdpBody::parse(KEYED_SESSION);
+        assert!(
+            answer_from(&offer, &session).is_err(),
+            "not answerable from formats alone"
+        );
+        let answer = answer_repeating(&offer, &previous, &session).expect("answered");
+        assert_eq!(answer.to_string(), session.to_string());
+    }
+
+    #[test]
+    fn a_keyed_hold_is_answered_with_the_session_in_force_receiving_only() {
+        let held = SdpBody::parse(&format!("{KEYED_OFFER}a=sendonly\r\n"));
+        let answer = answer_repeating(
+            &held,
+            &SdpBody::parse(KEYED_OFFER),
+            &SdpBody::parse(KEYED_SESSION),
+        )
+        .expect("answered")
+        .to_string();
+        assert!(answer.contains("a=recvonly\r\n"), "{answer}");
+        assert!(
+            answer.contains("a=fingerprint:sha-256 CC:DD\r\n"),
+            "{answer}"
+        );
+        assert!(answer.contains("a=setup:passive\r\n"), "{answer}");
+        assert!(answer.contains("a=ice-ufrag:efrg\r\n"), "{answer}");
+    }
+
+    #[test]
+    fn an_ice_restart_a_new_key_or_a_moved_stream_is_not_a_repeat() {
+        let previous = SdpBody::parse(KEYED_OFFER);
+        let session = SdpBody::parse(KEYED_SESSION);
+        for (what, changed) in [
+            (
+                "ICE restart",
+                KEYED_OFFER.replace("ice-ufrag:ofrg", "ice-ufrag:new1"),
+            ),
+            ("new key", KEYED_OFFER.replace("AA:BB", "EE:FF")),
+            (
+                "moved",
+                KEYED_OFFER.replace("m=audio 50000", "m=audio 50002"),
+            ),
+            (
+                "new address",
+                KEYED_OFFER.replace("c=IN IP4 192.0.2.10", "c=IN IP4 192.0.2.99"),
+            ),
+            (
+                "new format",
+                KEYED_OFFER.replace("SAVPF 111", "SAVPF 111 0"),
+            ),
+            (
+                "new stream",
+                format!("{KEYED_OFFER}m=video 50004 UDP/TLS/RTP/SAVPF 96\r\n"),
+            ),
+            ("no rtcp-mux", KEYED_OFFER.replace("a=rtcp-mux\r\n", "")),
+            (
+                "codec parameters",
+                format!("{KEYED_OFFER}a=fmtp:111 useinbandfec=1\r\n"),
+            ),
+            (
+                "another clock rate",
+                KEYED_OFFER.replace("opus/48000/2", "opus/16000"),
+            ),
+            (
+                "session-level credential",
+                KEYED_OFFER
+                    .replace("a=ice-ufrag:ofrg\r\n", "")
+                    .replace("t=0 0\r\n", "t=0 0\r\na=ice-ufrag:ofrg\r\n"),
+            ),
+        ] {
+            assert!(
+                answer_repeating(&SdpBody::parse(&changed), &previous, &session).is_err(),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trickled_candidate_and_a_new_version_leave_a_repeat_a_repeat() {
+        let offer = format!(
+            "{}a=candidate:1 1 UDP 2122252543 192.0.2.10 50000 typ host\r\na=end-of-candidates\r\n",
+            KEYED_OFFER.replace("o=- 4 4", "o=- 4 9")
+        );
+        assert!(answer_repeating(
+            &SdpBody::parse(&offer),
+            &SdpBody::parse(KEYED_OFFER),
+            &SdpBody::parse(KEYED_SESSION),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_rejected_stream_of_a_repeat_stays_as_it_was() {
+        let offer = format!("{KEYED_OFFER}m=video 0 UDP/TLS/RTP/SAVPF 96\r\n");
+        let session = format!("{KEYED_SESSION}m=video 0 UDP/TLS/RTP/SAVPF 96\r\n");
+        let answer = answer_repeating(
+            &SdpBody::parse(&offer),
+            &SdpBody::parse(&offer),
+            &SdpBody::parse(&session),
+        )
+        .expect("answered")
+        .to_string();
+        assert!(
+            answer.ends_with("m=video 0 UDP/TLS/RTP/SAVPF 96\r\n"),
+            "{answer}"
+        );
+    }
 
     const PARTY: &str = concat!(
         "v=0\r\n",

@@ -1114,6 +1114,7 @@ class SipTestHarness:
                     fn(call, offer)
             except Exception:
                 offer._decision = ("relay",)
+                offer._answer_extras = None
                 break
         return offer
 

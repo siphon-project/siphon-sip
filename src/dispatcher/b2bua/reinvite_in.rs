@@ -1,6 +1,6 @@
 //! An inbound re-INVITE on a bridged call: glare, the offer/answer it drives
 //! across the bridge, and the media re-anchor behind it.
-use crate::b2bua::reoffer::ReofferDecision;
+use crate::b2bua::reoffer::{AnswerExtras, ReofferDecision};
 use crate::dispatcher::*;
 
 #[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. handle_b2bua_reinvite
@@ -144,10 +144,11 @@ pub fn handle_b2bua_reinvite(
     // Track the offerer's own new endpoint SDP (its re-INVITE offer, raw —
     // before any topology/rtpengine rewrite) so a later siphon-terminated
     // transfer offers this leg's *current* media if it is the survivor.
-    if !message.body.is_empty() {
+    // The SDP part alone of a multipart body (RFC 5621 §3).
+    if let Some(description) = description_given(&message) {
         state
             .call_actors
-            .set_leg_last_sdp(&call_id, from_a_leg, &message.body);
+            .set_leg_last_sdp(&call_id, from_a_leg, &description);
     }
 
     // Snapshot routing info + per-leg contacts AFTER the flow refresh.
@@ -191,7 +192,15 @@ pub fn handle_b2bua_reinvite(
     // §14.1 reserves `491` for a genuinely crossing offer/answer; there is no
     // second offer here to cross with.
     if from_a_leg && winner_b_leg.is_none() {
-        answer_one_legged_reoffer(&inbound, &message, &call_id, &a_leg, "re-INVITE", state);
+        answer_one_legged_reoffer(
+            &inbound,
+            &message,
+            &call_id,
+            &a_leg,
+            "re-INVITE",
+            in_force,
+            state,
+        );
         return;
     }
 
@@ -319,6 +328,7 @@ pub fn handle_b2bua_reinvite(
             &call_id,
             offerer,
             false,
+            in_force.as_deref(),
             &hook.decision,
             state,
         );
@@ -769,14 +779,88 @@ pub fn handle_b2bua_reinvite(
 /// session, or with one that relays to a second party (a leg parted from its
 /// bridge), is answered by [`answer_unanchored_reoffer`] before this is
 /// reached: the engine has nothing to answer that leg from on its own.
+///
+/// `@b2bua.on_reoffer` is shown the offer first, as on a bridged call and on a
+/// leg the engine does not answer for, read against `in_force`, the
+/// description the party had given before it. A handler that refuses it, or
+/// answers it with an SDP of its own, decides ([`decide_reoffer_here`]). One
+/// that answers it without (`offer.answer()`) gets the engine's answer, the
+/// engine's current description of the leg, with the body and headers it put
+/// beside it. `@b2bua.on_reoffer_answered` sees the response either way.
 pub fn answer_one_legged_reoffer(
     inbound: &InboundMessage,
     message: &SipMessage,
     call_id: &str,
     a_leg: &Leg,
     what: &str,
+    in_force: Option<Vec<u8>>,
     state: &DispatcherState,
 ) {
+    let offerer = Offerer {
+        from_a_leg: true,
+        b_leg_branch: None,
+    };
+    // An UPDATE on the early dialog of a call siphon has not answered yet
+    // (RFC 3311 §5.1).
+    let early = state
+        .call_actors
+        .get_call(call_id)
+        .is_some_and(|call| !matches!(call.state, CallState::Answered));
+    let hook = run_reoffer_hook(
+        call_id,
+        inbound,
+        message,
+        offerer,
+        early,
+        in_force.as_deref(),
+        state,
+    );
+    let extras = match &hook.decision {
+        ReofferDecision::Relay => AnswerExtras::default(),
+        ReofferDecision::TakeOver { sdp: None, extras } => extras.clone(),
+        decision => {
+            let response = decide_reoffer_here(
+                inbound,
+                message,
+                call_id,
+                offerer,
+                early,
+                in_force.as_deref(),
+                decision,
+                state,
+            );
+            if response.status_code().is_some_and(|code| code >= 300) {
+                restore_offerer_sdp(call_id, offerer, in_force, state);
+            }
+            notify_reoffer_response(call_id, hook.facts, &response, true, state);
+            return;
+        }
+    };
+    match one_legged_engine_answer(inbound, message, call_id, a_leg, what, state) {
+        Some(sdp) => {
+            let response = send_one_legged_ok_with(inbound, message, call_id, sdp, &extras, state);
+            notify_reoffer_response(call_id, hook.facts, &response, true, state);
+        }
+        None => {
+            // The offer was refused 488 and never became the party's media
+            // (RFC 3261 §14.1): the description it had is the one in force.
+            restore_offerer_sdp(call_id, offerer, in_force, state);
+            notify_reoffer_refused_here(call_id, hook.facts, 488, state);
+        }
+    }
+}
+
+/// The media engine's answer to a one-legged re-offer: the SDP of the `200`,
+/// empty where the call has no media backend and the refresh is accepted
+/// without a body. `None` when the offer was refused `488` here.
+fn one_legged_engine_answer(
+    inbound: &InboundMessage,
+    message: &SipMessage,
+    call_id: &str,
+    a_leg: &Leg,
+    what: &str,
+    state: &DispatcherState,
+) -> Option<Vec<u8>> {
     let (Some(rtpengine_set), Some(media_sessions), Some(profiles)) = (
         state.rtpengine_set.as_ref(),
         state.rtpengine_sessions.as_ref(),
@@ -786,8 +870,7 @@ pub fn answer_one_legged_reoffer(
         // siphon agreed at answer, and there is nothing to re-negotiate. A
         // refresh is still a refresh, so accept it without a body.
         debug!(call_id = %call_id, what, "B2BUA: one-legged re-offer with no media backend — 200 without a body");
-        send_one_legged_ok(inbound, message, call_id, Vec::new(), state);
-        return;
+        return Some(Vec::new());
     };
 
     let session = media_sessions.get(&a_leg.dialog.call_id);
@@ -802,7 +885,7 @@ pub fn answer_one_legged_reoffer(
              answer describing a media path that does not exist"
         );
         reject_unanchorable_offer(message, inbound, state, call_id, Some(true));
-        return;
+        return None;
     };
 
     // The A-leg is the offering party on a one-legged call, so its own tag is
@@ -810,13 +893,17 @@ pub fn answer_one_legged_reoffer(
     let Some(offer_tag) = session.offer_tag(true) else {
         warn!(call_id = %call_id, what, "B2BUA: one-legged re-offer with no recorded offerer tag — 488");
         reject_unanchorable_offer(message, inbound, state, call_id, Some(true));
-        return;
+        return None;
     };
 
     // An offerless refresh asks us for the offer; answer from the media the leg
-    // last described, which is what the engine is already wired to.
-    let offer = if message.body.is_empty() {
-        match a_leg.last_sdp.as_ref() {
+    // last described, which is what the engine is already wired to. The offer
+    // is the SDP the request carries, alone or as a part of a multipart body
+    // (RFC 5621 §3): the engine is handed the session description, never the
+    // MIME framing around it.
+    let offer = match description_given(message) {
+        Some(offer) => offer,
+        None => match a_leg.last_sdp.as_ref() {
             Some(sdp) => sdp.clone(),
             None => {
                 warn!(
@@ -825,11 +912,9 @@ pub fn answer_one_legged_reoffer(
                     "B2BUA: offerless one-legged re-offer with no stored media to offer back — 488"
                 );
                 reject_unanchorable_offer(message, inbound, state, call_id, Some(true));
-                return;
+                return None;
             }
-        }
-    } else {
-        message.body.clone()
+        },
     };
 
     let mut answer_flags = profile.answer.clone();
@@ -856,7 +941,7 @@ pub fn answer_one_legged_reoffer(
             // The answer is the session description now in force on the leg.
             record_sdp_sent_to_leg(state, call_id, true, "application/sdp", sdp.as_bytes());
             debug!(call_id = %call_id, what, "B2BUA: answered a one-legged re-offer from the media engine");
-            send_one_legged_ok(inbound, message, call_id, sdp.into_bytes(), state);
+            Some(sdp.into_bytes())
         }
         Err(error) => {
             error!(
@@ -866,6 +951,7 @@ pub fn answer_one_legged_reoffer(
                  an answer it will not honour"
             );
             reject_unanchorable_offer(message, inbound, state, call_id, Some(true));
+            None
         }
     }
 }
@@ -882,6 +968,28 @@ pub fn send_one_legged_ok(
     body: Vec<u8>,
     state: &DispatcherState,
 ) {
+    send_one_legged_ok_with(
+        inbound,
+        message,
+        call_id,
+        body,
+        &AnswerExtras::default(),
+        state,
+    );
+}
+
+/// [`send_one_legged_ok`] with what a script put beside the answer
+/// (`offer.answer(body=…, headers=…)`): its body as a part of a multipart
+/// body with the SDP (RFC 5621 §3), and its headers. Returns the response
+/// sent.
+pub fn send_one_legged_ok_with(
+    inbound: &InboundMessage,
+    message: &SipMessage,
+    call_id: &str,
+    body: Vec<u8>,
+    extras: &AnswerExtras,
+    state: &DispatcherState,
+) -> SipMessage {
     let mut response = build_response(
         message,
         200,
@@ -903,23 +1011,28 @@ pub fn send_one_legged_ok(
         &mut response.headers,
         state,
     );
-    if !body.is_empty() {
-        response
-            .headers
-            .set("Content-Type", "application/sdp".to_string());
-        response
-            .headers
-            .set("Content-Length", body.len().to_string());
-        response.body = body;
+    let sdp = (!body.is_empty()).then_some(body.as_slice());
+    if let Err(why) = extras.apply(&mut response, sdp) {
+        // The body was proven to take the SDP part when the handler gave it,
+        // and the answer is already the engine's: it goes out, on its own.
+        error!(call_id = %call_id, "B2BUA: the script's body cannot go beside the answer ({why}): sending the answer alone");
+        let alone = AnswerExtras {
+            body: None,
+            headers: extras.headers.clone(),
+        };
+        if let Err(why) = alone.apply(&mut response, sdp) {
+            error!(call_id = %call_id, "B2BUA: the answer could not be framed: {why}");
+        }
     }
     send_message_from(
-        response,
+        response.clone(),
         inbound.transport,
         inbound.remote_addr,
         inbound.connection_id,
         Some(inbound.local_addr),
         state,
     );
+    response
 }
 
 /// What the media engine made of an offer one party of an anchored call re-offers.

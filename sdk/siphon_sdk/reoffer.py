@@ -30,8 +30,10 @@ Example::
 
 from __future__ import annotations
 
-from typing import Optional
+import re
+from typing import Optional, Union
 
+from siphon_sdk.call import _uas_response_headers
 from siphon_sdk.request import Request
 
 _DIRECTIONS = ("sendrecv", "sendonly", "recvonly", "inactive")
@@ -152,6 +154,45 @@ def classify(offer: Optional[str], in_force: Optional[str]) -> str:
     return "change"
 
 
+_BOUNDARY = re.compile(r'boundary=(?:"([^"]*)"|([^;,\s]*))', re.IGNORECASE)
+
+
+def _media_type(content_type: str) -> str:
+    return content_type.split(";")[0].strip().lower()
+
+
+def _sdp_part(content_type: str, body: bytes) -> Optional[str]:
+    """The ``application/sdp`` part of a multipart body, checked the way
+    siphon checks one it is to put the SDP part in."""
+    match = _BOUNDARY.search(content_type)
+    boundary = (match.group(1) or match.group(2)) if match else ""
+    if not boundary:
+        raise ValueError(
+            "offer.answer(): multipart body cannot take the SDP: "
+            "missing boundary parameter in Content-Type"
+        )
+    delimiter = b"--" + boundary.encode()
+    sections = body.split(delimiter)
+    if len(sections) < 2 or not any(
+        line.startswith(delimiter) for line in body.splitlines()
+    ):
+        raise ValueError(
+            "offer.answer(): multipart body cannot take the SDP: no part "
+            f"delimited by its boundary '{boundary}'"
+        )
+    for section in sections[1:]:
+        if section.startswith(b"--"):
+            break
+        head, separator, content = section.partition(b"\r\n\r\n")
+        if not separator:
+            head, separator, content = section.partition(b"\n\n")
+        for line in head.splitlines():
+            name, _, value = line.decode("utf-8", "replace").partition(":")
+            if name.strip().lower() == "content-type" and _media_type(value) == "application/sdp":
+                return content.decode("utf-8", "replace").rstrip("\r\n")
+    return None
+
+
 class Reoffer:
     """An in-dialog offer from one party of a bridged call.
 
@@ -185,6 +226,7 @@ class Reoffer:
             )
         self._request: Optional[Request] = request
         self._decision: tuple = ("relay",)
+        self._answer_extras: Optional[dict] = None
         self._status_code: Optional[int] = None
         self._answer_sdp: Optional[str] = None
         self._answered_locally = False
@@ -291,27 +333,120 @@ class Reoffer:
         if not 300 <= code <= 699:
             raise ValueError(f"offer.reject() takes a final non-2xx status, 300-699, not {code}")
         self._decision = ("reject", code, reason)
+        self._answer_extras = None
 
-    def answer(self, sdp: Optional[str] = None) -> None:
+    def answer(
+        self,
+        sdp: Optional[str] = None,
+        body: Optional[Union[str, bytes]] = None,
+        content_type: Optional[str] = None,
+        headers: Optional[dict[str, str]] = None,
+    ) -> None:
         """Answer the offer here and relay nothing.
 
         Without ``sdp`` siphon answers from the session in force toward the
         offerer (the media engine's on an anchored call), with the direction
         the offer leaves (a ``sendonly`` hold is answered ``recvonly``). The
         media engine is not told, so the other party can be played an
-        announcement. ``sdp`` is sent as the answer instead.
+        announcement. Streams that are keyed, use ICE or are grouped
+        (DTLS-SRTP, SDES, BUNDLE) are answered this way only for an offer
+        that asks for none of it again (the same streams, addresses, keys,
+        ICE credentials and grouping, any direction); an ICE restart, a
+        re-key or a moved stream is refused ``488``. On a call the media
+        engine answered itself, the engine answers the offer. ``sdp`` is sent
+        as the answer instead.
+
+        ``body`` with its ``content_type`` is sent with the answer, for a
+        service that carries a document of its own beside the session
+        description (RFC 5621 §3):
+
+        - a single part of any type goes out as the second part of a
+          ``multipart/mixed`` body after the SDP, under a boundary siphon
+          draws;
+        - a ``multipart/*`` body without an ``application/sdp`` part gets
+          the SDP part first, under its own boundary (build this one to give
+          a part its own headers);
+        - a ``multipart/*`` body with an ``application/sdp`` part, or an
+          ``application/sdp`` body, gives the answer itself, as ``sdp`` does.
+
+        A 200 that carries no SDP (an UPDATE without an offer) carries
+        ``body`` as it was given.
+
+        ``headers`` is added to the 200, in its order. The headers siphon
+        owns on a response it sends are refused, as on ``call.answer()``:
+        ``Via``, ``From``, ``To``, ``Call-ID``, ``CSeq``, ``Max-Forwards``,
+        ``Contact``, ``Record-Route``, ``Route``, ``Content-Length``,
+        ``Content-Type``, ``RSeq``, ``RAck``, ``Require``, ``Supported``,
+        ``Session-Expires`` and ``Min-SE``.
+
+        Example::
+
+            @b2bua.on_reoffer
+            def upgrade(call, offer):
+                if offer.request.get_header("Resource-Priority"):
+                    offer.answer(body=service_info_xml,
+                                 content_type="application/vnd.example.info+xml",
+                                 headers={"Resource-Priority": "example.0"})
 
         Raises:
             RuntimeError: in ``@b2bua.on_reoffer_answered``.
+            ValueError: for an owned header, ``body`` without
+                ``content_type`` or the reverse, an empty ``body``, an answer
+                given both in ``sdp`` and in the body, or a ``multipart/*``
+                body without a ``boundary`` or a part delimited by it.
+            TypeError: for a header name or value that is not a ``str``.
+
+        Nothing is decided when it raises.
         """
         self._still_open("answer")
+        checked = _uas_response_headers("offer.answer", headers)
+        if (body is None) != (content_type is None):
+            raise ValueError("offer.answer(body=…) and content_type=… go together")
+        extras_body = None
+        if body is not None and content_type is not None:
+            if not isinstance(body, (str, bytes)):
+                raise TypeError("body must be str or bytes")
+            raw = body.encode() if isinstance(body, str) else body
+            if any(character in content_type for character in "\r\n\0"):
+                raise ValueError("offer.answer(): content_type contains a line break or NUL")
+            if not raw:
+                raise ValueError("offer.answer(): body is empty")
+            twice = (
+                "offer.answer(): the body carries the SDP answer and sdp= "
+                "gives another: pass one"
+            )
+            media_type = _media_type(content_type)
+            if media_type == "application/sdp":
+                if sdp is not None:
+                    raise ValueError(twice)
+                sdp = raw.decode("utf-8", "replace")
+            else:
+                if media_type.startswith("multipart/"):
+                    part = _sdp_part(content_type, raw)
+                    if part is not None:
+                        if sdp is not None:
+                            raise ValueError(twice)
+                        sdp = part
+                extras_body = (content_type, raw)
         self._decision = ("answer", sdp)
+        self._answer_extras = {
+            "content_type": extras_body[0] if extras_body else None,
+            "body": extras_body[1] if extras_body else None,
+            "headers": checked,
+        }
 
     @property
     def decision(self) -> tuple:
         """Mock-only: ``("relay",)``, ``("reject", code, reason)`` or
         ``("answer", sdp)``."""
         return self._decision
+
+    @property
+    def answer_extras(self) -> Optional[dict]:
+        """Mock-only: what ``offer.answer()`` put beside the answer, as
+        ``{"content_type": str | None, "body": bytes | None, "headers":
+        dict}``; ``None`` unless the decision is an answer."""
+        return self._answer_extras
 
     def _still_open(self, what: str) -> None:
         if self._answered:

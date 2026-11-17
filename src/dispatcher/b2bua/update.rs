@@ -179,15 +179,15 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
     // Track the offerer's own new endpoint SDP (its UPDATE offer, raw) so a
     // later siphon-terminated transfer offers this leg's current media if it is
     // the survivor.
-    if !message.body.is_empty() {
+    if let Some(description) = description_given(&message) {
         if from_a_leg {
             state
                 .call_actors
-                .set_leg_last_sdp(&call_id, true, &message.body);
+                .set_leg_last_sdp(&call_id, true, &description);
         } else if let Some(branch) = origin_branch.as_deref() {
-            state.call_actors.update_b_leg_on(&call_id, branch, |leg| {
-                leg.last_sdp = Some(message.body.clone())
-            });
+            state
+                .call_actors
+                .update_b_leg_on(&call_id, branch, |leg| leg.last_sdp = Some(description));
         }
     }
 
@@ -258,7 +258,7 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
     // call when the refresher gives up.
     if from_a_leg && winner_b_leg.is_none() {
         crate::dispatcher::b2bua::answer_one_legged_reoffer(
-            &inbound, &message, &call_id, &a_leg, "UPDATE", state,
+            &inbound, &message, &call_id, &a_leg, "UPDATE", in_force, state,
         );
         return;
     }
@@ -309,6 +309,7 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
             &call_id,
             offerer,
             on_early_dialog,
+            in_force.as_deref(),
             &hook.decision,
             state,
         );

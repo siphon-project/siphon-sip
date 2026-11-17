@@ -567,6 +567,17 @@ own, and `offer.reject()` refuses it. A handler that leaves it alone gets what
 siphon does without one: a refresh answered from the session in force, a
 change refused `488`.
 
+And it sees an offer from the caller of a call the media engine answered
+itself (`answer_local`, an anchored `call.progress()`). A handler that leaves
+it alone, or calls `offer.answer()` without an `sdp`, gets the engine's answer
+as without the hook; `offer.answer(sdp=…)` and `offer.reject()` decide it
+instead, and the engine is then not asked.
+
+The offer may arrive as one part of a `multipart/*` body beside a part of the
+service's own (RFC 5621 §3). `offer.sdp` is the SDP part, `offer.request.body`
+and `offer.request.content_type` the whole body, and what siphon keeps as the
+party's description, and hands the media engine, is the SDP part alone.
+
 ```python
 from siphon import b2bua, rtpengine
 
@@ -613,17 +624,50 @@ What the handler can do with it:
   alone, and keeping it as it is keeps the other party's media on the engine,
   where `rtpengine.play_media` reaches it. An offerless re-INVITE gets that
   session as siphon's offer. Streams that are keyed, use ICE or are grouped
-  cannot be answered this way and are refused `488`. With `sdp`, that SDP is
-  the answer. siphon puts its own `o=` on either (RFC 3264 §8).
+  (DTLS-SRTP, SDES, BUNDLE) took the media engine to agree, and are answered
+  this way only for an offer that asks for none of it again: the same streams,
+  addresses, keys, ICE credentials and grouping the party had, with any
+  direction. An ICE restart, a re-key or a moved stream is refused `488`. An
+  answer that says what the session in force says is sent as that session
+  was, at the same `o=` version; anything else, and an `sdp` of the script's,
+  goes under siphon's `o=` at the next one (RFC 3264 §8).
+- **`offer.answer(body=…, content_type=…)`**: a body sent with the answer, for
+  a service that carries a document of its own beside the session description.
+  A single part of any type goes out as the second part of a `multipart/mixed`
+  body after the SDP, under a boundary siphon draws (RFC 2046 §5.1.1). A
+  `multipart/*` body without an `application/sdp` part gets the SDP part
+  first, under its own boundary, which is the way to give a part headers of
+  its own. A `multipart/*` body with an SDP part, or an `application/sdp`
+  body, is the answer itself, as `sdp=` is, and the two together raise
+  `ValueError`. A 200 that carries no SDP (an UPDATE without an offer) carries
+  the body as given.
+- **`offer.answer(headers={…})`**: headers added to the 200, in the mapping's
+  order. The headers siphon owns on a response it sends raise `ValueError`,
+  the same list as `call.answer()`: `Via`, `From`, `To`, `Call-ID`, `CSeq`,
+  `Max-Forwards`, `Contact`, `Record-Route`, `Route`, `Content-Length`,
+  `Content-Type`, `RSeq`, `RAck`, `Require`, `Supported`, `Session-Expires`
+  and `Min-SE`. A name or value that is not a `str` raises `TypeError`.
+  Nothing is decided when `offer.answer()` raises.
+
+```python
+@b2bua.on_reoffer
+def upgrade(call, offer):
+    # A participant raises the priority of its call: the request carries the
+    # service's part and Resource-Priority (RFC 4412), the media is unchanged.
+    if offer.kind == "refresh" and offer.request.get_header("Resource-Priority"):
+        offer.answer(body=service_info_xml,
+                     content_type="application/vnd.example.info+xml",
+                     headers={"Resource-Priority": "example.0"})
+```
 
 Every request is answered. A handler that raises, or an async one that runs
 past `script.handler_timeout_secs`, decides nothing and the offer is relayed.
 A crossing offer is answered `491 Request Pending` (RFC 3261 §14.1) before the
-script would see it. Not shown: a call siphon answered itself whose media
-session the engine answers for (the engine answers it), and a leg of a
-controller bridge. Shown, with nobody to relay to: a conference seat (above)
-and a call merged into a room with `b2bua.adopt_replaced`, whose far party's
-offer is answered from the session in force when the handler leaves it.
+script would see it. Not shown: a leg of a controller bridge. Shown, with
+nobody to relay to: a conference seat and a call the engine answered itself
+(both above), and a call merged into a room with `b2bua.adopt_replaced`, whose
+far party's offer is answered from the session in force when the handler
+leaves it.
 
 **Several handlers.** Every registered `@b2bua.on_reoffer` handler runs, in
 registration order, on the same `offer` object. Each `offer.answer()` or

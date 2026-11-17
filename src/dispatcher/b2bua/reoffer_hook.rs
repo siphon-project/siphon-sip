@@ -22,12 +22,17 @@
 //! last sent that party (the engine's ports on an anchored call), with the
 //! formats both list and the direction the offer leaves (RFC 3264 §6). The
 //! engine is told nothing, and keeps relaying the other party's media, which a
-//! script can then replace with an announcement.
+//! script can then replace with an announcement. A session the engine keyed,
+//! ran ICE for or bundled answers an offer that asks for none of that again
+//! ([`crate::media::answer::answer_repeating`]).
+//!
+//! The 2xx carries what the script put beside the answer: a body of its own,
+//! as a part of a `multipart/*` body with the SDP (RFC 5621 §3), and headers.
 //!
 //! [`notify_reoffer_answered`] runs once the offerer has its final response,
 //! whoever gave it.
 
-use crate::b2bua::reoffer::{ReofferAnswer, ReofferDecision, ReofferFacts};
+use crate::b2bua::reoffer::{AnswerExtras, ReofferAnswer, ReofferDecision, ReofferFacts};
 use crate::dispatcher::*;
 use crate::script::api::reoffer::PyReoffer;
 
@@ -363,13 +368,17 @@ pub fn restore_offerer_sdp(
 }
 
 /// The final response to an offer `@b2bua.on_reoffer` refused or took over,
-/// sent to the offerer. Returns the response sent.
+/// sent to the offerer. `previous` is the description the offerer had given
+/// before this offer, which an answer from the session in force is read
+/// against. Returns the response sent.
+#[allow(clippy::too_many_arguments)]
 pub fn decide_reoffer_here(
     inbound: &InboundMessage,
     message: &SipMessage,
     call_id: &str,
     offerer: Offerer<'_>,
     early: bool,
+    previous: Option<&[u8]>,
     decision: &ReofferDecision,
     state: &DispatcherState,
 ) -> SipMessage {
@@ -384,9 +393,16 @@ pub fn decide_reoffer_here(
                 &[],
             )
         }
-        ReofferDecision::TakeOver { sdp } => {
-            answer_reoffer_here(message, call_id, offerer, early, sdp.as_deref(), state)
-        }
+        ReofferDecision::TakeOver { sdp, extras } => answer_reoffer_here(
+            message,
+            call_id,
+            offerer,
+            early,
+            previous,
+            sdp.as_deref(),
+            extras,
+            state,
+        ),
         // Not this function's to send; answered as an error rather than not
         // at all should a caller ever get here with it.
         ReofferDecision::Relay => {
@@ -420,12 +436,22 @@ pub fn decide_reoffer_here(
 /// session as siphon's offer (RFC 3261 §14.1), and an UPDATE without an offer
 /// a 200 without a body. siphon's `o=` goes on whatever changed (RFC 3264 §8),
 /// and the SDP becomes the session in force on the offerer's dialog.
+///
+/// A session in force that is keyed, uses ICE or is grouped is the media
+/// engine's own description of the leg, and answers an offer that repeats
+/// what `previous`, the offerer's description before it, already had
+/// ([`crate::media::answer::answer_repeating`]).
+///
+/// `extras` go on the 200: the script's body beside the SDP, and its headers.
+#[allow(clippy::too_many_arguments)]
 fn answer_reoffer_here(
     message: &SipMessage,
     call_id: &str,
     offerer: Offerer<'_>,
     early: bool,
+    previous: Option<&[u8]>,
     script_sdp: Option<&str>,
+    extras: &AnswerExtras,
     state: &DispatcherState,
 ) -> SipMessage {
     let offer = sdp_in_body(message_content_type(message), &message.body);
@@ -462,11 +488,31 @@ fn answer_reoffer_here(
                 in_force,
                 crate::b2bua::bridge::MediaDirection::SendRecv,
             );
-            match crate::media::answer::answer_from(&parse(offer), &parse(&description)) {
+            let (offered, description) = (parse(offer), parse(&description));
+            let answered =
+                crate::media::answer::answer_from(&offered, &description).or_else(|why| {
+                    match previous.filter(|previous| !previous.is_empty()) {
+                        Some(previous) => crate::media::answer::answer_repeating(
+                            &offered,
+                            &parse(previous),
+                            &description,
+                        ),
+                        None => Err(why),
+                    }
+                });
+            match answered {
                 Ok(answer) => {
                     let answer = answer.to_string().into_bytes();
-                    let changed = answer != *in_force;
-                    Some((answer, changed))
+                    // An answer that says what the session in force says is
+                    // that session, sent again as it was sent before: the
+                    // same bytes under the same `o=` version (RFC 3264 §8).
+                    let repeats = answer == description.to_string().into_bytes()
+                        && crate::b2bua::bridge::offers_both_ways(in_force);
+                    if repeats {
+                        Some((in_force.clone(), false))
+                    } else {
+                        Some((answer, true))
+                    }
                 }
                 Err(why) => return refuse(why),
             }
@@ -503,6 +549,7 @@ fn answer_reoffer_here(
             state,
         );
     }
+    let mut sent_sdp = None;
     if let Some((mut body, changed)) = body {
         if changed {
             let identity = offerer.update(call_id, state, |leg| {
@@ -514,24 +561,23 @@ fn answer_reoffer_here(
                 stamp_sdp_origin(&mut body, &state.sdp_name, session_id, version, None);
             }
         }
-        let sent = body.clone();
-        let offered = offer.clone();
-        offerer.update(call_id, state, move |leg| {
-            leg.dialog.last_sent_sdp = Some(sent);
-            if let Some(offered) = offered {
-                leg.last_sdp = Some(offered);
-            }
-        });
-        response
-            .headers
-            .set("Content-Type", "application/sdp".to_string());
-        response
-            .headers
-            .set("Content-Length", body.len().to_string());
-        response.body = body;
-    } else if let Some(offered) = offer {
-        offerer.update(call_id, state, move |leg| leg.last_sdp = Some(offered));
+        sent_sdp = Some(body);
     }
+    // The script's body is proven to take the SDP part when the handler gives
+    // it (`AnswerExtras::checked`), so this refusal is for a body built some
+    // other way; nothing is recorded for an answer that was not sent.
+    if let Err(why) = extras.apply(&mut response, sent_sdp.as_deref()) {
+        return refuse(&why);
+    }
+    let offered = offer.clone();
+    offerer.update(call_id, state, move |leg| {
+        if let Some(sent) = sent_sdp {
+            leg.dialog.last_sent_sdp = Some(sent);
+        }
+        if let Some(offered) = offered {
+            leg.last_sdp = Some(offered);
+        }
+    });
     debug!(call_id = %call_id, "B2BUA: on_reoffer answered the offer itself");
     response
 }
