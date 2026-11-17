@@ -95,6 +95,21 @@ pub(super) fn protected_sent_by(
     pinned_sent_by(server, || state.wildcard_pinned_sent_by(transport, server))
 }
 
+/// The local socket the script made a relayed request leave from, for the
+/// branch record: a UDP flow's listener, or the `send_socket=` pin. A stream
+/// flow is not recorded: its ACK rides the connection, not a bound source.
+fn branch_egress_local_addr(
+    flow: Option<&crate::script::api::registrar::PyFlow>,
+    transport: Transport,
+    send_socket: Option<&crate::transport::SendSocket>,
+) -> Option<SocketAddr> {
+    match flow {
+        Some(flow) if transport == Transport::Udp => Some(flow.local_addr),
+        Some(_) => None,
+        None => send_socket.map(|pin| pin.addr),
+    }
+}
+
 /// Relay a SIP request to its destination.
 ///
 /// 1. Determine target address (explicit next_hop, or Request-URI)
@@ -111,7 +126,8 @@ pub(super) fn protected_sent_by(
 /// the UE's response routes back to the right port (load-bearing for
 /// IPSec sec-agree port pairs — 3GPP TS 33.203 §7.4).
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. relay_request: shares most of its body with relay_fork_branch; dedupe pending
+#[allow(clippy::too_many_lines)]
+// TODO(1.9.0 split): decomposed by the dispatcher module split. relay_request: shares most of its body with relay_fork_branch; dedupe pending
 pub(super) fn relay_request(
     message: &SipMessage,
     next_hop: Option<&str>,
@@ -382,6 +398,7 @@ pub(super) fn relay_request(
     let flow_transport = outbound_transport;
     if flow_over_mtu_upgrade(state, flow, &relayed) {
         outbound_transport = Transport::Tcp;
+        upgrade_metrics::record(OverMtuPath::Relay);
     }
     if state.mtu.is_some() && flow.is_none() {
         if let Some((tcp_transport, tcp_addr)) = over_mtu_upgrade(
@@ -398,6 +415,7 @@ pub(super) fn relay_request(
             } else {
                 outbound_transport = tcp_transport;
                 destination = tcp_addr;
+                upgrade_metrics::record(OverMtuPath::Relay);
                 if protected.is_some() {
                     protected = protected_request(destination, outbound_transport, state);
                     ipsec_source = protected.map(|protected| protected.source);
@@ -566,6 +584,7 @@ pub(super) fn relay_request(
     // Serialize the relayed request
     let data = Bytes::from(relayed.to_bytes());
     let flow_request_uri = flow.and_then(|_| relayed_request_uri(&relayed));
+    let egress_local_addr = branch_egress_local_addr(flow, outbound_transport, send_socket);
 
     debug!(
         branch = %branch,
@@ -641,6 +660,7 @@ pub(super) fn relay_request(
                         transport: outbound_transport,
                         connection_id: placeholder_connection_id,
                         flow_request_uri: flow_request_uri.clone(),
+                        egress_local_addr,
                     },
                 );
                 session.on_reply_callback = on_reply_callback.map(Arc::new);
@@ -772,6 +792,7 @@ pub(super) fn relay_request(
                         transport: outbound_transport,
                         connection_id,
                         flow_request_uri,
+                        egress_local_addr,
                     },
                 );
             }
@@ -1192,6 +1213,7 @@ pub(super) fn relay_fork_branch(
 
     let data = Bytes::from(relayed.to_bytes());
     let flow_request_uri = flow.and_then(|_| relayed_request_uri(&relayed));
+    let egress_local_addr = branch_egress_local_addr(flow, outbound_transport, send_socket);
 
     // Mark branch as Trying in aggregator (before any send, so a synchronous
     // response can find a branch in the right state).
@@ -1252,6 +1274,7 @@ pub(super) fn relay_fork_branch(
                     transport: outbound_transport,
                     connection_id: placeholder_connection_id,
                     flow_request_uri,
+                    egress_local_addr,
                 },
                 branch_index,
             );

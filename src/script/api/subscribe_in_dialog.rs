@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
+use super::super::uac_resolved::ResolvedEgress;
 use super::{SEND_RESOLVER, UAC_SENDER};
 use crate::dns::SipResolver;
 use crate::sip::builder::SipMessageBuilder;
@@ -78,6 +79,8 @@ enum InDialogEgress {
         address: std::net::SocketAddr,
         transport: Transport,
         sent_by: String,
+        /// The URI `address` was resolved from.
+        next_hop: String,
     },
 }
 
@@ -104,20 +107,36 @@ pub(super) async fn send_in_dialog(
         } => (sent_by.as_str(), *transport),
     };
     let message = build_in_dialog_subscribe(dialog, expires_secs, transport, sent_by)?;
+    // A refresh over the MTU (it carries the subscription's body) built for
+    // UDP leaves over TCP when the next hop takes it (RFC 3261 §18.1.1).
     let Some(wait) = wait else {
         match &egress {
             InDialogEgress::Flow(flow) => flow.send_and_forget(uac, message).await,
             InDialogEgress::Resolved {
-                address, transport, ..
-            } => uac.send_request(message, *address, *transport),
+                address,
+                transport,
+                next_hop,
+                ..
+            } => {
+                ResolvedEgress::resolved(next_hop, *address, *transport)
+                    .send_and_forget(uac, resolver, message)
+                    .await
+            }
         }
         return Ok(());
     };
     let receiver = match &egress {
         InDialogEgress::Flow(flow) => flow.send(uac, message).await,
         InDialogEgress::Resolved {
-            address, transport, ..
-        } => uac.send_request_with_response(message, *address, *transport),
+            address,
+            transport,
+            next_hop,
+            ..
+        } => {
+            ResolvedEgress::resolved(next_hop, *address, *transport)
+                .send(uac, resolver, message)
+                .await
+        }
     };
     match tokio::time::timeout(wait, receiver).await {
         Ok(Ok(crate::uac::UacResult::Response(message))) => {
@@ -206,6 +225,7 @@ async fn in_dialog_egress(
         address: target.address,
         transport,
         sent_by: format!("{host}:{port}"),
+        next_hop: resolve_target,
     })
 }
 

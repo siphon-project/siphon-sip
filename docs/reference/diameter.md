@@ -534,6 +534,54 @@ which tells the PCRF the AF session is an emergency one so it can apply its
 emergency policy (TS 29.214 §4.4.1). The AVP holds the URN without its
 `urn:service:` (§5.3.23), so the PCRF receives `sos`.
 
+### Mission critical sessions and reservation priority
+
+For an MCPTT or MCVideo call, TS 29.214 annex A.13 and A.15 have the P-CSCF
+send the identifier and the priority of the call, so the PCRF can set the PCC
+rules of the prioritized service. What the PCRF does with them is its
+operator's policy. Three arguments of `rx_aar` carry them:
+
+| Argument | AVP | Value |
+|---|---|---|
+| `mcptt_identifier` | MCPTT-Identifier (547, 3GPP, TS 29.214 §5.3.45) | The namespace of the call's Resource-Priority header, `"mcpttp"` or `"mcpttq"` (RFC 8101), optionally with the service provider's name |
+| `mcvideo_identifier` | MCVideo-Identifier (562, 3GPP, §5.3.45A) | The same for an MCVideo call |
+| `reservation_priority` | Reservation-Priority (458, ETSI 13019, ETSI TS 183 017 §7.3.9) | An int from `0` (DEFAULT, the lowest) to `15` (the highest) |
+
+```python
+# "Resource-Priority: mcpttp.5"
+result = await diameter.rx_aar(
+    framed_ip=request.source_ip,
+    media_components=components,
+    mcptt_identifier="mcpttp",
+    reservation_priority=5,
+)
+```
+
+`reservation_priority` is the priority value of the Resource-Priority header,
+unchanged: TS 29.214 §A.13.2 maps the lowest to DEFAULT (0) and the highest to
+PRIORITY-FIFTEEN (15). It is the priority of the whole AF session and needs no
+identifier beside it. `None` sends no AVP, which the PCRF reads as 0. A value
+outside 0..15 raises `ValueError`, anything but an int `TypeError`. An
+identifier of `None` or `""` sends none.
+
+All three are accepted on a modification too (`session_id` set). That is how a
+priority change, such as a call upgraded to an emergency one by a re-INVITE or
+UPDATE, reaches the PCRF (§4.4.2).
+
+An initial AAR with an identifier also carries Supported-Features naming the
+MCPTT (bit 17) or MCVideo (bit 22) feature of Feature-List-ID 1, without the
+M-bit, since §5.4.1 lets a client use only the features it advertised in the
+first request of the session. So pass the identifier on the first AAR. siphon
+does not read the features the PCRF answers with. Because Reservation-Priority
+is an ETSI AVP, a peer that advertises Rx names ETSI (13019) next to 3GPP in
+the Supported-Vendor-Id of its CER and CEA, as TS 29.214 table 5.4.0.1
+requires. The three AVPs go out with the V-bit and without the M-bit, as
+their tables have it, and are dictionary names for `get_avp`.
+
+`sbi.create_session` takes the same on N5 as `mcptt_id`, `mc_video_id` and
+`res_prio`; the same priority int means the same priority there (see
+[IMS control](ims.md)).
+
 Every AAR carries Rx-Request-Type: INITIAL_REQUEST, or UPDATE_REQUEST when
 `session_id` reuses an existing session (TS 29.214 §4.4.1, §4.4.2). It is sent
 without the M-bit, so a PCRF that does not know the AVP skips it. When the Rx

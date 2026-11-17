@@ -152,6 +152,20 @@ impl PySbi {
     ///         ``"FAILED_RESOURCES_ALLOCATION"``).  Each goes out under
     ///         ``evSubsc`` with ``notifMethod`` ``EVENT_DETECTION`` and
     ///         ``notif_uri`` as its ``notifUri``.  Requires ``notif_uri``.
+    ///     mcptt_id: ``mcpttId``, marking an MCPTT session: the
+    ///         Resource-Priority namespace of the call (``"mcpttp"`` or
+    ///         ``"mcpttq"``, RFC 8101), optionally with the service provider's
+    ///         name (TS 29.514 §B.13.2).  ``None`` or ``""`` sends none.
+    ///     mc_video_id: ``mcVideoId``, the same for an MCVideo session.
+    ///     res_prio: ``resPrio``, the reservation priority of the session.
+    ///         Either an int from 0 (lowest) to 15 (highest), the value
+    ///         :func:`diameter.rx_aar` takes as ``reservation_priority``, sent
+    ///         as ``"PRIO_1"`` to ``"PRIO_16"`` (priority n is ``PRIO_<n+1>``,
+    ///         TS 29.514 §5.6.3.4 and §B.13.2); or one of those sixteen strings.
+    ///         ``None`` sends none, which the PCF reads as ``PRIO_1``.
+    ///
+    /// With ``mcptt_id`` / ``mc_video_id`` the ``suppFeat`` of the request names
+    /// the MCPTT / MCVideo feature (TS 29.514 §5.8).
     ///
     /// Returns a dict with ``app_session_id``, ``authorized``, and
     /// ``app_session_uri`` (the absolute resource URI — persist it and pass it
@@ -159,7 +173,8 @@ impl PySbi {
     /// same PCF from any replica), or ``None`` on failure.
     ///
     /// Raises ``ValueError`` when neither ``notif_uri`` nor ``sbi.notif_uri``
-    /// is set, or when ``events`` is empty.
+    /// is set, when ``events`` is empty, or when ``res_prio`` is outside its
+    /// range; ``TypeError`` when ``res_prio`` is neither an int nor a str.
     ///
     /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
     /// tokio rather than on the calling thread, which for an `async def` handler
@@ -175,7 +190,11 @@ impl PySbi {
         media_components=None,
         pcf_uri=None,
         events=None,
+        mcptt_id=None,
+        mc_video_id=None,
+        res_prio=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn create_session<'py>(
         &self,
         python: Python<'py>,
@@ -189,6 +208,9 @@ impl PySbi {
         media_components: Option<&Bound<'py, PyAny>>,
         pcf_uri: Option<&str>,
         events: Option<Vec<String>>,
+        mcptt_id: Option<&str>,
+        mc_video_id: Option<&str>,
+        res_prio: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let components = match media_components {
             Some(obj) => parse_sbi_media_components(obj)?,
@@ -204,6 +226,7 @@ impl PySbi {
             notif_uri: notif_uri.or(self.notif_uri.as_deref()),
             media_components: components,
             events,
+            mission_critical: MissionCritical::from_arguments(mcptt_id, mc_video_id, res_prio)?,
         })
         .map_err(|error| {
             pyo3::exceptions::PyValueError::new_err(format!("sbi.create_session: {error}"))
@@ -295,6 +318,11 @@ impl PySbi {
     /// Raises ``ValueError`` when ``events`` is empty or ``notif_uri`` comes
     /// without ``events``.
     ///
+    /// ``mcptt_id``, ``mc_video_id`` and ``res_prio`` are those of
+    /// :func:`create_session` and signal the priority adjustment of a mission
+    /// critical session (TS 29.514 §4.2.3.19, §4.2.3.20).  ``None`` leaves the
+    /// member out of the merge patch, so the PCF keeps what it holds.
+    ///
     /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
     /// tokio rather than on the calling thread, which for an `async def` handler
     /// is the asyncio driver its whole loop shares.
@@ -303,6 +331,9 @@ impl PySbi {
         media_components=None,
         events=None,
         notif_uri=None,
+        mcptt_id=None,
+        mc_video_id=None,
+        res_prio=None,
     ))]
     fn update_session<'py>(
         &self,
@@ -311,15 +342,20 @@ impl PySbi {
         media_components: Option<&Bound<'py, PyAny>>,
         events: Option<Vec<String>>,
         notif_uri: Option<&str>,
+        mcptt_id: Option<&str>,
+        mc_video_id: Option<&str>,
+        res_prio: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let components = match media_components {
             Some(obj) => parse_sbi_media_components(obj)?,
             None => Vec::new(),
         };
 
-        let update_data = update_request_data(components, events, notif_uri).map_err(|error| {
-            pyo3::exceptions::PyValueError::new_err(format!("sbi.update_session: {error}"))
-        })?;
+        let mission_critical = MissionCritical::from_arguments(mcptt_id, mc_video_id, res_prio)?;
+        let update_data = update_request_data(components, events, notif_uri, mission_critical)
+            .map_err(|error| {
+                pyo3::exceptions::PyValueError::new_err(format!("sbi.update_session: {error}"))
+            })?;
 
         let client = Arc::clone(&self.client);
         let sid = session_id.to_string();
@@ -530,6 +566,55 @@ enum EventsArgumentError {
     NotifUriWithoutEvents,
 }
 
+/// The mission critical arguments of `sbi.create_session` and
+/// `sbi.update_session`, checked: `mcpttId`, `mcVideoId` and `resPrio` as they
+/// go out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MissionCritical {
+    mcptt_id: Option<String>,
+    mc_video_id: Option<String>,
+    res_prio: Option<String>,
+}
+
+impl MissionCritical {
+    /// An empty string is an absent argument. `res_prio` is an int from 0 to 15
+    /// (the Rx Reservation-Priority value, sent as `PRIO_<n+1>`) or one of the
+    /// `ReservPriority` strings: `ValueError` outside either range, `TypeError`
+    /// for any other type.
+    fn from_arguments(
+        mcptt_id: Option<&str>,
+        mc_video_id: Option<&str>,
+        res_prio: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let present =
+            |identifier: Option<&str>| identifier.filter(|id| !id.is_empty()).map(String::from);
+        let res_prio = match res_prio {
+            None => None,
+            Some(value) => match value.cast::<pyo3::types::PyString>() {
+                Ok(text) if text.is_empty()? => None,
+                Ok(text) => {
+                    let text = text.to_str()?;
+                    if !crate::sbi::npcf::is_reserv_priority(text) {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "res_prio must be \"PRIO_1\" to \"PRIO_16\" or an int from 0 to 15, \
+                             got {text:?}"
+                        )));
+                    }
+                    Some(text.to_string())
+                }
+                Err(_) => Some(crate::sbi::npcf::reserv_priority(
+                    super::diameter_rx::reservation_priority_argument("res_prio", value)?,
+                )),
+            },
+        };
+        Ok(Self {
+            mcptt_id: present(mcptt_id),
+            mc_video_id: present(mc_video_id),
+            res_prio,
+        })
+    }
+}
+
 /// `sbi.create_session` keyword arguments, after Python extraction.
 struct CreateSessionArguments<'a> {
     af_app_id: &'a str,
@@ -540,6 +625,7 @@ struct CreateSessionArguments<'a> {
     notif_uri: Option<&'a str>,
     media_components: Vec<MediaComponent>,
     events: Option<Vec<String>>,
+    mission_critical: MissionCritical,
 }
 
 /// The create request data for `sbi.create_session`'s arguments.
@@ -570,9 +656,16 @@ fn create_request_data(
         dnn: arguments.dnn.map(String::from),
         ev_subsc,
         notif_uri: Some(notif_uri.to_string()),
-        // Required by TS 29.514. None of the optional features of clause 5.8
-        // is implemented, which `None` serialises as: "0".
-        supp_feat: None,
+        // Required by TS 29.514. Of the optional features of clause 5.8 only
+        // MCPTT and MCVideo are implemented, and named when their member is
+        // sent; none serialises as "0".
+        supp_feat: crate::sbi::npcf::supp_feat_for(
+            arguments.mission_critical.mcptt_id.is_some(),
+            arguments.mission_critical.mc_video_id.is_some(),
+        ),
+        mcptt_id: arguments.mission_critical.mcptt_id,
+        mc_video_id: arguments.mission_critical.mc_video_id,
+        res_prio: arguments.mission_critical.res_prio,
     })
 }
 
@@ -582,6 +675,7 @@ fn update_request_data(
     media_components: Vec<MediaComponent>,
     events: Option<Vec<String>>,
     notif_uri: Option<&str>,
+    mission_critical: MissionCritical,
 ) -> Result<AppSessionContextUpdateData, EventsArgumentError> {
     let ev_subsc = match events {
         None if notif_uri.is_some() => return Err(EventsArgumentError::NotifUriWithoutEvents),
@@ -595,6 +689,9 @@ fn update_request_data(
     Ok(AppSessionContextUpdateData {
         med_components: components_to_map(media_components),
         ev_subsc,
+        mcptt_id: mission_critical.mcptt_id,
+        mc_video_id: mission_critical.mc_video_id,
+        res_prio: mission_critical.res_prio,
     })
 }
 
@@ -1008,6 +1105,7 @@ mod tests {
             notif_uri,
             media_components: Vec::new(),
             events: events.map(|events| events.into_iter().map(String::from).collect()),
+            mission_critical: MissionCritical::default(),
         }
     }
 
@@ -1143,8 +1241,13 @@ mod tests {
 
     #[test]
     fn update_request_data_carries_events_and_optional_notif_uri() {
-        let update_data = update_request_data(Vec::new(), event_names(&["QOS_NOTIF"]), None)
-            .expect("events without notif_uri are accepted on update");
+        let update_data = update_request_data(
+            Vec::new(),
+            event_names(&["QOS_NOTIF"]),
+            None,
+            MissionCritical::default(),
+        )
+        .expect("events without notif_uri are accepted on update");
         let value = serde_json::to_value(&update_data).unwrap();
         assert_eq!(
             value["evSubsc"],
@@ -1154,17 +1257,21 @@ mod tests {
             "{value}"
         );
 
-        let update_data =
-            update_request_data(Vec::new(), event_names(&["QOS_NOTIF"]), Some(NOTIF_URI))
-                .expect("events with notif_uri are accepted on update");
+        let update_data = update_request_data(
+            Vec::new(),
+            event_names(&["QOS_NOTIF"]),
+            Some(NOTIF_URI),
+            MissionCritical::default(),
+        )
+        .expect("events with notif_uri are accepted on update");
         let value = serde_json::to_value(&update_data).unwrap();
         assert_eq!(value["evSubsc"]["notifUri"], NOTIF_URI, "{value}");
     }
 
     #[test]
     fn update_request_data_without_events_has_no_subscription() {
-        let update_data =
-            update_request_data(Vec::new(), None, None).expect("no events is accepted");
+        let update_data = update_request_data(Vec::new(), None, None, MissionCritical::default())
+            .expect("no events is accepted");
         let value = serde_json::to_value(&update_data).unwrap();
         // Absent, not null: a null evSubsc in a merge patch removes it.
         assert!(value.get("evSubsc").is_none(), "{value}");
@@ -1172,16 +1279,172 @@ mod tests {
 
     #[test]
     fn update_request_data_rejects_empty_events() {
-        let error = update_request_data(Vec::new(), Some(Vec::new()), None)
-            .expect_err("an empty events list is refused");
+        let error = update_request_data(
+            Vec::new(),
+            Some(Vec::new()),
+            None,
+            MissionCritical::default(),
+        )
+        .expect_err("an empty events list is refused");
         assert_eq!(error, EventsArgumentError::Empty);
     }
 
     #[test]
     fn update_request_data_rejects_notif_uri_without_events() {
-        let error = update_request_data(Vec::new(), None, Some(NOTIF_URI))
-            .expect_err("notif_uri alone would be sent nowhere");
+        let error = update_request_data(
+            Vec::new(),
+            None,
+            Some(NOTIF_URI),
+            MissionCritical::default(),
+        )
+        .expect_err("notif_uri alone would be sent nowhere");
         assert_eq!(error, EventsArgumentError::NotifUriWithoutEvents);
+    }
+
+    fn mission_critical(
+        python: Python<'_>,
+        mcptt_id: Option<&str>,
+        mc_video_id: Option<&str>,
+        res_prio: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<MissionCritical> {
+        let _ = python;
+        MissionCritical::from_arguments(mcptt_id, mc_video_id, res_prio.as_ref())
+    }
+
+    /// `res_prio` as the int `diameter.rx_aar` takes: priority n goes out as
+    /// PRIO_(n+1) (TS 29.514 clauses 5.6.3.4 and B.13.2).
+    #[test]
+    fn res_prio_int_is_the_rx_value_one_below_the_prio_number() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            for (value, want) in [(0i64, "PRIO_1"), (7, "PRIO_8"), (15, "PRIO_16")] {
+                let object = value.into_pyobject(python).unwrap().into_any();
+                let parsed = mission_critical(python, None, None, Some(object)).unwrap();
+                assert_eq!(parsed.res_prio.as_deref(), Some(want));
+            }
+        });
+    }
+
+    #[test]
+    fn res_prio_string_is_sent_as_written_when_it_is_a_reserv_priority() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            for value in ["PRIO_1", "PRIO_16"] {
+                let object = value.into_pyobject(python).unwrap().into_any();
+                let parsed = mission_critical(python, None, None, Some(object)).unwrap();
+                assert_eq!(parsed.res_prio.as_deref(), Some(value));
+            }
+        });
+    }
+
+    #[test]
+    fn res_prio_out_of_range_is_a_value_error_and_another_type_a_type_error() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let out_of_range = [
+                (-1i64).into_pyobject(python).unwrap().into_any(),
+                16i64.into_pyobject(python).unwrap().into_any(),
+                "PRIO_0".into_pyobject(python).unwrap().into_any(),
+                "PRIO_17".into_pyobject(python).unwrap().into_any(),
+                "15".into_pyobject(python).unwrap().into_any(),
+            ];
+            for object in out_of_range {
+                let shown = object.to_string();
+                let error = mission_critical(python, None, None, Some(object))
+                    .expect_err("outside the range");
+                assert!(
+                    error.is_instance_of::<pyo3::exceptions::PyValueError>(python),
+                    "{shown}: {error}"
+                );
+                assert!(error.to_string().contains("res_prio"), "{error}");
+            }
+            let wrong_type = [
+                1.5f64.into_pyobject(python).unwrap().into_any(),
+                pyo3::types::PyBool::new(python, true).to_owned().into_any(),
+                pyo3::types::PyList::empty(python).into_any(),
+            ];
+            for object in wrong_type {
+                let error =
+                    mission_critical(python, None, None, Some(object)).expect_err("not int or str");
+                assert!(
+                    error.is_instance_of::<pyo3::exceptions::PyTypeError>(python),
+                    "{error}"
+                );
+                assert!(error.to_string().contains("res_prio"), "{error}");
+            }
+        });
+    }
+
+    /// The create request data carries the three members by their TS 29.514
+    /// names, and `suppFeat` names MCPTT (feature 9) and MCVideo (feature 10).
+    #[test]
+    fn create_request_data_carries_the_mission_critical_members() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let priority = 15i64.into_pyobject(python).unwrap().into_any();
+            let mut arguments = create_arguments(None, Some(NOTIF_URI));
+            arguments.mission_critical =
+                mission_critical(python, Some("mcpttp"), Some("mcpttq"), Some(priority)).unwrap();
+            let value = serde_json::to_value(create_request_data(arguments).unwrap()).unwrap();
+            assert_eq!(value["mcpttId"], "mcpttp", "{value}");
+            assert_eq!(value["mcVideoId"], "mcpttq", "{value}");
+            assert_eq!(value["resPrio"], "PRIO_16", "{value}");
+            assert_eq!(value["suppFeat"], "300", "{value}");
+
+            let mut arguments = create_arguments(None, Some(NOTIF_URI));
+            arguments.mission_critical =
+                mission_critical(python, Some("mcpttp"), None, None).unwrap();
+            let value = serde_json::to_value(create_request_data(arguments).unwrap()).unwrap();
+            assert_eq!(value["suppFeat"], "100", "{value}");
+            assert!(value.get("mcVideoId").is_none(), "{value}");
+            assert!(value.get("resPrio").is_none(), "{value}");
+        });
+    }
+
+    /// An empty identifier is an absent one, and without the arguments the
+    /// request data is what it was: no member, `suppFeat` "0".
+    #[test]
+    fn empty_mission_critical_arguments_send_nothing() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let no_priority = "".into_pyobject(python).unwrap().into_any();
+            let empty = mission_critical(python, Some(""), Some(""), Some(no_priority)).unwrap();
+            assert_eq!(empty, MissionCritical::default());
+
+            let mut arguments = create_arguments(None, Some(NOTIF_URI));
+            arguments.mission_critical = empty.clone();
+            let value = serde_json::to_value(create_request_data(arguments).unwrap()).unwrap();
+            for member in ["mcpttId", "mcVideoId", "resPrio"] {
+                assert!(value.get(member).is_none(), "{value}");
+            }
+            assert_eq!(value["suppFeat"], "0", "{value}");
+
+            let update = update_request_data(Vec::new(), None, None, empty).unwrap();
+            assert_eq!(
+                serde_json::to_value(&update).unwrap(),
+                serde_json::json!({})
+            );
+        });
+    }
+
+    /// The update data carries them for the merge patch, and only them.
+    #[test]
+    fn update_request_data_carries_the_mission_critical_members() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let priority = "PRIO_12".into_pyobject(python).unwrap().into_any();
+            let arguments =
+                mission_critical(python, Some("mcpttp"), Some("mcpttq"), Some(priority)).unwrap();
+            let update = update_request_data(Vec::new(), None, None, arguments).unwrap();
+            assert_eq!(
+                serde_json::to_value(&update).unwrap(),
+                serde_json::json!({
+                    "mcpttId": "mcpttp",
+                    "mcVideoId": "mcpttq",
+                    "resPrio": "PRIO_12"
+                })
+            );
+        });
     }
 
     /// Façade-drift regression (the live blocker): the embedded `_SbiNamespace`

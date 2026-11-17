@@ -18,6 +18,7 @@ mod python_stats;
 pub mod rate_limit;
 pub mod send_queue;
 pub mod stale_shed;
+pub mod subscribe_notify;
 pub mod timer;
 
 use std::sync::{Arc, OnceLock};

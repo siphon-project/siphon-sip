@@ -291,6 +291,8 @@ mod provisional_presentation_tests;
 #[cfg(test)]
 mod proxy_2xx_retransmission_tests;
 #[cfg(test)]
+mod proxy_ack_egress_tests;
+#[cfg(test)]
 mod proxy_branch_final_tests;
 #[cfg(test)]
 mod proxy_cancel_awaits_provisional_tests;
@@ -397,6 +399,10 @@ mod stop_the_world_tests;
 #[cfg(test)]
 mod subscribe_notify_before_2xx_tests;
 #[cfg(test)]
+mod subscribe_notify_over_mtu_tests;
+#[cfg(test)]
+mod subscribe_notify_response_tests;
+#[cfg(test)]
 mod subscribe_reply_order_tests;
 #[cfg(test)]
 mod subscribe_test_harness;
@@ -482,6 +488,9 @@ pub use media_init::{init_rtpengine, spawn_rtpengine_health_check};
 pub(crate) use proxy_release::proxy_release_call;
 pub(crate) use state::ProxyRfState;
 pub use state::{publish_store_gauges, DrainState, ReliableProvisional};
+#[cfg(test)]
+pub(crate) use target::forget_tcp_probe;
+pub(crate) use target::{OriginatedOverMtu, OriginatedTcp};
 
 use b2bua::*;
 use cancel_ack::*;

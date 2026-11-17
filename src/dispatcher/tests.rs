@@ -6514,6 +6514,7 @@ fn rescue_store_with_dialog(call_id: &str) -> ProxySessionStore {
             transport: Transport::Udp,
             connection_id: ConnectionId::default(),
             flow_request_uri: None,
+            egress_local_addr: None,
         },
     );
     store.insert(session);
@@ -6569,6 +6570,7 @@ fn resume_reinvite_still_reroutes_after_hold_transaction_cleanup() {
             transport: Transport::Udp,
             connection_id: ConnectionId::default(),
             flow_request_uri: None,
+            egress_local_addr: None,
         },
     );
     store.insert(hold_session);
@@ -6637,6 +6639,7 @@ fn rescue_declines_when_established_branch_is_also_ourselves() {
             transport: Transport::Udp,
             connection_id: ConnectionId::default(),
             flow_request_uri: None,
+            egress_local_addr: None,
         },
     );
     store.insert(session);
@@ -9048,6 +9051,7 @@ const FLOW_CONTACT: &str = "sip:+15550100001@10.20.30.40:12104;transport=TLS";
 fn flow_pinned_branch(flow_request_uri: Option<&str>) -> ClientBranch {
     ClientBranch {
         destination: "203.0.113.37:12104".parse().unwrap(),
+        egress_local_addr: None,
         transport: Transport::Tls,
         connection_id: ConnectionId(77),
         flow_request_uri: flow_request_uri.map(|uri| parse_uri_standalone(uri).unwrap()),

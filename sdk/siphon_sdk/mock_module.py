@@ -12,6 +12,7 @@ configurable backends for registrar, auth, cache, etc.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import ipaddress
 import math
@@ -308,6 +309,21 @@ class MockProxy:
         by default; when ``wait_for_response=True``, the awaitable resolves to
         a configured mock ``Reply`` (or ``None`` on timeout).
 
+        Transport: the request leaves over the transport its next hop
+        resolves to, UDP unless the URI says otherwise. With ``listen.mtu``
+        set, a request built for UDP that is over ``mtu - 200`` bytes (RFC
+        3261 18.1.1), a large MESSAGE for instance, leaves over TCP when the
+        next hop accepts a TCP connection, with a TCP top Via, and over UDP
+        when it does not. ``;transport=udp`` on the URI the request is routed
+        by (``next_hop``, else the first ``Route``, else ``ruri``) keeps it on
+        UDP whatever its size::
+
+            # Over TCP when it is over the MTU and the AS listens for TCP.
+            await proxy.send_request("MESSAGE", "sip:as.example.com", body=text)
+            # Always UDP.
+            await proxy.send_request(
+                "MESSAGE", "sip:as.example.com;transport=udp", body=text)
+
         Args:
             method: SIP method name (e.g. "NOTIFY", "OPTIONS", "MESSAGE").
             ruri: Request-URI string (e.g. "sip:alice@10.0.0.1:5060").
@@ -514,10 +530,47 @@ class MockSubscribeHandle:
 
     def notify(self, body=None, content_type: Optional[str] = None,
                state: Optional[str] = None) -> bool:
+        """Send an in-dialog NOTIFY.  Awaitable; recorded on the parent's
+        ``notifies``.
+
+        ``state`` is the whole ``Subscription-State`` value; left out, siphon
+        sends ``active;expires=<what is left>``.
+
+        Resolves ``True`` as soon as the NOTIFY is handed to the transport;
+        it does not wait for the subscriber's answer.  siphon reads that
+        answer in the background.  A subscriber that lost the dialog answers
+        481; that, any other of the responses RFC 6665 §4.2.2 names (404,
+        405, 410, 416, 480-485, 489, 501, 604), a 408, or no final response
+        before Timer F removes the subscription, here and in the Redis cache.
+        From then on the handle raises ``LookupError``, ``await
+        handle.reload()`` is ``False`` and
+        ``proxy.subscribe_state.for_resource()`` no longer lists it, so a
+        state change stops sending NOTIFYs to a subscriber that is gone.  Any
+        other failure (a 401, a 5xx) only failed the transaction and keeps
+        the subscription.  A SUBSCRIBE refresh that arrives while the NOTIFY
+        is out keeps it too: the subscriber still holds the dialog.  Every
+        NOTIFY that did not get a 2xx is counted in
+        ``siphon_subscribe_notify_failures_total{code}`` (the status, or
+        ``timeout``).
+
+        Raises ``LookupError`` when the dialog is gone (terminated, expired,
+        or removed after a failed NOTIFY)::
+
+            for handle in proxy.subscribe_state.for_resource(aor, "reg"):
+                try:
+                    await handle.notify(body=xml,
+                                        content_type="application/reginfo+xml")
+                except LookupError:
+                    pass            # removed meanwhile
+
+        In the mock the NOTIFY is answered with the status set by
+        :meth:`MockSubscribeState.set_notify_response` (200 unless set), and a
+        removal takes effect at once.
+        """
         async def _run():
             # Raises like the native handle: a NOTIFY in a dialog that is gone
             # is a script bug, and a False return would hide it.
-            self._live()
+            dialog = self._live()
             entry = {
                 "id": self._id,
                 "body": body,
@@ -525,6 +578,10 @@ class MockSubscribeHandle:
                 "state": state or f"active;expires={self.expires}",
             }
             self._parent.notifies.append(entry)
+            if not dialog.get("is_outbound") and _notify_ends_subscription(
+                self._parent._notify_response
+            ):
+                self._parent._dialogs.pop(self._id, None)
             return True
 
         return _run()
@@ -634,6 +691,22 @@ class MockSubscribeState:
         self._dialogs: dict[str, dict] = {}
         self.notifies: list[dict] = []
         self.terminates: list[dict] = []
+        self._notify_response: Optional[int] = 200
+
+    def set_notify_response(self, status: Optional[int]) -> None:
+        """Answer the NOTIFYs that follow with ``status`` (test helper).
+
+        ``None`` models a subscriber that never answers: Timer F expires.
+        A status RFC 6665 §4.2.2 names (404, 405, 410, 416, 480-485, 489,
+        501, 604), a 408 or ``None`` removes the subscription the NOTIFY was
+        sent in, as siphon does; any other status keeps it::
+
+            handle = proxy.subscribe_state.accept(request)
+            proxy.subscribe_state.set_notify_response(481)
+            await handle.notify(body="...")      # True: it was sent
+            assert proxy.subscribe_state.local_count == 0
+        """
+        self._notify_response = status
 
     @staticmethod
     def _event_identity(value: str) -> tuple[str, Optional[str]]:
@@ -790,7 +863,10 @@ class MockSubscribeState:
         each of those requests that is over the threshold (RFC 3261 18.1.1)
         goes over TCP from the UE's protected client port to the P-CSCF's
         protected server port, each by its own size, and over UDP when the
-        connection cannot be opened. ``route`` cannot be
+        connection cannot be opened. Without a flow the same holds toward the
+        resolved next hop: a SUBSCRIBE or refresh over the threshold goes over
+        TCP when the next hop accepts a TCP connection, unless the URI it is
+        routed by names ``;transport=udp``. ``route`` cannot be
         combined with ``target_uri`` or a ``Route`` in ``headers``.
 
         ``body`` (``str`` or ``bytes``) and ``content_type`` put a body on the
@@ -978,6 +1054,7 @@ class MockSubscribeState:
         self._dialogs.clear()
         self.notifies.clear()
         self.terminates.clear()
+        self._notify_response = 200
         if hasattr(self, "sends"):
             self.sends.clear()
 
@@ -10721,6 +10798,8 @@ class MockDiameter:
         self.sar_requests: list[dict] = []
         self.lir_requests: list[dict] = []
         self._aar_responses: dict[str, dict] = {}  # session_id -> response
+        # Every rx_aar request, in order (test inspection).
+        self.aar_requests: list[dict] = []
         # Sh (AS → HSS) responses, keyed by public_identity
         self._udr_responses: dict[str, dict] = {}
         self._pur_responses: dict[str, dict] = {}
@@ -11138,6 +11217,29 @@ class MockDiameter:
                     "TS 29.214 §5.3.13 defines (1-4, 6-21)"
                 )
 
+    @staticmethod
+    def _mission_critical_identifier(name: str, value: Any) -> Optional[str]:
+        """An MC identifier argument as siphon reads it: ``TypeError`` naming
+        the argument unless ``None`` or a str, and ``""`` is absent."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise TypeError(f"argument '{name}': must be a str")
+        return value or None
+
+    @staticmethod
+    def _reservation_priority(name: str, value: Any) -> Optional[int]:
+        """A reservation priority argument as siphon reads it: ``TypeError``
+        unless an int (a bool is not one here), ``ValueError`` outside 0..15,
+        each naming the argument."""
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an int from 0 to 15")
+        if not 0 <= value <= 15:
+            raise ValueError(f"{name} must be from 0 to 15, got {value}")
+        return value
+
     def rx_aar(self, session_id: Optional[str] = None,
                framed_ip: Optional[str] = None,
                framed_ipv6: Union[str, bytes, None] = None,
@@ -11145,7 +11247,11 @@ class MockDiameter:
                af_application_id: str = "IMS Services",
                subscription_id: Optional[tuple] = None,
                specific_actions: Optional[list[int]] = None,
-               service_urn: Optional[str] = None) -> Awaitable[Optional[dict]]:
+               service_urn: Optional[str] = None,
+               mcptt_identifier: Optional[str] = None,
+               mcvideo_identifier: Optional[str] = None,
+               reservation_priority: Optional[int] = None,
+               ) -> Awaitable[Optional[dict]]:
         """Send an Rx AA-Request for QoS resource reservation.
 
         Without ``session_id`` the AAR is sent as Rx-Request-Type
@@ -11203,6 +11309,30 @@ class MockDiameter:
                 as Service-URN so the PCRF applies its emergency policy
                 (TS 29.214 §4.4.1). The AVP holds the URN without its
                 ``urn:service:`` (§5.3.23), so ``"sos"`` is accepted too.
+            mcptt_identifier: Marks the session as an MCPTT one
+                (MCPTT-Identifier AVP, TS 29.214 §5.3.45), so the PCRF can
+                set the PCC rules of the prioritized service (§A.13).
+                The value is the namespace of the call's Resource-Priority
+                header, ``"mcpttp"`` or ``"mcpttq"`` (RFC 8101), optionally
+                with the name of the service provider (§A.13.2). ``None`` or
+                ``""`` sends none.
+            mcvideo_identifier: The same for an MCVideo session
+                (MCVideo-Identifier AVP, §5.3.45A, §A.15.2).
+            reservation_priority: Priority of the session, an int from ``0``
+                (DEFAULT, the lowest) to ``15`` (the highest), sent as the
+                Reservation-Priority AVP (ETSI TS 183 017 §7.3.9). For a
+                mission critical call it is the priority value of the
+                Resource-Priority header, unchanged (TS 29.214 §A.13.2).
+                ``None`` sends none, which the PCRF reads as ``0``. The same
+                int given to ``sbi.create_session(res_prio=...)`` goes out as
+                ``PRIO_<n+1>``.
+
+        The three mission critical arguments are accepted on a modification
+        too (``session_id`` set). That is how a priority change, such as a
+        call upgraded to an emergency one by a re-INVITE or UPDATE, reaches the
+        PCRF (§4.4.2). An initial AAR with an identifier also names the MCPTT
+        or MCVideo feature in Supported-Features (§5.4.1), so pass the
+        identifier on the first AAR of the session.
 
         Returns:
             Dict with ``result_code`` and ``session_id``, or ``None``.
@@ -11210,8 +11340,11 @@ class MockDiameter:
         Raises:
             ValueError: A ``specific_actions`` entry is not a defined value;
                 the message names it. Or ``service_urn`` has nothing after
-                ``urn:service:``.
-            TypeError: ``specific_actions`` is not a list of int.
+                ``urn:service:``. Or ``reservation_priority`` is outside
+                0..15.
+            TypeError: ``specific_actions`` is not a list of int,
+                ``reservation_priority`` is not an int, or an identifier is
+                not a str.
 
         Example::
 
@@ -11220,6 +11353,14 @@ class MockDiameter:
                 media_components=components,
                 # loss of bearer, release of bearer, failed allocation
                 specific_actions=[2, 4, 9],
+            )
+
+            # An MCPTT call: "Resource-Priority: mcpttp.5"
+            result = await diameter.rx_aar(
+                framed_ip=request.source_ip,
+                media_components=components,
+                mcptt_identifier="mcpttp",
+                reservation_priority=5,
             )
         """
         # Validated here rather than inside the coroutine, because siphon
@@ -11235,7 +11376,28 @@ class MockDiameter:
             rest = service_urn[len(prefix):] if service_urn.lower().startswith(prefix) else service_urn
             if not rest:
                 raise ValueError(f"service_urn names no service: {service_urn!r}")
+        mcptt_identifier = self._mission_critical_identifier(
+            "mcptt_identifier", mcptt_identifier)
+        mcvideo_identifier = self._mission_critical_identifier(
+            "mcvideo_identifier", mcvideo_identifier)
+        reservation_priority = self._reservation_priority(
+            "reservation_priority", reservation_priority)
         sid = session_id or f"mock-rx-{len(self._aar_responses) + 1}"
+        # Copied, as siphon owns its arguments once the call returns: a list
+        # the caller changes afterwards does not change what was sent.
+        self.aar_requests.append({
+            "session_id": session_id,
+            "framed_ip": framed_ip,
+            "framed_ipv6": framed_ipv6,
+            "media_components": copy.deepcopy(media_components),
+            "af_application_id": af_application_id,
+            "subscription_id": subscription_id,
+            "specific_actions": copy.deepcopy(specific_actions),
+            "service_urn": service_urn,
+            "mcptt_identifier": mcptt_identifier,
+            "mcvideo_identifier": mcvideo_identifier,
+            "reservation_priority": reservation_priority,
+        })
 
         async def _send() -> Optional[dict]:
             if sid in self._aar_responses:
@@ -12626,6 +12788,7 @@ class MockDiameter:
         self.sar_requests.clear()
         self.lir_requests.clear()
         self._aar_responses.clear()
+        self.aar_requests.clear()
         self._udr_responses.clear()
         self._pur_responses.clear()
         self._snr_responses.clear()
@@ -12991,7 +13154,10 @@ class MockPresence:
         that, any other of the responses RFC 6665 §4.2.2 names (404, 405, 410,
         416, 480-485, 489, 501, 604), a 408, or no final response before
         Timer F removes the subscription, in the background, so the next
-        :meth:`subscribers` no longer lists it.  It is counted in
+        :meth:`subscribers` no longer lists it.  With ``listen.mtu`` set, a
+        NOTIFY over ``mtu - 200`` bytes leaves over TCP when the watcher
+        accepts a TCP connection, and over UDP when it does not (RFC 3261
+        18.1.1).  It is counted in
         ``siphon_presence_subscriptions_removed_total{reason}``
         (``notify_rejected`` / ``notify_timeout``).  A refresh that arrives
         while the NOTIFY is out keeps the subscription: the subscriber still
@@ -13842,6 +14008,34 @@ class MockSbi:
             subscription["notifUri"] = notif_uri
         return subscription
 
+    _RESERV_PRIORITIES = tuple(f"PRIO_{number}" for number in range(1, 17))
+
+    @classmethod
+    def _mission_critical(cls, mcptt_id: Any, mc_video_id: Any,
+                          res_prio: Any) -> dict:
+        """Validate the mission critical arguments as siphon does and return
+        the ``mcpttId`` / ``mcVideoId`` / ``resPrio`` members siphon sends
+        (only those it sends)."""
+        members: dict = {}
+        for name, member, value in (("mcptt_id", "mcpttId", mcptt_id),
+                                    ("mc_video_id", "mcVideoId", mc_video_id)):
+            value = MockDiameter._mission_critical_identifier(name, value)
+            if value is not None:
+                members[member] = value
+        if isinstance(res_prio, str):
+            if res_prio and res_prio not in cls._RESERV_PRIORITIES:
+                raise ValueError(
+                    'res_prio must be "PRIO_1" to "PRIO_16" or an int from 0 '
+                    f"to 15, got {res_prio!r}"
+                )
+            if res_prio:
+                members["resPrio"] = res_prio
+        else:
+            priority = MockDiameter._reservation_priority("res_prio", res_prio)
+            if priority is not None:
+                members["resPrio"] = f"PRIO_{priority + 1}"
+        return members
+
     def create_session(self, af_app_id: str = "IMS Services",
                        sip_call_id: Optional[str] = None,
                        supi: Optional[str] = None,
@@ -13851,7 +14045,11 @@ class MockSbi:
                        notif_uri: Optional[str] = None,
                        media_components: Optional[list] = None,
                        pcf_uri: Optional[str] = None,
-                       events: Optional[list[str]] = None) -> Optional[dict]:
+                       events: Optional[list[str]] = None,
+                       mcptt_id: Optional[str] = None,
+                       mc_video_id: Optional[str] = None,
+                       res_prio: Union[int, str, None] = None,
+                       ) -> Optional[dict]:
         """Create an N5 app session for QoS policy authorization.
 
         Args:
@@ -13883,6 +14081,26 @@ class MockSbi:
                 through unchecked, so events newer than siphon work. Requires
                 ``notif_uri``. ``None`` (default) subscribes to nothing, and the
                 PCF sends no events.
+            mcptt_id: Marks the session as an MCPTT one (``mcpttId``,
+                TS 29.514 §4.2.2.19), so the PCF can set the PCC rules of the
+                prioritized service. The value is the
+                namespace of the call's Resource-Priority header, ``"mcpttp"``
+                or ``"mcpttq"`` (RFC 8101), optionally with the name of the
+                service provider (§B.13.2). ``None`` or ``""`` sends none.
+            mc_video_id: The same for an MCVideo session (``mcVideoId``,
+                §4.2.2.20, §B.15.2).
+            res_prio: Priority of the session (``resPrio``). Either an int
+                from ``0`` (the lowest) to ``15`` (the highest), which is the
+                priority value of the Resource-Priority header and the same
+                int ``diameter.rx_aar`` takes as ``reservation_priority``; or
+                the ``ReservPriority`` string itself, ``"PRIO_1"`` (the
+                lowest) to ``"PRIO_16"`` (the highest). The int ``n`` is sent
+                as ``"PRIO_<n+1>"`` (TS 29.514 §5.6.3.4, §B.13.2), so ``0`` is
+                ``"PRIO_1"`` and ``15`` is ``"PRIO_16"``. ``None`` sends none,
+                which the PCF reads as ``PRIO_1``.
+
+        With ``mcptt_id`` or ``mc_video_id`` siphon also names the MCPTT or
+        MCVideo feature in the request's ``suppFeat`` (TS 29.514 §5.8).
 
         Returns:
             Dict with ``app_session_id``, ``authorized`` and ``app_session_uri``
@@ -13892,8 +14110,10 @@ class MockSbi:
 
         Raises:
             ValueError: neither ``notif_uri`` nor ``sbi.notif_uri`` is set
-                (``notifUri`` is required on a create), or ``events`` is empty.
-            TypeError: ``events`` is not a list of strings.
+                (``notifUri`` is required on a create), ``events`` is empty,
+                or ``res_prio`` is outside its range.
+            TypeError: ``events`` is not a list of strings, ``res_prio`` is
+                neither an int nor a str, or an identifier is not a str.
 
         Example::
 
@@ -13902,6 +14122,15 @@ class MockSbi:
                 ue_ipv4=request.source_ip,
                 notif_uri="http://192.0.2.10:8080/sbi/events",
                 events=["FAILED_RESOURCES_ALLOCATION"],
+            )
+
+            # An MCPTT call: "Resource-Priority: mcpttp.5" goes out as
+            # mcpttId "mcpttp" and resPrio "PRIO_6".
+            result = await sbi.create_session(
+                ue_ipv4=request.source_ip,
+                notif_uri="http://192.0.2.10:8080/sbi/events",
+                mcptt_id="mcpttp",
+                res_prio=5,
             )
         """
         # Validated at the call, as siphon does: the request body is built
@@ -13914,6 +14143,7 @@ class MockSbi:
                 "set sbi.notif_uri (TS 29.514 requires notifUri on a create)"
             )
         subscription = self._event_subscription(events, notif_uri, creating=True)
+        mission_critical = self._mission_critical(mcptt_id, mc_video_id, res_prio)
         session_id = f"mock-n5-{self._next_session_id}"
         self._next_session_id += 1
         self._sessions[session_id] = {
@@ -13921,6 +14151,8 @@ class MockSbi:
             "ue_ipv4": ue_ipv4,
             "pcf_uri": pcf_uri,
             "ev_subsc": subscription,
+            # The members as siphon sends them: mcpttId, mcVideoId, resPrio.
+            "mission_critical": mission_critical,
         }
         base = (pcf_uri or "http://mock-pcf").rstrip("/")
         app_session_uri = (
@@ -13975,7 +14207,11 @@ class MockSbi:
     def update_session(self, session_id: str,
                        media_components: Optional[list] = None,
                        events: Optional[list[str]] = None,
-                       notif_uri: Optional[str] = None) -> Optional[dict]:
+                       notif_uri: Optional[str] = None,
+                       mcptt_id: Optional[str] = None,
+                       mc_video_id: Optional[str] = None,
+                       res_prio: Union[int, str, None] = None,
+                       ) -> Optional[dict]:
         """Update an N5 app session (media renegotiation, event subscription).
 
         The modify is a JSON merge patch, so only what you pass is sent.
@@ -13992,18 +14228,35 @@ class MockSbi:
             notif_uri: a new callback base for the subscription
                 (``http://<sbi.notif_listen>/sbi/events``). Only sent with
                 ``events``; ``None`` keeps the one the PCF holds.
+            mcptt_id: ``mcpttId``, as in ``create_session``: the modification
+                is the priority adjustment of an MCPTT session (TS 29.514
+                §4.2.3.19). ``None`` or ``""`` leaves it out of the patch.
+            mc_video_id: ``mcVideoId``, the same for an MCVideo session
+                (§4.2.3.20).
+            res_prio: the new ``resPrio``, an int from ``0`` to ``15`` or
+                ``"PRIO_1"`` to ``"PRIO_16"`` as in ``create_session``. This is
+                how a priority change, such as a call upgraded to an emergency
+                one by a re-INVITE or UPDATE, reaches the PCF. ``None`` keeps
+                the priority the PCF holds.
 
         Returns:
             Dict with ``app_session_id`` and ``authorized``, or ``None``.
 
         Raises:
-            ValueError: ``events`` is empty, or ``notif_uri`` is given without
-                ``events``.
-            TypeError: ``events`` is not a list of strings.
+            ValueError: ``events`` is empty, ``notif_uri`` is given without
+                ``events``, or ``res_prio`` is outside its range.
+            TypeError: ``events`` is not a list of strings, ``res_prio`` is
+                neither an int nor a str, or an identifier is not a str.
+
+        Example::
+
+            # The call became an emergency one: raise its priority.
+            await sbi.update_session(app_session_uri, mcptt_id="mcpttp", res_prio=15)
         """
         # Same as create_session: the update body, and so its validation,
         # is built before the future.
         subscription = self._event_subscription(events, notif_uri, creating=False)
+        mission_critical = self._mission_critical(mcptt_id, mc_video_id, res_prio)
         resolved = self._session_id(session_id)
 
         async def _update() -> Optional[dict]:
@@ -14011,6 +14264,9 @@ class MockSbi:
                 return None
             if subscription is not None:
                 self._sessions[resolved]["ev_subsc"] = subscription
+            # A merge patch: what is sent replaces, the rest stays.
+            self._sessions[resolved].setdefault("mission_critical", {}).update(
+                mission_critical)
             return {"app_session_id": resolved, "authorized": self._authorized}
 
         return _update()

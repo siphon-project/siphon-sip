@@ -875,7 +875,7 @@
       "rx_aar": {
         "doc": "Send an Rx AA-Request to authorize an IMS media session.",
         "kind": "method_descriptor",
-        "sig": "($self, session_id=None, framed_ip=None, framed_ipv6=None, media_components=None, af_application_id=\"IMS Services\", subscription_id=None, specific_actions=None, service_urn=None)"
+        "sig": "($self, session_id=None, framed_ip=None, framed_ipv6=None, media_components=None, af_application_id=\"IMS Services\", subscription_id=None, specific_actions=None, service_urn=None, mcptt_identifier=None, mcvideo_identifier=None, reservation_priority=None)"
       },
       "rx_str": {
         "kind": "method_descriptor",
@@ -2905,7 +2905,7 @@
       "create_session": {
         "doc": "Create an N5 app session for QoS policy authorization.",
         "kind": "method_descriptor",
-        "sig": "($self, af_app_id=\"IMS Services\", sip_call_id=None, supi=None, ue_ipv4=None, ue_ipv6=None, dnn=None, notif_uri=None, media_components=None, pcf_uri=None, events=None)"
+        "sig": "($self, af_app_id=\"IMS Services\", sip_call_id=None, supi=None, ue_ipv4=None, ue_ipv6=None, dnn=None, notif_uri=None, media_components=None, pcf_uri=None, events=None, mcptt_id=None, mc_video_id=None, res_prio=None)"
       },
       "delete_session": {
         "doc": "Delete an N5 app session.",
@@ -2920,7 +2920,7 @@
       "update_session": {
         "doc": "Update an N5 app session \u2014 media renegotiation (re-INVITE / UPDATE).",
         "kind": "method_descriptor",
-        "sig": "($self, session_id, media_components=None, events=None, notif_uri=None)"
+        "sig": "($self, session_id, media_components=None, events=None, notif_uri=None, mcptt_id=None, mc_video_id=None, res_prio=None)"
       }
     },
     "ScriptConfig": {

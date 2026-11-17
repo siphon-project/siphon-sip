@@ -45,6 +45,11 @@ pub struct ClientBranch {
     /// `.invalid` host. A 2xx ACK addressed to that same remote target has to
     /// take the same flow instead of resolving the Contact.
     pub flow_request_uri: Option<crate::sip::uri::SipUri>,
+    /// The local listener socket the request left from when the script chose
+    /// it (a UDP flow's listener, or a `send_socket=` pin); `None` when the
+    /// default egress was used. A 2xx ACK to the same remote target leaves
+    /// from it too, so one dialog does not speak to a peer from two addresses.
+    pub egress_local_addr: Option<SocketAddr>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1583,6 +1588,7 @@ mod tests {
                 transport: Transport::Udp,
                 connection_id: ConnectionId::default(),
                 flow_request_uri: None,
+                egress_local_addr: None,
             },
         );
 
@@ -1710,6 +1716,7 @@ mod tests {
                 transport: Transport::Tcp,
                 connection_id: ConnectionId::default(),
                 flow_request_uri: None,
+                egress_local_addr: None,
             },
         );
         store.insert(session1);
@@ -1752,6 +1759,7 @@ mod tests {
                 transport: Transport::Tls,
                 connection_id: ConnectionId::default(),
                 flow_request_uri: None,
+                egress_local_addr: None,
             },
         );
         store.insert(session2);
