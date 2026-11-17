@@ -1,5 +1,6 @@
 //! Calls siphon places itself, with no A-leg INVITE behind them
 //! (`b2bua.originate()`), and the responses they get back.
+use super::originate_progress as progress;
 use crate::dispatcher::*;
 
 // ---------------------------------------------------------------------------
@@ -239,7 +240,17 @@ pub fn b2bua_originate_with_route(
             "b2bua is not running — nothing to originate from".to_string(),
         ));
     };
-    let prepared = prepare_originate_with_route(&control.state, params, route)?;
+    dial_in_process(prepare_originate_with_route(&control.state, params, route)?)
+}
+
+/// Dial an originate staged for the in-process `b2bua.originate()` surface.
+/// Marked as the script's first, while its INVITE is still unsent, so that
+/// every provisional it draws runs `@b2bua.on_originate_progress`.
+fn dial_in_process(prepared: PreparedOriginate) -> Result<PreparedOriginate, OriginateError> {
+    if let Some(control) = B2BUA_CONTROL.get() {
+        let calls = &control.state.call_actors;
+        calls.mark_script_originated(&prepared.internal_call_id);
+    }
     if !b2bua_originate_dial(&prepared) {
         return Err(OriginateError::Unavailable(
             "originate was staged but the call vanished before dialling".to_string(),
@@ -876,13 +887,7 @@ pub fn dial_originate(state: &DispatcherState, prepared: &PreparedOriginate) -> 
 /// Stage **and** dial in one step, for the in-process `b2bua.originate()`
 /// surface (there is no channel to register between the two phases there).
 pub fn b2bua_originate(params: OriginateParams) -> Result<PreparedOriginate, OriginateError> {
-    let prepared = b2bua_originate_prepare(params)?;
-    if !b2bua_originate_dial(&prepared) {
-        return Err(OriginateError::Unavailable(
-            "originate was staged but the call vanished before dialling".to_string(),
-        ));
-    }
-    Ok(prepared)
+    dial_in_process(b2bua_originate_prepare(params)?)
 }
 
 /// Handle a response to an INVITE **siphon originated**.
@@ -943,53 +948,13 @@ pub fn handle_originated_call_response(
     }
 
     if (100..200).contains(&status_code) {
-        // RFC 3261 §12.1.2: the first provisional with a To-tag opens the early
-        // dialog; record its identity so a CANCEL/BYE has a target before answer.
-        let remote_tag = crate::b2bua::actor::extract_to_tag(message);
-        if let Some(mut call) = state.call_actors.get_call_mut(internal_call_id) {
-            // §12.1.2 sets the remote target once from the dialog-creating
-            // response; a downstream fork puts several early dialogs on this one
-            // branch, so later provisionals must not overwrite the first's
-            // target. The confirming 2xx below refreshes both to the winner.
-            if call.a_leg.dialog.remote_tag.is_none() {
-                call.a_leg.dialog.remote_tag = remote_tag.clone();
-            }
-            if call.a_leg.dialog.remote_contact.is_none() {
-                if let Some(contact) = message.headers.get("Contact") {
-                    call.a_leg.dialog.remote_contact =
-                        Some(crate::b2bua::actor::extract_contact_uri(contact));
-                }
-            }
-        }
-        let early_media = !message.body.is_empty();
-        state
-            .call_actors
-            .set_state(internal_call_id, CallState::Ringing);
-        let phase = if early_media { "progress" } else { "ringing" };
-        control_notify_channel_event(
-            &sip_call_id,
-            "ChannelStateChange",
-            serde_json::json!({
-                "state": phase,
-                "code": status_code,
-                "early_media": early_media,
-                "sdp": originate_body_text(message),
-            }),
-        );
-        originate_group_leg_progress(
-            state,
+        progress::handle_provisional(
             internal_call_id,
-            OriginateLegProgress {
-                code: status_code,
-                early_media,
-                sdp: originate_body_text(message),
-            },
-        );
-        debug!(
-            call_id = %internal_call_id,
-            status = status_code,
-            early_media,
-            "originate: provisional"
+            &sip_call_id,
+            message,
+            status_code,
+            response_source,
+            state,
         );
         return;
     }
@@ -1060,16 +1025,35 @@ pub fn handle_originated_call_response(
             .originate_offer(internal_call_id)
             .is_some();
         let mut offered_answer = None;
+        // RFC 3262 §5: an offer the callee made in a reliable provisional was
+        // answered in siphon's PRACK, and the 2xx brings no other.
+        let prack_answer = progress::prack_answer(internal_call_id, remote_tag.as_deref(), state);
+        let mut answered_early = None;
         let anchor_answer = match state.call_actors.originate_anchor(internal_call_id) {
             Some(anchor) => {
                 let anchored = if offered {
+                    let early =
+                        || progress::callee_answer(internal_call_id, remote_tag.as_deref(), state);
                     offered_leg_answer(message)
+                        .or_else(|reason| early().ok_or(reason))
                         .map(|answer| {
                             offered_answer = Some(answer);
                             None
                         })
                         .map_err(|reason| (NO_ANSWER_STATUS, reason))
+                } else if let Some(early) = prack_answer {
+                    early
+                        .map(|answer| {
+                            answered_early = Some(answer);
+                            None
+                        })
+                        .map_err(|reason| (status_code, reason))
                 } else {
+                    progress::claim_media_for_answer(
+                        internal_call_id,
+                        remote_tag.as_deref(),
+                        state,
+                    );
                     originate_anchor_2xx(
                         &sip_call_id,
                         remote_tag.as_deref().unwrap_or_default(),
@@ -1097,7 +1081,9 @@ pub fn handle_originated_call_response(
                             leg.dialog.remote_tag = Some(tag);
                         }
                         leg.dialog.remote_contact = remote_contact.clone();
-                        leg.dialog.local_cseq = leg.dialog.local_cseq.saturating_add(1);
+                        let counter = state.call_actors.get_call(internal_call_id);
+                        let counter = counter.map_or(1, |call| call.a_leg.dialog.local_cseq);
+                        leg.dialog.local_cseq = progress::next_cseq_after(message, counter);
                         if let Some(bye) = build_b2bua_bye(&leg, state) {
                             send_b2bua_to_bleg(
                                 bye,
@@ -1113,9 +1099,11 @@ pub fn handle_originated_call_response(
                             Some(failure_code),
                             Some(&reason),
                         );
-                        // An early offer's allocation, never to be answered.
-                        originate_delete_media(&sip_call_id, state);
                         state.call_actors.remove_call(internal_call_id);
+                        // An early offer's allocation, never to be answered.
+                        // After the call, so that an offer still being
+                        // answered finds the call gone and releases its own.
+                        originate_delete_media(&sip_call_id, state);
                         state.call_event_receivers.remove(internal_call_id);
                         // The group's winner cannot carry audio: a group whose
                         // first answer was final fails with it, one whose
@@ -1146,15 +1134,22 @@ pub fn handle_originated_call_response(
             if let Some(answer) = offered_answer {
                 call.a_leg.last_sdp = Some(answer);
             }
-            // The INVITE used CSeq 1; every later in-dialog request (BYE,
-            // re-INVITE) must exceed it (RFC 3261 §12.2.1.1).
-            call.a_leg.dialog.local_cseq = 2;
+            // Every later in-dialog request (BYE, re-INVITE) must exceed the
+            // INVITE's CSeq and that of each PRACK sent since (RFC 3261
+            // §12.2.1.1).
+            let counter = call.a_leg.dialog.local_cseq;
+            call.a_leg.dialog.local_cseq = progress::next_cseq_after(message, counter);
             // Kept for the ACK a retransmitted 2xx is owed, which has to be
             // this one.
             call.originate_answer_sdp = anchor_answer.clone();
             leg = call.a_leg.clone();
         }
-        originate_answered_session(internal_call_id, message, anchor_answer.as_deref(), state);
+        originate_answered_session(
+            internal_call_id,
+            message,
+            anchor_answer.as_deref().or(answered_early.as_deref()),
+            state,
+        );
         state
             .call_actors
             .set_state(internal_call_id, CallState::Answered);
@@ -1255,8 +1250,8 @@ pub fn handle_originated_call_response(
         Some(status_code),
         Some(&reason_phrase),
     );
-    originate_delete_media(&sip_call_id, state);
     state.call_actors.remove_call(internal_call_id);
+    originate_delete_media(&sip_call_id, state);
     state.call_event_receivers.remove(internal_call_id);
     // A leg of an originate group: the group decides what its rejection means.
     originate_group_leg_rejected(

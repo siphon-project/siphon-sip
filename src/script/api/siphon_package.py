@@ -829,6 +829,39 @@ class _B2buaNamespace:
         return fn
 
     @staticmethod
+    def on_originate_progress(fn):
+        """Register handler for the provisional responses of a call the
+        script placed with ``b2bua.originate()``.
+
+        Called as ``fn(call_id, code, reason, reply)`` for each 101-199 the
+        called party sends on that leg: a ``180 Ringing``, a ``183`` with or
+        without SDP. ``call_id`` is the Call-ID ``originate()`` returned,
+        ``reply`` the response itself, to read (``reply.get_header()``,
+        ``reply.body``): nothing relays it, so changing it does nothing.
+        Not called for a ``100 Trying``, which is hop by hop.
+
+        Once per response, in the order they arrive, and before
+        ``on_answer``. A provisional sent reliably (RFC 3262) has been
+        PRACKed by siphon when the handler runs, and its retransmissions
+        run nothing. ``on_provisional`` and ``on_early_media`` are for a
+        callee's provisionals relayed to a caller and do not run for these.
+
+        A script that holds a caller while it rings the called party this
+        way tells the caller itself:
+
+        Usage:
+            @b2bua.on_originate_progress
+            def ringing(call_id, code, reason, reply):
+                if code == 180:
+                    held = waiting.get(call_id)
+                    if held is not None:
+                        held.progress(180, "Ringing")
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("b2bua.on_originate_progress", None, fn, is_async)
+        return fn
+
+    @staticmethod
     def on_answer(fn):
         """Register handler for call answered (200 OK on B leg)."""
         is_async = _asyncio.iscoroutinefunction(fn)

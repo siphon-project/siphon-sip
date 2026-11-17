@@ -145,6 +145,7 @@ pub(super) fn retry_originate_with_credentials(
     // before a post-send registration would finish, and an unindexed branch is
     // a response for an unknown call.
     state.call_actors.mark_originated(internal_call_id, &branch);
+    super::originate_progress::forget_early_session(internal_call_id, state);
     if let Some(mut call) = state.call_actors.get_call_mut(internal_call_id) {
         call.a_leg.branch = branch.clone();
         call.a_leg.dialog.local_cseq = cseq;

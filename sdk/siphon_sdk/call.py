@@ -1757,6 +1757,17 @@ class Call:
         answers it. It refreshes the dialogs it ends up the refresher of and
         ends the call when a session runs out on either.
 
+        A call siphon answers itself has the caller's dialog only, and the
+        timer runs there: call this before ``call.answer()`` in the same
+        handler and the 2xx carries ``Session-Expires`` with the refresher,
+        and ``Require: timer`` toward a caller that supports the extension
+        (RFC 4028 section 9). ``answer(headers=...)`` refuses those headers,
+        which stay siphon's. What the caller asked for comes first there: a
+        shorter ``Session-Expires`` is the interval and a refresher it named
+        stands. A caller that neither supports the extension nor asks for an
+        interval gets no timer when ``refresher`` is ``"uac"``: it cannot
+        refresh, and siphon was not asked to.
+
         Args:
             expires: Session interval in seconds (default 1800).
             min_se: Smallest session interval accepted, in seconds (default 90).
@@ -1778,6 +1789,12 @@ class Call:
             def new_call(call):
                 call.session_timer(1800, min_se=90, refresher="b2bua")
                 call.dial("sip:bob@example.com")
+
+            @b2bua.on_invite
+            def announcement(call):
+                # No callee: the caller refreshes, or is released at expiry.
+                call.session_timer(1800, min_se=90, refresher="uac")
+                call.answer(200, "OK", body=sdp, content_type="application/sdp")
         """
         if refresher.lower() not in ("uac", "uas", "b2bua"):
             raise ValueError(

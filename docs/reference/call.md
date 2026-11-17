@@ -21,8 +21,9 @@ one from nothing — click-to-dial, callbacks, outbound notification — so it w
 from a timer or an event callback, where no `Call` object exists at all.
 
 It returns as soon as the INVITE is on the wire, with the new leg's SIP Call-ID;
-it does **not** wait for the callee. Ringing and answer come back through the
-ordinary handlers (`@b2bua.on_answer`, `@b2bua.on_failure`, `@b2bua.on_bye`), and
+it does **not** wait for the callee. Ringing and answer come back through
+handlers (`@b2bua.on_originate_progress`, `@b2bua.on_answer`,
+`@b2bua.on_failure`, `@b2bua.on_bye`), and
 the returned Call-ID is the handle for `b2bua.terminate()` / `b2bua.refer()`.
 
 ```python
@@ -49,6 +50,43 @@ body has to carry an SDP offer — a body that carries none raises rather than
 placing a call the callee can only answer by offering into silence. The full
 argument set and its failure modes are below; the out-of-process twin is the
 control plane's [`originate` verb](control-plane.md#placing-a-call-originate).
+
+### Ringing on a leg the script placed: `@b2bua.on_originate_progress`
+
+`@b2bua.on_provisional` and `@b2bua.on_early_media` run for a callee's
+provisional responses that siphon relays to a caller. A leg placed with
+`b2bua.originate()` has no caller behind it, so its provisionals have a handler
+of their own:
+
+```python
+@b2bua.on_originate_progress
+def ringing(call_id, code, reason, reply):
+    # call_id is what b2bua.originate() returned
+    if code == 180:
+        held = held_caller_for(call_id)       # the script's own bookkeeping
+        if held is not None:
+            held.progress(180, "Ringing")     # tell the caller it is ringing
+```
+
+It runs for every 101-199 the called party sends on that leg, once per
+response and in the order they arrive, before `@b2bua.on_answer`: a `180`, a
+`183` with or without SDP. A `100 Trying` runs nothing (hop by hop, RFC 3261
+§16.7). `reply` is the response, to read (`reply.get_header()`, `reply.body`);
+nothing relays it, so changing it has no effect. The typical use is a server
+that holds a caller's INVITE while it rings the called party on a leg of its
+own, and answers the caller with `call.progress(180, ...)` when that party
+rings.
+
+A provisional sent reliably (`Require: 100rel`, RFC 3262) is acknowledged by
+siphon with a PRACK before the handler runs, and its retransmissions are
+discarded and run nothing. siphon does not ask for reliable provisionals on a
+leg it places; pass `headers={"Supported": "100rel"}` to `originate()` to allow
+them. When the INVITE carried no offer (`media=True`) and the reliable
+provisional carries one, the PRACK carries siphon's answer from the media engine
+(RFC 3262 §5) and the 2xx is then ACKed without a second one.
+
+A leg the control plane placed runs no handler: its progress is reported as
+`ChannelStateChange` events, as before.
 
 A placed call runs the RFC 4028 session timer of the `session_timer:` block, or
 the one `session_timer={"expires": 1800, "min_se": 90, "refresher": "b2bua"}`
@@ -469,6 +507,24 @@ Compact forms (`k`, `m`, `l`, ...) count as their long names, and a value with
 a line break or NUL is refused too. The control plane's `answer`, `ring`,
 `progress` and `reject` verbs take the same `headers` object with the same
 rules ([control plane](control-plane.md)).
+
+The session timer of a call siphon answers itself is asked for with
+`call.session_timer()`, not with those headers. Called before `call.answer()`
+in the same handler, with nothing dialled and nothing handed over, it is
+negotiated against the caller's INVITE (RFC 4028 §9) and runs on the caller's
+dialog, the only one the call has. After
+`call.session_timer(expires=1800, min_se=90, refresher="uac")` a caller that
+lists `timer` in `Supported` and asks for no interval of its own gets
+`Session-Expires: 1800;refresher=uac` and `Require: timer` on the 200, and is
+released with a BYE 32 s before a session it did not refresh runs out (§10);
+with `refresher="uas"` or `"b2bua"` siphon refreshes that caller itself.
+
+What the caller asked for comes first, as §9 has it. A `Session-Expires`
+shorter than `expires` is the interval, and a refresher the caller named
+stands. A caller that does not support the extension cannot refresh: siphon
+refreshes it when it asked for an interval, or when `refresher` is `"uas"` or
+`"b2bua"`, and its dialog runs no session timer at all when it asked for none
+and `refresher` is `"uac"`.
 
 ## The Contact of siphon's own answer: `contact=`
 

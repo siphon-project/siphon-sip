@@ -265,6 +265,8 @@ mod media_summary_bridge_tests;
 #[cfg(test)]
 mod media_summary_event_tests;
 #[cfg(test)]
+mod notify_headers_tests;
+#[cfg(test)]
 mod on_provisional_tests;
 #[cfg(test)]
 mod originate_ack_retransmit_tests;
@@ -274,6 +276,8 @@ mod originate_auth_tests;
 mod originate_group_tests;
 #[cfg(test)]
 mod originate_media_source_tests;
+#[cfg(test)]
+mod originate_progress_tests;
 #[cfg(test)]
 mod originate_route_tests;
 #[cfg(test)]
@@ -428,6 +432,8 @@ mod tls_verify_server_tests;
 mod transfer_bye_tests;
 #[cfg(test)]
 mod transfer_ingress_tests;
+#[cfg(test)]
+mod uas_answer_session_timer_tests;
 #[cfg(test)]
 mod uas_bad_extension_tests;
 #[cfg(test)]
