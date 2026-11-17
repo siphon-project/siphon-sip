@@ -399,6 +399,8 @@ mod single_listener_snapshot_tests;
 #[cfg(test)]
 mod spiral_invite_tests;
 #[cfg(test)]
+mod srs_handshake_tests;
+#[cfg(test)]
 mod stale_in_dialog_request_tests;
 #[cfg(test)]
 mod stale_shed_tests;

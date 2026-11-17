@@ -120,25 +120,26 @@ fn srs_manager_session_lifecycle() {
     ))
     .unwrap();
 
-    // Create session.
-    let (created_session_id, to_tag) = manager
-        .create_session("call-id-123", "from-tag-abc", metadata)
+    // Create session: keyed by siphon's dialog, the SRC's session_id kept as data.
+    let to_tag = manager
+        .create_session("call-id-123", "from-tag-abc", "z9hG4bK-123", metadata)
         .unwrap();
 
-    assert!(!created_session_id.is_empty());
     assert!(!to_tag.is_empty());
     assert!(manager.is_srs_session("call-id-123"));
+    assert!(manager.in_dialog("call-id-123", "from-tag-abc", &to_tag));
 
     // Activate.
-    manager.activate_session(&created_session_id);
+    manager.activate_session("call-id-123");
     {
-        let session = manager.get_session(&created_session_id).unwrap();
+        let session = manager.get_session("call-id-123").unwrap();
         assert!(matches!(session.state, SrsSessionState::Recording));
+        assert_eq!(session.session_id, session_id);
     }
 
     // Stop → get recording record.
-    let record = manager.stop_session("call-id-123").unwrap();
-    assert_eq!(record.session_id, created_session_id);
+    let (record, _streams) = manager.stop_session("call-id-123").unwrap();
+    assert_eq!(record.session_id, session_id);
     assert_eq!(record.recording_call_id, "call-id-123");
     assert_eq!(record.participants.len(), 2);
     assert_eq!(record.participants[0].aor, "sip:caller@host.com");
@@ -168,21 +169,21 @@ fn srs_manager_multiple_sessions() {
     ))
     .unwrap();
 
-    let (sid1, _) = manager
-        .create_session("cid-1", "ftag-1", metadata1)
+    let tag1 = manager
+        .create_session("cid-1", "ftag-1", "z9hG4bK-1", metadata1)
         .unwrap();
-    let (sid2, _) = manager
-        .create_session("cid-2", "ftag-2", metadata2)
+    let tag2 = manager
+        .create_session("cid-2", "ftag-2", "z9hG4bK-2", metadata2)
         .unwrap();
 
-    assert_ne!(sid1, sid2);
+    assert_ne!(tag1, tag2);
     assert!(manager.is_srs_session("cid-1"));
     assert!(manager.is_srs_session("cid-2"));
     assert!(!manager.is_srs_session("cid-3"));
 
     // Activate and stop one.
-    manager.activate_session(&sid1);
-    let record = manager.stop_session("cid-1").unwrap();
+    manager.activate_session("cid-1");
+    let (record, _) = manager.stop_session("cid-1").unwrap();
     assert_eq!(record.participants[0].aor, "sip:a@x.com");
 
     // Second still active.
@@ -202,13 +203,12 @@ fn srs_manager_fail_session() {
     ))
     .unwrap();
 
-    let (session_id, _) = manager
-        .create_session("cid-fail", "ftag", metadata)
+    manager
+        .create_session("cid-fail", "ftag", "z9hG4bK-fail", metadata)
         .unwrap();
-    manager.fail_session(&session_id, "RTPEngine timeout");
+    manager.fail_session("cid-fail", "RTPEngine timeout");
 
-    let session_id_ref = manager.session_for_call_id("cid-fail").unwrap();
-    let session = manager.get_session(&session_id_ref).unwrap();
+    let session = manager.get_session("cid-fail").unwrap();
     match &session.state {
         SrsSessionState::Failed(reason) => {
             assert!(reason.contains("RTPEngine timeout"));
@@ -238,25 +238,28 @@ fn srs_manager_max_sessions_enforced() {
         .create_session(
             "cid-1",
             "ft-1",
+            "z9hG4bK-1",
             make_metadata("sess-1111-0000-0000-000000000001")
         )
-        .is_some());
+        .is_ok());
     assert!(manager
         .create_session(
             "cid-2",
             "ft-2",
+            "z9hG4bK-2",
             make_metadata("sess-2222-0000-0000-000000000002")
         )
-        .is_some());
+        .is_ok());
 
     // Third should fail (max_sessions = 2).
     assert!(manager
         .create_session(
             "cid-3",
             "ft-3",
+            "z9hG4bK-3",
             make_metadata("sess-3333-0000-0000-000000000003")
         )
-        .is_none());
+        .is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -290,13 +293,14 @@ async fn srs_file_storage_writes_metadata() {
     ))
     .unwrap();
 
-    let (session_id, _) = manager
-        .create_session("cid-storage", "ftag", metadata)
+    let session_id = metadata.session_id.clone();
+    manager
+        .create_session("cid-storage", "ftag", "z9hG4bK-storage", metadata)
         .unwrap();
-    manager.activate_session(&session_id);
+    manager.activate_session("cid-storage");
 
     // Wait a tiny bit so duration > 0 is possible (not required).
-    let record = manager.stop_session("cid-storage").unwrap();
+    let (record, _) = manager.stop_session("cid-storage").unwrap();
 
     // Write using storage backend.
     siphon::srs::storage::store_recording(&config, &record).await;
@@ -434,17 +438,17 @@ fn srs_session_captures_original_call_id() {
         vec!["original-dialog-call-id@10.0.0.1"]
     );
 
-    let (session_id, _) = manager
-        .create_session("siprec-call-1", "from-tag", metadata)
+    manager
+        .create_session("siprec-call-1", "from-tag", "z9hG4bK-siprec", metadata)
         .unwrap();
-    let session = manager.get_session(&session_id).unwrap();
+    let session = manager.get_session("siprec-call-1").unwrap();
     assert_eq!(
         session.original_call_id.as_deref(),
         Some("original-dialog-call-id@10.0.0.1")
     );
 
     drop(session);
-    let record = manager.stop_session("siprec-call-1").unwrap();
+    let (record, _) = manager.stop_session("siprec-call-1").unwrap();
     assert_eq!(
         record.original_call_id.as_deref(),
         Some("original-dialog-call-id@10.0.0.1")

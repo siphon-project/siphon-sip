@@ -545,6 +545,7 @@ impl Config {
         config.validate_media_profiles()?;
         config.validate_header_policies()?;
         config.validate_lawful_intercept()?;
+        config.validate_srs()?;
         config.validate_max_message_bytes()?;
         config.validate_control_tls()?;
         config.validate_admin_tls()?;
@@ -918,6 +919,35 @@ impl Config {
              implemented in the siphon-rtp media engine only. Set media.backend to \
              \"siphon-rtp\", or remove lawful_intercept.x3 and provision X2Only warrants \
              (X1 provisioning and X2 IRI delivery work on every backend).",
+            backend.as_str(),
+        )))
+    }
+
+    /// Refuse `srs.enabled` on a media backend that cannot terminate a
+    /// recording.
+    ///
+    /// The SRS answers each recorded stream receive-only on a single-leg engine
+    /// call of its own (RFC 7866 §8.1; §8.1.8: an SRS does not normally send
+    /// RTP), which only the siphon-rtp engine has a verb for (`answer_local`).
+    /// rtpengine and rtpproxy can only relay, so on them every recording would
+    /// be refused: a node that boots like that is worse than one that does not.
+    fn validate_srs(&self) -> Result<()> {
+        if !self.srs.as_ref().is_some_and(|srs| srs.enabled) {
+            return Ok(());
+        }
+        let backend = self
+            .media
+            .as_ref()
+            .map(MediaConfig::backend)
+            .unwrap_or_default();
+        if backend == MediaBackendKind::SiphonRtp {
+            return Ok(());
+        }
+        Err(SiphonError::Config(format!(
+            "srs.enabled is true, but media.backend is {:?}, which cannot terminate a \
+             recording: the SRS answers each stream receive-only on its own single-leg \
+             engine call, which only the siphon-rtp media engine supports. Set \
+             media.backend to \"siphon-rtp\", or turn srs off.",
             backend.as_str(),
         )))
     }

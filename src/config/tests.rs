@@ -6684,4 +6684,36 @@ fn script_gc_refuses_a_key_it_does_not_know() {
     let yaml = format!("{MINIMAL_DIRECT_DISPATCH_YAML}  gc:\n    freeze: true\n");
     let error = Config::from_str(&yaml).expect_err("a misspelled key");
     assert!(error.to_string().contains("freeze"), "{error}");
+/// The SRS answers each recorded stream on a single-leg engine call of its own
+/// (RFC 7866 §8.1: it receives and never relays), which only the siphon-rtp
+/// backend can do. A recording server that boots on another backend would
+/// refuse every recording, so it refuses to start instead.
+#[test]
+fn rejects_srs_without_the_siphon_rtp_backend() {
+    let error = Config::from_str(&backend_yaml("srs:\n  enabled: true\n"))
+        .expect_err("srs on the default backend must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("srs.enabled") && message.contains("siphon-rtp"),
+        "the error should name the setting and the backend it needs: {message}"
+    );
+    let error = Config::from_str(&backend_yaml(
+        "media:\n  backend: rtpengine\nsrs:\n  enabled: true\n",
+    ))
+    .expect_err("srs on rtpengine must be rejected");
+    assert!(error.to_string().contains("rtpengine"), "{error}");
+}
+
+#[test]
+fn accepts_srs_on_the_siphon_rtp_backend() {
+    Config::from_str(&backend_yaml(
+        "media:\n  backend: siphon-rtp\nsrs:\n  enabled: true\n",
+    ))
+    .expect("srs on siphon-rtp is a valid recording server");
+}
+
+#[test]
+fn a_disabled_srs_block_needs_no_backend() {
+    Config::from_str(&backend_yaml("srs:\n  enabled: false\n"))
+        .expect("srs turned off is held to nothing");
 }

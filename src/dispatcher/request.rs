@@ -454,26 +454,16 @@ pub(super) fn handle_request_after_queue(
         "processing request"
     );
 
-    // --- SRS: detect inbound SIPREC INVITEs, ACKs, and BYEs ---
-    if let Some(ref srs_manager) = state.srs_manager {
-        if method == "INVITE" && is_siprec_invite(&message) {
-            handle_srs_invite(inbound, message, Arc::clone(srs_manager), state);
-            return;
-        }
-        let sip_call_id = message.headers.get("Call-ID").map(|s| s.to_string());
-        if let Some(ref call_id) = sip_call_id {
-            if srs_manager.is_srs_session(call_id) {
-                if method == "ACK" {
-                    debug!(call_id = %call_id, "SRS: absorbed ACK for recording session");
-                    return;
-                }
-                if method == "BYE" {
-                    handle_srs_bye(inbound, message, call_id, Arc::clone(srs_manager), state);
-                    return;
-                }
+    // --- SRS: SIPREC INVITEs and every request on a recording dialog ---
+    let (inbound, message) = match state.srs_manager.as_ref() {
+        Some(srs_manager) => {
+            match route_srs_request(inbound, message, &method, srs_manager, state) {
+                Some(not_the_srs) => not_the_srs,
+                None => return,
             }
         }
-    }
+        None => (inbound, message),
+    };
 
     // Graceful drain — reject NEW INVITEs only (in-dialog re-INVITEs identified
     // by To-tag must still flow so active calls can finish their renegotiation).

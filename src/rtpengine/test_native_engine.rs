@@ -330,6 +330,42 @@ fn seat_command(command: &Command) -> (Option<Recorded>, Option<String>, bool, b
     }
 }
 
+/// The id an accepted `start_recording` is answered with: `rec-<n>`, from the
+/// counter the play ids come from.
+fn recording_id_for(
+    command: &Command,
+    refused: bool,
+    counter: &std::sync::atomic::AtomicU64,
+) -> Option<String> {
+    (!refused && matches!(command, Command::StartRecording { .. })).then(|| {
+        format!(
+            "rec-{}",
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        )
+    })
+}
+
+/// A recording on a call the engine holds: `detail` is the file it writes.
+fn recording_command(command: &Command) -> (Option<Recorded>, Option<String>, bool, bool) {
+    match command {
+        Command::StartRecording {
+            call_id,
+            from_tag,
+            path,
+            ..
+        } => (
+            Some(Recorded {
+                detail: path.clone(),
+                ..Recorded::new("start_recording", call_id, from_tag)
+            }),
+            None,
+            false,
+            true,
+        ),
+        _ => (None, None, false, false),
+    }
+}
+
 /// The engine's refusal of a `conference_seat` into a full room: one whose id
 /// starts `full-`.
 fn seat_refusal(command: &Command) -> Option<String> {
@@ -574,6 +610,7 @@ impl NativeTestEngine {
                             Command::AttachX3 { .. } | Command::DetachX3 { .. } => {
                                 x3_command(&request.command)
                             }
+                            Command::StartRecording { .. } => recording_command(&request.command),
                             Command::ConferenceSeat { .. }
                             | Command::ConferenceJoin { .. }
                             | Command::ConferenceLeave { .. } => seat_command(&request.command),
@@ -595,6 +632,8 @@ impl NativeTestEngine {
                                 next_play_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
                             );
                         }
+                        let recording_id =
+                            recording_id_for(&request.command, refused, &next_play_id);
                         let unknown_call = record
                             .as_ref()
                             .map(|record| format!("unknown call: {}", record.call_id));
@@ -649,7 +688,7 @@ impl NativeTestEngine {
                                 sdp,
                                 duration_ms: None,
                                 play_id,
-                                recording_id: None,
+                                recording_id,
                                 to_tag: None,
                                 stats: None,
                             },
