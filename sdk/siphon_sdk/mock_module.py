@@ -12,6 +12,7 @@ configurable backends for registrar, auth, cache, etc.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import ipaddress
 import math
@@ -10779,6 +10780,8 @@ class MockDiameter:
         self.sar_requests: list[dict] = []
         self.lir_requests: list[dict] = []
         self._aar_responses: dict[str, dict] = {}  # session_id -> response
+        # Every rx_aar request, in order (test inspection).
+        self.aar_requests: list[dict] = []
         # Sh (AS → HSS) responses, keyed by public_identity
         self._udr_responses: dict[str, dict] = {}
         self._pur_responses: dict[str, dict] = {}
@@ -11196,6 +11199,29 @@ class MockDiameter:
                     "TS 29.214 §5.3.13 defines (1-4, 6-21)"
                 )
 
+    @staticmethod
+    def _mission_critical_identifier(name: str, value: Any) -> Optional[str]:
+        """An MC identifier argument as siphon reads it: ``TypeError`` naming
+        the argument unless ``None`` or a str, and ``""`` is absent."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise TypeError(f"argument '{name}': must be a str")
+        return value or None
+
+    @staticmethod
+    def _reservation_priority(name: str, value: Any) -> Optional[int]:
+        """A reservation priority argument as siphon reads it: ``TypeError``
+        unless an int (a bool is not one here), ``ValueError`` outside 0..15,
+        each naming the argument."""
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an int from 0 to 15")
+        if not 0 <= value <= 15:
+            raise ValueError(f"{name} must be from 0 to 15, got {value}")
+        return value
+
     def rx_aar(self, session_id: Optional[str] = None,
                framed_ip: Optional[str] = None,
                framed_ipv6: Union[str, bytes, None] = None,
@@ -11203,7 +11229,11 @@ class MockDiameter:
                af_application_id: str = "IMS Services",
                subscription_id: Optional[tuple] = None,
                specific_actions: Optional[list[int]] = None,
-               service_urn: Optional[str] = None) -> Awaitable[Optional[dict]]:
+               service_urn: Optional[str] = None,
+               mcptt_identifier: Optional[str] = None,
+               mcvideo_identifier: Optional[str] = None,
+               reservation_priority: Optional[int] = None,
+               ) -> Awaitable[Optional[dict]]:
         """Send an Rx AA-Request for QoS resource reservation.
 
         Without ``session_id`` the AAR is sent as Rx-Request-Type
@@ -11261,6 +11291,30 @@ class MockDiameter:
                 as Service-URN so the PCRF applies its emergency policy
                 (TS 29.214 §4.4.1). The AVP holds the URN without its
                 ``urn:service:`` (§5.3.23), so ``"sos"`` is accepted too.
+            mcptt_identifier: Marks the session as an MCPTT one
+                (MCPTT-Identifier AVP, TS 29.214 §5.3.45), so the PCRF can
+                set the PCC rules of the prioritized service (§A.13).
+                The value is the namespace of the call's Resource-Priority
+                header, ``"mcpttp"`` or ``"mcpttq"`` (RFC 8101), optionally
+                with the name of the service provider (§A.13.2). ``None`` or
+                ``""`` sends none.
+            mcvideo_identifier: The same for an MCVideo session
+                (MCVideo-Identifier AVP, §5.3.45A, §A.15.2).
+            reservation_priority: Priority of the session, an int from ``0``
+                (DEFAULT, the lowest) to ``15`` (the highest), sent as the
+                Reservation-Priority AVP (ETSI TS 183 017 §7.3.9). For a
+                mission critical call it is the priority value of the
+                Resource-Priority header, unchanged (TS 29.214 §A.13.2).
+                ``None`` sends none, which the PCRF reads as ``0``. The same
+                int given to ``sbi.create_session(res_prio=...)`` goes out as
+                ``PRIO_<n+1>``.
+
+        The three mission critical arguments are accepted on a modification
+        too (``session_id`` set). That is how a priority change, such as a
+        call upgraded to an emergency one by a re-INVITE or UPDATE, reaches the
+        PCRF (§4.4.2). An initial AAR with an identifier also names the MCPTT
+        or MCVideo feature in Supported-Features (§5.4.1), so pass the
+        identifier on the first AAR of the session.
 
         Returns:
             Dict with ``result_code`` and ``session_id``, or ``None``.
@@ -11268,8 +11322,11 @@ class MockDiameter:
         Raises:
             ValueError: A ``specific_actions`` entry is not a defined value;
                 the message names it. Or ``service_urn`` has nothing after
-                ``urn:service:``.
-            TypeError: ``specific_actions`` is not a list of int.
+                ``urn:service:``. Or ``reservation_priority`` is outside
+                0..15.
+            TypeError: ``specific_actions`` is not a list of int,
+                ``reservation_priority`` is not an int, or an identifier is
+                not a str.
 
         Example::
 
@@ -11278,6 +11335,14 @@ class MockDiameter:
                 media_components=components,
                 # loss of bearer, release of bearer, failed allocation
                 specific_actions=[2, 4, 9],
+            )
+
+            # An MCPTT call: "Resource-Priority: mcpttp.5"
+            result = await diameter.rx_aar(
+                framed_ip=request.source_ip,
+                media_components=components,
+                mcptt_identifier="mcpttp",
+                reservation_priority=5,
             )
         """
         # Validated here rather than inside the coroutine, because siphon
@@ -11293,7 +11358,28 @@ class MockDiameter:
             rest = service_urn[len(prefix):] if service_urn.lower().startswith(prefix) else service_urn
             if not rest:
                 raise ValueError(f"service_urn names no service: {service_urn!r}")
+        mcptt_identifier = self._mission_critical_identifier(
+            "mcptt_identifier", mcptt_identifier)
+        mcvideo_identifier = self._mission_critical_identifier(
+            "mcvideo_identifier", mcvideo_identifier)
+        reservation_priority = self._reservation_priority(
+            "reservation_priority", reservation_priority)
         sid = session_id or f"mock-rx-{len(self._aar_responses) + 1}"
+        # Copied, as siphon owns its arguments once the call returns: a list
+        # the caller changes afterwards does not change what was sent.
+        self.aar_requests.append({
+            "session_id": session_id,
+            "framed_ip": framed_ip,
+            "framed_ipv6": framed_ipv6,
+            "media_components": copy.deepcopy(media_components),
+            "af_application_id": af_application_id,
+            "subscription_id": subscription_id,
+            "specific_actions": copy.deepcopy(specific_actions),
+            "service_urn": service_urn,
+            "mcptt_identifier": mcptt_identifier,
+            "mcvideo_identifier": mcvideo_identifier,
+            "reservation_priority": reservation_priority,
+        })
 
         async def _send() -> Optional[dict]:
             if sid in self._aar_responses:
@@ -12684,6 +12770,7 @@ class MockDiameter:
         self.sar_requests.clear()
         self.lir_requests.clear()
         self._aar_responses.clear()
+        self.aar_requests.clear()
         self._udr_responses.clear()
         self._pur_responses.clear()
         self._snr_responses.clear()
@@ -13900,6 +13987,34 @@ class MockSbi:
             subscription["notifUri"] = notif_uri
         return subscription
 
+    _RESERV_PRIORITIES = tuple(f"PRIO_{number}" for number in range(1, 17))
+
+    @classmethod
+    def _mission_critical(cls, mcptt_id: Any, mc_video_id: Any,
+                          res_prio: Any) -> dict:
+        """Validate the mission critical arguments as siphon does and return
+        the ``mcpttId`` / ``mcVideoId`` / ``resPrio`` members siphon sends
+        (only those it sends)."""
+        members: dict = {}
+        for name, member, value in (("mcptt_id", "mcpttId", mcptt_id),
+                                    ("mc_video_id", "mcVideoId", mc_video_id)):
+            value = MockDiameter._mission_critical_identifier(name, value)
+            if value is not None:
+                members[member] = value
+        if isinstance(res_prio, str):
+            if res_prio and res_prio not in cls._RESERV_PRIORITIES:
+                raise ValueError(
+                    'res_prio must be "PRIO_1" to "PRIO_16" or an int from 0 '
+                    f"to 15, got {res_prio!r}"
+                )
+            if res_prio:
+                members["resPrio"] = res_prio
+        else:
+            priority = MockDiameter._reservation_priority("res_prio", res_prio)
+            if priority is not None:
+                members["resPrio"] = f"PRIO_{priority + 1}"
+        return members
+
     def create_session(self, af_app_id: str = "IMS Services",
                        sip_call_id: Optional[str] = None,
                        supi: Optional[str] = None,
@@ -13909,7 +14024,11 @@ class MockSbi:
                        notif_uri: Optional[str] = None,
                        media_components: Optional[list] = None,
                        pcf_uri: Optional[str] = None,
-                       events: Optional[list[str]] = None) -> Optional[dict]:
+                       events: Optional[list[str]] = None,
+                       mcptt_id: Optional[str] = None,
+                       mc_video_id: Optional[str] = None,
+                       res_prio: Union[int, str, None] = None,
+                       ) -> Optional[dict]:
         """Create an N5 app session for QoS policy authorization.
 
         Args:
@@ -13941,6 +14060,26 @@ class MockSbi:
                 through unchecked, so events newer than siphon work. Requires
                 ``notif_uri``. ``None`` (default) subscribes to nothing, and the
                 PCF sends no events.
+            mcptt_id: Marks the session as an MCPTT one (``mcpttId``,
+                TS 29.514 §4.2.2.19), so the PCF can set the PCC rules of the
+                prioritized service. The value is the
+                namespace of the call's Resource-Priority header, ``"mcpttp"``
+                or ``"mcpttq"`` (RFC 8101), optionally with the name of the
+                service provider (§B.13.2). ``None`` or ``""`` sends none.
+            mc_video_id: The same for an MCVideo session (``mcVideoId``,
+                §4.2.2.20, §B.15.2).
+            res_prio: Priority of the session (``resPrio``). Either an int
+                from ``0`` (the lowest) to ``15`` (the highest), which is the
+                priority value of the Resource-Priority header and the same
+                int ``diameter.rx_aar`` takes as ``reservation_priority``; or
+                the ``ReservPriority`` string itself, ``"PRIO_1"`` (the
+                lowest) to ``"PRIO_16"`` (the highest). The int ``n`` is sent
+                as ``"PRIO_<n+1>"`` (TS 29.514 §5.6.3.4, §B.13.2), so ``0`` is
+                ``"PRIO_1"`` and ``15`` is ``"PRIO_16"``. ``None`` sends none,
+                which the PCF reads as ``PRIO_1``.
+
+        With ``mcptt_id`` or ``mc_video_id`` siphon also names the MCPTT or
+        MCVideo feature in the request's ``suppFeat`` (TS 29.514 §5.8).
 
         Returns:
             Dict with ``app_session_id``, ``authorized`` and ``app_session_uri``
@@ -13950,8 +14089,10 @@ class MockSbi:
 
         Raises:
             ValueError: neither ``notif_uri`` nor ``sbi.notif_uri`` is set
-                (``notifUri`` is required on a create), or ``events`` is empty.
-            TypeError: ``events`` is not a list of strings.
+                (``notifUri`` is required on a create), ``events`` is empty,
+                or ``res_prio`` is outside its range.
+            TypeError: ``events`` is not a list of strings, ``res_prio`` is
+                neither an int nor a str, or an identifier is not a str.
 
         Example::
 
@@ -13960,6 +14101,15 @@ class MockSbi:
                 ue_ipv4=request.source_ip,
                 notif_uri="http://192.0.2.10:8080/sbi/events",
                 events=["FAILED_RESOURCES_ALLOCATION"],
+            )
+
+            # An MCPTT call: "Resource-Priority: mcpttp.5" goes out as
+            # mcpttId "mcpttp" and resPrio "PRIO_6".
+            result = await sbi.create_session(
+                ue_ipv4=request.source_ip,
+                notif_uri="http://192.0.2.10:8080/sbi/events",
+                mcptt_id="mcpttp",
+                res_prio=5,
             )
         """
         # Validated at the call, as siphon does: the request body is built
@@ -13972,6 +14122,7 @@ class MockSbi:
                 "set sbi.notif_uri (TS 29.514 requires notifUri on a create)"
             )
         subscription = self._event_subscription(events, notif_uri, creating=True)
+        mission_critical = self._mission_critical(mcptt_id, mc_video_id, res_prio)
         session_id = f"mock-n5-{self._next_session_id}"
         self._next_session_id += 1
         self._sessions[session_id] = {
@@ -13979,6 +14130,8 @@ class MockSbi:
             "ue_ipv4": ue_ipv4,
             "pcf_uri": pcf_uri,
             "ev_subsc": subscription,
+            # The members as siphon sends them: mcpttId, mcVideoId, resPrio.
+            "mission_critical": mission_critical,
         }
         base = (pcf_uri or "http://mock-pcf").rstrip("/")
         app_session_uri = (
@@ -14033,7 +14186,11 @@ class MockSbi:
     def update_session(self, session_id: str,
                        media_components: Optional[list] = None,
                        events: Optional[list[str]] = None,
-                       notif_uri: Optional[str] = None) -> Optional[dict]:
+                       notif_uri: Optional[str] = None,
+                       mcptt_id: Optional[str] = None,
+                       mc_video_id: Optional[str] = None,
+                       res_prio: Union[int, str, None] = None,
+                       ) -> Optional[dict]:
         """Update an N5 app session (media renegotiation, event subscription).
 
         The modify is a JSON merge patch, so only what you pass is sent.
@@ -14050,18 +14207,35 @@ class MockSbi:
             notif_uri: a new callback base for the subscription
                 (``http://<sbi.notif_listen>/sbi/events``). Only sent with
                 ``events``; ``None`` keeps the one the PCF holds.
+            mcptt_id: ``mcpttId``, as in ``create_session``: the modification
+                is the priority adjustment of an MCPTT session (TS 29.514
+                §4.2.3.19). ``None`` or ``""`` leaves it out of the patch.
+            mc_video_id: ``mcVideoId``, the same for an MCVideo session
+                (§4.2.3.20).
+            res_prio: the new ``resPrio``, an int from ``0`` to ``15`` or
+                ``"PRIO_1"`` to ``"PRIO_16"`` as in ``create_session``. This is
+                how a priority change, such as a call upgraded to an emergency
+                one by a re-INVITE or UPDATE, reaches the PCF. ``None`` keeps
+                the priority the PCF holds.
 
         Returns:
             Dict with ``app_session_id`` and ``authorized``, or ``None``.
 
         Raises:
-            ValueError: ``events`` is empty, or ``notif_uri`` is given without
-                ``events``.
-            TypeError: ``events`` is not a list of strings.
+            ValueError: ``events`` is empty, ``notif_uri`` is given without
+                ``events``, or ``res_prio`` is outside its range.
+            TypeError: ``events`` is not a list of strings, ``res_prio`` is
+                neither an int nor a str, or an identifier is not a str.
+
+        Example::
+
+            # The call became an emergency one: raise its priority.
+            await sbi.update_session(app_session_uri, mcptt_id="mcpttp", res_prio=15)
         """
         # Same as create_session: the update body, and so its validation,
         # is built before the future.
         subscription = self._event_subscription(events, notif_uri, creating=False)
+        mission_critical = self._mission_critical(mcptt_id, mc_video_id, res_prio)
         resolved = self._session_id(session_id)
 
         async def _update() -> Optional[dict]:
@@ -14069,6 +14243,9 @@ class MockSbi:
                 return None
             if subscription is not None:
                 self._sessions[resolved]["ev_subsc"] = subscription
+            # A merge patch: what is sent replaces, the rest stays.
+            self._sessions[resolved].setdefault("mission_critical", {}).update(
+                mission_critical)
             return {"app_session_id": resolved, "authorized": self._authorized}
 
         return _update()

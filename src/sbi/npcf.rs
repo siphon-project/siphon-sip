@@ -150,6 +150,18 @@ pub struct AppSessionContextReqData {
     /// `/terminate` appended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notif_uri: Option<String>,
+    /// MCPTT identifier (`mcpttId`): the session is an MCPTT one (TS 29.514
+    /// clause 4.2.2.19). Needs the `MCPTT` feature in `supp_feat`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcptt_id: Option<String>,
+    /// MCVideo identifier (`mcVideoId`): the session is an MCVideo one
+    /// (clause 4.2.2.20). Needs the `MCVideo` feature in `supp_feat`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mc_video_id: Option<String>,
+    /// Reservation priority of the AF session (`resPrio`, a `ReservPriority`
+    /// of clause 5.6.3.4: "PRIO_1" to "PRIO_16"). See [`reserv_priority`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub res_prio: Option<String>,
     /// Supported features (`suppFeat`, the feature negotiation bitmask in
     /// hexadecimal). The attribute is required in `AppSessionContextReqData`,
     /// so it is always sent: `None` goes out as [`NO_OPTIONAL_FEATURES`].
@@ -160,6 +172,52 @@ pub struct AppSessionContextReqData {
 /// `suppFeat` of a client that implements none of the optional features of
 /// TS 29.514 clause 5.8.
 pub const NO_OPTIONAL_FEATURES: &str = "0";
+
+/// Feature numbers of TS 29.514 table 5.8-1. Feature number 1 is the lowest
+/// bit of the `SupportedFeatures` bitmask (TS 29.571 clause 5.2.2).
+const FEATURE_NUMBER_MCPTT: u32 = 9;
+const FEATURE_NUMBER_MCVIDEO: u32 = 10;
+
+/// `suppFeat` for request data that uses the optional features its members
+/// belong to: `MCPTT` for `mcpttId` and `MCVideo` for `mcVideoId`, the
+/// applicability table 5.6.2.3-1 gives those two. Clause 5.8: "the NF service
+/// consumer shall indicate the optional features the NF service consumer
+/// supports ... by including the "suppFeat" attribute". `None` when neither
+/// is used, which goes out as [`NO_OPTIONAL_FEATURES`].
+///
+/// The value is a string of hexadecimal characters with the lowest features
+/// last (TS 29.571 clause 5.2.2): "100" for MCPTT, "200" for MCVideo.
+pub fn supp_feat_for(mcptt: bool, mc_video: bool) -> Option<String> {
+    let bit = |used: bool, number: u32| if used { 1u32 << (number - 1) } else { 0 };
+    let features = bit(mcptt, FEATURE_NUMBER_MCPTT) | bit(mc_video, FEATURE_NUMBER_MCVIDEO);
+    (features != 0).then(|| format!("{features:X}"))
+}
+
+/// The `ReservPriority` (TS 29.514 clause 5.6.3.4) for a reservation
+/// priority of 0 to 15, the value an Rx Reservation-Priority AVP carries.
+///
+/// Both scales run lowest to highest and both start at the value an absent
+/// attribute stands for: Rx DEFAULT (0) and N5 "PRIO_1" ("If the "resPrio"
+/// attribute is not specified, the requested priority is PRIO_1", clause
+/// 4.2.2.2). Clause 5.6.3.4: "The lowest priority shall be indicated with the
+/// "PRIO_1" value, the next after the lowest with the "PRIO_2" value, and so
+/// on up to the highest priority which shall be indicated with "PRIO_16"."
+/// Clause B.13.2 pins the scale to the same Resource-Priority value Rx uses
+/// (TS 29.214 clause A.13.2): "PRIO_1 (Resource-Priority header value 0) ...
+/// PRIO_16 (Resource-Priority header value 15)". So priority n is PRIO_(n+1).
+pub fn reserv_priority(priority: crate::diameter::rx::ReservationPriority) -> String {
+    format!("PRIO_{}", u32::from(priority.value()) + 1)
+}
+
+/// Whether `value` is a `ReservPriority`: "PRIO_1" to "PRIO_16", written
+/// exactly so.
+pub fn is_reserv_priority(value: &str) -> bool {
+    value
+        .strip_prefix("PRIO_")
+        .filter(|number| !number.starts_with('0') && !number.starts_with('+'))
+        .and_then(|number| number.parse::<u32>().ok())
+        .is_some_and(|number| (1..=16).contains(&number))
+}
 
 fn serialize_supp_feat<S: serde::Serializer>(
     supp_feat: &Option<String>,
@@ -194,6 +252,18 @@ pub struct AppSessionContextUpdateData {
     /// `null`, which would remove it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ev_subsc: Option<EventsSubscReqData>,
+    /// MCPTT identifier (`mcpttId`): the modification is the priority
+    /// adjustment of an MCPTT session (TS 29.514 clause 4.2.3.19). Left out
+    /// when `None`, as every member of a merge patch that is to stay as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcptt_id: Option<String>,
+    /// MCVideo identifier (`mcVideoId`), the same for an MCVideo session
+    /// (clause 4.2.3.20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mc_video_id: Option<String>,
+    /// New reservation priority of the AF session (`resPrio`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub res_prio: Option<String>,
 }
 
 /// Top-level PATCH body for an app-session modify (TS 29.514
@@ -1086,6 +1156,110 @@ mod tests {
             .keys()
             .collect();
         assert_eq!(members, vec!["medComponents"], "{body}");
+    }
+
+    /// `ReservPriority` runs "PRIO_1" (lowest) to "PRIO_16" (highest), clause
+    /// 5.6.3.4; reservation priority n of Rx is PRIO_(n+1), clause B.13.2.
+    #[test]
+    fn reserv_priority_is_one_above_the_rx_value() {
+        use crate::diameter::rx::ReservationPriority;
+        let of = |value: u8| reserv_priority(ReservationPriority::new(value).unwrap());
+        assert_eq!(of(0), "PRIO_1");
+        assert_eq!(of(1), "PRIO_2");
+        assert_eq!(of(9), "PRIO_10");
+        assert_eq!(of(15), "PRIO_16");
+        for value in 0..=15 {
+            assert!(is_reserv_priority(&of(value)), "{value}");
+        }
+    }
+
+    #[test]
+    fn only_the_sixteen_enumerated_values_are_a_reserv_priority() {
+        for value in ["PRIO_1", "PRIO_9", "PRIO_10", "PRIO_16"] {
+            assert!(is_reserv_priority(value), "{value}");
+        }
+        for value in [
+            "", "PRIO_", "PRIO_0", "PRIO_17", "PRIO_01", "PRIO_+1", "PRIO_-1", "prio_1", "1",
+            "PRIO_1 ", "PRIO_1.0",
+        ] {
+            assert!(!is_reserv_priority(value), "{value:?}");
+        }
+    }
+
+    /// Table 5.8-1: MCPTT is feature number 9 and MCVideo 10, so bits 8 and 9
+    /// of the bitmask, written in hexadecimal.
+    #[test]
+    fn supp_feat_names_the_features_of_the_mission_critical_members() {
+        assert_eq!(supp_feat_for(false, false), None);
+        assert_eq!(supp_feat_for(true, false).as_deref(), Some("100"));
+        assert_eq!(supp_feat_for(false, true).as_deref(), Some("200"));
+        assert_eq!(supp_feat_for(true, true).as_deref(), Some("300"));
+    }
+
+    /// The POST body carries `mcpttId`, `mcVideoId` and `resPrio` under
+    /// `ascReqData`, by the names of the TS 29.514 OpenAPI, and `suppFeat`
+    /// names the two features.
+    #[tokio::test]
+    async fn create_wire_body_carries_the_mission_critical_members() {
+        let _gauge = locked_gauge().await;
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let pcf = spawn_mock(body_capturing_router(Arc::clone(&captured))).await;
+        let client = NpcfClient::new(&pcf, reqwest::Client::new());
+
+        let request_data = AppSessionContextReqData {
+            notif_uri: Some(NOTIF_URI.to_string()),
+            mcptt_id: Some("mcpttp".to_string()),
+            mc_video_id: Some("mcpttq".to_string()),
+            res_prio: Some("PRIO_16".to_string()),
+            supp_feat: supp_feat_for(true, true),
+            ..Default::default()
+        };
+        client
+            .create_app_session(None, &request_data)
+            .await
+            .expect("create must succeed");
+
+        let body = captured.lock().unwrap().clone().expect("captured body");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "ascReqData": {
+                    "notifUri": NOTIF_URI,
+                    "mcpttId": "mcpttp",
+                    "mcVideoId": "mcpttq",
+                    "resPrio": "PRIO_16",
+                    "suppFeat": "300"
+                }
+            })
+        );
+    }
+
+    /// The PATCH body carries them under `ascReqData` too
+    /// (`AppSessionContextUpdateData`), and nothing else when nothing else
+    /// changes.
+    #[tokio::test]
+    async fn update_wire_body_carries_the_mission_critical_members() {
+        let update_data = AppSessionContextUpdateData {
+            mcptt_id: Some("mcpttp".to_string()),
+            mc_video_id: Some("mcpttq".to_string()),
+            res_prio: Some("PRIO_3".to_string()),
+            ..Default::default()
+        };
+        let (content_type, body) = capture_update(&update_data).await;
+        assert_eq!(
+            content_type.as_deref(),
+            Some("application/merge-patch+json")
+        );
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "ascReqData": {
+                    "mcpttId": "mcpttp",
+                    "mcVideoId": "mcpttq",
+                    "resPrio": "PRIO_3"
+                }
+            })
+        );
     }
 
     /// A create router that records the raw request body it received.

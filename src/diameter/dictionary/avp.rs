@@ -220,6 +220,11 @@ pub const SERVICE_INFO_STATUS: u32 = 527;
 pub const RX_REQUEST_TYPE: u32 = 533;
 pub const MIN_REQUESTED_BANDWIDTH_DL: u32 = 534;
 pub const MIN_REQUESTED_BANDWIDTH_UL: u32 = 535;
+pub const MCPTT_IDENTIFIER: u32 = 547;
+pub const MCVIDEO_IDENTIFIER: u32 = 562;
+// ETSI TS 183 017 table 7.3.1, vendor 13019; Rx takes it over (TS 29.214
+// table 5.4.0.1). The code is also the base User-Equipment-Info's.
+pub const RESERVATION_PRIORITY: u32 = 458;
 
 // 3GPP Ro/Rf Charging (TS 32.299)
 pub const EVENT_TYPE: u32 = 823;

@@ -72,6 +72,33 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **Mission critical identifiers and reservation priority on Rx and N5.** A
+  P-CSCF had no way to give the PCRF or PCF the MCPTT or MCVideo identifier
+  and the priority of a session, which TS 29.214 annex A.13 and TS 29.514
+  annex B.13 have it send for a mission critical call. `diameter.rx_aar` takes `mcptt_identifier=` (MCPTT-Identifier, TS
+  29.214 clause 5.3.45), `mcvideo_identifier=` (MCVideo-Identifier, clause
+  5.3.45A) and `reservation_priority=` (Reservation-Priority at command level,
+  an int from 0 to 15, ETSI TS 183 017 clause 7.3.9), on the initial AAR and
+  on a modification, which is how a priority change reaches the PCRF (clause
+  4.4.2). `sbi.create_session` and `sbi.update_session` take `mcptt_id=`,
+  `mc_video_id=` and `res_prio=` (`mcpttId`, `mcVideoId`, `resPrio` of TS
+  29.514). `res_prio` is the same int, sent as `PRIO_<n+1>` (0 is `PRIO_1`, 15
+  is `PRIO_16`: both scales are pinned to the Resource-Priority value by TS
+  29.214 clause A.13.2 and TS 29.514 clause B.13.2), or a `"PRIO_1"` to
+  `"PRIO_16"` string. An empty string is an absent argument, a priority out of
+  range raises `ValueError` and a wrong type `TypeError`. An initial AAR with
+  an identifier names the MCPTT or MCVideo feature in Supported-Features
+  (clause 5.4.1), and a create names it in `suppFeat` (`"100"`, `"200"`),
+  which was always `"0"`. Reservation-Priority is an ETSI AVP (vendor 13019),
+  so a peer that advertises Rx now also sends Supported-Vendor-Id 13019 in its
+  CER and CEA, as TS 29.214 table 5.4.0.1 requires. `Reservation-Priority` is
+  a dictionary name for `get_avp` now; the two identifiers already were. The
+  Rust `rx::RxSessionRequest` has three new fields, and
+  `npcf::AppSessionContextReqData` and `AppSessionContextUpdateData` have
+  three each. The AAR is checked against Wireshark's Diameter dissector by
+  `scripts/validate_rx_aar.sh`. Mirrored in the SDK mock, which records each
+  AAR in `diameter.aar_requests`.
+
 - **`script.gc`: freeze startup objects and raise the collection threshold.**
   On free-threaded Python every garbage collection stops all threads and
   walks the whole heap, so it takes as long as the heap is large (about 35 ms
