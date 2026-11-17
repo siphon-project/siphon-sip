@@ -286,6 +286,7 @@ async fn a_resolved_refresh_names_siphon_in_its_via() {
         registrant_flow: None,
         body: None,
         local_contact: None,
+        generation: 0,
     };
     send_in_dialog(
         &watcher.uac.sender,
@@ -528,6 +529,7 @@ async fn a_refresh_of_a_dialog_without_a_kept_contact_derives_the_default() {
         registrant_flow: None,
         body: None,
         local_contact: None,
+        generation: 0,
     };
     send_in_dialog(
         &watcher.uac.sender,

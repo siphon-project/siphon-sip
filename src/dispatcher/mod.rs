@@ -397,6 +397,8 @@ mod stop_the_world_tests;
 #[cfg(test)]
 mod subscribe_notify_before_2xx_tests;
 #[cfg(test)]
+mod subscribe_notify_response_tests;
+#[cfg(test)]
 mod subscribe_reply_order_tests;
 #[cfg(test)]
 mod subscribe_test_harness;
