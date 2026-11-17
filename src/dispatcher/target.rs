@@ -634,11 +634,14 @@ pub(super) fn send_to_target(
 
     // HEP capture — outbound (sent to network)
     if let Some(ref hep) = state.hep_sender {
-        let local = state
-            .listen_addrs
-            .get(&transport)
-            .copied()
-            .unwrap_or(state.local_addr);
+        let local = super::timers::udp_egress_source(transport, destination, send_source)
+            .unwrap_or_else(|| {
+                state
+                    .listen_addrs
+                    .get(&transport)
+                    .copied()
+                    .unwrap_or(state.local_addr)
+            });
         hep.capture_outbound(
             state.hep_local_addr(local, transport),
             destination,
