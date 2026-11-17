@@ -46,7 +46,7 @@ pub(in crate::dispatcher) fn over_mtu_upgrade(
             destination,
             &state.dns_resolver,
         ),
-        ProtectedOverMtu::Tcp(tcp) => Some((Transport::Tcp, tcp)),
+        ProtectedOverMtu::Tcp { tcp, .. } => Some((Transport::Tcp, tcp)),
         ProtectedOverMtu::KeepUdp => None,
     }
 }
@@ -90,6 +90,7 @@ pub(in crate::dispatcher) fn fork_branch_over_mtu(
     outbound_transport: Transport,
 ) -> (Transport, SocketAddr) {
     if flow_over_mtu_upgrade(state, flow, relayed) {
+        upgrade_metrics::record(OverMtuPath::Relay);
         return (Transport::Tcp, destination);
     }
     if state.mtu.is_none() || flow.is_some() {
@@ -106,21 +107,75 @@ pub(in crate::dispatcher) fn fork_branch_over_mtu(
             warn!(%tcp_addr, "fork §18.1.1: TCP path loops back to us — keeping UDP");
             (outbound_transport, destination)
         }
-        Some((tcp_transport, tcp_addr)) => (tcp_transport, tcp_addr),
+        Some((tcp_transport, tcp_addr)) => {
+            upgrade_metrics::record(OverMtuPath::Relay);
+            (tcp_transport, tcp_addr)
+        }
         None => (outbound_transport, destination),
     }
 }
 
 /// What the switch does toward a destination with a security association.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProtectedOverMtu {
+pub(super) enum ProtectedOverMtu {
     /// No P-CSCF association for the destination, or no switch wanted: the
     /// generic switch decides.
     NotProtected,
-    /// Send over TCP to this address, the UE's protected server port.
-    Tcp(SocketAddr),
+    /// Send over TCP to `tcp`, the UE's protected server port, from `local`,
+    /// the P-CSCF's protected client port.
+    Tcp { local: SocketAddr, tcp: SocketAddr },
     /// Stay on UDP; the reason is logged.
     KeepUdp,
+}
+
+/// The P-CSCF's connection to a UE's protected server port that an over-MTU
+/// request waits on: what [`protected_plan`] found worth opening. The connect
+/// itself is the caller's, blocking ([`protected_over_mtu`]) or awaited (a
+/// request siphon originates); [`conclude`](Self::conclude) takes its result.
+pub(super) struct ProtectedConnect {
+    /// The P-CSCF's protected client port: the connection's source.
+    pub(super) local: SocketAddr,
+    /// The UE's protected server port: the connection's destination.
+    pub(super) tcp: SocketAddr,
+    probe: probe_cache::Probe<'static>,
+    serialized_len: usize,
+    mtu: u16,
+    destination: SocketAddr,
+}
+
+impl ProtectedConnect {
+    /// Record how the connect went and say where the request goes.
+    pub(super) fn conclude(self, opened: Result<ConnectionId, std::io::Error>) -> ProtectedOverMtu {
+        let Self {
+            local,
+            tcp,
+            probe,
+            serialized_len,
+            mtu,
+            destination,
+        } = self;
+        probe.finish(opened.is_ok(), std::time::Instant::now());
+        match opened {
+            Ok(connection_id) => {
+                debug!(
+                    serialized_len, mtu, %destination, to = %tcp, %local,
+                    connection_id = ?connection_id,
+                    "over-MTU UDP request to a protected UE → TCP on the P-CSCF's connection \
+                     to its protected server port"
+                );
+                ProtectedOverMtu::Tcp { local, tcp }
+            }
+            Err(error) => {
+                warn!(
+                    serialized_len, mtu, %destination, to = %tcp, %local, %error,
+                    "transport: forced UDP over-MTU send (the TCP connection from the \
+                     protected client port to the UE's protected server port could not be \
+                     opened)"
+                );
+                ProtectedOverMtu::KeepUdp
+            }
+        }
+    }
 }
 
 fn protected_over_mtu(
@@ -129,11 +184,42 @@ fn protected_over_mtu(
     serialized_len: usize,
     destination: SocketAddr,
 ) -> ProtectedOverMtu {
-    let (Some(mtu), Some(manager)) = (state.mtu, state.ipsec_manager.as_deref()) else {
-        return ProtectedOverMtu::NotProtected;
+    match protected_plan(
+        state.mtu,
+        state.ipsec_manager.as_deref(),
+        outbound_transport,
+        serialized_len,
+        destination,
+    ) {
+        Err(decided) => decided,
+        // The connect runs released from the interpreter (never blocking
+        // while attached).
+        Ok(connect) => {
+            let opened = crate::script::blocking::block_on_released(
+                state
+                    .connection_pool
+                    .connect_tcp_from(connect.local, connect.tcp),
+            );
+            connect.conclude(opened)
+        }
+    }
+}
+
+/// The over-MTU switch toward a UE with a security association, up to the
+/// connect: the connection to open, or (`Err`) what the association alone
+/// decides.
+pub(super) fn protected_plan(
+    mtu: Option<u16>,
+    manager: Option<&crate::ipsec::IpsecManager>,
+    outbound_transport: Transport,
+    serialized_len: usize,
+    destination: SocketAddr,
+) -> Result<ProtectedConnect, ProtectedOverMtu> {
+    let (Some(mtu), Some(manager)) = (mtu, manager) else {
+        return Err(ProtectedOverMtu::NotProtected);
     };
     if outbound_transport != Transport::Udp || !over_mtu(serialized_len, mtu) {
-        return ProtectedOverMtu::NotProtected;
+        return Err(ProtectedOverMtu::NotProtected);
     }
     let Some(pair) = manager.find_sa_by_ue(&destination.ip(), destination.port()) else {
         // A UE protected port whose pair is gone: the request is refused at
@@ -145,9 +231,9 @@ fn protected_over_mtu(
                 "transport: over-MTU request to a UE protected port whose security association \
                  is gone; no TCP path is opened"
             );
-            return ProtectedOverMtu::KeepUdp;
+            return Err(ProtectedOverMtu::KeepUdp);
         }
-        return ProtectedOverMtu::NotProtected;
+        return Err(ProtectedOverMtu::NotProtected);
     };
     // Only a pair the UE uses carries a new connection: not one an
     // authentication in progress set up, which the UE may not hold yet, nor an
@@ -161,16 +247,16 @@ fn protected_over_mtu(
             "transport: forced UDP over-MTU send (the UE's security association for this flow \
              is not in use: pending, or being retired)"
         );
-        return ProtectedOverMtu::KeepUdp;
+        return Err(ProtectedOverMtu::KeepUdp);
     }
     match pair.tcp_flow_to_ue() {
-        crate::ipsec::FlowToUe::NotProtected => ProtectedOverMtu::NotProtected,
+        crate::ipsec::FlowToUe::NotProtected => Err(ProtectedOverMtu::NotProtected),
         crate::ipsec::FlowToUe::Unusable(protocol) => {
             warn!(
                 serialized_len, mtu, %destination, %protocol,
                 "transport: forced UDP over-MTU send (the UE's security association carries no TCP)"
             );
-            ProtectedOverMtu::KeepUdp
+            Err(ProtectedOverMtu::KeepUdp)
         }
         crate::ipsec::FlowToUe::Protected {
             local,
@@ -178,41 +264,23 @@ fn protected_over_mtu(
         } => {
             // A connect to a dead UE can take the pool's whole connect timeout,
             // so at most one runs per UE at a time and none for a window after
-            // one failed (see `probe_cache`). It runs released from the
-            // interpreter (never blocking while attached).
-            let probe = match probe_cache().claim(tcp, std::time::Instant::now()) {
-                Ok(probe) => probe,
+            // one failed (see `probe_cache`).
+            match probe_cache().claim(tcp, std::time::Instant::now()) {
+                Ok(probe) => Ok(ProtectedConnect {
+                    local,
+                    tcp,
+                    probe,
+                    serialized_len,
+                    mtu,
+                    destination,
+                }),
                 Err(skip) => {
                     debug!(
                         serialized_len, mtu, %destination, to = %tcp, ?skip,
                         "transport: forced UDP over-MTU send (the P-CSCF's connection to the \
                          UE's protected server port failed recently, or is being opened)"
                     );
-                    return ProtectedOverMtu::KeepUdp;
-                }
-            };
-            let opened = crate::script::blocking::block_on_released(
-                state.connection_pool.connect_tcp_from(local, tcp),
-            );
-            probe.finish(opened.is_ok(), std::time::Instant::now());
-            match opened {
-                Ok(connection_id) => {
-                    debug!(
-                        serialized_len, mtu, %destination, to = %tcp, %local,
-                        connection_id = ?connection_id,
-                        "over-MTU UDP request to a protected UE → TCP on the P-CSCF's connection \
-                         to its protected server port"
-                    );
-                    ProtectedOverMtu::Tcp(tcp)
-                }
-                Err(error) => {
-                    warn!(
-                        serialized_len, mtu, %destination, to = %tcp, %local, %error,
-                        "transport: forced UDP over-MTU send (the TCP connection from the \
-                         protected client port to the UE's protected server port could not be \
-                         opened)"
-                    );
-                    ProtectedOverMtu::KeepUdp
+                    Err(ProtectedOverMtu::KeepUdp)
                 }
             }
         }

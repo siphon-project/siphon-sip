@@ -6,6 +6,7 @@
 
 pub mod accept;
 pub mod admission;
+pub mod cache;
 pub mod custom;
 mod diameter_inbound;
 pub mod enum_servers;
@@ -18,6 +19,7 @@ mod python_stats;
 pub mod rate_limit;
 pub mod send_queue;
 pub mod stale_shed;
+pub mod subscribe_notify;
 pub mod timer;
 
 use std::sync::{Arc, OnceLock};

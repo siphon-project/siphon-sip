@@ -259,6 +259,31 @@ impl UacSender {
             .map(|(pool, mtu)| (pool.as_ref(), *mtu))
     }
 
+    /// What the over-MTU switch of a request to a resolved destination decides
+    /// with (RFC 3261 clause 18.1.1): the relay's decision, read from this
+    /// sender. `None` without `listen.mtu`.
+    pub(crate) fn originated_over_mtu<'a>(
+        &'a self,
+        resolver: &'a crate::dns::SipResolver,
+    ) -> Option<crate::dispatcher::OriginatedOverMtu<'a>> {
+        let (pool, mtu) = self.over_mtu()?;
+        Some(crate::dispatcher::OriginatedOverMtu {
+            mtu,
+            pool,
+            ipsec: self
+                .ipsec_egress
+                .as_ref()
+                .map(|(manager, _)| manager.as_ref()),
+            resolver,
+        })
+    }
+
+    /// Whether this node has a listener of its own for `transport`, whose
+    /// identity a Via over that transport can name.
+    pub fn listens_on(&self, transport: Transport) -> bool {
+        self.listen_addrs.contains_key(&transport)
+    }
+
     /// `(destination, source_local_addr)` a send really uses.
     fn egress(
         &self,

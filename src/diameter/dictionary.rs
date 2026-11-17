@@ -1848,10 +1848,8 @@ static AVP_TABLE: &[AvpDef] = &[
 ///
 /// Uses binary search on the static table (sorted by vendor_id, then code).
 pub fn lookup_avp(code: u32, vendor_id: u32) -> Option<&'static AvpDef> {
-    if vendor_id == VENDOR_3GPP {
-        if let Some(entry) = policy::lookup(code) {
-            return Some(&entry.definition);
-        }
+    if let Some(entry) = policy::lookup(code, vendor_id) {
+        return Some(&entry.definition);
     }
     AVP_TABLE
         .binary_search_by(|entry| entry.vendor_id.cmp(&vendor_id).then(entry.code.cmp(&code)))
@@ -1862,9 +1860,7 @@ pub fn lookup_avp(code: u32, vendor_id: u32) -> Option<&'static AvpDef> {
 /// Every definition: the main table, then the policy and charging control
 /// AVPs of TS 29.212 and TS 29.214 ([`policy`]).
 fn all_definitions() -> impl Iterator<Item = &'static AvpDef> {
-    AVP_TABLE
-        .iter()
-        .chain(policy::POLICY_AVPS.iter().map(|entry| &entry.definition))
+    AVP_TABLE.iter().chain(policy::definitions())
 }
 
 /// Look up an AVP definition by name (linear scan — use sparingly).
@@ -1910,10 +1906,8 @@ pub fn lookup_avp_by_python_name(name: &str) -> Option<&'static AvpDef> {
 /// it too. A Gx or Rx AVP goes with the bit its table gives it ([`policy`]).
 pub fn avp_is_mandatory(code: u32, vendor_id: u32) -> bool {
     const ERROR_REPORTING_HOST: u32 = 294;
-    if vendor_id == VENDOR_3GPP {
-        if let Some(entry) = policy::lookup(code) {
-            return entry.mandatory;
-        }
+    if let Some(entry) = policy::lookup(code, vendor_id) {
+        return entry.mandatory;
     }
     match vendor_id {
         VENDOR_3GPP => !matches!(
@@ -1949,7 +1943,7 @@ pub fn avp_name(code: u32) -> Option<&'static str> {
 
 /// Total number of AVP definitions in the dictionary.
 pub fn avp_count() -> usize {
-    AVP_TABLE.len() + policy::POLICY_AVPS.len()
+    AVP_TABLE.len() + policy::definitions().count()
 }
 
 // ── Application IDs ──────────────────────────────────────────────────────
@@ -2478,6 +2472,7 @@ pub fn result_code_is_success(code: u32) -> bool {
 
 pub mod avp;
 mod policy;
+pub use policy::VENDOR_ETSI;
 
 #[cfg(test)]
 mod tests {
@@ -2584,6 +2579,47 @@ mod tests {
             lookup_avp_by_python_name("revalidation_time").map(|found| found.code),
             Some(1042)
         );
+    }
+
+    /// MCPTT-Identifier and MCVideo-Identifier per TS 29.214 table 5.3.0.1
+    /// (547 and 562, OctetString, V under "Must", M under "Must not"), and
+    /// Reservation-Priority per ETSI TS 183 017 table 7.3.1 (458, Enumerated,
+    /// the same flags) under the ETSI vendor id TS 29.214 table 5.4.0.1
+    /// requires. Code 458 without a vendor stays User-Equipment-Info.
+    #[test]
+    fn mission_critical_and_reservation_priority_avps_are_defined() {
+        for (name, code, vendor_id, data_type) in [
+            ("MCPTT-Identifier", 547, VENDOR_3GPP, AvpType::OctetString),
+            ("MCVideo-Identifier", 562, VENDOR_3GPP, AvpType::OctetString),
+            (
+                "Reservation-Priority",
+                458,
+                VENDOR_ETSI,
+                AvpType::Enumerated,
+            ),
+        ] {
+            let definition = lookup_by_name(name).unwrap_or_else(|| panic!("{name} is defined"));
+            assert_eq!((definition.code, definition.vendor_id), (code, vendor_id));
+            assert_eq!(definition.data_type, data_type, "{name}");
+            assert_eq!(
+                lookup_avp(code, vendor_id).map(|found| found.name),
+                Some(name)
+            );
+            assert!(!avp_is_mandatory(code, vendor_id), "{name}");
+        }
+        assert_eq!(VENDOR_ETSI, 13019);
+        assert_eq!(
+            lookup_avp(458, 0).map(|found| found.name),
+            Some("User-Equipment-Info")
+        );
+        assert!(lookup_avp(458, VENDOR_3GPP).is_none());
+        assert_eq!(
+            lookup_avp_by_python_name("reservation_priority").map(|found| found.vendor_id),
+            Some(VENDOR_ETSI)
+        );
+        assert_eq!(avp::MCPTT_IDENTIFIER, 547);
+        assert_eq!(avp::MCVIDEO_IDENTIFIER, 562);
+        assert_eq!(avp::RESERVATION_PRIORITY, 458);
     }
 
     #[test]

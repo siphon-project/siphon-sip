@@ -411,6 +411,19 @@ fn retire_fallback_lane(
     true
 }
 
+/// Whether a node with no `listen.tcp` still sends over TCP, and so needs an
+/// outbound distributor no TCP listener spawns for it: one that registers UEs
+/// from addresses of their own, over TCP or with their TCP half, and one with
+/// `listen.mtu`, where a request the UAC sender originates over UDP moves to
+/// TCP when it is over the MTU (RFC 3261 §18.1.1). Without a distributor such
+/// a request would sit in the channel unread.
+pub(crate) fn listenerless_tcp_egress(
+    listen: &crate::config::ListenConfig,
+    registrant_sockets: bool,
+) -> bool {
+    listen.tcp.is_empty() && (registrant_sockets || listen.mtu.is_some())
+}
+
 /// Spawn the outbound distributor for one stream listener.
 ///
 /// Routes each [`OutboundMessage`] to its connection's bounded sender; when no

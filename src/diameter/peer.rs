@@ -652,6 +652,27 @@ fn encode_application_ids(avps: &mut Vec<u8>, application_ids: &[(u32, u32)]) {
     }
 }
 
+/// Supported-Vendor-Id of a CER/CEA (RFC 6733 §5.3.6): 3GPP always, and ETSI
+/// beside it when Rx is advertised. Rx takes Reservation-Priority over from
+/// ETSI TS 183 017, and TS 29.214 table 5.4.0.1 has "The support of this AVP
+/// shall be advertised in the capabilities exchange mechanisms (CER/CEA) by
+/// including the ETSI parameter in the Supported-Vendor-Id AVP".
+fn encode_supported_vendor_ids(avps: &mut Vec<u8>, application_ids: &[(u32, u32)]) {
+    avps.extend_from_slice(&encode_avp_u32(
+        avp::SUPPORTED_VENDOR_ID,
+        dictionary::VENDOR_3GPP,
+    ));
+    if application_ids
+        .iter()
+        .any(|&(_, app_id)| app_id == dictionary::RX_APP_ID)
+    {
+        avps.extend_from_slice(&encode_avp_u32(
+            avp::SUPPORTED_VENDOR_ID,
+            dictionary::VENDOR_ETSI,
+        ));
+    }
+}
+
 pub fn build_cer(config: &PeerConfig, hbh: u32, e2e: u32) -> Vec<u8> {
     let mut avps = Vec::new();
 
@@ -667,10 +688,7 @@ pub fn build_cer(config: &PeerConfig, hbh: u32, e2e: u32) -> Vec<u8> {
         avp::FIRMWARE_REVISION,
         config.firmware_revision,
     ));
-    avps.extend_from_slice(&encode_avp_u32(
-        avp::SUPPORTED_VENDOR_ID,
-        dictionary::VENDOR_3GPP,
-    ));
+    encode_supported_vendor_ids(&mut avps, &config.application_ids);
 
     encode_application_ids(&mut avps, &config.application_ids);
 
@@ -701,10 +719,7 @@ pub fn build_cea(config: &PeerConfig, result_code: u32, hbh: u32, e2e: u32) -> V
         avp::FIRMWARE_REVISION,
         config.firmware_revision,
     ));
-    avps.extend_from_slice(&encode_avp_u32(
-        avp::SUPPORTED_VENDOR_ID,
-        dictionary::VENDOR_3GPP,
-    ));
+    encode_supported_vendor_ids(&mut avps, &config.application_ids);
 
     encode_application_ids(&mut avps, &config.application_ids);
 
@@ -1542,6 +1557,51 @@ mod tests {
     fn cea_advertises_gx_as_a_3gpp_auth_application() {
         let cea = build_cea(&gx_and_ro_config(), dictionary::DIAMETER_SUCCESS, 1, 1);
         assert_advertises_gx(&cea);
+    }
+
+    /// TS 29.214 table 5.4.0.1 on Reservation-Priority, the ETSI AVP Rx takes
+    /// over: "The support of this AVP shall be advertised in the capabilities
+    /// exchange mechanisms (CER/CEA) by including the ETSI parameter in the
+    /// Supported-Vendor-Id AVP." ETSI is 13019; a peer without Rx names 3GPP
+    /// alone, as before.
+    #[test]
+    fn cer_and_cea_name_etsi_as_a_supported_vendor_when_rx_is_advertised() {
+        let supported_vendors = |wire: &[u8]| -> Vec<u32> {
+            codec::DiameterMsg::from_wire(wire)
+                .expect("decode capabilities exchange")
+                .find_all(avp::SUPPORTED_VENDOR_ID, 0)
+                .filter_map(|a| a.as_u32())
+                .collect()
+        };
+        let rx_config = PeerConfig {
+            application_ids: vec![(dictionary::VENDOR_3GPP, dictionary::RX_APP_ID)],
+            ..gx_and_ro_config()
+        };
+        let success = dictionary::DIAMETER_SUCCESS;
+        assert_eq!(
+            supported_vendors(&build_cer(&rx_config, 1, 1)),
+            [10415, 13019]
+        );
+        assert_eq!(
+            supported_vendors(&build_cea(&rx_config, success, 1, 1)),
+            [10415, 13019]
+        );
+        // Supported-Vendor-Id 13019 written out from RFC 6733 §5.3.6: code 265
+        // (0x109), M, length 12, 0x32db.
+        let etsi = [
+            0x00, 0x00, 0x01, 0x09, 0x40, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x32, 0xdb,
+        ];
+        let cer = build_cer(&rx_config, 1, 1);
+        assert!(cer.windows(etsi.len()).any(|window| window == etsi));
+
+        assert_eq!(
+            supported_vendors(&build_cer(&gx_and_ro_config(), 1, 1)),
+            [10415]
+        );
+        assert_eq!(
+            supported_vendors(&build_cea(&gx_and_ro_config(), success, 1, 1)),
+            [10415]
+        );
     }
 
     /// Build a throwaway `PeerConfig` for the loopback leak tests. The watchdog

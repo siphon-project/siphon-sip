@@ -47,12 +47,18 @@ listen:
   udp_recv_buffer_bytes: 1048576
   # Path MTU (bytes) for the outbound UDP request path (RFC 3261 §18.1.1).
   # When set, an outbound SIP request built for UDP whose serialised length
-  # exceeds mtu-200 is relayed over TCP instead (if the next hop has a reachable
+  # exceeds mtu-200 is sent over TCP instead (if the next hop has a reachable
   # TCP path), else it stays on UDP with a warning.  This prevents oversized
   # requests (e.g. a large reg-event NOTIFY) from IP-fragmenting and being
-  # silently dropped by peers with strict ICMP filtering.  Default: off (unset),
-  # so UDP-at-any-size behaviour is unchanged.  1280 = the IPv6 minimum MTU, a
-  # safe lower bound for dual-stack IMS core legs.
+  # silently dropped by peers with strict ICMP filtering.  Applies to relayed
+  # and forked requests, B2BUA B-legs, and the requests a script originates
+  # (proxy.send_request, proxy.subscribe_state NOTIFY / SUBSCRIBE,
+  # presence.notify); a target URI with ;transport=udp keeps an originated
+  # request on UDP.  Counted in siphon_mtu_tcp_upgrade_total{path}.
+  # Default: off (unset), so UDP-at-any-size behaviour is unchanged.  RFC 3261
+  # names 1300 bytes as the limit when the path MTU is unknown, which is
+  # mtu: 1500 here.  1280 = the IPv6 minimum MTU, a safe lower bound for
+  # dual-stack IMS core legs.
   # mtu: 1280
   udp:
     - "0.0.0.0:5060"    # Standard SIP (PSTN gateways, legacy UEs)
@@ -1128,6 +1134,13 @@ auth:
 #     # tls: {ca_file: /etc/siphon/redis-ca.pem}, or ?ca_file=... in the url
 #     local_ttl_secs: 60       # optional in-process LRU in front of Redis
 #     local_max_entries: 10000
+#     # Each cache's Redis is probed once a second. While it is unreachable,
+#     # cache calls fail at once (fetch -> None, store -> False) and the gauge
+#     # siphon_cache_backend_up{cache} reads 0. Set true for a cache the node
+#     # cannot serve without: /admin/ready then answers 503 while its Redis is
+#     # unreachable, so the node leaves rotation. Off by default, because with
+#     # one Redis shared by every node that pulls all of them together.
+#     required_for_readiness: false   # default
 
 # ---------------------------------------------------------------------------
 # Media engine (rtpengine, native siphon-rtp, or classic rtpproxy)

@@ -443,3 +443,92 @@ async fn an_over_mtu_request_to_the_ports_of_a_deleted_pair_opens_no_tcp_connect
     relay_logged(&dispatcher, &notify(ue, "reg-event-65"));
     assert_never_connected(&listener).await;
 }
+
+/// The decision of a request the P-CSCF originates itself (a script's
+/// `proxy.send_request`, a NOTIFY of `proxy.subscribe_state`), read from the
+/// same state the relay decides with.
+fn originated(dispatcher: &TestDispatcher) -> OriginatedOverMtu<'_> {
+    OriginatedOverMtu {
+        mtu: MTU,
+        pool: &dispatcher.state.connection_pool,
+        ipsec: dispatcher.state.ipsec_manager.as_deref(),
+        resolver: &dispatcher.state.dns_resolver,
+    }
+}
+
+/// An over-MTU request the P-CSCF originates toward a protected UE takes the
+/// relay's path: the connection from the protected client port to the UE's
+/// protected server port is opened first, and no probe goes to the UE's client
+/// port in clear. The request keeps its address; the egress moves a TCP
+/// request for a UE onto that connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_originated_over_mtu_request_to_a_protected_ue_opens_the_p_cscf_connection() {
+    let _watchdog = watchdog("originated over-MTU request over TCP");
+    let (dispatcher, manager, _inbound) = p_cscf();
+    let ue: IpAddr = "127.0.0.66".parse().expect("an address");
+    let port_pc = free_port(pcscf_ip());
+    let listener = tokio::net::TcpListener::bind((ue, 0))
+        .await
+        .expect("the UE's protected server port");
+    let port_us = listener.local_addr().expect("bound").port();
+    // A listener on the client port would answer a probe in clear.
+    let client_port = tokio::net::TcpListener::bind((ue, UE_PORT_C))
+        .await
+        .expect("the UE's protected client port");
+    install(&manager, ue, port_us, port_pc).await;
+    let destination = SocketAddr::new(ue, UE_PORT_C);
+
+    let upgrade = originated(&dispatcher)
+        .upgrade(
+            1600,
+            &format!("sip:001010000000001@{destination}"),
+            destination,
+        )
+        .await;
+    assert_eq!(
+        upgrade,
+        Some(OriginatedTcp {
+            destination,
+            protected: true,
+        })
+    );
+    let (_stream, peer) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("the P-CSCF connects within 5 s")
+        .expect("an accepted connection");
+    assert_eq!(
+        peer,
+        SocketAddr::new(pcscf_ip(), port_pc),
+        "from the P-CSCF's protected client port"
+    );
+    assert_never_connected(&client_port).await;
+}
+
+/// And as for a relayed request, nothing is opened over a pair being retired:
+/// the request stays on UDP.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_originated_over_mtu_request_over_a_pair_being_retired_stays_on_udp() {
+    let _watchdog = watchdog("originated over-MTU request over a retiring pair");
+    let (dispatcher, manager, _inbound) = p_cscf();
+    let ue: IpAddr = "127.0.0.67".parse().expect("an address");
+    let port_pc = free_port(pcscf_ip());
+    let listener = tokio::net::TcpListener::bind((ue, 0))
+        .await
+        .expect("the UE's protected server port");
+    let port_us = listener.local_addr().expect("bound").port();
+    install(&manager, ue, port_us, port_pc).await;
+    assert!(manager.retire_pair(
+        ue,
+        UE_PORT_C,
+        Duration::from_secs(30),
+        crate::ipsec::retire::RetireCondition::Unregistered,
+        "de-registered",
+    ));
+    let destination = SocketAddr::new(ue, UE_PORT_C);
+
+    let upgrade = originated(&dispatcher)
+        .upgrade(1600, &destination.to_string(), destination)
+        .await;
+    assert_eq!(upgrade, None);
+    assert_never_connected(&listener).await;
+}

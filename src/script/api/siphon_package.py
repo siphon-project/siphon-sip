@@ -1794,6 +1794,11 @@ class _SbiNamespace:
             events: PCF events to subscribe to (``AfEvent`` names such as
                 ``"FAILED_RESOURCES_ALLOCATION"``), each with ``notifMethod``
                 ``EVENT_DETECTION``.  Requires ``notif_uri``.
+            mcptt_id: ``mcpttId``, marking an MCPTT session (``"mcpttp"`` or
+                ``"mcpttq"``, the Resource-Priority namespace).
+            mc_video_id: ``mcVideoId``, the same for an MCVideo session.
+            res_prio: ``resPrio``: an int from 0 (lowest) to 15 (highest),
+                sent as ``PRIO_<n+1>``, or ``"PRIO_1"`` to ``"PRIO_16"``.
 
         Returns:
             Dict with ``app_session_id``, ``authorized`` and
@@ -1801,7 +1806,8 @@ class _SbiNamespace:
 
         Raises:
             ValueError: neither ``notif_uri`` nor ``sbi.notif_uri`` is set
-                (``notifUri`` is required on a create), or ``events`` is empty.
+                (``notifUri`` is required on a create), ``events`` is empty,
+                or ``res_prio`` is out of range.
         """
         inner = self.__dict__.get("_inner")
         if inner is None:
@@ -1841,12 +1847,16 @@ class _SbiNamespace:
                 subscription and leaves the PCF's untouched.
             notif_uri: new callback base for the subscription; only sent
                 with ``events``.
+            mcptt_id, mc_video_id, res_prio: as in ``create_session``, for the
+                priority adjustment of a mission critical session.  ``None``
+                leaves the member out of the merge patch.
 
         Returns:
             Dict with ``app_session_id`` and ``authorized``, or None.
 
         Raises:
-            ValueError: ``events`` is empty, or ``notif_uri`` without ``events``.
+            ValueError: ``events`` is empty, ``notif_uri`` without ``events``,
+                or ``res_prio`` is out of range.
         """
         inner = self.__dict__.get("_inner")
         if inner is None:
