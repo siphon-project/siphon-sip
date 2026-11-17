@@ -287,6 +287,58 @@ pub struct RxSessionRequest<'a> {
     /// The service URN that marks an emergency (or other well-known
     /// service) session, sent as Service-URN. See [`service_urn_value`].
     pub service_urn: Option<&'a str>,
+    /// MCPTT-Identifier (TS 29.214 clause 5.3.45): the AF session is an MCPTT
+    /// one. `None` or empty sends none.
+    pub mcptt_identifier: Option<&'a str>,
+    /// MCVideo-Identifier (clause 5.3.45A): the AF session is an MCVideo one.
+    /// `None` or empty sends none.
+    pub mcvideo_identifier: Option<&'a str>,
+    /// Reservation-Priority at command level: the priority of the AF session
+    /// (clause 4.4.1). `None` sends none, which the PCRF reads as DEFAULT (0).
+    pub reservation_priority: Option<ReservationPriority>,
+}
+
+/// The value of a Reservation-Priority AVP: ETSI TS 183 017 clause 7.3.9
+/// defines DEFAULT (0), "the lowest level of priority", and PRIORITY-ONE (1)
+/// to PRIORITY-FIFTEEN (15), the highest.
+///
+/// For an MCPTT or MCVideo session it is the priority value of the
+/// Resource-Priority header, unchanged (TS 29.214 clauses A.13.2 and A.15.2):
+/// "the lowest priority shall be mapped to DEFAULT (0), the next after the
+/// lowest to PRIORITY-ONE (1), and so on up to the highest priority which
+/// shall be mapped to PRIORITY-FIFTEEN (15)".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReservationPriority(u8);
+
+impl ReservationPriority {
+    /// The highest value, PRIORITY-FIFTEEN.
+    pub const MAX: u8 = 15;
+
+    /// `None` for a value above PRIORITY-FIFTEEN (15).
+    pub fn new(value: u8) -> Option<Self> {
+        (value <= Self::MAX).then_some(Self(value))
+    }
+
+    /// The enumerated value, 0 to 15.
+    pub fn value(self) -> u8 {
+        self.0
+    }
+}
+
+/// Feature bits of Feature-List-ID 1 on Rx (TS 29.214 table 5.4.1.1).
+pub const FEATURE_MCPTT: u32 = 1 << 17;
+pub const FEATURE_MCVIDEO: u32 = 1 << 22;
+
+/// The Rx features an AAR is built with: MCPTT for MCPTT-Identifier, MCVideo
+/// for MCVideo-Identifier, the two AVPs table 5.3.0.1 lists as applicable to
+/// those features only. Zero for an AAR of the base (Rel-7) functionality.
+pub fn aar_feature_list(params: &RxSessionRequest<'_>) -> u32 {
+    let feature = |identifier: Option<&str>, bit: u32| match identifier {
+        Some(value) if !value.is_empty() => bit,
+        _ => 0,
+    };
+    feature(params.mcptt_identifier, FEATURE_MCPTT)
+        | feature(params.mcvideo_identifier, FEATURE_MCVIDEO)
 }
 
 /// The value of the Service-URN AVP for a service URN (TS 29.214 clause
@@ -415,6 +467,33 @@ pub fn encode_aar(
         payload.extend_from_slice(&encode_avp_grouped(avp::SUBSCRIPTION_ID, &sub_inner));
     }
 
+    // Supported-Features (clause 5.4.1): "The client shall, in the first
+    // request of a Diameter session indicate the set of supported features",
+    // and "Features that are not advertised as supported shall not be used to
+    // construct the command messages for that Diameter session". Sent with
+    // the M bit cleared, as the clause has it for an AF that interoperates
+    // with a Rel-7 PCRF, which then skips the AVP instead of refusing the AAR.
+    let feature_list = aar_feature_list(params);
+    if feature_list != 0 && params.rx_request_type == RxRequestType::InitialRequest {
+        payload.extend_from_slice(&crate::diameter::cx::supported_features_avp(
+            feature_list,
+            false,
+        ));
+    }
+
+    // Reservation-Priority at command level: the priority of the AF session
+    // (clause 4.4.1). An ETSI AVP (TS 183 017 clause 7.3.9), so "The
+    // vendor-id shall be set to ETSI (13019)" (table 5.4.0.1), and table
+    // 7.3.1 of TS 183 017 has V under "Must" and M under "Must not".
+    if let Some(priority) = params.reservation_priority {
+        payload.extend_from_slice(&encode_avp_vendor(
+            avp::RESERVATION_PRIORITY,
+            0,
+            dictionary::VENDOR_ETSI,
+            &u32::from(priority.value()).to_be_bytes(),
+        ));
+    }
+
     // Framed-IP-Address / Framed-IPv6-Prefix (subscriber addressing)
     if let Some(ip) = params.framed_ip {
         payload.extend_from_slice(&encode_avp_octet(avp::FRAMED_IP_ADDRESS, ip));
@@ -426,6 +505,24 @@ pub fn encode_aar(
     // Service-URN (§5.3.23): this AF session is an emergency one (§4.4.1).
     if let Some(value) = params.service_urn.and_then(service_urn_value) {
         payload.extend_from_slice(&encode_avp_octet_3gpp(avp::SERVICE_URN, value.as_bytes()));
+    }
+
+    // MCPTT-Identifier (§5.3.45) and MCVideo-Identifier (§5.3.45A): the AF
+    // session is a mission critical one, on which the PCRF selects the
+    // policy (§4.4.1, and §4.4.2 for a priority adjustment on a modification).
+    // OctetString; table 5.3.0.1 has V under "Must" and M under "Must not".
+    for (code, identifier) in [
+        (avp::MCPTT_IDENTIFIER, params.mcptt_identifier),
+        (avp::MCVIDEO_IDENTIFIER, params.mcvideo_identifier),
+    ] {
+        if let Some(value) = identifier.filter(|value| !value.is_empty()) {
+            payload.extend_from_slice(&encode_avp_vendor(
+                code,
+                0,
+                dictionary::VENDOR_3GPP,
+                value.as_bytes(),
+            ));
+        }
     }
 
     // Rx-Request-Type (§5.3.31). Table 5.3.1 forbids the M-bit on it, so a
@@ -801,6 +898,9 @@ mod tests {
             framed_ipv6: None,
             subscription_id: None,
             service_urn: None,
+            mcptt_identifier: None,
+            mcvideo_identifier: None,
+            reservation_priority: None,
         };
         encode_aar(&test_peer_config(None), 7, 9, "pcscf;1;1", &params)
     }
@@ -816,6 +916,9 @@ mod tests {
             framed_ipv6: None,
             subscription_id: None,
             service_urn,
+            mcptt_identifier: None,
+            mcvideo_identifier: None,
+            reservation_priority: None,
         };
         encode_aar(&test_peer_config(None), 7, 9, "pcscf;1;1", &params)
     }
@@ -881,6 +984,227 @@ mod tests {
         );
     }
 
+    // ── Mission critical identifiers and Reservation-Priority ───────────
+
+    fn mission_critical_aar(
+        mcptt_identifier: Option<&str>,
+        mcvideo_identifier: Option<&str>,
+        reservation_priority: Option<u8>,
+        rx_request_type: RxRequestType,
+    ) -> Vec<u8> {
+        let params = RxSessionRequest {
+            session_id: None,
+            af_application_id: b"IMS Services",
+            media_components: &[],
+            specific_actions: &[SpecificAction::IndicationOfLossOfBearer],
+            rx_request_type,
+            framed_ip: Some(&[192, 0, 2, 1]),
+            framed_ipv6: None,
+            subscription_id: Some(("sip:user@example.com", 2)),
+            service_urn: Some("sos"),
+            mcptt_identifier,
+            mcvideo_identifier,
+            reservation_priority: reservation_priority
+                .map(|value| ReservationPriority::new(value).unwrap()),
+        };
+        encode_aar(&test_peer_config(None), 7, 9, "pcscf;1;1", &params)
+    }
+
+    fn avps_with_code(wire: &[u8], wanted: u32) -> Vec<Vec<u8>> {
+        raw_top_level_avps(wire)
+            .into_iter()
+            .filter(|(code, _)| *code == wanted)
+            .map(|(_, bytes)| bytes.to_vec())
+            .collect()
+    }
+
+    /// MCPTT-Identifier by hand from TS 29.214 table 5.3.0.1 and clause
+    /// 5.3.45: code 547 (0x223), V without M (flags 0x80), vendor 10415
+    /// (0x28af), an OctetString. "mcpttp" is 6 octets: length 18 (0x12), two
+    /// octets pad. MCVideo-Identifier (clause 5.3.45A) is the same with code
+    /// 562 (0x232); "mcpttq.1" is 8 octets: length 20 (0x14), no padding.
+    #[test]
+    fn aar_carries_the_mission_critical_identifiers() {
+        let wire = mission_critical_aar(
+            Some("mcpttp"),
+            Some("mcpttq.1"),
+            None,
+            RxRequestType::InitialRequest,
+        );
+        let mut mcptt = vec![
+            0x00, 0x00, 0x02, 0x23, 0x80, 0x00, 0x00, 0x12, 0x00, 0x00, 0x28, 0xaf,
+        ];
+        mcptt.extend_from_slice(b"mcpttp\0\0");
+        assert_eq!(avps_with_code(&wire, 547), [mcptt]);
+        let mut mcvideo = vec![
+            0x00, 0x00, 0x02, 0x32, 0x80, 0x00, 0x00, 0x14, 0x00, 0x00, 0x28, 0xaf,
+        ];
+        mcvideo.extend_from_slice(b"mcpttq.1");
+        assert_eq!(avps_with_code(&wire, 562), [mcvideo]);
+    }
+
+    /// Reservation-Priority by hand from ETSI TS 183 017 table 7.3.1 and
+    /// clause 7.3.9: code 458 (0x1ca), V without M (flags 0x80), length 16,
+    /// vendor ETSI 13019 (0x32db), an Enumerated of 0 to 15.
+    #[test]
+    fn aar_carries_the_reservation_priority_as_an_etsi_avp() {
+        for (priority, last_octet) in [(0u8, 0x00u8), (7, 0x07), (15, 0x0f)] {
+            let wire =
+                mission_critical_aar(None, None, Some(priority), RxRequestType::InitialRequest);
+            assert_eq!(
+                avps_with_code(&wire, 458),
+                [vec![
+                    0x00, 0x00, 0x01, 0xca, 0x80, 0x00, 0x00, 0x10, 0x00, 0x00, 0x32, 0xdb, 0x00,
+                    0x00, 0x00, last_octet,
+                ]],
+                "priority {priority}"
+            );
+        }
+    }
+
+    #[test]
+    fn reservation_priority_stops_at_priority_fifteen() {
+        assert_eq!(ReservationPriority::new(0).map(|p| p.value()), Some(0));
+        assert_eq!(ReservationPriority::new(15).map(|p| p.value()), Some(15));
+        assert_eq!(ReservationPriority::new(16), None);
+        assert_eq!(ReservationPriority::new(u8::MAX), None);
+    }
+
+    /// Absent and empty both send nothing: no identifier, no priority and no
+    /// Supported-Features, so an AAR without the new arguments is the AAR it
+    /// was.
+    #[test]
+    fn aar_without_mission_critical_arguments_is_unchanged() {
+        let plain = mission_critical_aar(None, None, None, RxRequestType::InitialRequest);
+        for code in [
+            avp::MCPTT_IDENTIFIER,
+            avp::MCVIDEO_IDENTIFIER,
+            avp::RESERVATION_PRIORITY,
+            avp::SUPPORTED_FEATURES,
+        ] {
+            assert!(avps_with_code(&plain, code).is_empty(), "AVP {code}");
+        }
+        let empty = mission_critical_aar(Some(""), Some(""), None, RxRequestType::InitialRequest);
+        assert_eq!(empty, plain);
+    }
+
+    /// Supported-Features by hand from TS 29.229 clause 6.3.29 and TS 29.214
+    /// clause 5.4.1: code 628 (0x274), V without M, holding Vendor-Id 10415,
+    /// Feature-List-ID 1 and the Feature-List, in which table 5.4.1.1 gives
+    /// MCPTT bit 17 (0x00020000) and MCVideo bit 22 (0x00400000).
+    #[test]
+    fn initial_aar_advertises_the_features_its_identifiers_belong_to() {
+        let supported_features = |feature_list: [u8; 4]| {
+            let mut bytes = vec![
+                0x00, 0x00, 0x02, 0x74, 0x80, 0x00, 0x00, 0x38, 0x00, 0x00, 0x28,
+                0xaf, // group
+                0x00, 0x00, 0x01, 0x0a, 0x40, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x28, 0xaf, // 266
+                0x00, 0x00, 0x02, 0x75, 0x80, 0x00, 0x00, 0x10, 0x00, 0x00, 0x28, 0xaf, // 629
+                0x00, 0x00, 0x00, 0x01, //
+                0x00, 0x00, 0x02, 0x76, 0x80, 0x00, 0x00, 0x10, 0x00, 0x00, 0x28, 0xaf, // 630
+            ];
+            bytes.extend_from_slice(&feature_list);
+            bytes
+        };
+        let initial = RxRequestType::InitialRequest;
+        assert_eq!(
+            avps_with_code(
+                &mission_critical_aar(Some("mcpttp"), None, None, initial),
+                628
+            ),
+            [supported_features([0x00, 0x02, 0x00, 0x00])]
+        );
+        assert_eq!(
+            avps_with_code(
+                &mission_critical_aar(None, Some("mcpttp"), None, initial),
+                628
+            ),
+            [supported_features([0x00, 0x40, 0x00, 0x00])]
+        );
+        assert_eq!(
+            avps_with_code(
+                &mission_critical_aar(Some("mcpttp"), Some("mcpttp"), Some(3), initial),
+                628
+            ),
+            [supported_features([0x00, 0x42, 0x00, 0x00])]
+        );
+        // Reservation-Priority is base functionality: no feature to name.
+        assert!(
+            avps_with_code(&mission_critical_aar(None, None, Some(3), initial), 628).is_empty()
+        );
+    }
+
+    /// Clause 4.4.2: a modification carries the identifier and the priority
+    /// again (a priority adjustment). The features were negotiated by the
+    /// first request of the session (clause 5.4.1), so they are not repeated.
+    #[test]
+    fn modification_aar_carries_identifier_and_priority_without_supported_features() {
+        let wire =
+            mission_critical_aar(Some("mcpttp"), None, Some(15), RxRequestType::UpdateRequest);
+        assert_eq!(avps_with_code(&wire, 547).len(), 1);
+        assert_eq!(avps_with_code(&wire, 458).len(), 1);
+        assert!(avps_with_code(&wire, 628).is_empty());
+    }
+
+    /// The command ABNF of clause 5.6.1: Supported-Features, then
+    /// Reservation-Priority, before Framed-IP-Address; the identifiers after
+    /// Service-URN and before Rx-Request-Type.
+    #[test]
+    fn mission_critical_avps_sit_where_the_aar_abnf_has_them() {
+        let wire = mission_critical_aar(
+            Some("mcpttp"),
+            Some("mcpttp"),
+            Some(5),
+            RxRequestType::InitialRequest,
+        );
+        let codes: Vec<u32> = raw_top_level_avps(&wire)
+            .into_iter()
+            .map(|(code, _)| code)
+            .collect();
+        let tail = &codes[codes
+            .iter()
+            .position(|code| *code == avp::SUBSCRIPTION_ID)
+            .unwrap()..];
+        assert_eq!(
+            tail,
+            [
+                avp::SUBSCRIPTION_ID,
+                avp::SUPPORTED_FEATURES,
+                avp::RESERVATION_PRIORITY,
+                avp::FRAMED_IP_ADDRESS,
+                avp::SERVICE_URN,
+                avp::MCPTT_IDENTIFIER,
+                avp::MCVIDEO_IDENTIFIER,
+                avp::RX_REQUEST_TYPE,
+            ]
+        );
+    }
+
+    /// An inbound message names the three AVPs, so a script reads them by
+    /// name. Reservation-Priority shares code 458 with the base
+    /// User-Equipment-Info and is told from it by its vendor.
+    #[test]
+    fn mission_critical_avps_decode_by_name() {
+        let wire = mission_critical_aar(
+            Some("mcpttp"),
+            Some("mcpttq"),
+            Some(9),
+            RxRequestType::InitialRequest,
+        );
+        let decoded = decode_diameter(&wire).unwrap();
+        let hex = |value: &[u8]| crate::diameter::codec::hex::encode(value);
+        assert_eq!(
+            decoded.avps["MCPTT-Identifier"].as_str(),
+            Some(hex(b"mcpttp").as_str())
+        );
+        assert_eq!(
+            decoded.avps["MCVideo-Identifier"].as_str(),
+            Some(hex(b"mcpttq").as_str())
+        );
+        assert_eq!(decoded.avps["Reservation-Priority"].as_u64(), Some(9));
+        assert!(decoded.avps.get("User-Equipment-Info").is_none());
+    }
+
     #[test]
     fn aar_header_and_base_avps() {
         let config = test_peer_config(Some("pcrf1.ims.mnc001.mcc001.3gppnetwork.org"));
@@ -894,6 +1218,9 @@ mod tests {
             framed_ipv6: None,
             subscription_id: None,
             service_urn: None,
+            mcptt_identifier: None,
+            mcvideo_identifier: None,
+            reservation_priority: None,
         };
         let wire = encode_aar(&config, 7, 9, "pcscf;1;1", &params);
 

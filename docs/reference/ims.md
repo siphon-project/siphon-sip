@@ -185,6 +185,54 @@ to the advertised URI without a suffix, was deprecated in 1.9.0 and removed in
 1.10.0. It now answers `404` like any other unknown path. A PCF that appends the
 TS 29.514 suffix — which is what the spec defines — is unaffected.
 
+### Mission critical sessions and reservation priority
+
+For an MCPTT or MCVideo call, `sbi.create_session` tells the PCF so with
+`mcptt_id` (`mcpttId`) or `mc_video_id` (`mcVideoId`), and gives the priority
+of the session with `res_prio` (`resPrio`), which is what TS 29.514 annex B.13
+has a P-CSCF send so the PCF can set the PCC rules of the prioritized service.
+What the PCF does with them is its operator's policy. The identifier is the namespace of the call's
+Resource-Priority header, `"mcpttp"` or `"mcpttq"` (RFC 8101), optionally with
+the service provider's name (TS 29.514 §B.13.2, §B.15.2).
+
+```python
+# "Resource-Priority: mcpttp.5"
+created = await sbi.create_session(
+    ue_ipv4=request.source_ip,
+    media_components=components,
+    mcptt_id="mcpttp",
+    res_prio=5,          # sent as "PRIO_6"
+)
+
+# The call became an emergency one.
+await sbi.update_session(created["app_session_uri"], mcptt_id="mcpttp", res_prio=15)
+```
+
+`res_prio` is either an int from `0` to `15` or a `ReservPriority` string,
+`"PRIO_1"` to `"PRIO_16"`. The int is the one `diameter.rx_aar` takes as
+`reservation_priority`, so one value serves both interfaces:
+
+| Resource-Priority value / `reservation_priority` / `res_prio` int | Rx Reservation-Priority | N5 `resPrio` |
+|---|---|---|
+| `0` (lowest, and what an absent value means) | DEFAULT (0) | `PRIO_1` |
+| `n` | PRIORITY-n (n) | `PRIO_<n+1>` |
+| `15` (highest) | PRIORITY-FIFTEEN (15) | `PRIO_16` |
+
+Both specifications pin their scale to the Resource-Priority value: TS 29.214
+§A.13.2 maps the lowest to DEFAULT (0) and the highest to PRIORITY-FIFTEEN
+(15), and TS 29.514 §B.13.2 maps "PRIO_1 (Resource-Priority header value 0)"
+up to "PRIO_16 (Resource-Priority header value 15)". Each also takes an absent
+value as its lowest (ETSI TS 183 017 §7.3.9, TS 29.514 §4.2.2.2).
+
+A value outside either range raises `ValueError`, a type other than int or str
+`TypeError`. `None` or `""` sends nothing; on `update_session` that leaves the
+member out of the merge patch, so the PCF keeps what it holds.
+
+With `mcptt_id` or `mc_video_id` the create's `suppFeat` names the MCPTT
+(feature 9, `"100"`) or MCVideo (feature 10, `"200"`) feature of TS 29.514
+§5.8, which the two attributes belong to; otherwise it stays `"0"`. siphon does
+not read the `suppFeat` the PCF answers with.
+
 ::: siphon_sdk.mock_module.MockSbi
 
 ### `BsfError`
