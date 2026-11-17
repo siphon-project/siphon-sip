@@ -190,8 +190,9 @@ fn the_notify_of_an_expired_subscription_over_the_mtu_leaves_over_tcp() {
     assert_eq!(dialog.received_address, Some(subscriber));
     dialog.remote_uri = format!("sip:{}@siphon.example.com", "w".repeat(1400));
 
-    super::async_request_handler_tests::test_runtime()
-        .block_on(crate::script::api::subscribe_state::notify_expired(dialog));
+    super::async_request_handler_tests::test_runtime().block_on(
+        crate::script::api::subscribe_state::notify_expired(&harness.store, dialog),
+    );
 
     let notify = notify_over_tcp(harness, subscriber);
     assert_eq!(

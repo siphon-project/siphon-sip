@@ -59,6 +59,7 @@ use pyo3::types::{PyBytes, PyDict};
 use tracing::warn;
 
 use super::diameter_kwargs::encode_kwarg_avps;
+use super::diameter_rx::RxAarRequest;
 use crate::config::DiameterApplication;
 use crate::diameter::codec::{
     encode_application_identity, encode_avp_utf8, encode_diameter_message, FLAG_PROXIABLE,
@@ -274,7 +275,7 @@ pub(super) fn parse_media_components(
 /// Accepts an IPv6 string ("2001:db8::1") or raw bytes (the
 /// Framed-IPv6-Prefix AVP carries a length-prefixed octet string per
 /// RFC 3162 §2.3; if the caller passes raw bytes, trust them verbatim).
-fn extract_ipv6_prefix(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+pub(super) fn extract_ipv6_prefix(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     if let Ok(raw) = obj.extract::<Vec<u8>>() {
         return Ok(raw);
     }
@@ -297,7 +298,7 @@ fn extract_ipv6_prefix(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
 
 /// Accepts ``(data, type)`` where ``type`` is an int (RFC 4006 §8.47) or
 /// a string alias.
-fn extract_subscription_id(obj: &Bound<'_, PyAny>) -> PyResult<(String, u32)> {
+pub(super) fn extract_subscription_id(obj: &Bound<'_, PyAny>) -> PyResult<(String, u32)> {
     let tuple: (String, Bound<'_, PyAny>) = obj.extract().map_err(|_| {
         pyo3::exceptions::PyTypeError::new_err("subscription_id must be (data: str, type: int|str)")
     })?;
@@ -322,118 +323,6 @@ fn extract_subscription_id(obj: &Bound<'_, PyAny>) -> PyResult<(String, u32)> {
         }
     };
     Ok((data, type_num))
-}
-
-/// `rx_aar`'s Python arguments, parsed and owned so the borrowed
-/// [`crate::diameter::rx::RxSessionRequest`] for the shared encoder can outlive them.
-struct RxAarRequest {
-    session_id: Option<String>,
-    af_application_id: String,
-    media_components: Vec<crate::diameter::rx::MediaComponent>,
-    specific_actions: Vec<crate::diameter::rx::SpecificAction>,
-    framed_ip: Option<[u8; 4]>,
-    framed_ipv6: Option<Vec<u8>>,
-    subscription_id: Option<(String, u32)>,
-    service_urn: Option<String>,
-}
-
-impl RxAarRequest {
-    /// Validates in the order `rx_aar` always has, so a bad call raises what it did.
-    ///
-    /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
-    /// tokio rather than on the calling thread, which for an `async def` handler
-    /// is the asyncio driver its whole loop shares.
-    fn parse(
-        session_id: Option<&str>,
-        framed_ip: Option<&str>,
-        framed_ipv6: Option<&Bound<'_, PyAny>>,
-        media_components: Option<&Bound<'_, PyAny>>,
-        af_application_id: &str,
-        subscription_id: Option<&Bound<'_, PyAny>>,
-        specific_actions: Option<&Bound<'_, PyAny>>,
-        service_urn: Option<&str>,
-    ) -> PyResult<Self> {
-        let media_components = media_components.map(parse_media_components).transpose()?;
-        let framed_ipv6 = framed_ipv6.map(extract_ipv6_prefix).transpose()?;
-        let subscription_id = subscription_id.map(extract_subscription_id).transpose()?;
-        let framed_ip = framed_ip
-            .map(|ip| {
-                ip.parse::<std::net::Ipv4Addr>()
-                    .map(|addr| addr.octets())
-                    .map_err(|_| {
-                        pyo3::exceptions::PyValueError::new_err(format!(
-                            "framed_ip is not a valid IPv4 address: {ip}"
-                        ))
-                    })
-            })
-            .transpose()?;
-        let specific_actions = specific_actions.map(parse_specific_actions).transpose()?;
-        let service_urn = service_urn
-            .map(|urn| {
-                crate::diameter::rx::service_urn_value(urn)
-                    .map(str::to_string)
-                    .ok_or_else(|| {
-                        pyo3::exceptions::PyValueError::new_err(format!(
-                            "service_urn names no service: {urn:?}"
-                        ))
-                    })
-            })
-            .transpose()?;
-        Ok(Self {
-            session_id: session_id.map(String::from),
-            af_application_id: af_application_id.to_string(),
-            media_components: media_components.unwrap_or_default(),
-            specific_actions: specific_actions.unwrap_or_default(),
-            framed_ip,
-            framed_ipv6,
-            subscription_id,
-            service_urn,
-        })
-    }
-
-    fn params(&self) -> crate::diameter::rx::RxSessionRequest<'_> {
-        use crate::diameter::rx::RxRequestType::{InitialRequest, UpdateRequest};
-        crate::diameter::rx::RxSessionRequest {
-            session_id: self.session_id.as_deref(),
-            af_application_id: self.af_application_id.as_bytes(),
-            media_components: &self.media_components,
-            specific_actions: &self.specific_actions,
-            // A reused Session-Id modifies an existing Rx session.
-            rx_request_type: self
-                .session_id
-                .as_ref()
-                .map_or(InitialRequest, |_| UpdateRequest),
-            framed_ip: self.framed_ip.as_ref().map(|octets| octets.as_slice()),
-            framed_ipv6: self.framed_ipv6.as_deref(),
-            subscription_id: self
-                .subscription_id
-                .as_ref()
-                .map(|(data, kind)| (data.as_str(), *kind)),
-            service_urn: self.service_urn.as_deref(),
-        }
-    }
-}
-
-/// `specific_actions` → Specific-Action values: `TypeError` unless a sequence of
-/// int, `ValueError` naming the first value TS 29.214 §5.3.13 does not define.
-fn parse_specific_actions(
-    obj: &Bound<'_, PyAny>,
-) -> PyResult<Vec<crate::diameter::rx::SpecificAction>> {
-    let values: Vec<i64> = obj.extract()?;
-    values
-        .into_iter()
-        .map(|value| {
-            u32::try_from(value)
-                .ok()
-                .and_then(|value| crate::diameter::rx::SpecificAction::try_from(value).ok())
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "specific_actions: {value} is not a Specific-Action value \
-                         TS 29.214 §5.3.13 defines (1-4, 6-21)"
-                    ))
-                })
-        })
-        .collect()
 }
 
 /// Shell-style glob matcher supporting `*` (any run) and `?` (one char).
@@ -1806,6 +1695,22 @@ impl PyDiameter {
     ///         29.214 §4.4.1). The AVP holds the URN without its
     ///         ``urn:service:`` (§5.3.23), so ``"sos"`` is accepted too. A URN
     ///         with nothing after the prefix raises ``ValueError``.
+    ///     mcptt_identifier: MCPTT-Identifier (TS 29.214 §5.3.45), marking
+    ///         an MCPTT session: the Resource-Priority namespace of the call
+    ///         (``"mcpttp"`` or ``"mcpttq"``, RFC 8101), optionally with the
+    ///         service provider's name (§A.13.2). ``None`` or ``""`` sends none.
+    ///     mcvideo_identifier: MCVideo-Identifier (§5.3.45A), the same for an
+    ///         MCVideo session (§A.15.2).
+    ///     reservation_priority: Reservation-Priority of the AF session, an
+    ///         int from 0 (DEFAULT, lowest) to 15 (highest): the priority
+    ///         value of the Resource-Priority header (ETSI TS 183 017 §7.3.9).
+    ///         ``None`` sends none, which the PCRF reads as 0. ``ValueError``
+    ///         outside 0..15, ``TypeError`` for anything but an int.
+    ///
+    /// The three are accepted on a modification too (``session_id`` set), which
+    /// is how a priority change reaches the PCRF (§4.4.2). An initial AAR with
+    /// an identifier also names the MCPTT / MCVideo feature in
+    /// Supported-Features (§5.4.1).
     ///
     /// Returns:
     ///     Dict with ``result_code`` (int) and ``session_id`` (str),
@@ -1823,6 +1728,9 @@ impl PyDiameter {
         subscription_id=None,
         specific_actions=None,
         service_urn=None,
+        mcptt_identifier=None,
+        mcvideo_identifier=None,
+        reservation_priority=None,
     ))]
     fn rx_aar<'py>(
         &self,
@@ -1835,6 +1743,9 @@ impl PyDiameter {
         subscription_id: Option<&Bound<'py, PyAny>>,
         specific_actions: Option<&Bound<'py, PyAny>>,
         service_urn: Option<&str>,
+        mcptt_identifier: Option<&str>,
+        mcvideo_identifier: Option<&str>,
+        reservation_priority: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
@@ -1859,6 +1770,11 @@ impl PyDiameter {
             subscription_id,
             specific_actions,
             service_urn,
+        )?
+        .with_mission_critical(
+            mcptt_identifier,
+            mcvideo_identifier,
+            reservation_priority,
         )?;
 
         crate::script::awaitable(python, async move {
@@ -4585,6 +4501,9 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
+                    None,
+                    None,
                 )
                 .unwrap();
             assert!(resolve(python, result).is_none());
@@ -4660,6 +4579,9 @@ mod tests {
                         None,
                         Some(actions.as_any()),
                         None,
+                        None,
+                        None,
+                        None,
                     )
                     .unwrap_err();
                 assert!(
@@ -4685,6 +4607,9 @@ mod tests {
                         None,
                         Some(bad),
                         None,
+                        None,
+                        None,
+                        None,
                     )
                     .unwrap_err();
                 assert!(
@@ -4703,6 +4628,9 @@ mod tests {
                     "IMS Services",
                     None,
                     Some(huge.as_any()),
+                    None,
+                    None,
+                    None,
                     None,
                 )
                 .unwrap_err();
@@ -4874,6 +4802,19 @@ mod tests {
         .unwrap()
     }
 
+    /// The same AAR for a mission critical session: MCPTT-Identifier,
+    /// MCVideo-Identifier and a Reservation-Priority of 15.
+    fn mission_critical_rx_aar_request(
+        python: Python<'_>,
+        components: &Bound<'_, PyAny>,
+        specific_actions: &[i64],
+    ) -> RxAarRequest {
+        let priority = 15i64.into_pyobject(python).unwrap();
+        rx_aar_request_with(python, components, specific_actions)
+            .with_mission_critical(Some("mcpttp"), Some("mcpttq"), Some(priority.as_any()))
+            .unwrap()
+    }
+
     /// Emit a full `rx_aar` AAR as hex for [`scripts/validate_rx_aar.sh`] to
     /// feed to tshark.
     ///
@@ -4913,7 +4854,7 @@ mod tests {
         );
         let wire = pyo3::Python::attach(|python| {
             let components = qos_media_components(python, offer, answer);
-            let request = rx_aar_request_with(python, &components, &[6, 7, 9]);
+            let request = mission_critical_rx_aar_request(python, &components, &[6, 7, 9]);
             rx_aar_wire(&request, Some("pcrf1.ims.mnc001.mcc001.3gppnetwork.org"))
         });
 

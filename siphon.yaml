@@ -404,6 +404,39 @@ script:
   #                                # siphon_runner_admission_rejected_total.
   #                                # SIP request and Diameter handlers are not
   #                                # affected. Default off.
+  #
+  # --- Python garbage collector (see docs/handler-execution-model.md) ---
+  # On free-threaded Python every collection stops all threads and walks the
+  # whole heap, so it takes as long as the heap is large (about 35 ms for 2
+  # million objects) whatever it frees. Both keys are applied once at startup
+  # and default to leaving CPython alone.
+  # gc:
+  #   freeze_after_load: false     # true: one full collection, then gc.freeze(),
+  #                                # once the script and extensions have loaded.
+  #                                # Later collections skip everything alive at
+  #                                # that point (35 ms -> 17 ms measured on that
+  #                                # heap). A frozen reference cycle is never
+  #                                # freed. Not repeated on a script reload: the
+  #                                # startup copy of the script's modules stays
+  #                                # allocated after the first reload (once, not
+  #                                # per reload) and reloaded modules are
+  #                                # collected as usual. Set threshold with it:
+  #                                # a frozen heap no longer holds collections
+  #                                # back, so alone this makes them shorter but
+  #                                # far more frequent (a quarter of
+  #                                # siphon_python_gc_frozen_objects is a good
+  #                                # threshold to start from).
+  #   threshold: 50000             # gc.set_threshold(N). Unset = CPython's 2000.
+  #                                # A collection is considered once more than N
+  #                                # container objects are new (and at least a
+  #                                # quarter of the unfrozen heap); it runs when
+  #                                # memory grew by a tenth, or once 40 x N have
+  #                                # been set aside. Higher = fewer collections,
+  #                                # cyclic garbage held longer.
+  #                                # 0 (collection off) and values above
+  #                                # 53687091 are refused at startup.
+  # Observability: siphon_python_gc_pause_seconds, _collections_total,
+  # _collected_total, _uncollectable_total, _young_objects, _frozen_objects.
   # Observability: siphon_pyexec_inflight / _queue_depth / _pool_size / _pool_max
   # / _jobs_completed_total / _jobs_shed_total on /metrics. Alert on a sustained
   # _jobs_shed_total rate or pool_size pinned at pool_max while saturated.

@@ -23,6 +23,7 @@ mod diameter_cx;
 mod diameter_gba;
 mod diameter_kwargs;
 mod diameter_originate;
+mod diameter_rx;
 pub mod diameter_server;
 pub mod flow_kind;
 pub mod gateway;

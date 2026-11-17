@@ -25,7 +25,11 @@ use tracing::{debug, warn};
 use crate::cache::CacheManager;
 use crate::sip::message::SipMessage;
 
+mod l2;
+mod notify_response;
 mod outbound;
+
+pub use notify_response::watch_notify;
 
 pub use outbound::{
     AttemptFailure, EndedSubscription, NotifyDisposition, PendingSubscription, RemoteParty,
@@ -122,6 +126,12 @@ pub struct SubscribeDialog {
     /// before it: a refresh then derives the default one.
     #[serde(default)]
     pub local_contact: Option<String>,
+    /// How many times the subscription has been refreshed.  A NOTIFY is sent
+    /// under the generation current at the time, so that its failure later
+    /// does not remove a subscription the subscriber has refreshed since
+    /// (RFC 6665 §4.2.2).  0 for payloads cached before it.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// A SUBSCRIBE body with its Content-Type, kept with the dialog.
@@ -165,6 +175,7 @@ impl SubscribeDialog {
     pub fn refresh(&mut self, expires_secs: u64) {
         self.expires_secs = expires_secs;
         self.created_at_unix = unix_now();
+        self.generation = self.generation.saturating_add(1);
     }
 }
 
@@ -174,8 +185,8 @@ pub struct SubscribeStore {
     /// The subscriptions this node originated, by Call-ID, from the SUBSCRIBE
     /// leaving until the dialog is gone.  See [`outbound`].
     outbound: DashMap<String, outbound::OutboundSubscription>,
-    /// ``(cache_manager, cache_name)`` when configured.
-    cache: Option<(Arc<CacheManager>, String)>,
+    /// The L2 cache, when one is configured.
+    cache: Option<l2::L2>,
 }
 
 /// Process-wide subscribe-dialog store, installed at startup so background
@@ -217,8 +228,19 @@ impl SubscribeStore {
     /// Enable L2 write-through persistence via a named cache from
     /// ``siphon.yaml``.
     pub fn with_cache(mut self, cache_manager: Arc<CacheManager>, cache_name: String) -> Self {
-        self.cache = Some((cache_manager, cache_name));
+        self.cache = Some(l2::L2::Named {
+            manager: cache_manager,
+            name: cache_name,
+        });
         self
+    }
+
+    /// Write through to a cache a test reads the keys and expiries off.
+    #[cfg(test)]
+    pub(crate) fn with_recording_cache(mut self) -> (Self, Arc<l2::recording::Recording>) {
+        let recording = Arc::new(l2::recording::Recording::default());
+        self.cache = Some(l2::L2::Recording(Arc::clone(&recording)));
+        (self, recording)
     }
 
     /// Build the cache key for an id.
@@ -233,22 +255,43 @@ impl SubscribeStore {
     }
 
     /// Write a dialog through to L2, when one is configured.
+    ///
+    /// The key expires when the subscription does (RFC 6665 §4.2.1.4: "If no
+    /// refresh for a notification address is received before its expiration
+    /// time, the subscription is removed"), so it is stored for what is left
+    /// of the granted duration and not for the whole of it again: a NOTIFY
+    /// bumping the CSeq is a write, and must not buy the key another period.
+    /// A dialog with nothing left has no key at all. Its L1 entry stays for
+    /// the sweep, which sends the terminating NOTIFY from it.
     fn persist(&self, dialog: &SubscribeDialog) {
-        if let Some((manager, name)) = &self.cache {
-            let manager = Arc::clone(manager);
-            let cache_name = name.clone();
-            let key = Self::cache_key(&dialog.id);
-            let dialog_clone = dialog.clone();
-            let ttl = dialog.expires_secs;
+        let Some(cache) = self.cache.clone() else {
+            return;
+        };
+        let key = Self::cache_key(&dialog.id);
+        let ttl_secs = dialog.remaining_secs();
+        if ttl_secs == 0 {
             tokio::spawn(async move {
-                match serde_json::to_string(&dialog_clone) {
-                    Ok(json) => {
-                        manager.store(&cache_name, &key, &json, Some(ttl)).await;
-                    }
-                    Err(error) => {
-                        warn!(%error, "subscribe_state: failed to serialize dialog for cache");
-                    }
+                cache.delete(&key).await;
+            });
+            return;
+        }
+        let dialog = dialog.clone();
+        tokio::spawn(async move {
+            match serde_json::to_string(&dialog) {
+                Ok(json) => cache.store(&key, &json, ttl_secs).await,
+                Err(error) => {
+                    warn!(%error, "subscribe_state: failed to serialize dialog for cache");
                 }
+            }
+        });
+    }
+
+    /// Delete the L2 key of dialog `id`, when an L2 is configured.
+    fn delete_cached(&self, id: &str) {
+        if let Some(cache) = self.cache.clone() {
+            let key = Self::cache_key(id);
+            tokio::spawn(async move {
+                cache.delete(&key).await;
             });
         }
     }
@@ -272,7 +315,9 @@ impl SubscribeStore {
 
     /// Fetch a dialog by id.  Looks in L1 first; on miss, tries L2 and
     /// hydrates L1.  Returns ``None`` if the dialog is unknown or has
-    /// been terminated.
+    /// been terminated, and for one L2 still holds past its expiry, whose
+    /// key is deleted: an expired subscription is removed (RFC 6665
+    /// §4.2.1.4), not brought back for another round of NOTIFYs.
     pub async fn get(&self, id: &str) -> Option<SubscribeDialog> {
         // Present in L1 settles it either way: a terminated entry must answer
         // `None` rather than fall through and be revived out of L2, where
@@ -282,11 +327,16 @@ impl SubscribeStore {
             return self.get_local(id);
         }
 
-        let (manager, cache_name) = self.cache.as_ref()?;
-        let json = manager.fetch(cache_name, &Self::cache_key(id)).await?;
+        let cache = self.cache.as_ref()?;
+        let key = Self::cache_key(id);
+        let json = cache.fetch(&key).await?;
         match serde_json::from_str::<SubscribeDialog>(&json) {
             Ok(dialog) => {
                 if dialog.terminated {
+                    None
+                } else if dialog.remaining_secs() == 0 {
+                    cache.delete(&key).await;
+                    debug!(id, "subscribe_state: expired dialog deleted from the cache");
                     None
                 } else {
                     self.dialogs.insert(dialog.id.clone(), dialog.clone());
@@ -314,19 +364,7 @@ impl SubscribeStore {
         mutate(&mut entry);
         let updated = entry.clone();
         drop(entry);
-        // Write-through the updated dialog.
-        if let Some((manager, name)) = &self.cache {
-            let manager = Arc::clone(manager);
-            let cache_name = name.clone();
-            let key = Self::cache_key(id);
-            let dialog_clone = updated.clone();
-            let ttl = updated.expires_secs;
-            tokio::spawn(async move {
-                if let Ok(json) = serde_json::to_string(&dialog_clone) {
-                    manager.store(&cache_name, &key, &json, Some(ttl)).await;
-                }
-            });
-        }
+        self.persist(&updated);
         Some(updated)
     }
 
@@ -335,14 +373,7 @@ impl SubscribeStore {
         if let Some((_, dialog)) = self.dialogs.remove(id) {
             self.forget_outbound(&dialog);
         }
-        if let Some((manager, name)) = &self.cache {
-            let manager = Arc::clone(manager);
-            let cache_name = name.clone();
-            let key = Self::cache_key(id);
-            tokio::spawn(async move {
-                manager.delete(&cache_name, &key).await;
-            });
-        }
+        self.delete_cached(id);
         debug!(id, "subscribe_state: dialog removed");
     }
 
@@ -351,17 +382,19 @@ impl SubscribeStore {
         self.dialogs.len()
     }
 
-    /// Reap expired or terminated dialogs from the L1 store, returning the
+    /// Reap expired or terminated dialogs from the store, returning the
     /// number removed.  A subscriber that vanishes without an un-SUBSCRIBE
-    /// would otherwise pin its `SubscribeDialog` in L1 forever: the L2 cache
-    /// expires via its own TTL, but L1 has no such reaper.  Call periodically
-    /// (the dispatcher does so on its cleanup tick).
+    /// would otherwise pin its `SubscribeDialog` in L1 forever, which has no
+    /// expiry of its own.  Call periodically (the dispatcher does so on its
+    /// cleanup tick).
     pub fn sweep_stale(&self) -> usize {
         self.take_stale().len()
     }
 
     /// Remove stale dialogs atomically, returning their final snapshots so the
     /// notifier can send the mandatory terminating NOTIFY after releasing locks.
+    /// The L2 key of each goes with it: the subscription is removed (RFC 6665
+    /// §4.2.1.4), so no replica may read it back.
     ///
     /// Stale is expired or terminated, and for a subscription this node
     /// originated also accepted with no NOTIFY inside Timer N (RFC 6665
@@ -379,12 +412,12 @@ impl SubscribeStore {
             .collect();
         removed.reserve(stale.len());
         for id in &stale {
-            // L1-only: an expired L2 entry ages out via its own TTL, and a
-            // terminated dialog already had its L2 key deleted by `remove`.
             if let Some((_, dialog)) = self.dialogs.remove_if(id, |_, dialog| {
                 dialog.terminated || dialog.remaining_secs() == 0
             }) {
                 self.forget_outbound(&dialog);
+                // The snapshot is in hand, so the key can go now.
+                self.delete_cached(id);
                 removed.push(dialog);
             }
         }
@@ -505,6 +538,9 @@ impl Default for SubscribeStore {
 }
 
 #[cfg(test)]
+mod expiry_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -531,6 +567,7 @@ mod tests {
             registrant_flow: None,
             body: None,
             local_contact: None,
+            generation: 0,
         }
     }
 
@@ -705,8 +742,7 @@ mod tests {
     fn get_local_does_not_reach_l2() {
         let store = SubscribeStore::new();
         store.put(sample_dialog("abc"));
-        // `take_stale` is the one thing that drops an L1 entry while the L2
-        // key may still be alive on its own TTL.
+        // `take_stale` drops the L1 entry; nothing reads it back.
         store.update("abc", |dialog| dialog.expires_secs = 0);
         assert_eq!(store.take_stale().len(), 1);
         assert!(store.get_local("abc").is_none());

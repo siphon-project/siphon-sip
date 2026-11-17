@@ -51,15 +51,15 @@ jobs:
       SIPHON_TEST_REDIS_URL: redis://127.0.0.1:6379
       SIPHON_TEST_POSTGRES_URL: postgresql://siphon:siphon@127.0.0.1:5432/siphon
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install SCTP system dependency
         if: ${{ matrix.sctp }}
         run: sudo apt-get update && sudo apt-get install -y libsctp-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # The tests run on the free-threaded CPython the packages ship
       # (scripts/bundle-python.sh, pinned by version and SHA-256), not on a
@@ -109,8 +109,8 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -123,7 +123,7 @@ jobs:
     name: file size
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: scripts/check_file_size.py
       - run: scripts/check_too_many_lines_allows.py
       - run: scripts/check_disallowed_methods_allows.py
@@ -138,7 +138,7 @@ jobs:
     name: script await
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Prove the matcher still discriminates before trusting its verdict — a
       # gate that silently stops matching is how a check like this fails.
       - run: scripts/check_awaited_apis.py --self-test
@@ -161,21 +161,21 @@ jobs:
     # install over ("package python3.14 is not from deadsnakes").
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@v3.2.0
+        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
         with:
           python-version: "3.14-dev"
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsctp-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # Lint three feature configs. The default build (SCTP off) and
       # `--all-features` (SCTP on, compiling the gated libsctp code) catch the
@@ -209,10 +209,10 @@ jobs:
     name: minimum rust
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@v3.2.0
+        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
         with:
           python-version: "3.14-dev"
 
@@ -226,11 +226,11 @@ jobs:
           test -n "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: ${{ steps.declared.outputs.version }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Check (default features)
         run: PYO3_PYTHON=python3.14 cargo check --locked
@@ -249,19 +249,19 @@ jobs:
   benches:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@v3.2.0
+        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
         with:
           python-version: "3.14-dev"
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsctp-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Compile benches (no run)
         run: PYO3_PYTHON=python3.14 cargo bench --no-run --all-features
@@ -294,8 +294,8 @@ jobs:
           - name: control-sdk
             manifest: ./siphon-control-sdk/Cargo.toml
     steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           manifest-path: ${{ matrix.manifest }}
           command: check bans licenses sources
@@ -326,18 +326,18 @@ jobs:
       run:
         working-directory: siphon-bin
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@v3.2.0
+        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
         with:
           python-version: "3.14-dev"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: siphon-bin
 
@@ -472,12 +472,12 @@ jobs:
             package: false
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         if: matrix.package
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: matrix.package
         with:
           key: packages
@@ -544,19 +544,19 @@ jobs:
       run:
         working-directory: siphon-control-sdk
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Before the Rust steps: the `siphon-control` crate links against this
       # interpreter, so `cargo test` over the workspace needs it present.
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: siphon-control-sdk
 
@@ -608,13 +608,13 @@ jobs:
       run:
         working-directory: sdk
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # hatch-vcs derives the SDK version from git tags, so the SDK
           # build needs full history — a shallow clone hides the tags.
           fetch-depth: 0
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
 
@@ -632,11 +632,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: rust-tests
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install cargo-sbom
         run: cargo install cargo-sbom
@@ -648,7 +648,7 @@ jobs:
         run: cargo sbom --output-format cyclone_dx_json_1_4 > sbom.cdx.json
 
       - name: Upload SBOMs
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom
           path: |
@@ -670,12 +670,12 @@ jobs:
   build-image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build the siphon test image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           tags: sipp-siphon:latest
@@ -701,7 +701,7 @@ jobs:
         run: gzip -1 /tmp/sipp-siphon.tar
 
       - name: Upload the siphon image
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-siphon-image
           path: /tmp/sipp-siphon.tar.gz
@@ -713,7 +713,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -747,7 +747,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-functional-logs
           path: |
@@ -764,7 +764,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -784,7 +784,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -803,7 +803,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -825,7 +825,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -840,7 +840,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -858,7 +858,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -878,7 +878,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -900,7 +900,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -923,7 +923,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -941,7 +941,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -964,7 +964,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -1121,7 +1121,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-b2bua-logs
           path: |
@@ -1155,7 +1155,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -1193,7 +1193,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-b2bua-reliable-prov-logs
           path: siphon-reliable-prov.log
@@ -1217,7 +1217,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -1234,7 +1234,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-b2bua-session-timer-floor-logs
           path: siphon-session-timer-floor.log
@@ -1259,7 +1259,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -1305,7 +1305,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-b2bua-a-leg-reliable-prov-logs
           path: siphon-a-leg-reliable-prov.log
@@ -1329,7 +1329,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -1383,7 +1383,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-b2bua-fork-logs
           path: siphon-b2bua-fork.log
@@ -1406,7 +1406,7 @@ jobs:
       SIPP_PROFILE: b2bua-on-failure
       SIPP_CALLER: sipp-b2bua-on-failure-uac
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -1459,7 +1459,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-b2bua-on-failure-logs
           path: siphon-b2bua-on-failure.log
@@ -1484,7 +1484,7 @@ jobs:
       SIPP_PROFILE: b2bua-admission
       SIPP_CALLER: sipp-b2bua-admission-uac
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -1526,7 +1526,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-b2bua-admission-logs
           path: siphon-b2bua-admission.log
@@ -1548,7 +1548,7 @@ jobs:
     env:
       SIPP_PROFILE: b2bua-admission-gateway
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -1592,7 +1592,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-b2bua-admission-gateway-logs
           path: siphon-b2bua-admission-gateway.log
@@ -1615,7 +1615,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -1712,7 +1712,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-b2bua-lcr-logs
           path: |
@@ -1733,7 +1733,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -1945,7 +1945,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-b2bua-refer-logs
           path: |
@@ -1974,7 +1974,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -2005,7 +2005,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-originate-logs
           path: |
@@ -2036,7 +2036,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -2096,7 +2096,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-bridge-logs
           path: |
@@ -2127,7 +2127,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -2182,7 +2182,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-dial-bridge-logs
           path: |
@@ -2210,7 +2210,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -2344,7 +2344,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-control-logs
           path: |
@@ -2381,7 +2381,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -2429,7 +2429,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-control-transfer-logs
           path: |
@@ -2453,7 +2453,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -2474,7 +2474,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-b2bua-invite-auth-logs
           path: |
@@ -2489,7 +2489,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -2519,7 +2519,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-rtpproxy-logs
           path: |
@@ -2532,7 +2532,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -2577,7 +2577,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-voice-ai-logs
           path: |
@@ -2589,7 +2589,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -2644,7 +2644,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -2685,7 +2685,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-reoffer-logs
           path: |
@@ -2697,7 +2697,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -2726,7 +2726,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-refer-single-leg-logs
           path: |
@@ -2744,7 +2744,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -2780,7 +2780,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-cx-icscf-logs
           path: |
@@ -2799,16 +2799,16 @@ jobs:
     runs-on: ubuntu-24.04
     needs: rust-tests
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@v3.2.0
+        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
         with:
           python-version: "3.14-dev"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Extract the siphon-rtp binary from the published image
         # Pinned to the release siphon pins siphon-rtp-proto to, so this proves
@@ -2844,7 +2844,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -2883,7 +2883,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-siphon-rtp-native-logs
           path: |
@@ -2900,7 +2900,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -2934,7 +2934,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-siphon-rtp-ng-logs
           path: |
@@ -2954,7 +2954,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -2996,7 +2996,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-voice-ai-real-logs
           path: |
@@ -3018,7 +3018,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -3088,7 +3088,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-b2bua-early-dial-logs
           path: |
@@ -3106,7 +3106,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -3132,7 +3132,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-rtpengine-logs
           path: |
@@ -3148,7 +3148,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -3180,7 +3180,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-rtpengine-real-logs
           path: |
@@ -3195,7 +3195,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-image
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
@@ -3227,7 +3227,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-rtpproxy-real-logs
           path: |
@@ -3269,13 +3269,13 @@ jobs:
       RTPPROXY_TOOLS_COMMIT: 630f75e22ab30c9856e6200f4bab29e938b990c2
       RTPPROXY_IMAGE: ghcr.io/sippy/rtpproxy@sha256:7cf39743917d836af56f9c4293d4c79d1e528938f2a9e7fa60a6039d8358f4a8
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load the siphon image
         uses: ./.github/actions/load-siphon-image
 
       - name: Check out the suite
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.SUITE_REPOSITORY }}
           ref: ${{ env.SUITE_COMMIT }}
@@ -3283,7 +3283,7 @@ jobs:
           persist-credentials: false
 
       - name: Check out rtpproxy's control tools
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: sippy/rtpproxy
           ref: ${{ env.RTPPROXY_TOOLS_COMMIT }}
@@ -3317,7 +3317,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: interop-call-suite-${{ matrix.mode }}-${{ matrix.control }}-logs
           path: suite-logs
@@ -3336,16 +3336,16 @@ jobs:
   sipp-b2bua-answer-fail:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@v3.2.0
+        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
         with:
           python-version: "3.14-dev"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install SIPp
         run: sudo apt-get update && sudo apt-get install -y sip-tester
@@ -3368,16 +3368,16 @@ jobs:
   sipp-b2bua-max-duration:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@v3.2.0
+        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
         with:
           python-version: "3.14-dev"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install SIPp
         run: sudo apt-get update && sudo apt-get install -y sip-tester
@@ -3396,16 +3396,16 @@ jobs:
   sipp-b2bua-reoffer:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@v3.2.0
+        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
         with:
           python-version: "3.14-dev"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install SIPp
         run: sudo apt-get update && sudo apt-get install -y sip-tester
@@ -3427,16 +3427,16 @@ jobs:
     env:
       RUSTFLAGS: -Cdebuginfo=0
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@v3.2.0
+        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
         with:
           python-version: "3.14-dev"
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
@@ -3486,7 +3486,7 @@ jobs:
       group: ipsec-runner-${{ github.repository }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The ipsec runner is self-hosted and persistent — a stale container from
       # a previous run (started with an older image/config, e.g. before the
@@ -3530,7 +3530,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sipp-ipsec-logs
           path: |
@@ -3562,16 +3562,16 @@ jobs:
       group: ipsec-runner-${{ github.repository }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@v3.2.0
+        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
         with:
           python-version: "3.14-dev"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # Build the test binary WITH network, OUTSIDE the namespace, so the
       # network-isolated `unshare -n` run below never needs to fetch or compile.

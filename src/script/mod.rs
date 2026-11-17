@@ -13,6 +13,7 @@ pub mod deferred;
 pub mod diameter_dispatch;
 pub mod engine;
 pub mod error_report;
+pub(crate) mod gc_control;
 pub(crate) mod gc_metrics;
 pub mod handle;
 pub mod handler_keyword;

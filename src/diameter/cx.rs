@@ -820,7 +820,7 @@ pub const FEATURE_SIFC: u32 = 1 << 0;
 /// Supported-Features with Feature-List-ID 1. TS 29.229 §7.2.1: the M bit is
 /// set in a request the features were used to construct (`mandatory`), and
 /// never in an answer.
-fn supported_features_avp(feature_list: u32, mandatory: bool) -> Vec<u8> {
+pub(crate) fn supported_features_avp(feature_list: u32, mandatory: bool) -> Vec<u8> {
     let mut children = Vec::new();
     children.extend_from_slice(&encode_avp_u32(avp::VENDOR_ID, dictionary::VENDOR_3GPP));
     children.extend_from_slice(&encode_avp_vendor(

@@ -577,6 +577,7 @@ fn load_engine(config: &SoakConfig) -> Arc<ScriptEngine> {
             } else {
                 crate::config::DirectDispatch::Off
             },
+            gc: Default::default(),
         })
         .unwrap(),
     )

@@ -616,6 +616,10 @@ siphon keeps every such wait detached:
 | `siphon_interpreter_attach_wait_ms` | the longest of those waits in the last completed one-second window |
 | `siphon_python_gc_pause_seconds{generation}` | histogram: wall time of each Python garbage collection (buckets 100 µs to 3.3 s) |
 | `siphon_python_gc_collections_total{generation}` | Python garbage collections completed |
+| `siphon_python_gc_collected_total{generation}` | unreachable objects those collections freed |
+| `siphon_python_gc_uncollectable_total{generation}` | unreachable objects they found and could not free; above 0 is a leak |
+| `siphon_python_gc_young_objects` | `gc.get_count()[0]`, read once a second: container objects allocated minus freed since the collector last looked |
+| `siphon_python_gc_frozen_objects` | objects `script.gc.freeze_after_load` took out of every later collection; set once at startup, 0 without it |
 | `siphon_blocking_waits_in_flight` | threads parked right now in a blocking wait through siphon's released helpers; stuck high means a slow backend or a hang |
 | `siphon_blocking_waits_total` | blocking waits started through those helpers |
 | `siphon_auth_ha1_cache_hits_total` | HTTP-auth lookups served from cache |
@@ -639,6 +643,101 @@ Reading the interpreter metrics:
 - **`generation`** is the generation the collection was asked for. A
   free-threaded interpreter scans the whole heap every time: its automatic
   collections report `0`, `gc.collect()` reports `2`.
+- **Collected** is the collector's own count. With `gc.DEBUG_SAVEALL` set it
+  counts objects it then keeps in `gc.garbage`. **Uncollectable** counts
+  unreachable objects with a legacy finalizer, which it also keeps.
+- **Collected** over **collections** is what a collection is worth. A node
+  whose collections each take tens of milliseconds and free a few hundred
+  objects is paying for the walk, not for the garbage: raise
+  `script.gc.threshold`. Objects freed by their reference count never reach
+  the collector and are in neither counter.
+- **Young objects** is not the size of the heap. CPython 3.14 does not expose
+  how many objects the collector tracks without a walk of the heap
+  (`gc.get_objects()` builds a list of all of them), so siphon does not
+  publish it. The young count goes back to 0 at every collection and, on a
+  free-threaded build, every time a collection is considered and put off; a
+  thread reports its allocations in batches of 512. Read it as how fast
+  container objects pile up between collections. The one exact reading of the
+  heap is `siphon_python_gc_frozen_objects`, with the freeze on.
+
+## Tuning the garbage collector (`script.gc`)
+
+On a free-threaded interpreter every collection stops every thread and walks
+the whole heap, so a collection takes as long as the heap is large, whatever
+it frees: about 35 ms for 2 million tracked objects on 3.14.2t. Most of those
+objects were built at startup (the standard library, the script's modules, its
+tables) and are never freed. Both keys default to leaving CPython alone.
+
+```yaml
+script:
+  gc:
+    freeze_after_load: true
+    threshold: 50000
+```
+
+The line numbers below are in CPython 3.14.2, `Python/gc_free_threading.c`
+unless another file is named.
+
+**`threshold`** is `gc.set_threshold(threshold)`. It sets the first of
+CPython's three thresholds and leaves the other two (`Modules/gcmodule.c` line
+162); the default is 2000 (line 1588). On a free-threaded build an automatic
+collection is considered when the young count exceeds the threshold (line
+2091) and is at least a quarter of the unfrozen objects that survived the last
+collection (line 2099). It then runs when either
+
+- the young counts set aside since the last collection exceed 40 times the
+  threshold (line 2057), or
+- the process's RSS plus swap has grown since the last collection by more than
+  a tenth, and by more than 128 KiB (lines 2066-2068).
+
+Otherwise the young count is set aside and starts again from 0 (lines
+2077-2079). So the threshold is the floor under which nothing is considered,
+and 40 times it is what must have been set aside before a node whose memory is
+steady collects anyway: 80,000 with the default, 2 million with
+`threshold: 50000`. Neither is an interval. The quarter-of-survivors rule
+comes first, so an unfrozen heap of 2 million objects is not considered before
+500,000 are new, whatever the threshold. The cost of a higher threshold is
+that cyclic garbage waits longer to be freed, so RSS between collections is
+higher by what those cycles hold; the RSS rule still collects on real growth.
+`0` is refused at startup (it turns automatic collection off, line 2091, and
+cycles are then freed only by an explicit `gc.collect()`), and so is anything
+above 53687091, where `threshold * 40` overflows a C `int`.
+
+**`freeze_after_load`** runs one full collection and then `gc.freeze()` when
+the script has loaded and the extensions have started, and logs the number of
+objects frozen. A frozen object is still stepped over in the heap walk, but it
+is dropped before any traversal or reference-count work (`op_from_block`,
+lines 360-374), and the pass that marks everything reachable from the roots is
+skipped (lines 2184-2190). Measured on 3.14.2t with 2.1 million tracked
+objects, a full collection went from 35 ms to 17 ms: the walk remains, the
+work per object goes. (On a GIL build the same heap went from 236 ms to under
+0.1 ms, since frozen objects leave the generations altogether.)
+
+Three things to know before turning it on:
+
+- **A frozen cycle is never freed.** Frozen objects are not examined again, so
+  objects alive at startup that later become cyclic garbage stay allocated.
+  Objects freed by their reference count are freed as before.
+- **The freeze happens once, not on a reload.** A reload replaces the script's
+  modules; the copy frozen at startup stays allocated after the first reload,
+  a one-off cost of the size of the script's own module-level objects. Modules
+  built by a reload are not frozen and are collected when the next reload
+  replaces them, so this does not grow per reload. Freezing again on each
+  reload would strand one copy per reload and would freeze whatever calls
+  were in flight.
+- **Alone, it makes collections more frequent.** The quarter-of-survivors rule
+  counts unfrozen objects only (line 1214). An unfrozen heap of 2 million
+  objects keeps the collector quiet until 500,000 objects are new; frozen, it
+  no longer does, and the threshold rules above decide alone. Churning 3
+  million cyclic objects over a heap of 2.1 million on 3.14.2t took 2
+  collections unfrozen, 24 with the freeze alone (shorter each, three times
+  the pause in total), and 1 with the freeze and `threshold: 500000`. So set
+  `threshold` with the freeze: around a quarter of
+  `siphon_python_gc_frozen_objects` restores the floor the frozen heap used
+  to give. siphon warns at startup when the freeze is on without a threshold.
+
+Check the effect on `siphon_python_gc_pause_seconds` and on the upper buckets
+of `siphon_interpreter_attach_wait_seconds`.
 
 **Alert on**: a sustained `rate(siphon_pyexec_jobs_shed_total)` > 0, or
 `siphon_pyexec_pool_size == siphon_pyexec_pool_max` with

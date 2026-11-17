@@ -11,10 +11,10 @@
 //! `proxy.send_request`, the NOTIFYs and SUBSCRIBEs of `proxy.subscribe_state`
 //! and `presence.notify`.
 //!
-//! These requests have no retransmission timer of their own (the UAC sender
-//! sends once and waits for the response until Timer F), so over TCP there is
-//! no Timer A or Timer E to switch off (§17.1.1.2, §17.1.2.2): the top Via is
-//! what has to follow the transport, and does.
+//! The client transaction the UAC sender opens for a non-INVITE request reads
+//! the transport it is sent with: over UDP it retransmits on Timer E, over TCP
+//! it does not (§17.1.2.2). So a request moved to TCP here loses Timer E with
+//! no further step; the top Via is what has to follow the transport, and does.
 
 use std::borrow::Cow;
 use std::net::SocketAddr;

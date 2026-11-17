@@ -3,8 +3,15 @@
 # NOTE: cargo PRs must NOT be auto-merged. Project policy mandates the 16-row
 # perf baseline + mem-leak test before every commit, and CI does not run perf — a
 # crate bump that is green in CI can still regress throughput or leak. Treat
-# each cargo PR as "green CI AND I ran the perf/mem baseline". github-actions
-# and docker bumps are safe to merge on green CI.
+# each cargo PR as "green CI AND I ran the perf/mem baseline". Docker bumps are
+# safe to merge on green CI.
+#
+# Supply chain: a compromised release usually gets yanked within days, so cargo
+# and github-actions updates wait out a 7-day cooldown before Dependabot offers
+# them. Actions are pinned to full commit SHAs (a tag can be moved under us, a SHA
+# cannot); an action bump PR changes the SHA, so read the action's diff between
+# the two SHAs before merging, not just CI. The release workflows run those
+# actions with crates.io / PyPI / registry publish rights.
 version: 2
 updates:
   # Rust crate dependencies — one grouped PR for all minor/patch bumps;
@@ -14,6 +21,8 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]
@@ -38,6 +47,10 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # siphon-sip is our own lib; its locked SHA should keep tracking main.
+    cooldown:
+      default-days: 7
+      exclude: ["siphon-sip"]
     groups:
       cargo-excluded-workspaces-minor-patch:
         update-types: ["minor", "patch"]
@@ -45,11 +58,14 @@ updates:
       - dependency-name: "siphon-smpp"
       - dependency-name: "siphon-http"
 
-  # Pinned action versions in the workflows (checkout, rust-cache, docker/*, …).
+  # SHA-pinned actions in the workflows; the `# vX.Y.Z` comment is what
+  # Dependabot reads to propose the next version.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns: ["*"]

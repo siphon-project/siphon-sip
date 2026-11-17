@@ -51,9 +51,9 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
     crate::dispatcher::b2bua::bridge_relay_sweep(state, now);
     let uac_pending = state.uac_sender.pending_count();
     let dialog_sessions = state.session_store.dialog_key_count();
-    // Reap expired/abandoned SUBSCRIBE dialogs from the L1 store (L2 expires
-    // via its own TTL; L1 has no reaper, so a subscriber that vanishes without
-    // an un-SUBSCRIBE would otherwise pin its dialog forever).
+    // Reap expired/abandoned SUBSCRIBE dialogs from the store, L1 entry and L2
+    // key both (RFC 6665 §4.2.1.4): a subscriber that vanishes without an
+    // un-SUBSCRIBE would otherwise pin its dialog forever.
     let (expired_subs, subscribe_dialogs) = match crate::subscribe_state::global_store() {
         Some(store) => {
             let expired = store.take_stale();
@@ -62,9 +62,11 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
                 // `spawn`, not `spawn_blocking`: the terminating NOTIFY no
                 // longer blocks a thread for its DNS lookup, so it needs no
                 // blocking-pool slot — only to stay off the dispatch task.
+                let notifier = Arc::clone(&store);
                 tokio::spawn(async move {
                     for dialog in expired {
-                        crate::script::api::subscribe_state::notify_expired(dialog).await;
+                        crate::script::api::subscribe_state::notify_expired(&notifier, dialog)
+                            .await;
                     }
                 });
             }
