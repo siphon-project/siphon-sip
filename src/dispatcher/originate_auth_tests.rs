@@ -293,3 +293,55 @@ async fn a_trunk_that_challenges_every_attempt_stops_at_the_retry_cap() {
         "the call should have been failed once the cap was reached"
     );
 }
+
+/// RFC 3261 §12.2.1.1: every request in the dialog is numbered past the one
+/// before it. The credentialed retry is the dialog's second INVITE (§8.1.3.5),
+/// so the BYE of the call it sets up comes after it, not beside it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bye_after_a_credentialed_retry_is_numbered_past_the_retried_invite() {
+    let dispatcher = test_dispatcher();
+    let prepared = originate_to_trunk(&dispatcher, true);
+    let trunk = std::net::SocketAddr::from(([192, 0, 2, 99], 5060));
+    handle_originated_call_response(
+        &prepared.internal_call_id,
+        &challenge(&prepared, 401),
+        401,
+        trunk,
+        &dispatcher.state,
+    );
+    let sent = wire(&dispatcher);
+    let retry = find_invite(&sent).expect("the credentialed retry").clone();
+    assert_eq!(retry.headers.cseq().map(String::as_str), Some("2 INVITE"));
+
+    let mut answer = build_response(&retry, 200, "OK", None, &[]);
+    let to = retry.headers.to().cloned().expect("the INVITE has a To");
+    answer.headers.set("To", format!("{to};tag=trunk-tag"));
+    answer.headers.set("Contact", format!("<{TRUNK}>"));
+    set_sdp_body(
+        &mut answer,
+        b"v=0\r\no=- 2 2 IN IP4 192.0.2.50\r\ns=-\r\nc=IN IP4 192.0.2.50\r\nt=0 0\r\nm=audio 42000 RTP/AVP 0\r\n".to_vec(),
+        "application/sdp",
+    );
+    handle_originated_call_response(
+        &prepared.internal_call_id,
+        &answer,
+        200,
+        trunk,
+        &dispatcher.state,
+    );
+    let _ = wire(&dispatcher);
+
+    assert!(b2bua_terminate_call_inner(
+        &prepared.internal_call_id,
+        None,
+        "b2bua",
+        &dispatcher.state
+    ));
+    let sent = wire(&dispatcher);
+    let bye = sent
+        .iter()
+        .map(|(_, message)| message)
+        .find(|message| method_of(message).as_deref() == Some("BYE"))
+        .expect("the BYE");
+    assert_eq!(bye.headers.cseq().map(String::as_str), Some("3 BYE"));
+}

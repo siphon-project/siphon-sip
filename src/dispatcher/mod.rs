@@ -274,6 +274,8 @@ mod originate_group_tests;
 #[cfg(test)]
 mod originate_media_source_tests;
 #[cfg(test)]
+mod originate_progress_tests;
+#[cfg(test)]
 mod originate_route_tests;
 #[cfg(test)]
 mod originate_test_harness;

@@ -435,13 +435,15 @@ pub fn b2bua_ack_and_bye_answered_leg(
     }
     leg.dialog.route_set = route_set;
     // The BYE CSeq must exceed the INVITE's; derive it from the 2xx's CSeq.
+    // And that of every PRACK the leg sent since, which left the counter on
+    // the number after it (RFC 3261 §12.2.1.1).
     let invite_cseq = response
         .headers
         .cseq()
         .and_then(|c| c.split_whitespace().next())
         .and_then(|n| n.parse::<u32>().ok())
         .unwrap_or(leg.dialog.local_cseq);
-    leg.dialog.local_cseq = invite_cseq.saturating_add(1);
+    leg.dialog.local_cseq = invite_cseq.saturating_add(1).max(leg.dialog.local_cseq);
 
     let bye = build_b2bua_bye(&leg, state);
     let bye_sent = bye.is_some();

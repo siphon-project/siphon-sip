@@ -75,6 +75,9 @@ pub enum HandlerKind {
     B2buaProvisional,
     /// `@b2bua.on_early_media` — provisional response with SDP (183/180).
     B2buaEarlyMedia,
+    /// `@b2bua.on_originate_progress`: every provisional response (101-199)
+    /// to the INVITE of a call the script placed with `b2bua.originate()`.
+    B2buaOriginateProgress,
     /// `@b2bua.on_answer`
     B2buaAnswer,
     /// `@b2bua.on_failure`
@@ -1115,6 +1118,7 @@ fn extract_handlers(python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<V
             }
             "b2bua.on_provisional" => HandlerKind::B2buaProvisional,
             "b2bua.on_early_media" => HandlerKind::B2buaEarlyMedia,
+            "b2bua.on_originate_progress" => HandlerKind::B2buaOriginateProgress,
             "b2bua.on_answer" => HandlerKind::B2buaAnswer,
             "b2bua.on_failure" => HandlerKind::B2buaFailure,
             "b2bua.on_bye" => HandlerKind::B2buaBye,
@@ -2193,6 +2197,30 @@ async def on_provisional(call, reply):
         assert!(state.handlers[0].is_async);
         assert_eq!(state.handlers_for(&HandlerKind::B2buaProvisional).len(), 1);
         assert!(state.handlers_for(&HandlerKind::B2buaEarlyMedia).is_empty());
+    }
+
+    #[test]
+    fn b2bua_on_originate_progress_decorator_registers_handler() {
+        let source = r#"
+from siphon import b2bua
+
+@b2bua.on_originate_progress
+def ringing(call_id, code, reason, reply):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 1);
+        assert_eq!(state.handlers[0].kind, HandlerKind::B2buaOriginateProgress);
+        assert!(!state.handlers[0].is_async);
+        assert_eq!(
+            state
+                .handlers_for(&HandlerKind::B2buaOriginateProgress)
+                .len(),
+            1
+        );
+        assert!(state
+            .handlers_for(&HandlerKind::B2buaProvisional)
+            .is_empty());
     }
 
     #[test]

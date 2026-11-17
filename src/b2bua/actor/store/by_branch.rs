@@ -80,6 +80,41 @@ impl CallActorStore {
         })
     }
 
+    /// RFC 3262 §4 on the dialog of a call siphon placed, whose callee is on
+    /// its A-leg: `true` for the first reliable provisional of the early
+    /// dialog `to_tag`, whatever its `rseq`, and after it only for the one
+    /// numbered one higher than the last ("that response MUST NOT be
+    /// acknowledged with a PRACK, and MUST NOT be processed further"
+    /// otherwise). `false` for a retransmission, for one that arrives ahead of
+    /// its turn, and when the call is gone.
+    pub fn try_mark_originated_prack_acked(&self, call_id: &str, to_tag: &str, rseq: u32) -> bool {
+        self.calls.get_mut(call_id).is_some_and(|mut call| {
+            let acknowledged = &mut call.a_leg.prack_acked_rseq;
+            match acknowledged.get(to_tag) {
+                Some(&last) if last.checked_add(1) != Some(rseq) => false,
+                _ => {
+                    acknowledged.insert(to_tag.to_string(), rseq);
+                    true
+                }
+            }
+        })
+    }
+
+    /// Mark a call as placed through the in-process `b2bua.originate()`
+    /// surface, before its INVITE leaves.
+    pub fn mark_script_originated(&self, call_id: &str) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.originate_progress.script_originated = true;
+        }
+    }
+
+    /// Whether the call was placed through `b2bua.originate()`.
+    pub fn is_script_originated(&self, call_id: &str) -> bool {
+        self.calls
+            .get(call_id)
+            .is_some_and(|call| call.originate_progress.script_originated)
+    }
+
     /// [`try_win`](Self::try_win) for the leg whose INVITE rode Via `branch`,
     /// found under the lock that claims the answer for it. `None` when the
     /// call, or that leg, is gone.
