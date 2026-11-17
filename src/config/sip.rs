@@ -264,6 +264,7 @@ fn default_enum_server_hold_down_secs() -> u64 {
 ///     url: "redis://192.0.2.131:6379"
 ///     local_ttl_secs: 60
 ///     local_max_entries: 10000
+///     required_for_readiness: true   # optional, default false
 /// ```
 #[derive(Debug, Deserialize, Clone)]
 pub struct NamedCacheConfig {
@@ -275,4 +276,12 @@ pub struct NamedCacheConfig {
     /// If set, a local LRU cache is maintained in front of Redis.
     pub local_ttl_secs: Option<u64>,
     pub local_max_entries: Option<usize>,
+    /// Whether `/admin/ready` answers 503 while this cache's Redis backend is
+    /// unreachable. Off by default: with one Redis shared by every node, a
+    /// required cache takes all of them out of rotation together. Turn it on
+    /// for a cache the node cannot serve without (a script that reads routing
+    /// state from it gets `None` for every key while it is down). The probe,
+    /// the metrics and failing fast apply to every cache either way.
+    #[serde(default)]
+    pub required_for_readiness: bool,
 }

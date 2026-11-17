@@ -407,8 +407,7 @@ pub(super) fn relay_request(
             &target_uri_string,
             destination,
         ) {
-            // A hostname's _sip._tcp path could point back at us — don't switch
-            // into a loop (the UDP destination already passed is_own_address).
+            // A _sip._tcp path back to us would loop (UDP passed is_own_address).
             if state.is_own_address(&tcp_addr) {
                 warn!(%tcp_addr, "§18.1.1: TCP path loops back to us — keeping UDP");
             } else {
