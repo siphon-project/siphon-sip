@@ -923,33 +923,23 @@ impl Config {
         )))
     }
 
-    /// Refuse `srs.enabled` on a media backend that cannot terminate a
-    /// recording.
-    ///
-    /// The SRS answers each recorded stream receive-only on a single-leg engine
-    /// call of its own (RFC 7866 §8.1; §8.1.8: an SRS does not normally send
-    /// RTP), which only the siphon-rtp engine has a verb for (`answer_local`).
-    /// rtpengine and rtpproxy can only relay, so on them every recording would
-    /// be refused: a node that boots like that is worse than one that does not.
+    /// The `srs:` block against the media backend and the control apps it
+    /// leans on ([`SrsConfig::validate`]).
     fn validate_srs(&self) -> Result<()> {
-        if !self.srs.as_ref().is_some_and(|srs| srs.enabled) {
+        let Some(srs) = self.srs.as_ref() else {
             return Ok(());
-        }
+        };
         let backend = self
             .media
             .as_ref()
             .map(MediaConfig::backend)
             .unwrap_or_default();
-        if backend == MediaBackendKind::SiphonRtp {
-            return Ok(());
-        }
-        Err(SiphonError::Config(format!(
-            "srs.enabled is true, but media.backend is {:?}, which cannot terminate a \
-             recording: the SRS answers each stream receive-only on its own single-leg \
-             engine call, which only the siphon-rtp media engine supports. Set \
-             media.backend to \"siphon-rtp\", or turn srs off.",
-            backend.as_str(),
-        )))
+        let apps: Vec<&str> = self
+            .control
+            .as_ref()
+            .map(|control| control.apps.iter().map(|app| app.name.as_str()).collect())
+            .unwrap_or_default();
+        srs.validate(backend, &apps).map_err(SiphonError::Config)
     }
 
     /// Refuse a `backend:` selector nothing dispatches to.

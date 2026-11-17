@@ -41,11 +41,13 @@ async fn renegotiate(
     }
     let from_tag = tag_of(message.headers.from()).unwrap_or_default();
     let recording_dir = srs_manager.recording_dir(&call_id).unwrap_or_default();
+    let recording = srs_manager.recording(&call_id);
     let owner = media::StreamOwner {
         recording_call_id: &call_id,
         from_tag: &from_tag,
         source_ip: inbound.remote_addr.ip(),
         recording_dir: &recording_dir,
+        recording: &recording,
     };
     match media::anchor_streams(
         state,
@@ -210,6 +212,7 @@ pub(super) fn handle_bye(
 ) {
     info!(call_id = %call_id, "SRS: received BYE from SRC");
     respond(&inbound, &message, 200, "OK", None, &[], state);
+    control_notify_terminated(&call_id, "bye");
     let Some(ended) = take_session(&call_id, &srs_manager, state) else {
         return;
     };
@@ -249,6 +252,14 @@ pub(in crate::dispatcher) fn handle_srs_cancel(
     match srs_manager.cancel_pending(&call_id, &from_tag, branch, terminated.clone()) {
         CancelOutcome::Cancelled => {
             info!(call_id = %call_id, "SRS: initial INVITE cancelled");
+            // An application still deciding gets nothing more to decide.
+            srs_manager.withdraw_decision(&call_id);
+            control_notify_terminated_with_cause(
+                &call_id,
+                "cancelled",
+                Some(487),
+                Some("Request Terminated"),
+            );
             respond(inbound, message, 200, "OK", None, &[], state);
             // The INVITE's 487, where the INVITE came from, and kept for its
             // retransmissions. The task answering it sees the CANCEL when it
@@ -300,36 +311,69 @@ fn dialog_leg(call_id: &str, srs_manager: &SrsManager) -> Option<crate::b2bua::a
 /// is confirmed, but the session SHOULD be terminated": siphon BYEs the SRC and
 /// ends the recording. Called by the 64×T1 sweep, which has already taken the
 /// 2xx out of the retransmission store.
+/// BYE the SRC in the recording dialog (RFC 3261 §15), with the route set and
+/// remote target the INVITE gave siphon.
+fn send_bye_to_src(call_id: &str, srs_manager: &SrsManager, state: &DispatcherState) {
+    let Some(leg) = dialog_leg(call_id, srs_manager) else {
+        return;
+    };
+    let Some(bye) = crate::dispatcher::b2bua::build_b2bua_bye(&leg, state) else {
+        return;
+    };
+    let (destination, transport) = resolve_in_dialog_destination(
+        &leg.dialog.route_set,
+        state,
+        leg.transport.remote_addr,
+        leg.transport.transport,
+    );
+    let connection_id =
+        if destination == leg.transport.remote_addr && transport == leg.transport.transport {
+            leg.transport.connection_id
+        } else {
+            ConnectionId::default()
+        };
+    send_message_from(
+        bye,
+        transport,
+        destination,
+        connection_id,
+        leg.transport.local_addr,
+        state,
+    );
+}
+
+/// End a recording session from siphon's side: the application's `hangup`,
+/// or its owner lost. The SRC is BYEd, the channel ends with `reason`, and the
+/// recordings are closed and stored.
+pub(super) fn end_from_siphon(call_id: &str, reason: &str, state: &Arc<DispatcherState>) {
+    let Some(srs_manager) = state.srs_manager.clone() else {
+        return;
+    };
+    info!(call_id = %call_id, reason, "SRS: ending the recording session");
+    send_bye_to_src(call_id, &srs_manager, state);
+    control_notify_terminated(call_id, reason);
+    let Some(ended) = take_session(call_id, &srs_manager, state) else {
+        return;
+    };
+    let call_id = call_id.to_string();
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        script::session_ended(&state, &ended.record, &call_id).await;
+        release_and_store(ended, state.rtpengine_set.clone(), srs_manager).await;
+    });
+}
+
+/// RFC 3261 §13.3.1.4: the SRC never ACKed the 2xx within 64×T1. "The dialog
+/// is confirmed, but the session SHOULD be terminated": siphon BYEs the SRC and
+/// ends the recording. Called by the 64×T1 sweep, which has already taken the
+/// 2xx out of the retransmission store.
 pub(in crate::dispatcher) fn srs_unacked_answer_terminate(call_id: &str, state: &DispatcherState) {
     let Some(srs_manager) = state.srs_manager.clone() else {
         return;
     };
     warn!(call_id = %call_id, "RFC 3261 §13.3.1.4: the SRC never ACKed the 2xx within 64*T1, ending the recording");
-    if let Some(leg) = dialog_leg(call_id, &srs_manager) {
-        if let Some(bye) = crate::dispatcher::b2bua::build_b2bua_bye(&leg, state) {
-            let (destination, transport) = resolve_in_dialog_destination(
-                &leg.dialog.route_set,
-                state,
-                leg.transport.remote_addr,
-                leg.transport.transport,
-            );
-            let connection_id = if destination == leg.transport.remote_addr
-                && transport == leg.transport.transport
-            {
-                leg.transport.connection_id
-            } else {
-                ConnectionId::default()
-            };
-            send_message_from(
-                bye,
-                transport,
-                destination,
-                connection_id,
-                leg.transport.local_addr,
-                state,
-            );
-        }
-    }
+    send_bye_to_src(call_id, &srs_manager, state);
+    control_notify_terminated(call_id, "unacknowledged");
     srs_manager.fail_session(call_id, "2xx never acknowledged");
     let Some(ended) = take_session(call_id, &srs_manager, state) else {
         return;

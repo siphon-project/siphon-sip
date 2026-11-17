@@ -110,6 +110,36 @@ pub struct SrsPeer {
     pub terminated: Option<SipMessage>,
 }
 
+/// How each stream of a session is recorded: the media profile it is answered
+/// with, the file format, and the directory the files go in. The defaults are
+/// the `srs:` block's; a control application's `accept` can set each.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordingOptions {
+    /// A media profile in place of `srs.rtpengine_profile`.
+    pub profile: Option<String>,
+    /// The file format.
+    pub format: crate::rtpengine::events::RecordingFormat,
+    /// Opus target bitrate (`ogg_opus` only).
+    pub bitrate_bps: Option<u32>,
+    /// A directory in place of the session's directory under
+    /// `srs.recording_dir`; siphon names the files in it.
+    pub directory: Option<PathBuf>,
+}
+
+/// A control application's answer to a recording session it was offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SrsDecision {
+    /// Answer 200 and record as asked.
+    Accept(RecordingOptions),
+    /// Answer with this final response; nothing is anchored.
+    Reject { code: u16, reason: String },
+}
+
+/// A decision for a session that is not waiting for one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("no recording session is waiting for a decision")]
+pub struct NotPending;
+
 /// What a CANCEL for a recording's initial INVITE found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CancelOutcome {
@@ -172,6 +202,8 @@ pub struct SrsSession {
     pub cancelled: bool,
     /// The SRC side of the dialog, once the INVITE is accepted.
     pub peer: Option<SrsPeer>,
+    /// How its streams are recorded.
+    pub recording: RecordingOptions,
 }
 
 /// How an INVITE relates to the recording dialogs the SRS holds.
@@ -288,16 +320,41 @@ pub struct SrsManager {
     /// The recording dialog's Call-ID → its session. The From-tag and To-tag
     /// are checked on every request that names one.
     sessions: DashMap<String, SrsSession>,
+    /// Sessions offered to a control application, waiting for its `accept` or
+    /// `reject`, by Call-ID.
+    pending_decisions: DashMap<String, tokio::sync::oneshot::Sender<SrsDecision>>,
     /// Configuration.
     config: SrsConfig,
+    /// The control bus sessions are offered on, in a test that cannot install
+    /// the process-wide one.
+    #[cfg(test)]
+    control_bus: std::sync::OnceLock<std::sync::Arc<crate::control::ControlBus>>,
 }
 
 impl SrsManager {
+    /// The control bus a recording session is offered on.
+    pub fn control_bus(&self) -> Option<std::sync::Arc<crate::control::ControlBus>> {
+        #[cfg(test)]
+        if let Some(bus) = self.control_bus.get() {
+            return Some(std::sync::Arc::clone(bus));
+        }
+        crate::control::ControlBus::global()
+    }
+
+    /// Offer sessions on `bus` in place of the process-wide one.
+    #[cfg(test)]
+    pub fn use_control_bus(&self, bus: std::sync::Arc<crate::control::ControlBus>) {
+        let _ = self.control_bus.set(bus);
+    }
+
     /// Create a new SRS manager from config.
     pub fn new(config: SrsConfig) -> Self {
         Self {
             sessions: DashMap::new(),
+            pending_decisions: DashMap::new(),
             config,
+            #[cfg(test)]
+            control_bus: std::sync::OnceLock::new(),
         }
     }
 
@@ -391,6 +448,7 @@ impl SrsManager {
             final_response: None,
             cancelled: false,
             peer: None,
+            recording: RecordingOptions::default(),
         };
 
         match self.sessions.entry(recording_call_id.to_string()) {
@@ -492,6 +550,58 @@ impl SrsManager {
         }
     }
 
+    /// Wait for a control application's decision on the session: the receiver
+    /// gets it from [`decide`](Self::decide).
+    pub fn await_decision(
+        &self,
+        recording_call_id: &str,
+    ) -> tokio::sync::oneshot::Receiver<SrsDecision> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.pending_decisions
+            .insert(recording_call_id.to_string(), sender);
+        receiver
+    }
+
+    /// Hand the session waiting on [`await_decision`](Self::await_decision) its
+    /// decision. One decision per session: a second finds nothing waiting.
+    pub fn decide(&self, recording_call_id: &str, decision: SrsDecision) -> Result<(), NotPending> {
+        let (_, sender) = self
+            .pending_decisions
+            .remove(recording_call_id)
+            .ok_or(NotPending)?;
+        sender.send(decision).map_err(|_| NotPending)
+    }
+
+    /// Whether the session is waiting for a decision.
+    pub fn is_awaiting_decision(&self, recording_call_id: &str) -> bool {
+        self.pending_decisions.contains_key(recording_call_id)
+    }
+
+    /// Stop waiting for a decision (the deadline passed, or the INVITE was
+    /// cancelled).
+    pub fn withdraw_decision(&self, recording_call_id: &str) {
+        self.pending_decisions.remove(recording_call_id);
+    }
+
+    /// Record the session's streams as `options` say: the directory in place of
+    /// the default one, when it names one.
+    pub fn set_recording(&self, recording_call_id: &str, options: RecordingOptions) {
+        if let Some(mut session) = self.sessions.get_mut(recording_call_id) {
+            if let Some(directory) = &options.directory {
+                session.recording_dir = Some(directory.clone());
+            }
+            session.recording = options;
+        }
+    }
+
+    /// How the session's streams are recorded.
+    pub fn recording(&self, recording_call_id: &str) -> RecordingOptions {
+        self.sessions
+            .get(recording_call_id)
+            .map(|session| session.recording.clone())
+            .unwrap_or_default()
+    }
+
     /// Keep the SRC side of the dialog, for a request siphon has to send in it.
     pub fn set_peer(&self, recording_call_id: &str, peer: SrsPeer) {
         if let Some(mut session) = self.sessions.get_mut(recording_call_id) {
@@ -538,6 +648,7 @@ impl SrsManager {
         &self,
         recording_call_id: &str,
     ) -> Option<(RecordingRecord, Vec<SrsStream>)> {
+        self.pending_decisions.remove(recording_call_id);
         let (_, mut session) = self.sessions.remove(recording_call_id)?;
         if !matches!(session.state, SrsSessionState::Failed(_)) {
             session.state = SrsSessionState::Completed;
@@ -607,6 +718,7 @@ mod tests {
             file: None,
             http: None,
             rtpengine_profile: "srs_recording".to_string(),
+            app: None,
         }
     }
 
@@ -986,5 +1098,77 @@ mod tests {
             handle.join().unwrap();
         }
         assert_eq!(manager.session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_decision_reaches_the_session_waiting_for_it_once() {
+        let manager = manager();
+        manager
+            .create_session("call-1", "tag-1", "z9hG4bK-1", test_metadata())
+            .unwrap();
+        let receiver = manager.await_decision("call-1");
+        assert!(manager.is_awaiting_decision("call-1"));
+        manager
+            .decide(
+                "call-1",
+                SrsDecision::Reject {
+                    code: 403,
+                    reason: "Forbidden".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            receiver.await.unwrap(),
+            SrsDecision::Reject {
+                code: 403,
+                reason: "Forbidden".to_string()
+            }
+        );
+        assert_eq!(
+            manager.decide("call-1", SrsDecision::Accept(RecordingOptions::default())),
+            Err(NotPending)
+        );
+        assert!(!manager.is_awaiting_decision("call-1"));
+    }
+
+    #[test]
+    fn a_decision_for_nobody_is_not_pending() {
+        assert_eq!(
+            manager().decide("nope", SrsDecision::Accept(RecordingOptions::default())),
+            Err(NotPending)
+        );
+    }
+
+    #[test]
+    fn stopping_a_session_withdraws_its_pending_decision() {
+        let manager = manager();
+        manager
+            .create_session("call-1", "tag-1", "z9hG4bK-1", test_metadata())
+            .unwrap();
+        let _receiver = manager.await_decision("call-1");
+        manager.stop_session("call-1");
+        assert!(
+            !manager.is_awaiting_decision("call-1"),
+            "nothing left behind"
+        );
+    }
+
+    #[test]
+    fn recording_options_move_the_directory() {
+        let manager = manager();
+        manager
+            .create_session("call-1", "tag-1", "z9hG4bK-1", test_metadata())
+            .unwrap();
+        let options = RecordingOptions {
+            format: crate::rtpengine::events::RecordingFormat::OggOpus,
+            directory: Some(PathBuf::from("/srv/tenant-a")),
+            ..Default::default()
+        };
+        manager.set_recording("call-1", options.clone());
+        assert_eq!(manager.recording("call-1"), options);
+        assert_eq!(
+            manager.recording_dir("call-1"),
+            Some(PathBuf::from("/srv/tenant-a"))
+        );
     }
 }

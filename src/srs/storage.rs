@@ -345,6 +345,7 @@ mod tests {
             file: None,
             http: None,
             rtpengine_profile: "srs_recording".to_string(),
+            app: None,
         };
 
         // The session's own directory, named by siphon's key: the metadata

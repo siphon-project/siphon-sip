@@ -151,6 +151,7 @@ export type {
   RecordDirection,
   RecordChannels,
   RecordFormat,
+  RecordingAcceptOptions,
   RecordOptions,
   Recording,
   OriginateMedia,

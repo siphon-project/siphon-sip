@@ -125,7 +125,8 @@ impl ControlAdapter for SipControlAdapter {
                 verb("answer", "Send a UAS 2xx to the parked A-leg; with anchor (or a profile / ws_uri, which imply it) the SDP answer is synthesized and the media anchored to the media engine in the same act — the verb form of call.handover(answer=True). Without a ws_uri the leg is anchored on the engine with no bridge, which is what play / DTMF / recording need for an IVR, a queue or a voicemail box (args: code, reason, body, content_type, anchor, profile, ws_uri, contact_host, contact_user). contact_host is the host siphon presents in its own Contact toward the caller, on this response and every later one and every request it sends the caller, for a peer that identifies the tenant by that host; fixed once an 18x or 2xx went out, when another host is invalid_state. contact_user is the user part of that Contact (an RFC 3261 user; userless by default), fixed the same way"),
                 verb("ring", "Send 180 Ringing to the parked A-leg — alerting only, no early media (RFC 3261 §13.2.1); a body is refused, use progress for that (args: reason, contact_host, contact_user, as for answer)"),
                 verb("progress", "Send a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to 183 Session Progress. With anchor (or a profile / ws_uri, which imply it) the SDP is the media engine's and a later answer repeats it — how ringback or an announcement plays before answering (args: code, reason, body, content_type, anchor, profile, ws_uri, contact_host, contact_user, as for answer)"),
-                verb("reject", "Send a final non-2xx and tear the call down (args: code, reason)"),
+                verb("reject", "Send a final non-2xx and tear the call down (args: code, reason). On a recording session (StasisStart kind: siprec), refuse it before anything is anchored"),
+                verb("accept", "Accept a recording session (StasisStart kind: siprec): answer 200 and record each stream (args: profile, format=wav|ogg_opus, bitrate_bps (ogg_opus only), channels=mono, path: an absolute directory siphon names the files in). No accept or reject within the handoff deadline refuses it 503"),
                 verb("hangup", "BYE an answered call, or reject an unanswered one (args: reason)"),
                 verb("drop", "Abandon an unanswered call with NOTHING on the wire — no final response, no CANCEL (the 100 Trying siphon sent when the INVITE arrived has already gone) — and release it, so an unsolicited INVITE costs a scanner silence instead of a 404 that confirms the number it probed (args: reason, ban). Refused on an answered call, whose dialog is owed a BYE (RFC 3261 §15) — that is hangup. The reason reaches the log and the CDR, which records disconnect_initiator=control with no response code. With ban=true the caller's source is also scored in the auto-ban store (needs security.failed_auth_ban; strong weight over a stream transport, weight 1 over UDP where the source can be forged; trusted_cidrs never), so a source that keeps sending unwanted calls is banned"),
                 verb("refer", "Send an in-dialog REFER on the A-leg; the reply reports only that it was sent, the far end's verdict arrives as TransferProgress then TransferCompleted / TransferFailed (args: to, replaces)"),
@@ -311,7 +312,8 @@ const MODULE_VERB: &str = "originate";
 /// The guard reads these tables rather than a list of its own, and sends every
 /// verb in them through `apply`: a name here with no arm in [`apply_sip`], or an
 /// arm there with no name here, is answered `unsupported_verb` and fails it.
-const SIP_VERBS: [&str; 17] = [
+const SIP_VERBS: [&str; 18] = [
+    "accept",
     "answer",
     "ring",
     "progress",
@@ -365,7 +367,23 @@ fn apply_sip(command: AdapterCommand) -> ControlResult {
         Err(result) => return result,
     };
 
+    // A recording session (the SRS role) has a verb set of its own.
+    if let Some(recording_call_id) = channel
+        .call_actor_id
+        .strip_prefix(crate::dispatcher::srs::SRS_ACTOR_PREFIX)
+    {
+        return crate::dispatcher::srs::srs_control_verb(
+            recording_call_id,
+            &command.verb,
+            &command.args,
+        );
+    }
+
     match command.verb.as_str() {
+        "accept" => ControlResult::error(
+            ControlErrorCode::InvalidState,
+            "accept applies to a recording session (kind: siprec); answer a call with answer",
+        ),
         "answer" => answer(&channel, &command.args, true),
         "ring" => ring(&channel, &command.args),
         "progress" => answer(&channel, &command.args, false),

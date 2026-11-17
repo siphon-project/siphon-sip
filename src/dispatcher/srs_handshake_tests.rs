@@ -11,10 +11,10 @@ use super::test_dispatcher::test_dispatcher;
 use super::*;
 use crate::rtpengine::test_native_engine::NativeTestEngine;
 
-const SRC: &str = "198.51.100.20:5060";
+pub(super) const SRC: &str = "198.51.100.20:5060";
 
 /// A dispatcher with the SRS on, its media on `engine`.
-fn srs_state(
+pub(super) fn srs_state(
     engine: &NativeTestEngine,
     recording_dir: &std::path::Path,
 ) -> (Arc<DispatcherState>, flume::Receiver<OutboundMessage>) {
@@ -30,16 +30,17 @@ fn srs_state(
             file: None,
             http: None,
             rtpengine_profile: "srs_recording".to_string(),
+            app: None,
         },
     )));
     (Arc::new(dispatcher.state), dispatcher.udp)
 }
 
-fn srs(state: &DispatcherState) -> &crate::srs::SrsManager {
+pub(super) fn srs(state: &DispatcherState) -> &crate::srs::SrsManager {
     state.srs_manager.as_deref().expect("the SRS is on")
 }
 
-fn scratch_dir(name: &str) -> std::path::PathBuf {
+pub(super) fn scratch_dir(name: &str) -> std::path::PathBuf {
     let directory = std::env::temp_dir().join(format!(
         "siphon-srs-handshake-{name}-{}",
         uuid::Uuid::new_v4().simple()
@@ -49,7 +50,7 @@ fn scratch_dir(name: &str) -> std::path::PathBuf {
 }
 
 /// An SDP offer of `streams` sendonly audio m-lines, labelled 1, 2, ...
-fn offer(streams: usize) -> String {
+pub(super) fn offer(streams: usize) -> String {
     let mut sdp = String::from(concat!(
         "v=0\r\n",
         "o=src 1 1 IN IP4 198.51.100.20\r\n",
@@ -68,7 +69,7 @@ fn offer(streams: usize) -> String {
 }
 
 /// Complete metadata for a two-party call recorded on `streams` streams.
-fn metadata(streams: usize) -> String {
+pub(super) fn metadata(streams: usize) -> String {
     let mut xml = String::from(concat!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n",
         "<recording xmlns=\"urn:ietf:params:xml:ns:recording:1\">\r\n",
@@ -92,7 +93,7 @@ fn metadata(streams: usize) -> String {
 }
 
 /// A multipart SIPREC body with `sdp` and `xml`.
-fn multipart(sdp: &str, xml: &str) -> String {
+pub(super) fn multipart(sdp: &str, xml: &str) -> String {
     format!(
         concat!(
             "--srs-boundary\r\n",
@@ -113,7 +114,7 @@ fn multipart(sdp: &str, xml: &str) -> String {
 
 /// The SRC's request: `markers` false leaves out both RFC 7866 markers.
 #[allow(clippy::too_many_arguments)]
-fn request(
+pub(super) fn request(
     method: &str,
     call_id: &str,
     branch: &str,
@@ -158,7 +159,7 @@ fn request(
     raw
 }
 
-fn siprec_invite(call_id: &str, streams: usize, markers: bool) -> String {
+pub(super) fn siprec_invite(call_id: &str, streams: usize, markers: bool) -> String {
     request(
         "INVITE",
         call_id,
@@ -171,7 +172,7 @@ fn siprec_invite(call_id: &str, streams: usize, markers: bool) -> String {
     )
 }
 
-fn send(state: &Arc<DispatcherState>, raw: &str) {
+pub(super) fn send(state: &Arc<DispatcherState>, raw: &str) {
     let message = parse_sip_message_bytes(raw.as_bytes()).expect("the request parses");
     let method = message
         .method()
@@ -182,7 +183,7 @@ fn send(state: &Arc<DispatcherState>, raw: &str) {
 }
 
 /// Everything sent so far, parsed.
-fn drain(udp: &flume::Receiver<OutboundMessage>) -> Vec<SipMessage> {
+pub(super) fn drain(udp: &flume::Receiver<OutboundMessage>) -> Vec<SipMessage> {
     let mut sent = Vec::new();
     while let Ok(outbound) = udp.try_recv() {
         if let Ok(message) = parse_sip_message_bytes(&outbound.data) {
@@ -194,7 +195,7 @@ fn drain(udp: &flume::Receiver<OutboundMessage>) -> Vec<SipMessage> {
 
 /// Wait up to two seconds for a response `code` to `method`, collecting
 /// everything sent meanwhile.
-async fn await_response(
+pub(super) async fn await_response(
     udp: &flume::Receiver<OutboundMessage>,
     seen: &mut Vec<SipMessage>,
     code: u16,
@@ -221,7 +222,7 @@ async fn await_response(
     );
 }
 
-fn count(seen: &[SipMessage], code: u16, method: &str) -> usize {
+pub(super) fn count(seen: &[SipMessage], code: u16, method: &str) -> usize {
     seen.iter()
         .filter(|message| {
             message.status_code() == Some(code)
@@ -233,20 +234,20 @@ fn count(seen: &[SipMessage], code: u16, method: &str) -> usize {
         .count()
 }
 
-fn body(message: &SipMessage) -> String {
+pub(super) fn body(message: &SipMessage) -> String {
     String::from_utf8_lossy(&message.body).into_owned()
 }
 
-fn to_tag(response: &SipMessage) -> String {
+pub(super) fn to_tag(response: &SipMessage) -> String {
     let to = response.headers.to().expect("a To");
     to.split("tag=").nth(1).expect("a To-tag").to_string()
 }
 
-fn m_lines(sdp: &str) -> Vec<&str> {
+pub(super) fn m_lines(sdp: &str) -> Vec<&str> {
     sdp.lines().filter(|line| line.starts_with("m=")).collect()
 }
 
-async fn eventually(check: impl Fn() -> bool) -> bool {
+pub(super) async fn eventually(check: impl Fn() -> bool) -> bool {
     for _ in 0..200 {
         if check() {
             return true;
@@ -403,6 +404,7 @@ async fn an_unknown_profile_refuses_the_recording() {
             file: None,
             http: None,
             rtpengine_profile: "no_such_profile".to_string(),
+            app: None,
         },
     )));
     let (state, udp) = (Arc::new(dispatcher.state), dispatcher.udp);

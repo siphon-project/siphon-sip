@@ -16,11 +16,15 @@
 
 use super::*;
 
+mod control;
 mod in_dialog;
 mod invite;
 mod media;
 mod script;
 
+#[cfg(test)]
+pub(crate) use control::srs_control_verb_in;
+pub(crate) use control::{srs_control_verb, srs_terminate_session, SRS_ACTOR_PREFIX};
 pub(super) use in_dialog::{handle_srs_cancel, srs_unacked_answer_terminate};
 
 /// Methods the SRS answers in a recording dialog (RFC 3261 §20.5).

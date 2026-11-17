@@ -2141,6 +2141,8 @@ auth:
 #   recording_dir: "/var/lib/siphon/recordings"  # base directory for recordings
 #   max_sessions: 1000                # maximum concurrent recording sessions
 #   rtpengine_profile: "srs_recording"  # media profile each stream is answered with (built-in or media.profiles)
+#   app: recorder                     # optional: offer each session to this control.apps
+#                                     # entry (StasisStart kind: siprec); it accepts or rejects
 #   backend: file                     # storage backend: "file" or "http"
 #   file:
 #     base_dir: "/var/lib/siphon/recordings"

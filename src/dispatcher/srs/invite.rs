@@ -4,7 +4,7 @@
 use super::*;
 use crate::siprec::metadata::{DataMode, RecordingMetadata};
 use crate::siprec::srs_sdp::OfferedStream;
-use crate::srs::{CreateSessionError, SrsManager, SrsPeer};
+use crate::srs::{CreateSessionError, SrsDecision, SrsManager, SrsPeer};
 
 /// What a request on a recording dialog carried: an SDP offer, recording
 /// metadata, both, or neither.
@@ -258,12 +258,16 @@ impl PendingInvite {
         metadata: RecordingMetadata,
         state: &Arc<DispatcherState>,
     ) {
-        if !script::invite_accepted(state, &metadata, &self.call_id).await {
-            info!(call_id = %self.call_id, "SRS: recording rejected by script");
-            self.refuse(403, "Forbidden", state);
-            return;
+        match self.decision(&offer, &metadata, state).await {
+            SrsDecision::Accept(options) => self.srs_manager.set_recording(&self.call_id, options),
+            SrsDecision::Reject { code, reason } => {
+                info!(call_id = %self.call_id, code, "SRS: recording rejected");
+                self.refuse(code, &reason, state);
+                return;
+            }
         }
 
+        let recording = self.srs_manager.recording(&self.call_id);
         let recording_dir = self
             .srs_manager
             .recording_dir(&self.call_id)
@@ -273,6 +277,7 @@ impl PendingInvite {
             from_tag: &self.from_tag,
             source_ip: self.inbound.remote_addr.ip(),
             recording_dir: &recording_dir,
+            recording: &recording,
         };
         let anchored = match media::anchor_streams(
             state,
@@ -332,6 +337,38 @@ impl PendingInvite {
         );
     }
 
+    /// Whether to record, and how: the control application's decision when
+    /// `srs.app` names one, otherwise the `@srs.on_invite` hooks'.
+    async fn decision(
+        &self,
+        offer: &[OfferedStream],
+        metadata: &RecordingMetadata,
+        state: &Arc<DispatcherState>,
+    ) -> SrsDecision {
+        if let Some(app) = self.srs_manager.config().app.clone() {
+            return control::offer_to_application(
+                control::Offered {
+                    app: &app,
+                    inbound: &self.inbound,
+                    message: &self.message,
+                    call_id: &self.call_id,
+                    metadata,
+                    offer,
+                },
+                &self.srs_manager,
+            )
+            .await;
+        }
+        if script::invite_accepted(state, metadata, &self.call_id).await {
+            SrsDecision::Accept(crate::srs::RecordingOptions::default())
+        } else {
+            SrsDecision::Reject {
+                code: 403,
+                reason: "Forbidden".to_string(),
+            }
+        }
+    }
+
     /// The 200 carrying `sdp`.
     fn answer(&self, sdp: &[u8], state: &DispatcherState) -> SipMessage {
         let contact = self
@@ -364,6 +401,12 @@ impl PendingInvite {
             .claim_final_response(&self.call_id, response.clone())
         {
             send_response(&self.inbound, &self.message, response, state);
+            control_notify_terminated_with_cause(
+                &self.call_id,
+                "rejected",
+                Some(code),
+                Some(reason),
+            );
         }
         self.srs_manager.stop_session(&self.call_id);
     }

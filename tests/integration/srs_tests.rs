@@ -23,6 +23,7 @@ fn sample_srs_config() -> SrsConfig {
         file: None,
         http: None,
         rtpengine_profile: "srs_recording".to_string(),
+        app: None,
     }
 }
 
@@ -281,6 +282,7 @@ async fn srs_file_storage_writes_metadata() {
         }),
         http: None,
         rtpengine_profile: "srs_recording".to_string(),
+        app: None,
     };
 
     let manager = SrsManager::new(config.clone());

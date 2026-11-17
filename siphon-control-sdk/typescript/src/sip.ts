@@ -1014,6 +1014,18 @@ export type RecordChannels = "mono" | "stereo";
  */
 export type RecordFormat = "wav" | "ogg_opus";
 
+/** How an accepted recording session is recorded ({@link Call.acceptRecording}). */
+export interface RecordingAcceptOptions {
+  /** A media profile in place of `srs.rtpengine_profile`. */
+  profile?: string;
+  /** The file format; unset is `wav`. */
+  format?: RecordFormat;
+  /** Opus target bitrate (`ogg_opus` only). */
+  bitrateBps?: number;
+  /** An absolute directory siphon writes the files to; it names them. */
+  path?: string;
+}
+
 /** Optional shaping for {@link Call.recordStart}. */
 export interface RecordOptions {
   /** Which side to record (`"ingress"` server-side when unset). */
@@ -1490,6 +1502,29 @@ export class Call {
    */
   async progress(options?: ResponseOptions): Promise<void> {
     await this.sip(SipVerb.Progress, options ? responseArgs(options) : {});
+  }
+
+  /**
+   * Accept a recording session (`StasisStart` with `kind: "siprec"`): siphon
+   * answers the recording client and records each stream as `options` say.
+   * Unset fields take siphon's `srs:` configuration. Refuse one with
+   * {@link Call.reject}.
+   */
+  async acceptRecording(options: RecordingAcceptOptions = {}): Promise<void> {
+    const args: Record<string, unknown> = {};
+    if (options.profile !== undefined) {
+      args.profile = options.profile;
+    }
+    if (options.format !== undefined) {
+      args.format = options.format;
+    }
+    if (options.bitrateBps !== undefined) {
+      args.bitrate_bps = options.bitrateBps;
+    }
+    if (options.path !== undefined) {
+      args.path = options.path;
+    }
+    await this.sip(SipVerb.Accept, args);
   }
 
   /** Send a final non-2xx and tear the call down. */

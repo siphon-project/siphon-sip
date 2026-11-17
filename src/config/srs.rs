@@ -47,6 +47,12 @@ pub struct SrsConfig {
     /// RTPEngine media profile to use for recording. Default: "srs_recording".
     #[serde(default = "default_srs_rtpengine_profile")]
     pub rtpengine_profile: String,
+    /// The control application (a `control.apps` name) every recording session
+    /// is offered to before it is answered (`StasisStart` with `kind:
+    /// "siprec"`), which accepts or rejects it. Unset, the `@srs.*` script hooks
+    /// decide, as before.
+    #[serde(default)]
+    pub app: Option<String>,
 }
 
 /// SRS file backend — writes JSON metadata alongside audio files.
@@ -83,4 +89,42 @@ fn default_srs_backend() -> String {
 }
 fn default_srs_rtpengine_profile() -> String {
     "srs_recording".to_string()
+}
+
+impl SrsConfig {
+    /// Refuse an `srs:` block siphon could not serve.
+    ///
+    /// `enabled` needs the siphon-rtp media backend: the SRS answers each
+    /// recorded stream receive-only on a single-leg engine call of its own (RFC
+    /// 7866 §8.1; §8.1.8: an SRS does not normally send RTP), which only the
+    /// siphon-rtp engine has a verb for (`answer_local`). rtpengine and rtpproxy
+    /// can only relay, so on them every recording would be refused, and a node
+    /// that boots like that is worse than one that does not.
+    ///
+    /// `app` must be one of the configured control apps (`apps`): every
+    /// session would otherwise be offered to an application that cannot
+    /// connect, and refused at its deadline.
+    pub fn validate(&self, backend: super::MediaBackendKind, apps: &[&str]) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if backend != super::MediaBackendKind::SiphonRtp {
+            return Err(format!(
+                "srs.enabled is true, but media.backend is {:?}, which cannot terminate a \
+                 recording: the SRS answers each stream receive-only on its own single-leg \
+                 engine call, which only the siphon-rtp media engine supports. Set \
+                 media.backend to \"siphon-rtp\", or turn srs off.",
+                backend.as_str(),
+            ));
+        }
+        match &self.app {
+            Some(app) if !apps.contains(&app.as_str()) => Err(format!(
+                "srs.app is {app:?}, which is not one of the configured control.apps ({}). \
+                 Every recording session would be offered to an application that cannot \
+                 connect, and refused at its deadline.",
+                apps.join(", "),
+            )),
+            _ => Ok(()),
+        }
+    }
 }

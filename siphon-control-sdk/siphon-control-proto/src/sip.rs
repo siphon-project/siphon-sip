@@ -142,6 +142,11 @@ pub enum SipVerb {
     /// named. The reply is the accept; `RecordingFinished` is what says the file
     /// is closed and names its path.
     RecordStop,
+    /// Accept a recording session (`StasisStart` with `kind: "siprec"`): siphon
+    /// answers the SRC 200 and records each stream. Its arguments set how
+    /// (`profile`, `format`, `bitrate_bps`, `path`). [`SipVerb::Reject`] refuses
+    /// one; neither within the handoff deadline refuses it `503`.
+    Accept,
 }
 
 impl SipVerb {
@@ -177,6 +182,7 @@ impl SipVerb {
             SipVerb::StreamStop => "stream_stop",
             SipVerb::RecordStart => "record_start",
             SipVerb::RecordStop => "record_stop",
+            SipVerb::Accept => "accept",
         }
     }
 }
@@ -1384,6 +1390,7 @@ mod tests {
         assert_eq!(SipVerb::RecordStop.to_string(), "record_stop");
         // The silent teardown, distinct from `reject` and `hangup` — both of
         // those put a final response on the wire.
+        assert_eq!(SipVerb::Accept.as_str(), "accept");
         assert_eq!(SipVerb::Reject.as_str(), "reject");
         assert_eq!(SipVerb::Hangup.as_str(), "hangup");
         assert_eq!(SipVerb::Drop.to_string(), "drop");

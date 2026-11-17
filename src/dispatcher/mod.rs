@@ -93,7 +93,7 @@ mod response_builder;
 mod rtpengine_events;
 mod sanitize;
 mod send;
-mod srs;
+pub(crate) mod srs;
 mod stale_shed;
 mod state;
 mod sweep;
@@ -400,6 +400,8 @@ mod shutdown_teardown_tests;
 mod single_listener_snapshot_tests;
 #[cfg(test)]
 mod spiral_invite_tests;
+#[cfg(test)]
+mod srs_control_tests;
 #[cfg(test)]
 mod srs_handshake_tests;
 #[cfg(test)]

@@ -62,6 +62,9 @@ pub(super) struct StreamOwner<'a> {
     pub(super) from_tag: &'a str,
     pub(super) source_ip: std::net::IpAddr,
     pub(super) recording_dir: &'a Path,
+    /// How its streams are recorded; the profile, when it names none, is
+    /// `srs.rtpengine_profile`.
+    pub(super) recording: &'a crate::srs::RecordingOptions,
 }
 
 /// An offered m-section with its direction attribute left out: two offers of a
@@ -100,8 +103,13 @@ pub(super) async fn anchor_streams(
     owner: &StreamOwner<'_>,
     offered: &[OfferedStream],
     existing: &[SrsStream],
-    profile_name: &str,
+    default_profile: &str,
 ) -> Result<Anchored, AnchorError> {
+    let profile_name = owner
+        .recording
+        .profile
+        .as_deref()
+        .unwrap_or(default_profile);
     let backend = state
         .rtpengine_set
         .as_ref()
@@ -215,15 +223,19 @@ async fn answer_stream(
         .answer_local(&engine_call_id, owner.from_tag, &stream.sdp, flags)
         .await
         .map_err(|error| error.to_string())?;
+    let extension = match owner.recording.format {
+        RecordingFormat::Wav => "wav",
+        RecordingFormat::OggOpus => "ogg",
+    };
     let file = owner.recording_dir.join(format!(
-        "stream-{}-{}.wav",
+        "stream-{}-{}.{extension}",
         stream.index,
         &uuid::Uuid::new_v4().simple().to_string()[..8],
     ));
     let path = file.display().to_string();
     let request = RecordingRequest {
-        format: RecordingFormat::Wav,
-        bitrate_bps: None,
+        format: owner.recording.format,
+        bitrate_bps: owner.recording.bitrate_bps,
         direction: RecordingDirection::Ingress,
         channels: RecordingChannels::Mono,
         max_duration_ms: None,
