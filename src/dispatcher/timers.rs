@@ -448,6 +448,12 @@ pub(super) fn process_timer_actions_with_followups(
             Action::Timeout if is_register_branch(&key.branch) => {
                 registrant_transaction_timed_out(key, state);
             }
+            // A request the UAC sender originated: whoever waits for its final
+            // response is told it timed out (Timer F, RFC 3261 §17.1.2.2).
+            Action::Timeout if crate::uac::is_uac_branch(&key.branch) => {
+                debug!(key = %key, "UAC request unanswered at Timer F");
+                state.uac_sender.expire_branch(&key.branch);
+            }
             Action::Timeout => {
                 // RFC 3261 §16.7 step 2: when a client transaction times out
                 // (Timer B for INVITE, Timer F otherwise), the proxy MUST

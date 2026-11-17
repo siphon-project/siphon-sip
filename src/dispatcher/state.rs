@@ -593,12 +593,19 @@ impl DrainState {
     /// The registrant's own REGISTERs are not counted: shutdown waits for its
     /// de-registrations separately, under a bound of their own
     /// (`registrant::await_deregistrations`), and one left unanswered must not
-    /// hold the drain until its Timer F.
+    /// hold the drain until its Timer F. Nor are the requests the UAC sender
+    /// originates: nothing upstream waits on one, and each would hold the
+    /// drain for Timer K after its answer, or until Timer F without one.
     pub fn active_counts(&self) -> (usize, usize) {
         let txs = self
             .transaction_manager
             .get()
-            .map(|tm| tm.count_where(|key| !super::is_register_branch(&key.branch)))
+            .map(|tm| {
+                tm.count_where(|key| {
+                    !super::is_register_branch(&key.branch)
+                        && !crate::uac::is_uac_branch(&key.branch)
+                })
+            })
             .unwrap_or(0);
         let calls = self
             .call_actors
