@@ -70,6 +70,33 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`script.gc`: freeze startup objects and raise the collection threshold.**
+  On free-threaded Python every garbage collection stops all threads and
+  walks the whole heap, so it takes as long as the heap is large (about 35 ms
+  for 2 million tracked objects) however little it frees.
+  `script.gc.freeze_after_load: true` runs one full collection and
+  `gc.freeze()` once the script and the extensions have loaded, so later
+  collections skip everything alive at that point (35 ms to 17 ms on that
+  heap). It is done once: a reload does not freeze again, the startup copy of
+  the script's modules stays allocated after the first reload, and reloaded
+  modules are collected as usual. `script.gc.threshold: N` is
+  `gc.set_threshold(N)`: a collection is considered once more than N container
+  objects are new, and runs when memory grew by a tenth or once 40 x N have
+  been set aside (80,000 with CPython's default of 2000). 0 and values above
+  53687091 are
+  refused at startup. Set the two together: a frozen heap no longer holds
+  collections back, so the freeze alone makes them shorter and far more
+  frequent, and siphon warns about that at startup. Both default to leaving
+  CPython alone. See "Tuning the
+  garbage collector" in `docs/handler-execution-model.md`.
+- **What Python's collections free.**
+  `siphon_python_gc_collected_total{generation}` and
+  `siphon_python_gc_uncollectable_total{generation}` from the collector's own
+  report, `siphon_python_gc_young_objects` (`gc.get_count()[0]`, read once a
+  second) and `siphon_python_gc_frozen_objects` (set once by the freeze).
+  CPython does not expose how many objects the collector tracks without a walk
+  of the heap, so there is no gauge of that.
+
 - Inbound Diameter requests can be answered by Rust handlers registered at
   server start (`SiphonServer::register_diameter_handlers`); the
   `siphon_diameter_inbound_*` metrics gain a `path` label (`script` | `native`).
