@@ -38,7 +38,7 @@ pub(super) fn handle_registrant_response(
     // A retransmitted final response is absorbed by the client transaction
     // (RFC 3261 17.1.2.2): acting on a repeated 401 again would start a second
     // authentication.
-    if !drive_register_transaction(message, status_code, state) {
+    if !drive_client_transaction(message, status_code, state) {
         debug!(
             status_code,
             "registrant: response absorbed by its client transaction"
@@ -516,60 +516,8 @@ impl crate::registrant::RegisterTransactions for RegisterTransactionLayer {
         request: &SipMessage,
         message: &crate::transport::OutboundMessage,
     ) -> Result<(), String> {
-        let (key, actions) = self.transactions.new_client_transaction(
-            request,
-            message.data.clone(),
-            crate::transaction::state::Transport::from(message.transport),
-        )?;
-        // The first send is the caller's; only the timers are armed here:
-        // Timer F always, Timer E over UDP only (RFC 3261 17.1.2.2).
-        for action in actions {
-            if let Action::StartTimer(name, duration) = action {
-                self.timer_wheel.insert(
-                    format!("{key}:{name:?}"),
-                    Box::new(TimerEntry {
-                        key: key.clone(),
-                        name,
-                        fires_at: std::time::Instant::now() + duration,
-                        destination: Some(message.destination),
-                        transport: Some(message.transport),
-                        connection_id: Some(message.connection_id),
-                        source_local_addr: message.source_local_addr,
-                    }),
-                );
-            }
-        }
-        Ok(())
+        open_client_transaction(&self.transactions, &self.timer_wheel, request, message).map(|_| ())
     }
-}
-
-/// Feed a response on a registrant branch to its REGISTER's client
-/// transaction. `false` when the transaction absorbed it (a repeat of the final
-/// response it already passed on), which the registrant must not act on twice;
-/// `true` otherwise, including for a response with no transaction left.
-fn drive_register_transaction(
-    message: &SipMessage,
-    status_code: u16,
-    state: &DispatcherState,
-) -> bool {
-    let Ok(key) = TransactionManager::key_from_message(message) else {
-        return true;
-    };
-    let event = if status_code < 200 {
-        NictEvent::Provisional(message.clone())
-    } else {
-        NictEvent::FinalResponse(message.clone())
-    };
-    let Ok(actions) = state
-        .transaction_manager
-        .process_client_event(&key, ClientEvent::Nict(event))
-    else {
-        return true;
-    };
-    process_timer_actions(&actions, &key, None, None, None, None, state);
-    actions
-        .iter()
-        .any(|action| matches!(action, Action::PassToTu(_)))
 }
 
 /// Timer F of a registrant REGISTER fired (RFC 3261 17.1.2.2): the entry
