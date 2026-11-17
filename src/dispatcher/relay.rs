@@ -389,7 +389,8 @@ pub(super) fn relay_request(
     // transport is the flow's.  Toward a UE with a security association the
     // TCP path is the P-CSCF's own connection to the UE's protected server
     // port (see `over_mtu_upgrade`), and the protected source and Via follow
-    // it.  The `state.mtu.is_some()` guard keeps the serialise off the hot path.
+    // it.  The `state.mtu.is_some()` guard keeps the serialise off the default
+    // hot path.
     //
     // Over siphon's own UE flow (the registrant's SA) the switch is the same
     // rule on the flow's own connection (`flow_over_mtu_upgrade`); the Via
