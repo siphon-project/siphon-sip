@@ -1134,6 +1134,13 @@ auth:
 #     # tls: {ca_file: /etc/siphon/redis-ca.pem}, or ?ca_file=... in the url
 #     local_ttl_secs: 60       # optional in-process LRU in front of Redis
 #     local_max_entries: 10000
+#     # Each cache's Redis is probed once a second. While it is unreachable,
+#     # cache calls fail at once (fetch -> None, store -> False) and the gauge
+#     # siphon_cache_backend_up{cache} reads 0. Set true for a cache the node
+#     # cannot serve without: /admin/ready then answers 503 while its Redis is
+#     # unreachable, so the node leaves rotation. Off by default, because with
+#     # one Redis shared by every node that pulls all of them together.
+#     required_for_readiness: false   # default
 
 # ---------------------------------------------------------------------------
 # Media engine (rtpengine, native siphon-rtp, or classic rtpproxy)

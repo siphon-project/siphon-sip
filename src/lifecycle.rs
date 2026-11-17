@@ -69,6 +69,12 @@ impl Participants {
         }
     }
 
+    /// How many participants are registered.
+    #[cfg(test)]
+    pub(crate) fn registered_count(&self) -> usize {
+        self.snapshot().len()
+    }
+
     /// Clone of the list, so no lock is held while a callback runs.
     fn snapshot(&self) -> Vec<Arc<dyn LifecycleParticipant>> {
         self.registered

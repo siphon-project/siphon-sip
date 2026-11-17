@@ -1884,6 +1884,84 @@ mod tests {
         assert_eq!(json["reason"], "no upstream peer up");
     }
 
+    /// A cache as configured by default never holds readiness back: its Redis
+    /// refusing shows in the gauge, and the probe keeps answering 200.
+    #[cfg(feature = "redis-backend")]
+    #[tokio::test]
+    async fn ready_stays_200_while_a_cache_not_marked_required_cannot_reach_its_redis() {
+        let (state, drain) = state_with_participants(&[]);
+        let name = "admin_ready_unmarked";
+        let caches = Arc::new(crate::cache::CacheManager::new(&[
+            crate::config::NamedCacheConfig {
+                name: name.to_string(),
+                // Nothing listens on port 1: every connect is refused.
+                target: ("redis://127.0.0.1:1".to_string()).into(),
+                local_ttl_secs: None,
+                local_max_entries: None,
+                required_for_readiness: false,
+            },
+        ]));
+        caches.watch_backends(&drain.participants);
+        // Up to the first failed probe, and for a while after it: the fetch
+        // is refused at once only after the backend was found down.
+        let mut found_down = false;
+        for _ in 0..200 {
+            let response = router(state.clone(), None, false)
+                .oneshot(Request::get("/admin/ready").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_of(response).await["status"], "ready");
+            if found_down {
+                break;
+            }
+            let before = crate::metrics::cache::errors(name, "get");
+            assert!(caches.fetch(name, "key").await.is_none());
+            found_down = crate::metrics::cache::errors(name, "get") > before
+                && !crate::metrics::cache::backend_up(name);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(found_down, "the unreachable backend was never noticed");
+        assert!(!crate::metrics::cache::backend_up(name));
+    }
+
+    /// A cache marked required whose Redis refuses takes the node out of
+    /// rotation through the probe an orchestrator reads.
+    #[cfg(feature = "redis-backend")]
+    #[tokio::test]
+    async fn ready_returns_503_while_a_required_cache_cannot_reach_its_redis() {
+        let (state, drain) = state_with_participants(&[]);
+        let caches = Arc::new(crate::cache::CacheManager::new(&[
+            crate::config::NamedCacheConfig {
+                name: "admin_ready_flows".to_string(),
+                // Nothing listens on port 1: every connect is refused.
+                target: ("redis://127.0.0.1:1".to_string()).into(),
+                local_ttl_secs: None,
+                local_max_entries: None,
+                required_for_readiness: true,
+            },
+        ]));
+        caches.watch_backends(&drain.participants);
+        let mut last = serde_json::Value::Null;
+        for _ in 0..200 {
+            let response = router(state.clone(), None, false)
+                .oneshot(Request::get("/admin/ready").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            last = json_of(response).await;
+            if last["reason"] == "cache 'admin_ready_flows': Redis backend unreachable" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(last["status"], "not_ready");
+        assert_eq!(
+            last["reason"],
+            "cache 'admin_ready_flows': Redis backend unreachable"
+        );
+    }
+
     #[tokio::test]
     async fn ready_is_200_when_every_participant_is_ready() {
         use crate::lifecycle::test_support::FakeParticipant;
