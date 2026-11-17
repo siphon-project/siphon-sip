@@ -98,6 +98,10 @@ pub(crate) const NATIVE_ENGINE_FAR_OFFER: &str = concat!(
 /// far party that picks a codec its offer did not list.
 pub(crate) const NATIVE_ENGINE_UNOFFERED_CODEC: &str = "G729/8000";
 
+/// An attribute that makes the engine refuse the `answer_local` whose SDP
+/// carries it, as the real one refuses an offer it has no stream for.
+pub(crate) const NATIVE_ENGINE_REFUSED_OFFER: &str = "a=x-test-refused";
+
 /// One media command the engine was sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeCommand {
@@ -109,7 +113,8 @@ pub(crate) struct NativeCommand {
     pub(crate) from_tag: String,
     /// What the command carried that a test asserts on: the tone a
     /// `play_media` plays (`None` for any other source), the `play_id` a
-    /// `stop_media` targets (`None` for a stop of everything).
+    /// `stop_media` targets (`None` for a stop of everything), the SDP an
+    /// `answer_local` is asked to answer.
     pub(crate) detail: Option<String>,
     /// The `repeat_times` a `play_media` carried, as it is on the wire: a
     /// count, or `inf`. `None` when the command named none.
@@ -329,6 +334,9 @@ fn seat_command(command: &Command) -> (Option<Recorded>, Option<String>, bool, b
 /// starts `full-`.
 fn seat_refusal(command: &Command) -> Option<String> {
     match command {
+        Command::AnswerLocal { sdp, .. } if sdp.contains(NATIVE_ENGINE_REFUSED_OFFER) => {
+            Some("answer_local: no stream of the offer can be answered".to_string())
+        }
         Command::ConferenceSeat { conference_id, .. } if conference_id.starts_with("full-") => {
             Some(format!(
                 "conference_seat: conference {conference_id} is full"
@@ -440,10 +448,11 @@ impl NativeTestEngine {
                                 call_id,
                                 from_tag,
                                 profile,
-                                ..
+                                sdp,
                             } => (
                                 Some(Recorded {
                                     profile: Some(profile.clone()),
+                                    detail: Some(sdp.clone()),
                                     ..Recorded::new("answer_local", call_id, from_tag)
                                 }),
                                 Some(NATIVE_ENGINE_ANSWER.to_string()),

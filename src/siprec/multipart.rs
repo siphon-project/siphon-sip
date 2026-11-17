@@ -119,12 +119,12 @@ pub fn parse_multipart(content_type: &str, body: &[u8]) -> Result<Vec<MimePart>,
         // Extract Content-Type from the part headers.
         let mut part_content_type = None;
         for line in header_block.lines() {
-            let line = line.trim();
-            if let Some(value) = line
-                .strip_prefix("Content-Type:")
-                .or_else(|| line.strip_prefix("content-type:"))
-            {
-                part_content_type = Some(value.trim().to_string());
+            // A header field name is matched whatever its case (RFC 2045 §3,
+            // RFC 5322 §1.2.2).
+            if let Some((name, value)) = line.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("content-type") {
+                    part_content_type = Some(value.trim().to_string());
+                }
             }
         }
 
@@ -317,5 +317,15 @@ mod tests {
         assert_eq!(parts[0].content_type, "text/plain");
         assert_eq!(parts[1].content_type, "text/html");
         assert_eq!(parts[2].content_type, "application/json");
+    }
+
+    #[test]
+    fn a_part_header_name_is_matched_whatever_its_case() {
+        for name in ["CONTENT-TYPE", "Content-type", "content-Type "] {
+            let body = format!("--b\r\n{name}: application/sdp\r\n\r\nv=0\r\n--b--\r\n");
+            let parts = parse_multipart("multipart/mixed;boundary=b", body.as_bytes())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(parts[0].content_type, "application/sdp", "{name}");
+        }
     }
 }

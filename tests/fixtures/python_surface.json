@@ -1902,7 +1902,7 @@
       "answer": {
         "doc": "Answer the offer here and relay nothing to the other party, which",
         "kind": "method_descriptor",
-        "sig": "($self, sdp=None)"
+        "sig": "($self, sdp=None, body=None, content_type=None, headers=None)"
       },
       "answer_direction": {
         "doc": "Which way ``answer_sdp`` has media flow, for the party that answered",

@@ -124,7 +124,124 @@ pub fn strip_sdp_attributes(content_type: &str, body: &mut Vec<u8>, names: &[Str
     })
 }
 
-/// Where a line of a multipart body sits, for [`strip_sdp_attributes`].
+/// A body siphon sends carrying `sdp` beside what a script gave it to send:
+/// the `Content-Type` and the bytes.
+///
+/// A session description rides with other content as one part of a
+/// `multipart/*` body (RFC 5621 §3), whatever the other parts are: a
+/// service's own XML document, a location object. What the script gave is
+/// either such a body already or a single part:
+///
+/// * a `multipart/*` body with an `application/sdp` part: that part's content
+///   becomes `sdp`, and every other part and the framing cross byte for byte;
+/// * a `multipart/*` body without one: an `application/sdp` part is put first,
+///   under the body's own boundary;
+/// * any other type: a `multipart/mixed` body of the SDP part and then the
+///   script's part, under a boundary that occurs in neither (RFC 2046 §5.1.1).
+///
+/// `Err` says why a `multipart/*` body cannot take the part: no `boundary`
+/// parameter, or no delimiter line of that boundary in it.
+pub fn with_sdp_part(
+    content_type: &str,
+    body: &[u8],
+    sdp: &[u8],
+) -> Result<(String, Vec<u8>), String> {
+    if !is_multipart(content_type) {
+        return Ok(mixed_of(sdp, content_type, body));
+    }
+    let boundary = extract_boundary(content_type)
+        .map_err(|error| format!("multipart body cannot take the SDP: {error}"))?;
+    let delimiter = format!("--{boundary}");
+    let has_sdp_part = parse_multipart(content_type, body)
+        .is_ok_and(|parts| parts.iter().any(|part| is_sdp(&part.content_type)));
+    let mut composed = Vec::with_capacity(body.len() + sdp.len() + 64);
+    let mut section = MultipartSection::Outside;
+    let mut placed = false;
+    for line in body.split_inclusive(|byte| *byte == b'\n') {
+        let content = line.strip_suffix(b"\n").unwrap_or(line);
+        let content = content.strip_suffix(b"\r").unwrap_or(content);
+        if let Some(after_delimiter) = content.strip_prefix(delimiter.as_bytes()) {
+            if !placed && !has_sdp_part {
+                // The first delimiter: the SDP part goes ahead of it.
+                composed.extend_from_slice(delimiter.as_bytes());
+                composed.extend_from_slice(b"\r\nContent-Type: application/sdp\r\n\r\n");
+                push_part_content(&mut composed, sdp);
+                placed = true;
+            } else if !placed && matches!(section, MultipartSection::PartBody { sdp: true }) {
+                // The end of the part whose content `sdp` replaces.
+                push_part_content(&mut composed, sdp);
+                placed = true;
+            }
+            section = if after_delimiter.starts_with(b"--") {
+                MultipartSection::Outside
+            } else {
+                MultipartSection::PartHeaders { sdp: false }
+            };
+            composed.extend_from_slice(line);
+            continue;
+        }
+        match section {
+            MultipartSection::PartHeaders { sdp: named } if content.is_empty() => {
+                section = MultipartSection::PartBody { sdp: named };
+            }
+            MultipartSection::PartHeaders { .. } => {
+                if let Some(value) = part_content_type(content) {
+                    section = MultipartSection::PartHeaders { sdp: is_sdp(value) };
+                }
+            }
+            // The content `sdp` replaces: only the first SDP part's.
+            MultipartSection::PartBody { sdp: true } if !placed => continue,
+            MultipartSection::PartBody { .. } | MultipartSection::Outside => {}
+        }
+        composed.extend_from_slice(line);
+    }
+    if !placed {
+        return Err(format!(
+            "multipart body cannot take the SDP: no part delimited by its boundary '{boundary}'"
+        ));
+    }
+    Ok((content_type.trim().to_string(), composed))
+}
+
+/// The content of a part and the line break that belongs to the delimiter
+/// after it (RFC 2046 §5.1.1), so an SDP whose last line ends in CRLF, as
+/// RFC 8866 §5 has every line end, keeps that CRLF as its own.
+fn push_part_content(composed: &mut Vec<u8>, content: &[u8]) {
+    composed.extend_from_slice(content);
+    if !content.ends_with(b"\n") {
+        composed.extend_from_slice(b"\r\n");
+    }
+    composed.extend_from_slice(b"\r\n");
+}
+
+/// A `multipart/mixed` body of `sdp` and then `body` under `content_type`.
+fn mixed_of(sdp: &[u8], content_type: &str, body: &[u8]) -> (String, Vec<u8>) {
+    let contains = |haystack: &[u8], needle: &[u8]| {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    };
+    // A boundary must not occur in any part (RFC 2046 §5.1.1). A random one
+    // does not, and is drawn again in the case it ever does.
+    let boundary = loop {
+        let candidate = format!("siphon-{}", uuid::Uuid::new_v4().as_simple());
+        if !contains(sdp, candidate.as_bytes()) && !contains(body, candidate.as_bytes()) {
+            break candidate;
+        }
+    };
+    let mut composed = Vec::with_capacity(sdp.len() + body.len() + 256);
+    composed.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    composed.extend_from_slice(b"Content-Type: application/sdp\r\n\r\n");
+    push_part_content(&mut composed, sdp);
+    composed.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    composed.extend_from_slice(format!("Content-Type: {}\r\n\r\n", content_type.trim()).as_bytes());
+    composed.extend_from_slice(body);
+    composed.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (format!("multipart/mixed;boundary={boundary}"), composed)
+}
+
+/// Where a line of a multipart body sits, for [`strip_sdp_attributes`] and
+/// [`with_sdp_part`].
 #[derive(Clone, Copy)]
 enum MultipartSection {
     /// The preamble before the first delimiter, or the epilogue after the last.
@@ -386,5 +503,120 @@ mod tests {
             &names(&["x-hidden"])
         ));
         assert_eq!(body, original);
+    }
+
+    const SEAT_SDP: &str = concat!(
+        "v=0\r\n",
+        "o=- 7 8 IN IP4 203.0.113.7\r\n",
+        "s=-\r\n",
+        "c=IN IP4 203.0.113.7\r\n",
+        "t=0 0\r\n",
+        "m=audio 40002 RTP/AVP 0\r\n",
+    );
+
+    #[test]
+    fn a_single_part_is_wrapped_with_the_sdp_first_under_a_fresh_boundary() {
+        let (content_type, body) = with_sdp_part(
+            "application/vnd.example+xml",
+            b"<additional-data/>",
+            SEAT_SDP.as_bytes(),
+        )
+        .expect("composes");
+        assert!(content_type.starts_with("multipart/mixed;boundary=siphon-"));
+        let boundary = extract_boundary(&content_type).expect("a boundary");
+        // RFC 2046 §5.1.1: at most 70 characters.
+        assert!(boundary.len() <= 70, "{boundary}");
+        let text = String::from_utf8(body.clone()).expect("text");
+        assert_eq!(
+            text,
+            format!(
+                "--{boundary}\r\nContent-Type: application/sdp\r\n\r\n{SEAT_SDP}\r\n\
+                 --{boundary}\r\nContent-Type: application/vnd.example+xml\r\n\r\n\
+                 <additional-data/>\r\n--{boundary}--\r\n"
+            )
+        );
+        let parts = parse_multipart(&content_type, &body).expect("parses");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].content_type, "application/sdp");
+        assert_eq!(parts[1].body, b"<additional-data/>");
+        assert_eq!(
+            sdp_from_body(&content_type, &body).expect("the SDP part"),
+            SEAT_SDP.trim_end().as_bytes()
+        );
+    }
+
+    #[test]
+    fn two_wraps_draw_different_boundaries() {
+        let one = with_sdp_part("text/plain", b"x", SEAT_SDP.as_bytes()).expect("composes");
+        let other = with_sdp_part("text/plain", b"x", SEAT_SDP.as_bytes()).expect("composes");
+        assert_ne!(one.0, other.0);
+    }
+
+    #[test]
+    fn a_multipart_without_an_sdp_part_gets_one_first_under_its_own_boundary() {
+        let given = concat!(
+            "--b\r\n",
+            "Content-Type: application/vnd.example+xml\r\n",
+            "Content-Disposition: render\r\n",
+            "\r\n",
+            "<additional-data/>\r\n",
+            "--b--\r\n",
+        );
+        let (content_type, body) = with_sdp_part(
+            "multipart/mixed;boundary=b",
+            given.as_bytes(),
+            SEAT_SDP.as_bytes(),
+        )
+        .expect("composes");
+        assert_eq!(content_type, "multipart/mixed;boundary=b");
+        let text = String::from_utf8(body).expect("text");
+        assert_eq!(
+            text,
+            format!("--b\r\nContent-Type: application/sdp\r\n\r\n{SEAT_SDP}\r\n{given}")
+        );
+    }
+
+    #[test]
+    fn the_sdp_part_of_a_multipart_is_replaced_and_the_rest_crosses_untouched() {
+        let (content_type, body) = with_sdp_part(
+            "multipart/mixed;boundary=siphon-1",
+            multipart_body().as_bytes(),
+            SEAT_SDP.as_bytes(),
+        )
+        .expect("composes");
+        assert_eq!(content_type, "multipart/mixed;boundary=siphon-1");
+        let text = String::from_utf8(body).expect("text");
+        assert_eq!(
+            text,
+            format!(
+                "--siphon-1\r\nContent-Type: application/sdp\r\n\r\n{SEAT_SDP}\r\n\
+                 --siphon-1\r\nContent-Type: application/vnd.example+xml\r\n\r\n\
+                 <additional-data/>\r\n--siphon-1--\r\n"
+            )
+        );
+    }
+
+    #[test]
+    fn an_sdp_without_a_final_line_break_is_given_one() {
+        let (_, body) = with_sdp_part("text/plain", b"x", b"v=0\r\ns=-").expect("composes");
+        let text = String::from_utf8(body).expect("text");
+        assert!(
+            text.contains("\r\n\r\nv=0\r\ns=-\r\n\r\n--siphon-"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_multipart_that_cannot_take_the_part_says_why() {
+        let error = with_sdp_part("multipart/mixed", b"--b\r\n", SEAT_SDP.as_bytes())
+            .expect_err("no boundary");
+        assert!(error.contains("boundary"), "{error}");
+        let error = with_sdp_part(
+            "multipart/mixed;boundary=b",
+            b"no delimiter here\r\n",
+            SEAT_SDP.as_bytes(),
+        )
+        .expect_err("no delimiter");
+        assert!(error.contains("no part delimited"), "{error}");
     }
 }

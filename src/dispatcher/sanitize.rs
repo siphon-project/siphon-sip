@@ -517,6 +517,25 @@ pub(super) fn sdp_in_body(content_type: &str, body: &[u8]) -> Option<Vec<u8>> {
     crate::media::body::sdp_from_body(content_type, body).ok()
 }
 
+/// The session description `message` brings as its sender's own, to keep as
+/// that party's (`Leg::last_sdp`): the body under `application/sdp`, or the
+/// SDP part of a `multipart/*` body, where the offer rides beside parts SIP
+/// does not interpret (RFC 5621 §3). `None` when it brings none, which leaves
+/// the session as it was: no body, a multipart body with no SDP part, or a
+/// body of another type (a service's own document in an UPDATE, say). A body
+/// with no `Content-Type` at all is taken for the SDP it has always been
+/// taken for.
+pub(super) fn description_given(message: &SipMessage) -> Option<Vec<u8>> {
+    if message.body.is_empty() {
+        return None;
+    }
+    let content_type = message_content_type(message);
+    if content_type.trim().is_empty() || crate::media::body::is_sdp(content_type) {
+        return Some(message.body.clone());
+    }
+    crate::media::body::sdp_from_body(content_type, &message.body).ok()
+}
+
 /// Record a body's session description as the one siphon has in force on a
 /// leg's dialog (`Dialog::last_sent_sdp`), the A-leg or the winning B-leg: the
 /// answer siphon just sent that leg, or an offer the leg just accepted. A body

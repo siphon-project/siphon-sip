@@ -158,3 +158,88 @@ def toggle(call, offer):
                                  session_sdp=session)
     assert offer.session_sdp == session
     assert offer.decision == ("answer", session + "a=record:on\r\n")
+
+
+class TestAnswerBodyAndHeaders:
+    """``offer.answer(body=…, content_type=…, headers=…)``."""
+
+    def test_a_part_and_headers_go_beside_the_answer(self, harness):
+        harness.load_source(
+            """
+from siphon import b2bua
+
+@b2bua.on_reoffer
+def on_reoffer(call, offer):
+    offer.answer(body="<info/>", content_type="application/vnd.example.info+xml",
+                 headers={"Resource-Priority": "example.0", "X-Second": "2"})
+"""
+        )
+        offer = harness.send_reoffer(sdp=TALKING, previous_sdp=TALKING)
+        assert offer.decision == ("answer", None)
+        assert offer.answer_extras == {
+            "content_type": "application/vnd.example.info+xml",
+            "body": b"<info/>",
+            "headers": {"Resource-Priority": "example.0", "X-Second": "2"},
+        }
+
+    def test_no_extras_without_an_answer(self):
+        offer = Reoffer(sdp=HELD, previous_sdp=TALKING)
+        assert offer.answer_extras is None
+        offer.answer()
+        assert offer.answer_extras == {"content_type": None, "body": None, "headers": {}}
+        offer.reject(488, "Not Acceptable Here")
+        assert offer.answer_extras is None
+
+    def test_a_body_that_is_or_carries_the_sdp_is_the_answer(self):
+        offer = Reoffer(sdp=HELD, previous_sdp=TALKING)
+        offer.answer(body=TALKING, content_type="application/sdp")
+        assert offer.decision == ("answer", TALKING)
+        assert offer.answer_extras["body"] is None
+        multipart = (
+            "--b\r\nContent-Type: application/sdp\r\n\r\n" + TALKING
+            + "\r\n--b\r\nContent-Type: application/vnd.example.info+xml\r\n\r\n"
+            "<info/>\r\n--b--\r\n"
+        )
+        offer.answer(body=multipart, content_type="multipart/mixed;boundary=b")
+        assert offer.decision == ("answer", TALKING.rstrip("\r\n"))
+        assert offer.answer_extras["body"] == multipart.encode()
+        without = "--b\r\nContent-Type: text/plain\r\n\r\nx\r\n--b--\r\n"
+        offer.answer(body=without.encode(), content_type='multipart/mixed; boundary="b"')
+        assert offer.decision == ("answer", None)
+
+    @pytest.mark.parametrize("owned", [
+        "Via", "From", "To", "Call-ID", "CSeq", "Max-Forwards", "Contact",
+        "Record-Route", "Route", "Content-Length", "Content-Type", "RSeq",
+        "RAck", "Require", "Supported", "Session-Expires", "Min-SE", "k", "l",
+    ])
+    def test_an_owned_header_is_refused_and_nothing_is_decided(self, owned):
+        offer = Reoffer(sdp=HELD, previous_sdp=TALKING)
+        with pytest.raises(ValueError, match="offer.answer"):
+            offer.answer(headers={owned: "x"})
+        assert offer.decision == ("relay",)
+
+    def test_what_cannot_be_sent_is_refused(self):
+        offer = Reoffer(sdp=HELD, previous_sdp=TALKING)
+        with pytest.raises(TypeError):
+            offer.answer(headers={"X-Number": 5})
+        with pytest.raises(ValueError, match="go together"):
+            offer.answer(body="<info/>")
+        with pytest.raises(ValueError, match="go together"):
+            offer.answer(content_type="text/plain")
+        with pytest.raises(ValueError, match="empty"):
+            offer.answer(body="", content_type="text/plain")
+        with pytest.raises(ValueError, match="line break"):
+            offer.answer(body="x", content_type="text/plain\r\nX-Injected: 1")
+        with pytest.raises(ValueError, match="pass one"):
+            offer.answer(sdp=TALKING, body=TALKING, content_type="application/sdp")
+        with pytest.raises(ValueError, match="boundary"):
+            offer.answer(body="--b--\r\n", content_type="multipart/mixed")
+        with pytest.raises(ValueError, match="no part delimited"):
+            offer.answer(body="<info/>", content_type="multipart/mixed;boundary=b")
+        assert offer.decision == ("relay",)
+
+    def test_not_after_the_offer_was_answered(self):
+        offer = Reoffer(sdp=HELD, previous_sdp=TALKING)
+        offer._complete(200, None, True)
+        with pytest.raises(RuntimeError):
+            offer.answer(body="<info/>", content_type="text/plain")

@@ -475,6 +475,13 @@ These are limits of siphon-rtp 0.14.0, not of the script API:
           await rtpengine.conference_route(room, call, "talker")
       offer.answer()
   ```
+
+  A seat whose media is keyed, runs ICE or is bundled is answered the same
+  way as long as the offer renegotiates none of that (a hold, a resume, a
+  refresh); an ICE restart or a re-key is refused `488`. `offer.answer()` also
+  takes a `body` with its `content_type`, sent beside the SDP in a multipart
+  200, and `headers` for it
+  ([reference](../reference/call.md#hold-resume-and-other-re-offers-b2buaon_reoffer)).
 - **Re-seating.** There is no verb that updates a seat in place, and the
   engine does not report a second seat under one From-tag, so a call holds one
   seat and a second `conference_join` raises `ValueError`. A re-INVITE that
