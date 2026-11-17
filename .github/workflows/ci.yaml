@@ -61,20 +61,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
-      # The tests run on the free-threaded CPython the packages ship
-      # (scripts/bundle-python.sh, pinned by version and SHA-256), not on a
+      # The tests run on the free-threaded CPython the packages ship, not on a
       # nightly or a GIL build: the stop-the-world tests only mean something
-      # on the interpreter siphon runs on. After the cache restore, so a cached
-      # target/ cannot overlay it.
-      - name: Stage the bundled free-threaded CPython
-        run: |
-          scripts/bundle-python.sh target/python-bundle
-          echo "PYO3_PYTHON=$GITHUB_WORKSPACE/target/python-bundle/bin/python3.14t" >> "$GITHUB_ENV"
-          echo "RUSTFLAGS=$(scripts/bundle-python.sh --print-rustflags target/python-bundle)" >> "$GITHUB_ENV"
-          # rustdoc links doctests with RUSTDOCFLAGS, never RUSTFLAGS, so
-          # without this every doctest fails to find -lpython3.14t.
-          echo "RUSTDOCFLAGS=$(scripts/bundle-python.sh --print-rustflags target/python-bundle)" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/target/python-bundle/lib" >> "$GITHUB_ENV"
+      # on the interpreter siphon runs on.
+      - uses: ./.github/actions/bundle-python
 
       - name: Run tests
         run: cargo test ${{ matrix.flags }}
@@ -156,17 +146,9 @@ jobs:
   # clippy lint or rustc warning into a hard failure so the clippy-clean
   # baseline cannot regress.
   clippy:
-    # Every job that installs Python with deadsnakes/action stays on 24.04:
-    # ubuntu-26.04 ships its own python3.14, which the action refuses to
-    # install over ("package python3.14 is not from deadsnakes").
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
-        with:
-          python-version: "3.14-dev"
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsctp-dev
@@ -177,6 +159,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
+      - uses: ./.github/actions/bundle-python
+
       # Lint three feature configs. The default build (SCTP off) and
       # `--all-features` (SCTP on, compiling the gated libsctp code) catch the
       # code that is in or out with those. `--no-default-features` is the one
@@ -186,13 +170,13 @@ jobs:
       # call into a `#[cfg(feature = "redis-backend")]` function from an arm
       # that was not gated — and no job built it, so nothing said so.
       - name: Run clippy (default features)
-        run: PYO3_PYTHON=python3.14 cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Run clippy (all features)
-        run: PYO3_PYTHON=python3.14 cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run clippy (no default features)
-        run: PYO3_PYTHON=python3.14 cargo clippy --no-default-features --all-targets -- -D warnings
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
 
   # ── Minimum supported Rust version ──────────────────────────────────────
   # Every other job builds with the current stable compiler, so nothing said
@@ -211,11 +195,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
-        with:
-          python-version: "3.14-dev"
-
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsctp-dev
 
@@ -232,11 +211,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
+      - uses: ./.github/actions/bundle-python
+
       - name: Check (default features)
-        run: PYO3_PYTHON=python3.14 cargo check --locked
+        run: cargo check --locked
 
       - name: Check (all features)
-        run: PYO3_PYTHON=python3.14 cargo check --locked --all-features
+        run: cargo check --locked --all-features
 
   # ── Criterion bench compile gate ─────────────────────────────────────────
   # Keep the per-message hot-path criterion benches (benches/sip_hot_path.rs)
@@ -251,11 +232,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
-        with:
-          python-version: "3.14-dev"
-
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsctp-dev
 
@@ -263,8 +239,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
+      - uses: ./.github/actions/bundle-python
+
       - name: Compile benches (no run)
-        run: PYO3_PYTHON=python3.14 cargo bench --no-run --all-features
+        run: cargo bench --no-run --all-features
 
   # ── Dependency policy gate (cargo-deny) ─────────────────────────────────
   # The DETERMINISTIC half of cargo-deny: bans (duplicate / wildcard crates),
@@ -328,11 +306,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
-        with:
-          python-version: "3.14-dev"
-
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy
@@ -340,6 +313,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: siphon-bin
+
+      - uses: ./.github/actions/bundle-python
 
       # siphon-sigtran reaches kernel SCTP through async-sctp, which links
       # libsctp — needed to LINK the `sigtran` and `full` legs below, not just
@@ -352,42 +327,42 @@ jobs:
       # feature now, so this leg needs --no-default-features to still cover the
       # truly-empty build.
       - name: Build (no extensions)
-        run: PYO3_PYTHON=python3.14 cargo build --no-default-features
+        run: cargo build --no-default-features
 
       - name: Clippy (no extensions)
-        run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --no-default-features -- -D warnings
+        run: cargo clippy -p siphon-bin --no-default-features -- -D warnings
 
       # The default build — `http` and nothing else. This is what a bare
       # `cargo build -p siphon-bin` gets you, so it is worth its own leg.
       - name: Build (defaults)
-        run: PYO3_PYTHON=python3.14 cargo build
+        run: cargo build
 
       - name: Clippy (defaults)
-        run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin -- -D warnings
+        run: cargo clippy -p siphon-bin -- -D warnings
 
       # Feature on: pulls siphon-smpp + smpp34 and wires the `smpp` namespace.
       - name: Build (--features smpp)
-        run: PYO3_PYTHON=python3.14 cargo build --features smpp
+        run: cargo build --features smpp
 
       - name: Clippy (--features smpp)
-        run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features smpp -- -D warnings
+        run: cargo clippy -p siphon-bin --features smpp -- -D warnings
 
       # siphon-http on its own, without the default pulling it in — proves the
       # feature still stands alone if the default ever changes back.
       - name: Build (--features http, no defaults)
-        run: PYO3_PYTHON=python3.14 cargo build --no-default-features --features http
+        run: cargo build --no-default-features --features http
 
       - name: Clippy (--features http, no defaults)
-        run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --no-default-features --features http -- -D warnings
+        run: cargo clippy -p siphon-bin --no-default-features --features http -- -D warnings
 
       # Same for siphon-sigtran: SIGTRAN/SS7 transport, routing and MAP/CAP/INAP
       # termination. This is the one module that mounts its surface through
       # `register_module_extension` rather than a single namespace.
       - name: Build (--features sigtran)
-        run: PYO3_PYTHON=python3.14 cargo build --features sigtran
+        run: cargo build --features sigtran
 
       - name: Clippy (--features sigtran)
-        run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features sigtran -- -D warnings
+        run: cargo clippy -p siphon-bin --features sigtran -- -D warnings
 
       # Every module at once — the real drop-in binary, and the only leg that
       # catches cross-extension breakage: a version skew between two extension
@@ -395,10 +370,10 @@ jobs:
       # `full` is the aggregate in Cargo.toml, so a new module joins this leg
       # by being added there.
       - name: Build (--features full)
-        run: PYO3_PYTHON=python3.14 cargo build --features full
+        run: cargo build --features full
 
       - name: Clippy (--features full)
-        run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features full -- -D warnings
+        run: cargo clippy -p siphon-bin --features full -- -D warnings
 
       # The floor siphon-bin declares, checked the way the `minimum rust` job
       # checks the library's: built with exactly that version, read from
@@ -416,7 +391,7 @@ jobs:
         run: rustup toolchain install ${{ steps.declared.outputs.version }} --profile minimal
 
       - name: Check with the declared minimum rust (--features full)
-        run: PYO3_PYTHON=python3.14 cargo +${{ steps.declared.outputs.version }} check --locked --features full
+        run: cargo +${{ steps.declared.outputs.version }} check --locked --features full
 
       # The release composition, and the one leg that is NOT a bit-rot guard.
       # Everything above resolves siphon-sip from git, so it can be green against
@@ -440,10 +415,10 @@ jobs:
         run: ../scripts/pin-siphon-sip-to-tree.sh
 
       - name: Build (patched to this tree — the released composition)
-        run: PYO3_PYTHON=python3.14 cargo build --features ui
+        run: cargo build --features ui
 
       - name: Clippy (patched to this tree — the released composition)
-        run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features ui -- -D warnings
+        run: cargo clippy -p siphon-bin --features ui -- -D warnings
 
   # ── Release packaging: the bundled Python ──────────────────────────────
   # The .deb / .rpm / tarball carry their own free-threaded CPython and the
@@ -2801,14 +2776,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
-        with:
-          python-version: "3.14-dev"
-
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - uses: ./.github/actions/bundle-python
 
       - name: Extract the siphon-rtp binary from the published image
         # Pinned to the release siphon pins siphon-rtp-proto to, so this proves
@@ -2822,13 +2794,13 @@ jobs:
 
       - name: Smoke test against the real engine (NG + native control)
         run: |
-          SIPHON_RTP_BIN="$PWD/siphon-rtp" PYO3_PYTHON=python3.14 \
+          SIPHON_RTP_BIN="$PWD/siphon-rtp" \
             cargo test --test integration_tests -- --ignored --exact \
             siphon_rtp_tests::smoke_test_against_real_siphon_rtp --nocapture
 
       - name: Two seats in one conference room of the real engine hear each other
         run: |
-          SIPHON_RTP_BIN="$PWD/siphon-rtp" PYO3_PYTHON=python3.14 \
+          SIPHON_RTP_BIN="$PWD/siphon-rtp" \
             cargo test --test integration_tests -- --ignored --exact \
             siphon_rtp_tests::two_seats_in_a_real_siphon_rtp_room_hear_each_other --nocapture
 
@@ -3338,23 +3310,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
-        with:
-          python-version: "3.14-dev"
-
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - uses: ./.github/actions/bundle-python
 
       - name: Install SIPp
         run: sudo apt-get update && sudo apt-get install -y sip-tester
 
       - name: Build siphon
-        run: PYO3_PYTHON=python3.14 cargo build --bin siphon
+        run: cargo build --bin siphon
 
       - name: A raised handler and call.terminate() must both fail the call
-        run: MODE=both PYO3_PYTHON=python3.14 scripts/b2bua_answer_fail_test.sh
+        run: MODE=both scripts/b2bua_answer_fail_test.sh
 
   # An answered call has to be able to end on siphon's own clock. `timeout=`
   # bounds the ring and stops mattering at the 200 OK, so before max_duration an
@@ -3370,23 +3339,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
-        with:
-          python-version: "3.14-dev"
-
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - uses: ./.github/actions/bundle-python
 
       - name: Install SIPp
         run: sudo apt-get update && sudo apt-get install -y sip-tester
 
       - name: Build siphon
-        run: PYO3_PYTHON=python3.14 cargo build --bin siphon
+        run: cargo build --bin siphon
 
       - name: A call must be cut at its maximum duration, and only then
-        run: PYO3_PYTHON=python3.14 scripts/b2bua_max_duration_test.sh
+        run: scripts/b2bua_max_duration_test.sh
 
   # A script has to see a bridged call's hold before siphon relays it, and be
   # able to answer it itself. Deterministic: the caller's hold is answered by
@@ -3398,23 +3364,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
-        with:
-          python-version: "3.14-dev"
-
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - uses: ./.github/actions/bundle-python
 
       - name: Install SIPp
         run: sudo apt-get update && sudo apt-get install -y sip-tester
 
       - name: Build siphon
-        run: PYO3_PYTHON=python3.14 cargo build --bin siphon
+        run: cargo build --bin siphon
 
       - name: A hold the script answers, a resume it relays
-        run: PYO3_PYTHON=python3.14 scripts/b2bua_reoffer_test.sh
+        run: scripts/b2bua_reoffer_test.sh
 
   # ── Fuzz testing (nightly) ─────────────────────────────────────────────
   fuzz:
@@ -3424,31 +3387,29 @@ jobs:
     # whole siphon-sip crate through LLVM as one module: rustc peaked at ~17 GB,
     # over the runner's 16 GB, and the runner was shut down mid-compile. 16
     # units without debug info peak at ~12.6 GB and build in about half the time.
-    env:
-      RUSTFLAGS: -Cdebuginfo=0
+    # -Cdebuginfo=0 goes through the bundle action, which owns RUSTFLAGS.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
-        with:
-          python-version: "3.14-dev"
 
       - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
+      - uses: ./.github/actions/bundle-python
+        with:
+          extra-rustflags: -Cdebuginfo=0
+
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
 
       - name: Run fuzz target — SIP parser (60s)
-        run: PYO3_PYTHON=python3.14 cargo +nightly fuzz run --codegen-units 16 sip_parser_fuzz -- -max_total_time=60
+        run: cargo +nightly fuzz run --codegen-units 16 sip_parser_fuzz -- -max_total_time=60
 
       - name: Run fuzz target — stream framing (60s)
-        run: PYO3_PYTHON=python3.14 cargo +nightly fuzz run --codegen-units 16 stream_framing_fuzz -- -max_total_time=60
+        run: cargo +nightly fuzz run --codegen-units 16 stream_framing_fuzz -- -max_total_time=60
 
       - name: Run fuzz target — framer/parser agreement (60s)
-        run: PYO3_PYTHON=python3.14 cargo +nightly fuzz run --codegen-units 16 framing_parser_agreement_fuzz -- -max_total_time=60
+        run: cargo +nightly fuzz run --codegen-units 16 framing_parser_agreement_fuzz -- -max_total_time=60
 
   # ── SIPp IPsec VoLTE test (self-hosted) ────────────────────────────────
   # IPsec XFRM SA installation needs CAP_NET_ADMIN, which GitHub-hosted runners
@@ -3564,27 +3525,24 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
-        with:
-          python-version: "3.14-dev"
-
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
+      - uses: ./.github/actions/bundle-python
+
       # Build the test binary WITH network, OUTSIDE the namespace, so the
       # network-isolated `unshare -n` run below never needs to fetch or compile.
       - name: Build the firewall live tests
-        run: "PYO3_PYTHON=python3.14 cargo test --lib --no-run firewall::"
+        run: "cargo test --lib --no-run firewall::"
 
       # Every ignored firewall test: the netlink roundtrip, and the allow set
       # recovering from an operator reloading the table that holds it. One
       # thread, because both read back the one namespace's ruleset.
       - name: nftables live-kernel tests (isolated user+net namespace)
-        run: "unshare -rn env PYO3_PYTHON=python3.14 cargo test --lib firewall:: -- --ignored --nocapture --test-threads=1"
+        run: "unshare -rn cargo test --lib firewall:: -- --ignored --nocapture --test-threads=1"
 
       # Same lib test binary, same kind of throwaway namespace: real XFRM states
       # for the SPI allocator, proving a full partition never replaces a live SA.
       - name: XFRM SPI allocation live-kernel test (isolated user+net namespace)
-        run: "unshare -rn env PYO3_PYTHON=python3.14 cargo test --lib ipsec::spi_reuse_tests -- --ignored --nocapture --test-threads=1"
+        run: "unshare -rn cargo test --lib ipsec::spi_reuse_tests -- --ignored --nocapture --test-threads=1"

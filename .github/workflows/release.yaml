@@ -215,23 +215,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Only so `cargo publish` can compile the crate to verify it; nothing
-      # built here ships, so the GIL build is fine.
-      - name: Install Python 3.14
-        uses: deadsnakes/action@e640ac8743173a67cca4d7d77cd837e514bf98e8 # v3.2.0
-        with:
-          python-version: "3.14-dev"
-
       # `cargo publish` verifies with default features (SCTP off), so the
       # libsctp system dependency is not required to publish.
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - uses: ./.github/actions/bundle-python
 
       - name: Authenticate to crates.io (OIDC Trusted Publishing)
         uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: auth
 
       - name: Publish to crates.io
-        run: PYO3_PYTHON=python3.14 cargo publish
+        run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
