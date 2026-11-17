@@ -101,6 +101,7 @@ impl Notifier {
             Some("application/reginfo+xml"),
             Some(b"<reginfo/>"),
             None,
+            &[],
         )
         .await
         .expect("the NOTIFY is sent");
@@ -358,6 +359,7 @@ async fn a_notify_with_no_stream_to_leave_on_leaves_nothing_pending() {
         None,
         None,
         None,
+        &[],
     )
     .await
     .expect_err("there is no such connection");

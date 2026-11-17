@@ -184,6 +184,36 @@ uses that exact live stream, never another phone sharing the same proxy address;
 a closed stream fails visibly. The Contact remains the NOTIFY Request-URI.
 Subscriptions with Record-Route follow their established route set.
 
+`handle.notify(headers={...})` and `handle.terminate(headers={...})` add headers
+to the NOTIFY, a `dict` of `str` names to `str` values in the order it gives
+them: what an event package or its profile puts on a notification, such as the
+identity it is sent under and the service it belongs to (RFC 3325 §9.1,
+RFC 6050 §4.2). The order holds among the added headers; as on every message
+siphon writes, `Content-*` headers stay last, so a `Content-Language` goes
+there wherever the dict has it.
+
+```python
+await handle.notify(
+    body=conference_info,
+    content_type="application/conference-info+xml",
+    headers={
+        "P-Asserted-Identity": "<sip:group@example.com>",
+        "P-Asserted-Service": "urn:urn-7:3gpp-service.ims.icsi.mcptt",
+    },
+)
+```
+
+siphon owns the headers that make the NOTIFY a request of the subscription's
+dialog (RFC 3261 §12.2.1.1, RFC 6665 §4.2.1.2): `Via`, `From`, `To`, `Call-ID`,
+`CSeq`, `Contact`, `Route`, `Max-Forwards`, `Content-Length`, `Content-Type`
+(pass `content_type=`), `Event` and `Subscription-State` (pass `state=` or
+`reason=`). Naming one, in any case or in its compact form, raises `ValueError`
+saying which, and so does a name that is not a header name or a value with a
+line break. A name or value that is not a `str` raises `TypeError`. Nothing is
+sent in either case, the CSeq is not used up, and a refused `terminate()` leaves
+the subscription standing. The NOTIFY siphon sends when a subscription expires
+carries no script headers.
+
 `proxy.subscribe_state.for_resource(uri, event)` lists the live subscriptions this
 node is the notifier of for a resource and event package, oldest first, as
 `SubscribeHandle`s: the subscribers to NOTIFY when the resource changes (a

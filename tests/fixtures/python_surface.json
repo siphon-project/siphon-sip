@@ -3242,7 +3242,7 @@
       "notify": {
         "doc": "Send an in-dialog NOTIFY with ``body``/``content_type``.",
         "kind": "method_descriptor",
-        "sig": "($self, body=None, content_type=None, state=None)"
+        "sig": "($self, body=None, content_type=None, state=None, headers=None)"
       },
       "refresh": {
         "doc": "Re-SUBSCRIBE to refresh the dialog. Only valid on dialogs",
@@ -3257,7 +3257,7 @@
       "terminate": {
         "doc": "Terminate the subscription dialog.",
         "kind": "method_descriptor",
-        "sig": "($self, reason=None, body=None, content_type=None)"
+        "sig": "($self, reason=None, body=None, content_type=None, headers=None)"
       }
     },
     "SubscribeStateNamespace": {

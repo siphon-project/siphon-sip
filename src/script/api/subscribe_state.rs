@@ -568,7 +568,9 @@ impl PySubscribeHandle {
     /// ``state`` is the full ``Subscription-State`` header value.  When
     /// omitted, siphon emits ``active;expires=<remaining>``.  Set it
     /// explicitly for ``pending``, ``active;expires=N;reason=...``, or
-    /// to override the expiry.
+    /// to override the expiry.  ``headers`` is a ``{name: value}`` mapping
+    /// of ``str`` added to the NOTIFY in its order.  A header siphon owns on
+    /// it raises ``ValueError``, a non-``str`` ``TypeError``; nothing is sent.
     ///
     /// Returns ``True`` once the NOTIFY is handed to the transport; the
     /// subscriber's answer is not waited for.  Raises ``LookupError`` when the
@@ -583,14 +585,16 @@ impl PySubscribeHandle {
     /// removes the subscription, here and in the cache; any other failure
     /// keeps it, and so does a SUBSCRIBE refresh that arrives while the NOTIFY
     /// is out.  Counted in ``siphon_subscribe_notify_failures_total{code}``.
-    #[pyo3(signature = (body=None, content_type=None, state=None))]
+    #[pyo3(signature = (body=None, content_type=None, state=None, headers=None))]
     fn notify<'py>(
         &self,
         python: Python<'py>,
         body: Option<&Bound<'_, PyAny>>,
         content_type: Option<&str>,
         state: Option<&str>,
+        headers: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let headers = super::notify_headers::from_script("notify", headers)?;
         // Read the body here: a `Bound` cannot cross into the future. The CSeq
         // bump stays here too, so two NOTIFYs a script sends in order keep
         // their order.
@@ -617,6 +621,7 @@ impl PySubscribeHandle {
                 content_type.as_deref(),
                 body_bytes.as_deref(),
                 gate.as_deref(),
+                &headers,
             )
             .await?;
             Ok(true)
@@ -630,7 +635,7 @@ impl PySubscribeHandle {
     /// ``Subscription-State: terminated;reason=<reason>`` (RFC 6665
     /// §4.2.2), and the dialog is marked terminated and removed from the
     /// store. ``reason`` defaults to ``"noresource"`` and is only used on
-    /// this path.
+    /// this path, as is ``headers``, which is as for :meth:`notify`.
     ///
     /// For dialogs we originated as the watcher (the
     /// :meth:`SubscribeStateNamespace.send` flow), this sends a
@@ -641,14 +646,16 @@ impl PySubscribeHandle {
     /// :meth:`SubscribeStateNamespace.find` and answers 200, and siphon
     /// removes it when the handler has returned. If no such NOTIFY comes
     /// within Timer N (32 s), siphon removes it anyway.
-    #[pyo3(signature = (reason=None, body=None, content_type=None))]
+    #[pyo3(signature = (reason=None, body=None, content_type=None, headers=None))]
     fn terminate<'py>(
         &self,
         python: Python<'py>,
         reason: Option<&str>,
         body: Option<&Bound<'_, PyAny>>,
         content_type: Option<&str>,
+        headers: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let headers = super::notify_headers::from_script("terminate", headers)?;
         let body_bytes = match body {
             Some(obj) => Some(super::request::extract_body_bytes(obj)?),
             None => None,
@@ -680,6 +687,7 @@ impl PySubscribeHandle {
                     content_type.as_deref(),
                     body_bytes.as_deref(),
                     gate.as_deref(),
+                    &headers,
                 )
                 .await?;
             }

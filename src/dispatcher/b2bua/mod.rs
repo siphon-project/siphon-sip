@@ -49,6 +49,7 @@ mod originate_auth;
 mod originate_cancel;
 mod originate_group;
 mod originate_media;
+mod originate_progress;
 mod outbound;
 mod prack_bridge;
 mod refer;
