@@ -1574,6 +1574,8 @@ class MockB2bua:
         - ``@b2bua.on_invite`` — new call
         - ``@b2bua.on_provisional``: every provisional response relayed (101-199)
         - ``@b2bua.on_early_media`` — provisional response with SDP (183/180)
+        - ``@b2bua.on_originate_progress``: every provisional response
+          (101-199) on a leg placed with ``b2bua.originate()``
         - ``@b2bua.on_answer`` — call answered
         - ``@b2bua.on_failure`` — all B-legs failed
         - ``@b2bua.on_bye`` — call ended
@@ -1685,7 +1687,9 @@ class MockB2bua:
 
         **Asynchronous.** Returns as soon as the INVITE is on the wire, with the
         new leg's SIP Call-ID — it does not wait for the callee. Ringing and
-        answer arrive through the ordinary handlers: ``@b2bua.on_answer`` fires
+        answer arrive through handlers: ``@b2bua.on_originate_progress`` fires
+        with ``(call_id, code, reason, reply)`` for each provisional (101-199)
+        the callee sends, ``@b2bua.on_answer`` fires
         with ``(call, reply)``, ``@b2bua.on_failure`` with
         ``(call, code, reason)``, ``@b2bua.on_bye`` on teardown. Feed the
         returned Call-ID to ``b2bua.terminate()`` / ``b2bua.refer()``.
@@ -2694,6 +2698,49 @@ class MockB2bua:
         """
         is_async = asyncio.iscoroutinefunction(fn)
         _registry.register("b2bua.on_early_media", None, fn, is_async)
+        return fn
+
+    @staticmethod
+    def on_originate_progress(fn: Callable) -> Callable:
+        """Register handler for the provisional responses of a call the
+        script placed with ``b2bua.originate()``.
+
+        Called for each 101-199 the called party sends on that leg: a
+        ``180 Ringing``, a ``183`` with or without SDP. Not for a
+        ``100 Trying``, which is hop by hop. Once per response, in the order
+        they arrive, and before ``on_answer``. A provisional sent reliably
+        (RFC 3262) has been PRACKed by siphon when the handler runs, and its
+        retransmissions run nothing.
+
+        Handler signature: ``(call_id, code, reason, reply) -> None``
+
+        * ``call_id``: the Call-ID ``b2bua.originate()`` returned.
+        * ``code`` / ``reason``: the status and its phrase (``180``,
+          ``"Ringing"``).
+        * ``reply``: the response, to read (``reply.get_header()``,
+          ``reply.body``). Nothing relays it, so changing it does nothing.
+
+        ``on_provisional`` and ``on_early_media`` are for a callee's
+        provisionals relayed to a caller and do not run for these. A leg the
+        control plane placed runs no handler: its progress is reported as
+        channel events.
+
+        A script that holds a caller while it rings the called party with
+        ``originate()`` tells the caller itself::
+
+            waiting = {}    # per-process here; use the cache namespace in production
+
+            @b2bua.on_originate_progress
+            def ringing(call_id, code, reason, reply):
+                held = waiting.get(call_id)
+                if held is not None and code == 180:
+                    held.progress(180, "Ringing")
+
+        In a test, ``SipTestHarness.send_originate_progress(call_id, 180)``
+        runs the handlers.
+        """
+        is_async = asyncio.iscoroutinefunction(fn)
+        _registry.register("b2bua.on_originate_progress", None, fn, is_async)
         return fn
 
     @staticmethod

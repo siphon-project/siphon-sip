@@ -59,7 +59,9 @@ impl PyB2buaControl {
     ///
     /// Returns immediately with the new leg's **SIP Call-ID** as soon as the
     /// INVITE is on the wire; it does *not* wait for the callee. Ringing and
-    /// answer arrive later through the ordinary handlers — `@b2bua.on_answer`
+    /// answer arrive later through handlers: `@b2bua.on_originate_progress`
+    /// fires with `(call_id, code, reason, reply)` for each provisional
+    /// (101-199) the callee sends, `@b2bua.on_answer`
     /// fires with `(call, reply)` when the callee answers, `@b2bua.on_failure`
     /// with `(call, code, reason)` when it rejects, and `@b2bua.on_bye` when
     /// either side hangs up. Feed the returned Call-ID to `b2bua.terminate()` /

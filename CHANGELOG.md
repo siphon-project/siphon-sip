@@ -67,6 +67,7 @@ entry, but a working config keeps working.
   succeeds. A peer that resets before the accept (`ECONNABORTED`, `EPROTO`,
   `EPERM`, `EINTR`) is retried at once and logged at debug. The error line is
   limited to one per listener per 10 s and says how many it stood for.
+- **A reliable provisional on a call siphon placed is now acknowledged (RFC 3262 §4).** siphon is the only UAC of an INVITE it originates (`b2bua.originate()`, the control plane's `originate` and bridging `dial`), and it sent no PRACK for a `Require: 100rel` provisional on one: the callee retransmitted it, each copy was reported again, and after 64*T1 the callee failed the INVITE. siphon does not ask for reliable provisionals on these legs, so this needed `Supported: 100rel` passed in `headers` or a callee sending them unasked. The PRACK now goes out on the early dialog the provisional belongs to (its Contact, To tag and Record-Route), numbered after the INVITE, and a retransmission of the provisional is discarded. When the INVITE carried no offer (`media=True`) and the reliable provisional carries one, the PRACK carries siphon's answer from the media engine (§5) and the 2xx is ACKed without a second one. An answer in a reliable provisional to an INVITE that carried siphon's offer is kept, so a 2xx that does not repeat it connects the call. A BYE or re-INVITE on the answered call is numbered past every PRACK, and past the INVITE re-sent with credentials after a 401/407, which it used to share a CSeq with. A provisional that arrives behind the 2xx of such a call is dropped and no longer reported.
 - **The Diameter server listener survives running out of file descriptors.**
   Its accept loop ended on any accept error, so a single `EMFILE` stopped it
   accepting peers until restart. It now backs off the same way.
@@ -194,6 +195,8 @@ entry, but a working config keeps working.
   `siphon_pyexec_queue_wait_seconds`: every executor job's wait in the queue,
   next to the `siphon_pyexec_queue_wait_ms` gauge; also in
   `/admin/metrics.json` as `pyexec.queue_wait`.
+- **`@b2bua.on_originate_progress`: a script hears the ringing of a leg it placed.** `b2bua.originate()` reported an answer, a failure and a hangup, and nothing in between. The new handler runs as `fn(call_id, code, reason, reply)` for every 101-199 the called party sends on such a leg (a `180`, a `183` with or without SDP; not a `100`), once per response and in order, before `@b2bua.on_answer`. `call_id` is the Call-ID `originate()` returned and `reply` is the response, to read. A script that holds a caller while it rings the called party on a leg of its own can now send the caller its `180` with `call.progress()` when that party rings. A leg the control plane placed runs no handler and reports `ChannelStateChange` as before. The SDK has the decorator and `SipTestHarness.send_originate_progress()`.
+
 
 ## [1.15.14] — 2026-11-13
 

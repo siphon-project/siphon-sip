@@ -857,6 +857,70 @@ class SipTestHarness:
 
         return CallResult(call=call, actions=list(call.actions))
 
+    def send_originate_progress(
+        self,
+        call_id: str,
+        status_code: int = 180,
+        reason: str = "Ringing",
+        reply: Optional[Any] = None,
+        body: Optional[bytes] = None,
+        content_type: Optional[str] = None,
+        headers: Optional[dict] = None,
+    ) -> Any:
+        """Send a provisional response (101-199) on a leg placed with
+        ``b2bua.originate()``.
+
+        Runs the ``@b2bua.on_originate_progress`` handlers with
+        ``(call_id, status_code, reason, reply)``, what siphon does for each
+        provisional the called party sends on such a leg. A ``100`` runs
+        nothing, as in siphon, and a status outside 100-199 raises
+        ``ValueError``. Returns the reply the handlers were given.
+
+        Args:
+            call_id: the Call-ID ``b2bua.originate()`` returned.
+            status_code: the provisional status.
+            reason: its reason phrase.
+            reply: the called party's response; auto-created from the other
+                arguments if ``None``.
+            body: body of the auto-created reply (early-media SDP).
+            content_type: its Content-Type (``application/sdp`` when a body
+                is given without one).
+            headers: headers of the auto-created reply.
+
+        Usage::
+
+            call_id = siphon.b2bua.originate("sip:bob@example.com", sdp=offer)
+            harness.send_originate_progress(call_id, 180)
+        """
+        if not 100 <= status_code <= 199:
+            raise ValueError(
+                f"send_originate_progress takes a provisional status, got {status_code}"
+            )
+
+        from siphon_sdk.reply import Reply
+
+        if reply is None:
+            if body is not None and content_type is None:
+                content_type = "application/sdp"
+            reply = Reply(
+                status_code=status_code,
+                reason=reason,
+                call_id=call_id,
+                body=body,
+                content_type=content_type,
+                headers=headers,
+            )
+        if status_code == 100:
+            return reply
+
+        registry = mock_module.get_registry()
+        for fn, is_async in registry.get("b2bua.on_originate_progress"):
+            if is_async:
+                self._loop.run_until_complete(fn(call_id, status_code, reason, reply))
+            else:
+                fn(call_id, status_code, reason, reply)
+        return reply
+
     def send_failure(
         self,
         call: Optional[Call] = None,
