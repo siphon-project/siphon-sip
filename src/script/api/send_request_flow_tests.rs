@@ -378,3 +378,131 @@ async fn an_over_threshold_send_request_refused_by_the_p_cscf_goes_udp_and_a_cal
         .pool
         .reconcile_pinned_sources(Default::default(), &Default::default());
 }
+
+// --- over the MTU to a resolved next hop ----------------------------------------
+
+use crate::script::api::uac_resolved_tests::Peer;
+
+/// Send a MESSAGE from Python to `ruri`, with no flow, and a `body_len` body;
+/// `kwargs` adds arguments. The request comes back from whichever channel it
+/// left on: `(over_tcp, message)`.
+fn send_resolved(
+    fixture: &SendFixture,
+    ruri: &str,
+    body_len: usize,
+    extra: impl FnOnce(&Bound<'_, PyDict>),
+) -> (bool, OutboundMessage) {
+    Python::attach(|python| {
+        let proxy = Py::new(
+            python,
+            super::PyProxyUtils::new(std::sync::Arc::clone(&fixture.resolver)),
+        )
+        .unwrap();
+        let kwargs = PyDict::new(python);
+        let headers = PyDict::new(python);
+        headers
+            .set_item("To", "<sip:001010000000001@example.com>")
+            .unwrap();
+        headers.set_item("Content-Type", "text/plain").unwrap();
+        kwargs.set_item("headers", &headers).unwrap();
+        kwargs
+            .set_item("body", pyo3::types::PyBytes::new(python, &filler(body_len)))
+            .unwrap();
+        extra(&kwargs);
+        run_send_request(
+            python,
+            proxy.bind(python).as_any(),
+            "MESSAGE",
+            ruri,
+            &kwargs,
+        )
+        .expect("sent");
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(sent) = fixture.tcp.try_recv() {
+            return (true, sent);
+        }
+        if let Ok(sent) = fixture.udp.try_recv() {
+            return (false, sent);
+        }
+        assert!(std::time::Instant::now() < deadline, "the MESSAGE went out");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// `proxy.send_request` to a next hop it resolves: a MESSAGE over the MTU
+/// leaves over TCP with a TCP top Via when the next hop listens for TCP, a
+/// small one over UDP, and `;transport=udp` in the URI it is routed by keeps
+/// UDP (RFC 3261 §18.1.1). The shared sender's `listen.mtu` is 1280, so the
+/// threshold is 1080 bytes.
+// The turn on the shared sender is held across the awaits on purpose: it keeps
+// the other tests off it while this one reads its wire.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_threshold_send_request_to_a_resolved_next_hop_goes_tcp() {
+    let (_turn, fixture) = SendFixture::turn();
+    let peer = Peer::listening().await;
+    let ruri = format!("sip:001010000000001@{}", peer.addr);
+
+    let (over_tcp, sent) = send_resolved(fixture, &ruri, 1500, |_| {});
+    assert!(over_tcp, "over the MTU: TCP");
+    assert_eq!(sent.transport, crate::transport::Transport::Tcp);
+    assert_eq!(sent.destination, peer.addr);
+    assert!(
+        via(&sent).starts_with("SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bK-uac-"),
+        "{}",
+        via(&sent)
+    );
+    let message = parse_sip_message_bytes(&sent.data).unwrap();
+    assert_eq!(message.body.len(), 1500, "the whole body");
+
+    let (over_tcp, sent) = send_resolved(fixture, &ruri, 400, |_| {});
+    assert!(!over_tcp, "under the MTU: UDP");
+    assert!(via(&sent).starts_with("SIP/2.0/UDP "), "{}", via(&sent));
+
+    // The Request-URI names UDP.
+    let pinned = format!("{ruri};transport=udp");
+    let (over_tcp, sent) = send_resolved(fixture, &pinned, 1500, |_| {});
+    assert!(!over_tcp, "transport=udp in the Request-URI keeps UDP");
+    assert!(sent.data.len() > 1500);
+
+    // The next hop decides, not the Request-URI: a `next_hop` that names UDP
+    // keeps it, and a route set's first entry is the one probed.
+    let (over_tcp, _) = send_resolved(fixture, &ruri, 1500, |kwargs| {
+        kwargs
+            .set_item("next_hop", format!("sip:{};transport=udp", peer.addr))
+            .unwrap();
+    });
+    assert!(!over_tcp, "transport=udp in next_hop keeps UDP");
+    let (over_tcp, sent) = send_resolved(
+        fixture,
+        "sip:001010000000001@unresolvable.invalid",
+        1500,
+        |kwargs| {
+            let route = vec![format!("<sip:{};lr>", peer.addr)];
+            kwargs
+                .set_item("route", PyList::new(kwargs.py(), &route).unwrap())
+                .unwrap();
+        },
+    );
+    assert!(over_tcp, "routed by its first Route, over TCP");
+    assert_eq!(sent.destination, peer.addr);
+}
+
+/// With no TCP listener at the next hop, the MESSAGE over the MTU goes over
+/// UDP as it would have, whole.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_threshold_send_request_to_a_udp_only_next_hop_stays_udp() {
+    let (_turn, fixture) = SendFixture::turn();
+    let peer = Peer::udp_only().await;
+    let ruri = format!("sip:001010000000001@{}", peer.addr);
+
+    let (over_tcp, sent) = send_resolved(fixture, &ruri, 1500, |_| {});
+    assert!(!over_tcp, "the UDP fallback");
+    assert!(via(&sent).starts_with("SIP/2.0/UDP "), "{}", via(&sent));
+    let message = parse_sip_message_bytes(&sent.data).unwrap();
+    assert_eq!(message.body.len(), 1500, "the whole body");
+    crate::dispatcher::forget_tcp_probe(peer.addr);
+}

@@ -3,7 +3,8 @@
 //! RFC 3261 §18.1.1 over a UE's SA flow: the decision every request a script
 //! sends over a flow makes (`PyFlow::over_mtu_tcp`). Only a registrant UE's
 //! UDP flow with an MTU set reads the request's size; every other flow, and a
-//! deployment without `listen.mtu`, pays the comparisons alone.
+//! deployment without `listen.mtu`, pays the comparisons alone. And the same
+//! rule for a request a script originates to a resolved next hop.
 
 use std::hint::black_box;
 
@@ -70,5 +71,61 @@ fn bench_decision(criterion: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_decision);
+/// The same rule for a request a script originates to a resolved next hop
+/// (`proxy.send_request`, a NOTIFY or SUBSCRIBE of `proxy.subscribe_state`):
+/// what each such request pays before any probe
+/// (`ResolvedEgress::over_threshold`).
+fn bench_resolved(criterion: &mut Criterion) {
+    use siphon::script::api::uac_resolved::ResolvedEgress;
+    use siphon::transport::Transport;
+
+    let small = parse_sip_message_bytes(
+        concat!(
+            "MESSAGE sip:001010000000001@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-uac-1\r\n",
+            "Max-Forwards: 70\r\n",
+            "From: <sip:as@example.com>;tag=a1\r\n",
+            "To: <sip:001010000000001@example.com>\r\n",
+            "Call-ID: bench-resolved\r\n",
+            "CSeq: 1 MESSAGE\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        )
+        .as_bytes(),
+    )
+    .expect("a message");
+    let mut large = small.clone();
+    large.body = vec![b'x'; 1500];
+    large.headers.set("Content-Length", "1500".to_string());
+    let destination = "198.51.100.20:5060".parse().expect("an address");
+    let udp = ResolvedEgress::resolved("sip:as.example.com", destination, Transport::Udp);
+    let pinned = ResolvedEgress::resolved(
+        "sip:as.example.com;transport=udp",
+        destination,
+        Transport::Udp,
+    );
+    let tcp = ResolvedEgress::resolved("sip:as.example.com", destination, Transport::Tcp);
+
+    // No `listen.mtu`: nothing is read.
+    criterion.bench_function("resolved_over_mtu/no_mtu", |bencher| {
+        bencher.iter(|| black_box(udp.over_threshold(black_box(None), &small)));
+    });
+    // Already on a stream transport: nothing is read.
+    criterion.bench_function("resolved_over_mtu/stream_transport", |bencher| {
+        bencher.iter(|| black_box(tcp.over_threshold(black_box(Some(1500)), &small)));
+    });
+    // Under the threshold: one serialisation.
+    criterion.bench_function("resolved_over_mtu/under_threshold", |bencher| {
+        bencher.iter(|| black_box(udp.over_threshold(black_box(Some(1500)), &small)));
+    });
+    // Over it: the serialisation and the target URI's transport parameter.
+    criterion.bench_function("resolved_over_mtu/over_threshold", |bencher| {
+        bencher.iter(|| black_box(udp.over_threshold(black_box(Some(1500)), &large)));
+    });
+    criterion.bench_function("resolved_over_mtu/over_threshold_udp_named", |bencher| {
+        bencher.iter(|| black_box(pinned.over_threshold(black_box(Some(1500)), &large)));
+    });
+}
+
+criterion_group!(benches, bench_decision, bench_resolved);
 criterion_main!(benches);

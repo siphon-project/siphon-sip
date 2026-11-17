@@ -13,6 +13,15 @@ use tracing::warn;
 
 use crate::config::NamedCacheConfig;
 
+#[cfg(feature = "redis-backend")]
+mod health;
+
+/// The `op` label values of `siphon_cache_errors_total`.
+#[cfg(feature = "redis-backend")]
+const OPS: [&str; 9] = [
+    "get", "set", "del", "exists", "expire", "rpush", "pop_all", "llen", "scan",
+];
+
 /// Escape Redis glob metacharacters (`* ? [ ] \`) so a `SCAN MATCH`
 /// prefix is matched literally. Backslash is escaped first (it is the
 /// glob escape char) by handling it in the same per-char pass.
@@ -43,6 +52,10 @@ struct NamedCache {
     /// Redis async connection (established lazily).
     #[cfg(feature = "redis-backend")]
     redis: tokio::sync::OnceCell<crate::redis_target::RedisConnection>,
+
+    /// Whether that connection's server is reachable.
+    #[cfg(feature = "redis-backend")]
+    health: std::sync::Arc<health::BackendHealth>,
 
     /// Local LRU cache (if `local_ttl_secs` is configured).
     local: Option<Mutex<LocalLru>>,
@@ -116,6 +129,11 @@ impl NamedCache {
             target: config.target.clone(),
             #[cfg(feature = "redis-backend")]
             redis: tokio::sync::OnceCell::new(),
+            #[cfg(feature = "redis-backend")]
+            health: std::sync::Arc::new(health::BackendHealth::new(
+                &config.name,
+                config.required_for_readiness,
+            )),
             local,
         }
     }
@@ -201,78 +219,142 @@ impl NamedCache {
 
     #[cfg(feature = "redis-backend")]
     async fn redis_delete(&self, key: &str) -> bool {
-        if let Some(mut connection) = self.get_redis_connection().await {
-            if let Err(error) = redis::cmd("DEL")
-                .arg(key)
-                .query_async::<()>(&mut connection)
-                .await
-            {
-                warn!(key = key, "Redis DEL failed: {error}");
-                return false;
-            }
-            return true;
+        let Some(mut connection) = self.connection("del").await else {
+            return false;
+        };
+        let result = redis::cmd("DEL")
+            .arg(key)
+            .query_async::<()>(&mut connection)
+            .await;
+        self.settle("del", key, result).is_some()
+    }
+
+    /// The connection for one `op`, or `None` (counted as a failed `op`) when
+    /// the backend is marked down or cannot be reached. A down backend is not
+    /// dialled per command: the caller gets its answer at once, and the
+    /// monitor and one trial command per interval do the redialling.
+    #[cfg(feature = "redis-backend")]
+    async fn connection(&self, op: &'static str) -> Option<crate::redis_target::RedisConnection> {
+        if !self.health.admit() {
+            crate::metrics::cache::record_error(self.health.cache(), op);
+            debug!(cache = %self.health.cache(), op, "cache: Redis backend is down, not tried");
+            return None;
         }
-        false
+        match self.connect().await {
+            Ok(connection) => Some(connection),
+            Err(error) => {
+                crate::metrics::cache::record_error(self.health.cache(), op);
+                self.health.mark_down(&error);
+                None
+            }
+        }
     }
 
     #[cfg(feature = "redis-backend")]
-    async fn get_redis_connection(&self) -> Option<crate::redis_target::RedisConnection> {
-        let connection = self
-            .redis
+    async fn connect(&self) -> redis::RedisResult<crate::redis_target::RedisConnection> {
+        self.redis
             .get_or_try_init(|| async {
                 crate::redis_target::RedisConnection::connect(self.target.clone()).await
             })
-            .await;
+            .await
+            .cloned()
+    }
 
-        match connection {
-            Ok(connection) => Some(connection.clone()),
+    /// Record how `op` ended: a success marks the backend up, a failure is
+    /// counted, and one that says the link or the primary is gone marks the
+    /// backend down. Any other failure is logged on its own and leaves the
+    /// state alone: the server refusing this command (`WRONGTYPE`, ...), or
+    /// one command running past its deadline (a `SCAN` of a large keyspace),
+    /// which a server that still answers `PING` is not down for. A server
+    /// that answers nothing at all is found by the monitor's probe.
+    #[cfg(feature = "redis-backend")]
+    fn settle<T>(&self, op: &'static str, key: &str, result: redis::RedisResult<T>) -> Option<T> {
+        match result {
+            Ok(value) => {
+                self.health.mark_up();
+                Some(value)
+            }
             Err(error) => {
-                warn!(target = ?self.target, "Redis connection failed: {error}");
+                crate::metrics::cache::record_error(self.health.cache(), op);
+                if crate::redis_target::is_link_failure(&error) && !error.is_timeout() {
+                    self.health.mark_down(&error);
+                } else {
+                    warn!(cache = %self.health.cache(), op, key, "Redis command failed: {error}");
+                }
                 None
             }
+        }
+    }
+
+    /// [`settle`](Self::settle) for a command that was sent at most once. Its
+    /// link failure does not say the backend is down: the connection may have
+    /// died idle and been redialled since, which a replayed command would
+    /// have shown. A probe on the redialled connection decides instead.
+    #[cfg(feature = "redis-backend")]
+    async fn settle_unreplayed<T>(
+        &self,
+        op: &'static str,
+        key: &str,
+        result: redis::RedisResult<T>,
+    ) -> Option<T> {
+        match result {
+            Err(error) if crate::redis_target::is_link_failure(&error) => {
+                crate::metrics::cache::record_error(self.health.cache(), op);
+                debug!(cache = %self.health.cache(), op, key, "Redis command not replayed: {error}");
+                self.probe().await;
+                None
+            }
+            result => self.settle(op, key, result),
+        }
+    }
+
+    /// One `PING`, whatever the backend's state: the monitor's probe.
+    #[cfg(feature = "redis-backend")]
+    async fn probe(&self) {
+        match self.connect().await {
+            Ok(mut connection) => {
+                let result = redis::cmd("PING")
+                    .query_async::<String>(&mut connection)
+                    .await;
+                match result {
+                    Ok(_) => self.health.mark_up(),
+                    Err(error) => self.health.mark_down(&error),
+                }
+            }
+            Err(error) => self.health.mark_down(&error),
         }
     }
 
     #[cfg(feature = "redis-backend")]
     async fn redis_fetch(&self, key: &str) -> Option<String> {
-        let mut connection = self.get_redis_connection().await?;
-        match redis::cmd("GET")
+        let mut connection = self.connection("get").await?;
+        let result = redis::cmd("GET")
             .arg(key)
             .query_async::<Option<String>>(&mut connection)
-            .await
-        {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(key = key, "Redis GET failed: {error}");
-                None
-            }
-        }
+            .await;
+        self.settle("get", key, result).flatten()
     }
 
     #[cfg(feature = "redis-backend")]
     async fn redis_store(&self, key: &str, value: &str, ttl_secs: Option<u64>) -> bool {
-        if let Some(mut connection) = self.get_redis_connection().await {
-            let result = if let Some(ttl) = ttl_secs {
-                redis::cmd("SETEX")
-                    .arg(key)
-                    .arg(ttl)
-                    .arg(value)
-                    .query_async::<()>(&mut connection)
-                    .await
-            } else {
-                redis::cmd("SET")
-                    .arg(key)
-                    .arg(value)
-                    .query_async::<()>(&mut connection)
-                    .await
-            };
-            if let Err(error) = result {
-                warn!(key = key, "Redis SET failed: {error}");
-                return false;
-            }
-            return true;
-        }
-        false
+        let Some(mut connection) = self.connection("set").await else {
+            return false;
+        };
+        let result = if let Some(ttl) = ttl_secs {
+            redis::cmd("SETEX")
+                .arg(key)
+                .arg(ttl)
+                .arg(value)
+                .query_async::<()>(&mut connection)
+                .await
+        } else {
+            redis::cmd("SET")
+                .arg(key)
+                .arg(value)
+                .query_async::<()>(&mut connection)
+                .await
+        };
+        self.settle("set", key, result).is_some()
     }
 
     /// Append `item` to the right of a Redis list. Returns the new
@@ -282,19 +364,15 @@ impl NamedCache {
     async fn list_push(&self, key: &str, item: &str) -> Option<u64> {
         #[cfg(feature = "redis-backend")]
         {
-            let mut connection = self.get_redis_connection().await?;
-            match redis::cmd("RPUSH")
+            let connection = self.connection("rpush").await?;
+            // Not idempotent: a replay after a lost reply would queue the
+            // item twice, so the command is sent at most once.
+            let result = redis::cmd("RPUSH")
                 .arg(key)
                 .arg(item)
-                .query_async::<u64>(&mut connection)
-                .await
-            {
-                Ok(len) => Some(len),
-                Err(error) => {
-                    warn!(key = key, "Redis RPUSH failed: {error}");
-                    None
-                }
-            }
+                .query_async::<u64>(&mut connection.at_most_once())
+                .await;
+            self.settle_unreplayed("rpush", key, result).await
         }
         #[cfg(not(feature = "redis-backend"))]
         {
@@ -312,10 +390,13 @@ impl NamedCache {
     async fn list_pop_all(&self, key: &str) -> Vec<String> {
         #[cfg(feature = "redis-backend")]
         {
-            let Some(mut connection) = self.get_redis_connection().await else {
+            let Some(connection) = self.connection("pop_all").await else {
                 return Vec::new();
             };
             // Pipeline: LRANGE key 0 -1 ; DEL key — atomic via MULTI/EXEC.
+            // Sent at most once: a replay after a lost reply would find the
+            // list already deleted and return nothing for the items the first
+            // attempt removed.
             let result: Result<(Vec<String>, ()), _> = redis::pipe()
                 .atomic()
                 .cmd("LRANGE")
@@ -324,15 +405,12 @@ impl NamedCache {
                 .arg(-1)
                 .cmd("DEL")
                 .arg(key)
-                .query_async(&mut connection)
+                .query_async(&mut connection.at_most_once())
                 .await;
-            match result {
-                Ok((items, _)) => items,
-                Err(error) => {
-                    warn!(key = key, "Redis list_pop_all failed: {error}");
-                    Vec::new()
-                }
-            }
+            self.settle_unreplayed("pop_all", key, result)
+                .await
+                .map(|(items, _)| items)
+                .unwrap_or_default()
         }
         #[cfg(not(feature = "redis-backend"))]
         {
@@ -348,23 +426,17 @@ impl NamedCache {
     async fn expire(&self, key: &str, ttl_secs: u64) -> bool {
         #[cfg(feature = "redis-backend")]
         {
-            let Some(mut connection) = self.get_redis_connection().await else {
+            let Some(mut connection) = self.connection("expire").await else {
                 return false;
             };
             // Redis EXPIRE returns 1 when the timeout was set, 0 when
             // the key did not exist.
-            match redis::cmd("EXPIRE")
+            let result = redis::cmd("EXPIRE")
                 .arg(key)
                 .arg(ttl_secs)
                 .query_async::<i64>(&mut connection)
-                .await
-            {
-                Ok(set) => set == 1,
-                Err(error) => {
-                    warn!(key = key, "Redis EXPIRE failed: {error}");
-                    false
-                }
-            }
+                .await;
+            self.settle("expire", key, result) == Some(1)
         }
         #[cfg(not(feature = "redis-backend"))]
         {
@@ -381,18 +453,12 @@ impl NamedCache {
     async fn list_len(&self, key: &str) -> Option<u64> {
         #[cfg(feature = "redis-backend")]
         {
-            let mut connection = self.get_redis_connection().await?;
-            match redis::cmd("LLEN")
+            let mut connection = self.connection("llen").await?;
+            let result = redis::cmd("LLEN")
                 .arg(key)
                 .query_async::<u64>(&mut connection)
-                .await
-            {
-                Ok(len) => Some(len),
-                Err(error) => {
-                    warn!(key = key, "Redis LLEN failed: {error}");
-                    None
-                }
-            }
+                .await;
+            self.settle("llen", key, result)
         }
         #[cfg(not(feature = "redis-backend"))]
         {
@@ -416,26 +482,21 @@ impl NamedCache {
     async fn list_len_sum(&self, prefix: &str) -> Option<u64> {
         #[cfg(feature = "redis-backend")]
         {
-            let mut connection = self.get_redis_connection().await?;
+            let mut connection = self.connection("scan").await?;
             let pattern = format!("{}*", escape_glob(prefix));
             let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut cursor: u64 = 0;
             loop {
-                let (next_cursor, batch): (u64, Vec<String>) = match redis::cmd("SCAN")
+                let result = redis::cmd("SCAN")
                     .arg(cursor)
                     .arg("MATCH")
                     .arg(&pattern)
                     .arg("COUNT")
                     .arg(512)
                     .query_async(&mut connection)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(error) => {
-                        warn!(prefix = prefix, "Redis SCAN failed: {error}");
-                        return None;
-                    }
-                };
+                    .await;
+                let (next_cursor, batch): (u64, Vec<String>) =
+                    self.settle("scan", prefix, result)?;
                 keys.extend(batch);
                 cursor = next_cursor;
                 if cursor == 0 {
@@ -449,13 +510,9 @@ impl NamedCache {
             for key in &keys {
                 pipe.cmd("LLEN").arg(key);
             }
-            match pipe.query_async::<Vec<u64>>(&mut connection).await {
-                Ok(lengths) => Some(lengths.iter().sum()),
-                Err(error) => {
-                    warn!(prefix = prefix, "Redis LLEN pipeline failed: {error}");
-                    None
-                }
-            }
+            let result = pipe.query_async::<Vec<u64>>(&mut connection).await;
+            self.settle("llen", prefix, result)
+                .map(|lengths| lengths.iter().sum())
         }
         #[cfg(not(feature = "redis-backend"))]
         {
@@ -481,20 +538,15 @@ impl NamedCache {
         }
         #[cfg(feature = "redis-backend")]
         {
-            let Some(mut connection) = self.get_redis_connection().await else {
+            let Some(mut connection) = self.connection("exists").await else {
                 return false;
             };
-            match redis::cmd("EXISTS")
+            let result = redis::cmd("EXISTS")
                 .arg(key)
                 .query_async::<i64>(&mut connection)
-                .await
-            {
-                Ok(present) => present > 0,
-                Err(error) => {
-                    warn!(key = key, "Redis EXISTS failed: {error}");
-                    false
-                }
-            }
+                .await;
+            self.settle("exists", key, result)
+                .is_some_and(|present| present > 0)
         }
         #[cfg(not(feature = "redis-backend"))]
         {
@@ -505,7 +557,9 @@ impl NamedCache {
 
 /// Manages all named caches configured in `siphon.yaml`.
 pub struct CacheManager {
-    caches: HashMap<String, NamedCache>,
+    /// Shared with each cache's monitor task, which holds its own cache only
+    /// weakly between probes.
+    caches: HashMap<String, std::sync::Arc<NamedCache>>,
 }
 
 impl CacheManager {
@@ -513,7 +567,12 @@ impl CacheManager {
     pub fn new(configs: &[NamedCacheConfig]) -> Self {
         let caches = configs
             .iter()
-            .map(|config| (config.name.clone(), NamedCache::new(config)))
+            .map(|config| {
+                (
+                    config.name.clone(),
+                    std::sync::Arc::new(NamedCache::new(config)),
+                )
+            })
             .collect();
         Self { caches }
     }
@@ -522,6 +581,53 @@ impl CacheManager {
     pub fn empty() -> Self {
         Self {
             caches: HashMap::new(),
+        }
+    }
+
+    /// Watch the Redis backend of every cache and take part in readiness.
+    ///
+    /// Starts one monitor task per cache, which probes the backend once a
+    /// second until the manager is dropped, and registers the caches with
+    /// `participants`: `/admin/ready` then answers 503 while the backend of a
+    /// cache marked `required_for_readiness` (off by default) is unreachable
+    /// or has not answered yet. A cache not marked is probed and measured the
+    /// same and never holds readiness back. Does nothing, and registers
+    /// nothing, when no cache is configured. Must be called from inside a
+    /// Tokio runtime.
+    pub fn watch_backends(&self, participants: &crate::lifecycle::Participants) {
+        #[cfg(feature = "redis-backend")]
+        {
+            if self.caches.is_empty() {
+                return;
+            }
+            let mut backends = Vec::with_capacity(self.caches.len());
+            for (name, cache) in &self.caches {
+                crate::metrics::cache::declare(name, &OPS);
+                backends.push(std::sync::Arc::clone(&cache.health));
+                // Each task holds its own cache, and only for the length of a
+                // probe: it ends once the manager is gone, however long the
+                // probes of the other caches take.
+                let cache = std::sync::Arc::downgrade(cache);
+                tokio::spawn(async move {
+                    loop {
+                        let Some(cache) = cache.upgrade() else {
+                            return;
+                        };
+                        cache.probe().await;
+                        cache.health.publish();
+                        drop(cache);
+                        tokio::time::sleep(health::PROBE_INTERVAL).await;
+                    }
+                });
+            }
+            backends.sort_by(|left, right| left.cache().cmp(right.cache()));
+            participants.register(std::sync::Arc::new(health::CacheReadiness { backends }));
+        }
+        #[cfg(not(feature = "redis-backend"))]
+        {
+            // Without a Redis layer a cache is its in-process map: nothing
+            // can be unreachable.
+            let _ = participants;
         }
     }
 
@@ -608,6 +714,9 @@ impl CacheManager {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(all(test, feature = "redis-backend"))]
+mod redis_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,6 +732,7 @@ mod tests {
             target: ("redis://127.0.0.1:1".to_string()).into(),
             local_ttl_secs: ttl_secs,
             local_max_entries: max_entries,
+            required_for_readiness: false,
         }
     }
 
@@ -652,6 +762,7 @@ mod tests {
             target: ("redis://127.0.0.1:1".to_string()).into(),
             local_ttl_secs: Some(0), // 0-second TTL = expires immediately
             local_max_entries: Some(100),
+            required_for_readiness: false,
         }];
         let manager = CacheManager::new(&configs);
 
@@ -790,6 +901,142 @@ mod tests {
     async fn list_len_sum_returns_none_for_unknown_cache_name() {
         let manager = CacheManager::empty();
         assert!(manager.list_len_sum("nope", "ims_queue_").await.is_none());
+    }
+
+    #[test]
+    fn a_cache_counts_towards_readiness_only_when_configured_to() {
+        let caches: Vec<NamedCacheConfig> = crate::config::yaml::from_str(concat!(
+            "- name: cnam\n",
+            "  url: redis://192.0.2.10:6379\n",
+            "- name: flows\n",
+            "  url: redis://192.0.2.10:6379\n",
+            "  required_for_readiness: true\n",
+        ))
+        .expect("cache list");
+        assert!(!caches[0].required_for_readiness);
+        assert!(caches[1].required_for_readiness);
+    }
+
+    /// The readiness wiring end to end, with a Redis that refuses: the
+    /// monitor finds it down, the probe names the cache, and a cache
+    /// configured out of readiness does not hold the node back.
+    #[cfg(feature = "redis-backend")]
+    #[tokio::test]
+    async fn an_unreachable_backend_holds_readiness_only_for_a_required_cache() {
+        let wait = |participants: std::sync::Arc<crate::lifecycle::Participants>,
+                    wanted: Option<&'static str>| async move {
+            for _ in 0..200 {
+                if participants.not_ready_reason().as_deref() == wanted {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!(
+                "wanted {wanted:?}, got {:?}",
+                participants.not_ready_reason()
+            );
+        };
+
+        // As configured by default: probed, found down, readiness untouched.
+        let optional = make_config("mod_tests_optional", None, None);
+        let manager = std::sync::Arc::new(CacheManager::new(&[optional]));
+        let participants = std::sync::Arc::new(crate::lifecycle::Participants::default());
+        manager.watch_backends(&participants);
+        assert_eq!(participants.not_ready_reason(), None, "before the probe");
+        for _ in 0..200 {
+            if !manager.caches["mod_tests_optional"].health.admit() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(!manager.caches["mod_tests_optional"].health.admit());
+        assert!(!crate::metrics::cache::backend_up("mod_tests_optional"));
+        assert_eq!(participants.not_ready_reason(), None, "and once it is down");
+
+        let mut required = make_config("mod_tests_required", None, None);
+        required.required_for_readiness = true;
+        let manager = std::sync::Arc::new(CacheManager::new(&[required]));
+        let participants = std::sync::Arc::new(crate::lifecycle::Participants::default());
+        manager.watch_backends(&participants);
+        wait(
+            std::sync::Arc::clone(&participants),
+            Some("cache 'mod_tests_required': Redis backend unreachable"),
+        )
+        .await;
+        assert!(!crate::metrics::cache::backend_up("mod_tests_required"));
+        // Refused at once and counted, with the server known to be gone.
+        assert!(manager.fetch("mod_tests_required", "key").await.is_none());
+        assert!(crate::metrics::cache::errors("mod_tests_required", "get") >= 1);
+    }
+
+    /// Which command failures take the backend down: the link going, not a
+    /// refused command and not one command running past its deadline.
+    #[cfg(feature = "redis-backend")]
+    #[test]
+    fn only_a_lost_link_marks_the_backend_down() {
+        let name = "mod_tests_settle";
+        let cache = NamedCache::new(&make_config(name, None, None));
+        let io = |kind: std::io::ErrorKind| redis::RedisError::from(std::io::Error::from(kind));
+
+        assert_eq!(cache.settle("get", "key", Ok(7)), Some(7));
+        let refused = redis::RedisError::from((redis::ErrorKind::InvalidClientConfig, "refused"));
+        assert_eq!(cache.settle::<u8>("get", "key", Err(refused)), None);
+        assert!(cache.health.admit(), "a refused command is not an outage");
+        let slow = io(std::io::ErrorKind::TimedOut);
+        assert_eq!(cache.settle::<u8>("get", "key", Err(slow)), None);
+        assert!(cache.health.admit(), "a slow command is not an outage");
+
+        let reset = io(std::io::ErrorKind::ConnectionReset);
+        assert_eq!(cache.settle::<u8>("get", "key", Err(reset)), None);
+        assert!(!cache.health.admit(), "a reset link is");
+        assert_eq!(crate::metrics::cache::errors(name, "get"), 3);
+
+        assert_eq!(cache.settle("get", "key", Ok(7)), Some(7));
+        assert!(cache.health.admit(), "and an answer ends it");
+    }
+
+    #[tokio::test]
+    async fn no_configured_cache_registers_nothing_with_readiness() {
+        let manager = std::sync::Arc::new(CacheManager::empty());
+        let participants = crate::lifecycle::Participants::default();
+        manager.watch_backends(&participants);
+        assert_eq!(participants.not_ready_reason(), None);
+        assert_eq!(participants.registered_count(), 0);
+    }
+
+    /// A monitor holds its cache only while it probes, and no other cache at
+    /// all: once the manager is dropped every task ends and the caches are
+    /// freed, with the monitors already running.
+    #[cfg(feature = "redis-backend")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_monitors_end_with_their_manager() {
+        let manager = CacheManager::new(&[
+            make_config("mod_tests_dropped_a", None, None),
+            make_config("mod_tests_dropped_b", None, None),
+        ]);
+        let participants = crate::lifecycle::Participants::default();
+        manager.watch_backends(&participants);
+        let caches: Vec<_> = manager
+            .caches
+            .values()
+            .map(std::sync::Arc::downgrade)
+            .collect();
+        // Both monitors have probed: the backends are known to be down.
+        for _ in 0..200 {
+            if manager.caches.values().all(|cache| !cache.health.admit()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(manager.caches.values().all(|cache| !cache.health.admit()));
+        drop(manager);
+        for _ in 0..200 {
+            if caches.iter().all(|cache| cache.strong_count() == 0) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("a monitor task still holds its cache");
     }
 
     #[cfg(feature = "redis-backend")]

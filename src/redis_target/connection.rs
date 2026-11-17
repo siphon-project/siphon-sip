@@ -25,6 +25,8 @@ struct State {
     connection: MultiplexedConnection,
     generation: u64,
     last_attempt: Option<tokio::time::Instant>,
+    /// When the last redial failed, for the commands queued behind it.
+    last_failure: Option<tokio::time::Instant>,
 }
 
 /// Clones share the current connection and serialize only reconnect attempts.
@@ -61,6 +63,7 @@ impl RedisConnection {
                 connection,
                 generation: 0,
                 last_attempt: None,
+                last_failure: None,
             })),
         }
     }
@@ -76,9 +79,17 @@ impl RedisConnection {
         if !recoverable(&error) || matches!(*self.source, Source::Fixed) {
             return Err(error);
         }
+        let asked = tokio::time::Instant::now();
         let mut state = self.state.lock().await;
         if state.generation != generation {
             return Ok(state.connection.clone());
+        }
+        // Commands queued behind a redial share its outcome, a failure as much
+        // as a success. Without this each of them redials in turn, a backoff
+        // apart, and a burst against an unreachable server waits out the whole
+        // operation deadline one command at a time.
+        if state.last_failure.is_some_and(|failed| failed >= asked) {
+            return Err(error);
         }
         tracing::warn!(%error, target = ?self.target(), "Redis command failed; rediscovering primary before one retry");
         let delay = state
@@ -87,7 +98,13 @@ impl RedisConnection {
             .unwrap_or(BACKOFF);
         tokio::time::sleep(delay).await;
         state.last_attempt = Some(tokio::time::Instant::now());
-        let connection = open(&self.source).await?;
+        let connection = match open(&self.source).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                state.last_failure = Some(tokio::time::Instant::now());
+                return Err(error);
+            }
+        };
         state.connection = connection.clone();
         state.generation += 1;
         Ok(connection)
@@ -105,12 +122,71 @@ impl RedisConnection {
         result
     }
 }
+/// A view of a [`RedisConnection`] that never sends a command twice.
+///
+/// For commands that are not idempotent (`RPUSH`, a read-and-delete
+/// transaction): when the link fails with the reply outstanding the server may
+/// or may not have run the command, so replaying it can duplicate or lose
+/// data. The failure is returned as it is; the connection is still redialled,
+/// so that the next command finds a working one.
+pub(crate) struct AtMostOnce<'a>(&'a RedisConnection);
+
+impl RedisConnection {
+    pub(crate) fn at_most_once(&self) -> AtMostOnce<'_> {
+        AtMostOnce(self)
+    }
+    async fn redial_after(&self, generation: u64, error: RedisError) -> RedisError {
+        let _ = self.recover(generation, error.clone()).await;
+        error
+    }
+}
+impl ConnectionLike for AtMostOnce<'_> {
+    fn req_packed_command<'a>(
+        &'a mut self,
+        command: &'a redis::Cmd,
+    ) -> redis::RedisFuture<'a, Value> {
+        Box::pin(bounded(async move {
+            let (generation, mut connection) = self.0.snapshot().await;
+            match connection
+                .req_packed_command(command)
+                .await
+                .and_then(Value::extract_error)
+            {
+                Ok(value) => Ok(value),
+                Err(error) => Err(self.0.redial_after(generation, error).await),
+            }
+        }))
+    }
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        pipeline: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisFuture<'a, Vec<Value>> {
+        Box::pin(bounded(async move {
+            let (generation, mut connection) = self.0.snapshot().await;
+            match connection
+                .req_packed_commands(pipeline, offset, count)
+                .await
+                .and_then(|values| values.into_iter().map(Value::extract_error).collect())
+            {
+                Ok(values) => Ok(values),
+                Err(error) => Err(self.0.redial_after(generation, error).await),
+            }
+        }))
+    }
+    fn get_db(&self) -> i64 {
+        self.0.db
+    }
+}
 impl From<MultiplexedConnection> for RedisConnection {
     fn from(connection: MultiplexedConnection) -> Self {
         Self::new(Source::Fixed, connection)
     }
 }
-fn recoverable(error: &RedisError) -> bool {
+/// Whether `error` says the link or the primary is gone, as opposed to the
+/// server refusing one command.
+pub(crate) fn recoverable(error: &RedisError) -> bool {
     error.is_io_error()
         || error.is_connection_refusal()
         || error.is_connection_dropped()
@@ -515,6 +591,90 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+        }
+    }
+
+    /// Commands that fail together against an unreachable server cost one
+    /// redial between them, not one each, a backoff apart.
+    #[tokio::test]
+    async fn commands_queued_behind_a_failed_redial_share_its_failure() {
+        use redis::AsyncCommands;
+        let (old, old_driver, old_server) = mock_connection("").await;
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connection = RedisConnection::new(
+            Source::Test {
+                next: Arc::new(tokio::sync::Mutex::new(None)),
+                attempts: attempts.clone(),
+            },
+            old,
+        );
+        let started = std::time::Instant::now();
+        let results = futures_util::future::join_all((0..20).map(|index| {
+            let mut connection = connection.clone();
+            async move {
+                connection
+                    .set::<_, _, ()>(format!("key{index}"), "value")
+                    .await
+            }
+        }))
+        .await;
+        assert!(results.iter().all(Result::is_err));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        // The next command, issued after that failure, redials for itself.
+        let mut later = connection.clone();
+        assert!(later.set::<_, _, ()>("key", "value").await.is_err());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        drop(later);
+        drop(connection);
+        for task in [old_driver, old_server] {
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    /// The at-most-once view returns the failure of a dropped command without
+    /// replaying it, and leaves a redialled connection for the next command.
+    #[tokio::test]
+    async fn at_most_once_does_not_replay_and_still_redials() {
+        use redis::AsyncCommands;
+        for pipeline in [false, true] {
+            let (old, old_driver, old_server) = mock_connection("").await;
+            let (new, new_driver, new_server) = mock_connection("+OK\r\n").await;
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut connection = RedisConnection::new(
+                Source::Test {
+                    next: Arc::new(tokio::sync::Mutex::new(Some(new))),
+                    attempts: attempts.clone(),
+                },
+                old,
+            );
+            let result = if pipeline {
+                redis::pipe()
+                    .set("key", "value")
+                    .ignore()
+                    .query_async::<()>(&mut connection.at_most_once())
+                    .await
+            } else {
+                connection
+                    .at_most_once()
+                    .set::<_, _, ()>("key", "value")
+                    .await
+            };
+            assert!(result.is_err(), "the dropped command is not replayed");
+            assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            connection.set::<_, _, ()>("key", "value").await.unwrap();
+            assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            drop(connection);
+            for task in [old_driver, old_server, new_driver, new_server] {
+                tokio::time::timeout(Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
         }
     }
 

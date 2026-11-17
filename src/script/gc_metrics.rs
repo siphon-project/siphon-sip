@@ -560,12 +560,30 @@ mod tests {
     #[test]
     fn freed_cycles_are_counted_and_none_is_uncollectable() {
         const CYCLES: usize = 500;
+        // In its own process: in the shared one, other tests' collections and
+        // threads raced this one often enough that the cycles outlived the
+        // deadline.
+        if !in_child(
+            concat!(
+                module_path!(),
+                "::freed_cycles_are_counted_and_none_is_uncollectable"
+            ),
+            Duration::from_secs(60),
+        ) {
+            return;
+        }
         Python::initialize();
         install();
         let global = collectors().expect("collectors build");
-        // Other tests collect beside this one, into whichever generation
-        // they ask for, and their collection may be the one that frees these
-        // cycles; the sum over the generations sees them either way.
+        // Only the collections asked for below may run.
+        Python::attach(|python| {
+            python
+                .import("gc")
+                .and_then(|gc| gc.call_method0("disable"))
+                .expect("gc.disable");
+        });
+        // A young collection may miss cycles an earlier one moved on; the sum
+        // over the generations counts them whichever collection frees them.
         let collected = || global.collected.iter().map(IntCounter::get).sum::<u64>();
         let uncollectable = || {
             global

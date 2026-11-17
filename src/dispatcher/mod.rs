@@ -100,6 +100,7 @@ mod sweep;
 mod target;
 mod tasks;
 mod timers;
+mod uac_transactions;
 #[cfg(test)]
 mod unprotected_response_tests;
 
@@ -294,6 +295,8 @@ mod provisional_presentation_tests;
 #[cfg(test)]
 mod proxy_2xx_retransmission_tests;
 #[cfg(test)]
+mod proxy_ack_egress_tests;
+#[cfg(test)]
 mod proxy_branch_final_tests;
 #[cfg(test)]
 mod proxy_cancel_awaits_provisional_tests;
@@ -400,6 +403,10 @@ mod stop_the_world_tests;
 #[cfg(test)]
 mod subscribe_notify_before_2xx_tests;
 #[cfg(test)]
+mod subscribe_notify_over_mtu_tests;
+#[cfg(test)]
+mod subscribe_notify_response_tests;
+#[cfg(test)]
 mod subscribe_reply_order_tests;
 #[cfg(test)]
 mod subscribe_test_harness;
@@ -485,6 +492,9 @@ pub use media_init::{init_rtpengine, spawn_rtpengine_health_check};
 pub(crate) use proxy_release::proxy_release_call;
 pub(crate) use state::ProxyRfState;
 pub use state::{publish_store_gauges, DrainState, ReliableProvisional};
+#[cfg(test)]
+pub(crate) use target::forget_tcp_probe;
+pub(crate) use target::{OriginatedOverMtu, OriginatedTcp};
 
 use b2bua::*;
 use cancel_ack::*;
@@ -519,6 +529,7 @@ use sweep::*;
 use target::*;
 use tasks::*;
 use timers::*;
+use uac_transactions::*;
 
 /// RTPEngine wiring produced by [`init_rtpengine`]: the media-control backend
 /// (rtpengine NG or native siphon-rtp), the media session store, and the
@@ -876,6 +887,9 @@ pub async fn run(
     if let Some(registrant) = state.registrant_manager.as_ref() {
         registrant.attach_transactions(Arc::new(RegisterTransactionLayer::of(&state)));
     }
+    // So does every other non-INVITE request siphon originates as a UAC, for a
+    // script or for itself (RFC 3261 §17.1.2.2).
+    attach_uac_transactions(&state);
 
     // Published now as well as on the sweep, so the limit gauges are right
     // from the first scrape rather than thirty seconds in.
@@ -921,7 +935,24 @@ pub async fn run(
 
 /// Create Rust-backed auth, registrar, log, and proxy utility singletons
 /// and inject them into the Python `siphon` module, replacing the Python stubs.
+///
+/// The `cache` namespace gets a cache manager of its own, which nothing
+/// probes: it finds a lost Redis again through its own commands. The server
+/// shares one manager between the namespace and its other users and watches
+/// it ([`crate::cache::CacheManager::watch_backends`]).
 pub fn inject_python_singletons(config: &Config) {
+    let cache_manager = Arc::new(crate::cache::CacheManager::new(
+        config.cache.as_deref().unwrap_or(&[]),
+    ));
+    inject_python_singletons_with_cache(config, cache_manager);
+}
+
+/// [`inject_python_singletons`] with the cache manager (local LRU + optional
+/// Redis) the `cache` namespace reads and writes through.
+pub(crate) fn inject_python_singletons_with_cache(
+    config: &Config,
+    cache_manager: Arc<crate::cache::CacheManager>,
+) {
     let dns_resolver = Arc::new(match SipResolver::from_system() {
         Ok(resolver) => resolver,
         Err(error) => {
@@ -1037,10 +1068,6 @@ pub fn inject_python_singletons(config: &Config) {
     let py_proxy_utils = crate::script::api::proxy_utils::PyProxyUtils::new(dns_resolver)
         .with_enum_servers(enum_servers);
 
-    // Cache namespace (local LRU + optional Redis)
-    let cache_manager = std::sync::Arc::new(crate::cache::CacheManager::new(
-        config.cache.as_deref().unwrap_or(&[]),
-    ));
     let py_cache = crate::script::api::cache::PyCacheNamespace::new(cache_manager);
 
     // Store singletons in the global so install_siphon_module() will inject
