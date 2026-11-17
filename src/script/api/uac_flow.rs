@@ -3,6 +3,7 @@
 
 use std::net::SocketAddr;
 
+use crate::transport::mtu::{upgrade_metrics, OverMtuPath};
 use crate::transport::{ConnectionId, Transport};
 use crate::uac::UacSender;
 
@@ -80,6 +81,7 @@ impl FlowEgress {
             if let Some(path) = path {
                 if path.connect(pool, request_label(&message)).await {
                     path.apply(&mut message);
+                    upgrade_metrics::record(OverMtuPath::of_originated(&message));
                     return (message, Transport::Tcp, ConnectionId::default());
                 }
             }

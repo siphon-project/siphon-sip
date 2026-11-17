@@ -35,6 +35,7 @@ pub fn init() -> Result<(), prometheus::Error> {
     rate_limit::init(&metrics.registry)?;
     send_queue::init(&metrics.registry)?;
     pool_connect::init(&metrics.registry)?;
+    crate::transport::mtu::upgrade_metrics::init(&metrics.registry)?;
     crate::presence::metrics::init(&metrics.registry)?;
     stale_shed::init(&metrics.registry)?;
     subscribe_notify::init(&metrics.registry)?;

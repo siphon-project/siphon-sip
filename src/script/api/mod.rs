@@ -66,6 +66,12 @@ pub(crate) mod uac_flow_lab;
 #[cfg(test)]
 #[path = "uac_flow_over_mtu_tests.rs"]
 mod uac_flow_over_mtu_tests;
+// Public for `benches/flow_over_mtu.rs` only; not part of the API.
+#[doc(hidden)]
+pub mod uac_resolved;
+#[cfg(test)]
+#[path = "uac_resolved_tests.rs"]
+pub(crate) mod uac_resolved_tests;
 
 use std::ffi::CString;
 use std::sync::{Arc, Mutex, OnceLock};

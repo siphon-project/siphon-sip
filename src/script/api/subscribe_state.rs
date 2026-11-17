@@ -1277,7 +1277,13 @@ impl PySubscribeState {
 
         let mut receiver = match &flow_egress {
             Some(egress) => egress.send(uac_sender, message).await,
-            None => uac_sender.send_request_with_response(message, destination, transport),
+            // Over the MTU and built for UDP, over TCP (RFC 3261 §18.1.1).
+            None => {
+                let next_hop = super::uac_resolved::next_hop_uri(pre_loaded_route.first(), ruri);
+                super::uac_resolved::ResolvedEgress::resolved(next_hop, destination, transport)
+                    .send(uac_sender, resolver, message)
+                    .await
+            }
         };
 
         let timeout = std::time::Duration::from_millis(timeout_ms);

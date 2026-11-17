@@ -190,17 +190,20 @@ fn the_public_surface_is_pinned() {
     // `forget_reoffer` for a script that stops waiting, plus the 2
     // crate-internal items `b2bua.adopt_replaced()` goes through: its entry
     // point and `AdoptRequest`, plus the crate-internal `network_deregister`
-    // `registrar.network_deregister()` ends a registration through, plus the
-    // crate-internal `inject_python_singletons_with_cache` the server hands
-    // the `cache` namespace the cache manager it shares and watches through
-    // (the published `inject_python_singletons` keeps its signature).
+    // `registrar.network_deregister()` ends a registration through, plus the 3
+    // crate-internal items a request a script originates decides its RFC 3261
+    // §18.1.1 transport through: `OriginatedOverMtu`, `OriginatedTcp`, and the
+    // test-only `forget_tcp_probe`, plus the crate-internal
+    // `inject_python_singletons_with_cache` the server hands the `cache`
+    // namespace the cache manager it shares and watches through (the published
+    // `inject_python_singletons` keeps its signature).
     // All additive, so a minor-compatible change — recorded here because that
     // is the tripwire.
     assert_eq!(
         declared + re_exported,
-        120,
+        123,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 120. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 123. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,
