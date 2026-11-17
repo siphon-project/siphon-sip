@@ -1667,6 +1667,7 @@ mod tests {
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
             direct_dispatch: Default::default(),
+            gc: Default::default(),
         };
         let engine = ScriptEngine::new(&config).expect("initial load");
         assert_eq!(std::fs::read_to_string(&output).unwrap(), "v1");
@@ -1736,6 +1737,7 @@ mod tests {
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
             direct_dispatch: Default::default(),
+            gc: Default::default(),
         };
         let engine = Arc::new(ScriptEngine::new(&config).expect("initial load"));
         (dir, engine, imported, stranger)
@@ -2545,6 +2547,7 @@ async def route(request):
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
             direct_dispatch: Default::default(),
+            gc: Default::default(),
         };
         let result = ScriptEngine::new(&config);
         assert!(result.is_err());
@@ -2574,6 +2577,7 @@ def route(request):
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
             direct_dispatch: Default::default(),
+            gc: Default::default(),
         };
         let engine = ScriptEngine::new(&config).unwrap();
         assert_eq!(engine.state().handlers.len(), 1);
@@ -2621,6 +2625,7 @@ def route(request):
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
             direct_dispatch: Default::default(),
+            gc: Default::default(),
         };
         let engine = ScriptEngine::new(&config).unwrap();
         assert_eq!(engine.state().handlers.len(), 1);
@@ -2647,6 +2652,7 @@ def route(request):
             executor_queue_capacity: 1024,
             include_paths: Vec::new(),
             direct_dispatch: Default::default(),
+            gc: Default::default(),
         }
     }
 

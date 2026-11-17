@@ -96,6 +96,8 @@ pub(super) fn subscribe_harness() -> (MutexGuard<'static, ()>, &'static Subscrib
         let TestDispatcher { state, udp } = test_dispatcher_with_script(SCRIPT);
         crate::script::api::subscribe_state::set_uac_sender(Arc::clone(&state.uac_sender));
         crate::script::api::subscribe_state::set_resolver(Arc::clone(&state.dns_resolver));
+        // As `dispatcher::run` does: what the UAC sends is retransmitted.
+        attach_uac_transactions(&state);
         SubscribeHarness {
             state: Arc::new(state),
             udp,

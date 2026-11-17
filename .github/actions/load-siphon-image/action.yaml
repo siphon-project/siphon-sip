@@ -11,7 +11,7 @@ description: Download and load the sipp-siphon image built once per run by build
 runs:
   using: composite
   steps:
-    - uses: actions/download-artifact@v7
+    - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
       with:
         name: sipp-siphon-image
         path: /tmp

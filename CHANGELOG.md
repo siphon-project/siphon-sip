@@ -68,8 +68,36 @@ entry, but a working config keeps working.
 - **The Diameter server listener survives running out of file descriptors.**
   Its accept loop ended on any accept error, so a single `EMFILE` stopped it
   accepting peers until restart. It now backs off the same way.
+- **A request a script originates over UDP is now retransmitted until it is answered (RFC 3261 §17.1.2.2).** `proxy.send_request`, the NOTIFYs of `proxy.subscribe_state` (the initial one behind the 200, later ones, the terminating one and the one that ends an expired subscription), `proxy.subscribe_state.send()` with its refresh and unsubscribe, `presence.notify()` and the in-dialog OPTIONS of the proxy's dialog probe went out as one datagram, so a single lost packet read as no answer at all. Each now runs as a non-INVITE client transaction of the transaction layer relayed requests use: over UDP Timer E re-sends the same bytes (same branch, same CSeq) to the same address from the same socket after 0.5 s, 1 s, 2 s, then every 4 s (T1 doubling to T2), every T2 once a provisional response has come, until the final response or Timer F (`transaction.timeout_secs`, default 64*T1 = 32 s), which is the timeout a caller waiting for the final response sees. After the final response the transaction stays for Timer K (T4, 5 s) so a repeated response is absorbed. Over TCP, TLS, WS, WSS and SCTP the request is still written exactly once. A caller that stops waiting on purpose (the dialog probe at `probe_timeout_secs`) ends the retransmissions with its wait; `proxy.send_request(wait_for_response=True)` returning `None` at `timeout_ms` does not, the request is retransmitted until Timer F as the RFC has it. A UAC request to a UE's protected client port on a P-CSCF that was sent without waiting for its response now leaves over the security association, as one waited on already did (TS 33.203 clause 7.1). Unchanged, one datagram each: the OPTIONS of the NAT keepalive, the gateway health probe and the registrar liveness check, which count a miss and probe again on their own schedule, and an INVITE or ACK sent with `proxy.send_request`. These transactions do not hold a drain at shutdown.
 
 ### Added
+
+- **`script.gc`: freeze startup objects and raise the collection threshold.**
+  On free-threaded Python every garbage collection stops all threads and
+  walks the whole heap, so it takes as long as the heap is large (about 35 ms
+  for 2 million tracked objects) however little it frees.
+  `script.gc.freeze_after_load: true` runs one full collection and
+  `gc.freeze()` once the script and the extensions have loaded, so later
+  collections skip everything alive at that point (35 ms to 17 ms on that
+  heap). It is done once: a reload does not freeze again, the startup copy of
+  the script's modules stays allocated after the first reload, and reloaded
+  modules are collected as usual. `script.gc.threshold: N` is
+  `gc.set_threshold(N)`: a collection is considered once more than N container
+  objects are new, and runs when memory grew by a tenth or once 40 x N have
+  been set aside (80,000 with CPython's default of 2000). 0 and values above
+  53687091 are
+  refused at startup. Set the two together: a frozen heap no longer holds
+  collections back, so the freeze alone makes them shorter and far more
+  frequent, and siphon warns about that at startup. Both default to leaving
+  CPython alone. See "Tuning the
+  garbage collector" in `docs/handler-execution-model.md`.
+- **What Python's collections free.**
+  `siphon_python_gc_collected_total{generation}` and
+  `siphon_python_gc_uncollectable_total{generation}` from the collector's own
+  report, `siphon_python_gc_young_objects` (`gc.get_count()[0]`, read once a
+  second) and `siphon_python_gc_frozen_objects` (set once by the freeze).
+  CPython does not expose how many objects the collector tracks without a walk
+  of the heap, so there is no gauge of that.
 
 - Inbound Diameter requests can be answered by Rust handlers registered at
   server start (`SiphonServer::register_diameter_handlers`); the

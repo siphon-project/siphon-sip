@@ -122,6 +122,103 @@ pub struct ScriptConfig {
     /// handlers are not affected by this switch. See `script::runner`.
     #[serde(default)]
     pub direct_dispatch: DirectDispatch,
+    /// Python garbage-collector settings, applied once at startup. See
+    /// [`ScriptGcConfig`].
+    #[serde(default)]
+    pub gc: ScriptGcConfig,
+}
+
+/// `script.gc`: what siphon tells the interpreter's cyclic garbage collector
+/// once, at startup. Both keys default to leaving CPython as it is.
+///
+/// The line references are to CPython 3.14.2, `Python/gc_free_threading.c`
+/// (the collector of a free-threaded build) and `Modules/gcmodule.c`.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptGcConfig {
+    /// Run one full collection and then `gc.freeze()` when the script and the
+    /// extensions have loaded, so no later collection examines the objects
+    /// alive at that point (the standard library, the script's modules,
+    /// whatever its top level built).
+    ///
+    /// On a free-threaded build every collection is a stop-the-world over the
+    /// whole heap. A frozen object is still stepped over in that walk
+    /// (`gc_visit_heaps`), but `op_from_block` drops it before any
+    /// `tp_traverse` or refcount work (lines 360-374), and the pass that marks
+    /// what is reachable from the roots is skipped altogether (lines
+    /// 2184-2190). Measured on 3.14.2t with 2.1 million tracked objects: a
+    /// full collection went from 35 ms to 17 ms.
+    ///
+    /// Frozen objects are never examined again, so a reference cycle among
+    /// them that dies later is never freed. The freeze happens once: a script
+    /// reload builds new modules, which are not frozen and are collected as
+    /// usual when the next reload replaces them, while the copy of the
+    /// script's modules that was frozen at startup stays allocated after the
+    /// first reload. That is a one-off cost of the size of the script's own
+    /// module-level objects, not a leak per reload.
+    ///
+    /// The collector counts only unfrozen objects as long-lived (line 1214),
+    /// and it does not start an automatic collection while fewer objects than
+    /// a quarter of that count are new (line 2099). With most of the heap
+    /// frozen that floor drops, so the freeze alone makes collections shorter
+    /// and far more frequent (24 against 2 in one measurement, three times
+    /// the pause in total). Set `threshold` with it; a quarter of the frozen
+    /// count restores the floor.
+    #[serde(default)]
+    pub freeze_after_load: bool,
+    /// `gc.set_threshold(threshold)`, which sets only the first of CPython's
+    /// three thresholds (`gcmodule.c` line 162). Unset leaves CPython's 2000
+    /// (line 1588).
+    ///
+    /// On a free-threaded build an automatic collection is considered when
+    /// the young count (container objects allocated minus those freed since
+    /// the collector last looked) exceeds this (line 2091) and is at least a
+    /// quarter of the unfrozen objects that survived the last collection
+    /// (line 2099). It then runs if the counts set aside since the last
+    /// collection exceed 40 times the threshold (line 2057), or the process's
+    /// RSS plus swap has grown since then by more than a tenth, and by more
+    /// than 128 KiB (lines 2066-2068). Otherwise the young count is set aside
+    /// and starts again from zero (lines 2077-2079).
+    ///
+    /// So the value is the floor under which nothing is considered and, times
+    /// 40, what must have been set aside before a process whose memory is
+    /// steady collects anyway: 80,000 by default. Neither is an interval. A
+    /// heap of 2 million unfrozen survivors is not considered before 500,000
+    /// objects are new, whatever the threshold.
+    ///
+    /// 0 is refused: it turns automatic collection off (line 2091), and then
+    /// no reference cycle is freed unless something calls `gc.collect()`. So
+    /// is anything above 53,687,091, where CPython's `threshold * 40`
+    /// overflows a C `int`.
+    #[serde(default, deserialize_with = "deserialize_gc_threshold")]
+    pub threshold: Option<u32>,
+}
+
+/// The largest `script.gc.threshold`: CPython computes `threshold * 40` in a
+/// C `int` (`Python/gc_free_threading.c` line 2057 in 3.14.2).
+pub const GC_THRESHOLD_MAX: u32 = i32::MAX.unsigned_abs() / 40;
+
+fn deserialize_gc_threshold<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(threshold) = Option::<u64>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if threshold == 0 {
+        return Err(serde::de::Error::custom(
+            "script.gc.threshold must be at least 1: 0 turns Python's automatic garbage \
+             collection off, and reference cycles are then not freed (leave the key out \
+             to keep CPython's default)",
+        ));
+    }
+    match u32::try_from(threshold) {
+        Ok(threshold) if threshold <= GC_THRESHOLD_MAX => Ok(Some(threshold)),
+        _ => Err(serde::de::Error::custom(format!(
+            "script.gc.threshold must be at most {GC_THRESHOLD_MAX}, not {threshold}: \
+             CPython multiplies it by 40 in a C int"
+        ))),
+    }
 }
 
 /// `script.direct_dispatch`.
@@ -219,6 +316,7 @@ impl Default for ScriptConfig {
             executor_queue_capacity: default_executor_queue_capacity(),
             include_paths: Vec::new(),
             direct_dispatch: DirectDispatch::Off,
+            gc: ScriptGcConfig::default(),
         }
     }
 }
