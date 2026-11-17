@@ -579,8 +579,13 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(30);
             Python::attach(|python| {
                 let references = drop_cycles(python, CYCLES);
+                collect(python, generation);
+                // An automatic collection another test set off may have
+                // moved the cycles out of the young generation before the one
+                // above ran, and a young collection never reaches them there;
+                // a full one does, and the sum below still counts them.
                 while alive(&references) > 0 {
-                    collect(python, generation);
+                    collect(python, 2);
                     assert!(Instant::now() < deadline, "the cycles were never collected");
                 }
             });
