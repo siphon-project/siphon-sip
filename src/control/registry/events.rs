@@ -11,6 +11,38 @@ use crate::control::protocol::EventFrame;
 use super::queue::record_push_outcome;
 use super::ControlBus;
 
+/// The party whose BYE ended a call, relative to the call the app owns: the
+/// `initiator` of a `StasisEnd` with `reason: "bye"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HangupInitiator {
+    /// The party that placed the call: the A leg of a call siphon received.
+    Caller,
+    /// A party the call was placed to: the B leg of a call siphon received,
+    /// and any party of a call siphon placed (`originate`).
+    Callee,
+}
+
+impl HangupInitiator {
+    /// The side of a BYE that arrived on the A leg (`from_a_leg`) of a call
+    /// siphon received, or placed (`originated`). On an originated call siphon
+    /// itself is the caller, so whoever hangs up is a callee.
+    pub fn from_bye(from_a_leg: bool, originated: bool) -> Self {
+        if from_a_leg && !originated {
+            Self::Caller
+        } else {
+            Self::Callee
+        }
+    }
+
+    /// The wire value: `"caller"` or `"callee"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Caller => "caller",
+            Self::Callee => "callee",
+        }
+    }
+}
+
 impl ControlBus {
     /// Push an event to whichever channel owns `sip_call_id`, if any.
     ///
@@ -153,6 +185,35 @@ impl ControlBus {
         code: Option<u16>,
         response: Option<&str>,
     ) {
+        let mut payload = serde_json::json!({ "reason": reason });
+        if let Some(object) = payload.as_object_mut() {
+            if let Some(code) = code {
+                object.insert("code".to_string(), serde_json::json!(code));
+            }
+            if let Some(response) = response {
+                object.insert("response".to_string(), serde_json::json!(response));
+            }
+        }
+        self.end_channel(sip_call_id, payload);
+    }
+
+    /// [`on_call_terminated`](Self::on_call_terminated) for a call a party
+    /// ended with a BYE: `reason: "bye"` plus `initiator`, the side that sent
+    /// it relative to the call the app owns (`"caller"` or `"callee"`). Without
+    /// it a bridged call's owner cannot tell a caller who gave up from a callee
+    /// who finished. A teardown nobody sent a BYE for goes through
+    /// [`on_call_terminated_with_cause`](Self::on_call_terminated_with_cause)
+    /// and carries no `initiator`.
+    pub fn on_call_hung_up(&self, sip_call_id: &str, initiator: HangupInitiator) {
+        self.end_channel(
+            sip_call_id,
+            serde_json::json!({ "reason": "bye", "initiator": initiator.as_str() }),
+        );
+    }
+
+    /// Emit `StasisEnd` carrying `payload` for the channel owning
+    /// `sip_call_id`, and remove the channel. A no-op for an uncontrolled call.
+    fn end_channel(&self, sip_call_id: &str, payload: serde_json::Value) {
         let Some(channel_id) = self.channel_id_for_sip_call_id(sip_call_id) else {
             return;
         };
@@ -163,15 +224,6 @@ impl ControlBus {
         // A transfer still awaiting its verdict can never get one once the call
         // is gone — report it before the StasisEnd that ends the stream.
         self.flush_outbound_transfer(&channel_id, sip_call_id);
-        let mut payload = serde_json::json!({ "reason": reason });
-        if let Some(object) = payload.as_object_mut() {
-            if let Some(code) = code {
-                object.insert("code".to_string(), serde_json::json!(code));
-            }
-            if let Some(response) = response {
-                object.insert("response".to_string(), serde_json::json!(response));
-            }
-        }
         self.publish_to_channel(
             &channel_id,
             EventFrame::new(
@@ -189,7 +241,7 @@ impl ControlBus {
             self.retain_tombstone(sip_call_id, &channel_id, &entry);
         }
         self.remove_channel(&channel_id);
-        debug!(%channel_id, %sip_call_id, reason, ?code, "control plane: StasisEnd + channel removed");
+        debug!(%channel_id, %sip_call_id, "control plane: StasisEnd + channel removed");
     }
 
     /// Forward an in-band DTMF digit (detected by the media engine on a
@@ -247,5 +299,44 @@ impl ControlBus {
             debug!(%channel_id, %sip_call_id, digit, "control plane: ChannelDtmfReceived forwarded");
         }
         pushed
+    }
+}
+
+#[cfg(test)]
+mod hangup_initiator_tests {
+    use super::HangupInitiator;
+
+    #[test]
+    fn a_bye_on_the_a_leg_of_a_received_call_is_the_callers() {
+        assert_eq!(
+            HangupInitiator::from_bye(true, false),
+            HangupInitiator::Caller
+        );
+    }
+
+    #[test]
+    fn a_bye_on_the_b_leg_of_a_received_call_is_the_callees() {
+        assert_eq!(
+            HangupInitiator::from_bye(false, false),
+            HangupInitiator::Callee
+        );
+    }
+
+    #[test]
+    fn a_bye_on_either_leg_of_an_originated_call_is_a_callees() {
+        assert_eq!(
+            HangupInitiator::from_bye(true, true),
+            HangupInitiator::Callee
+        );
+        assert_eq!(
+            HangupInitiator::from_bye(false, true),
+            HangupInitiator::Callee
+        );
+    }
+
+    #[test]
+    fn wire_values() {
+        assert_eq!(HangupInitiator::Caller.as_str(), "caller");
+        assert_eq!(HangupInitiator::Callee.as_str(), "callee");
     }
 }

@@ -282,6 +282,20 @@ pub fn control_notify_terminated(sip_call_id: &str, reason: &str) {
     control_notify_terminated_with_cause(sip_call_id, reason, None, None);
 }
 
+/// [`control_notify_terminated`] for a call a party ended with a BYE: the
+/// `StasisEnd` names which side sent it (`initiator`).
+pub fn control_notify_hung_up(sip_call_id: &str, initiator: crate::control::HangupInitiator) {
+    #[cfg(test)]
+    crate::control::channel_event_capture::record(
+        sip_call_id,
+        "StasisEnd",
+        &serde_json::json!({ "reason": "bye", "initiator": initiator.as_str() }),
+    );
+    if let Some(bus) = crate::control::ControlBus::global() {
+        bus.on_call_hung_up(sip_call_id, initiator);
+    }
+}
+
 /// [`control_notify_terminated`] carrying the SIP cause. Used by the originate
 /// paths, where the controller has no other way to learn *why* the leg it
 /// placed died — there is no A-leg the callee's final was relayed to.

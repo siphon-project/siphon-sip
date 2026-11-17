@@ -369,6 +369,15 @@ with no SIP response — an ordinary BYE, a script-driven terminate, a `drop` �
 omits both keys rather than inventing one, so `code` present always means a real
 status was on the wire.
 
+**A `bye` names the party that sent it.** When a party's BYE ended the call,
+`StasisEnd` carries `initiator: "caller" | "callee"` beside `reason: "bye"`,
+relative to the call the app owns: on a call siphon received, the A leg is the
+caller and the party it was bridged to the callee; on a call siphon placed
+(`originate`), siphon is the caller, so whoever hangs up is a callee. The side
+is read from the BYE's dialog identity (RFC 3261 §12), never its source address.
+A teardown nobody sent a BYE for (a `hangup`, `drop`, timeout or CANCEL) has no
+`initiator`.
+
 The media verbs (`play` / `stop` / `dtmf` / `hold` / `unhold` / `stream_start` /
 `stream_stop`) act on the controlled A-leg's anchored media session. They are
 resolved against the configured media backend and answer with a typed reply the
@@ -1266,7 +1275,7 @@ events on your id:
 | `ChannelStateChange` | `{state:"answered", code, sdp?}` | the callee answered; siphon has ACKed |
 | `StasisEnd` | `{reason:"rejected", code, response}` | the callee rejected it — the SIP cause, since there is no A-leg it was relayed to |
 | `StasisEnd` | `{reason:"cancelled", code:487, response}` | the leg was abandoned before answer (RFC 3261 §9.1) |
-| `StasisEnd` | `{reason:"bye"}` / `{reason:"ring timeout"}` / `{reason:<hangup reason>}` | the call ended |
+| `StasisEnd` | `{reason:"bye", initiator:"callee"}` / `{reason:"ring timeout"}` / `{reason:<hangup reason>}` | the call ended |
 
 **Media.** Exactly one plan is required, because an INVITE with no offer and no
 way to answer the callee's leaves its 2xx unanswerable (RFC 3261 §13.2.2.4) — a
