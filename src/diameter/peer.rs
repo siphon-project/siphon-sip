@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 use tracing::{error, info, warn};
 
 use crate::diameter::transport::DiameterStream;
@@ -205,7 +205,10 @@ pub struct DiameterPeer {
     /// Connection lifecycle state (see [`PeerState`]).
     state: Arc<AtomicU8>,
     /// Shutdown signal
-    shutdown: Arc<Notify>,
+    /// Latched: a shutdown asked for while a task is between two awaits (or
+    /// before it first polls) is still seen. A `Notify::notify_waiters` is not,
+    /// and a lost one left the connection open until the peer closed it.
+    shutdown: Arc<watch::Sender<bool>>,
     /// The other end's Origin-Host and Origin-Realm, from its CER (an
     /// accepted connection) or its CEA (a connection this node dialled).
     remote: OnceLock<(String, String)>,
@@ -592,7 +595,7 @@ impl DiameterPeer {
 
     /// Shutdown the peer connection.
     pub fn shutdown(&self) {
-        self.shutdown.notify_waiters();
+        self.shutdown.send_replace(true);
     }
 
     /// Create a peer handle for unit testing (no background tasks). Starts in
@@ -611,7 +614,7 @@ impl DiameterPeer {
             session_counter: Arc::new(AtomicU32::new(1)),
             session_high: session_high_seed(),
             state: Arc::new(AtomicU8::new(PeerState::Open.as_u8())),
-            shutdown: Arc::new(Notify::new()),
+            shutdown: Arc::new(watch::channel(false).0),
             remote: OnceLock::new(),
             remote_disconnect_cause: Arc::new(AtomicU32::new(NO_DISCONNECT_CAUSE)),
             disconnecting: AtomicBool::new(false),
@@ -818,6 +821,11 @@ fn refusal_answer(raw: &[u8], origin: (&str, &str), result_code: u32) -> Option<
     )
 }
 
+/// Resolves once `shutdown()` was called, however long ago.
+async fn shutdown_requested(receiver: &mut watch::Receiver<bool>) {
+    let _ = receiver.wait_for(|requested| *requested).await;
+}
+
 /// Spawn reader, writer, and watchdog tasks for an established connection.
 /// Returns the peer handle. Shared between client and server modes.
 pub(crate) fn spawn_connection_tasks<S>(
@@ -839,7 +847,7 @@ where
     let e2e_counter = Arc::new(AtomicU32::new(1));
     // The connection is established (CER/CEA done) by the time tasks spawn.
     let state = Arc::new(AtomicU8::new(PeerState::Open.as_u8()));
-    let shutdown = Arc::new(Notify::new());
+    let shutdown = Arc::new(watch::channel(false).0);
 
     let peer = Arc::new(DiameterPeer {
         config: config.clone(),
@@ -865,7 +873,7 @@ where
     }
 
     // Writer task
-    let shutdown_w = shutdown.clone();
+    let mut shutdown_w = shutdown.subscribe();
     let flush_close_w = peer.flush_close.clone();
     tokio::spawn(async move {
         loop {
@@ -909,7 +917,7 @@ where
                         None => break,
                     }
                 }
-                _ = shutdown_w.notified() => break,
+                _ = shutdown_requested(&mut shutdown_w) => break,
             }
         }
     });
@@ -919,7 +927,7 @@ where
     let origin_host = config.origin_host.clone();
     let origin_realm = config.origin_realm.clone();
     let write_tx_r = peer.write_tx.clone();
-    let shutdown_r = shutdown.clone();
+    let mut shutdown_r = shutdown.subscribe();
     let state_r = state.clone();
     let peer_r = peer.clone();
     let remote_cause_r = peer.remote_disconnect_cause.clone();
@@ -1055,7 +1063,7 @@ where
                         }
                     }
                 }
-                _ = shutdown_r.notified() => break,
+                _ = shutdown_requested(&mut shutdown_r) => break,
             }
         }
         // Reader loop exited → the connection is no longer usable. Mark Closed
@@ -1081,7 +1089,7 @@ where
     // requests fail over) and then closes the connection, which in client
     // mode makes the reconnect loop dial again.
     let peer_w = peer.clone();
-    let shutdown_dw = shutdown.clone();
+    let mut shutdown_dw = shutdown.subscribe();
     let tick = config
         .lifecycle
         .watchdog_interval_ms
@@ -1096,7 +1104,7 @@ where
                         break;
                     }
                 }
-                _ = shutdown_dw.notified() => break,
+                _ = shutdown_requested(&mut shutdown_dw) => break,
             }
         }
     });
@@ -2536,5 +2544,21 @@ mod tests {
         }
         assert_eq!(peer.watchdog_state(), WatchdogState::Okay);
         assert!(peer.is_open());
+    }
+
+    /// `shutdown()` is not a broadcast to whoever happens to be waiting: the
+    /// reader, writer and watchdog tasks have not polled yet (a current-thread
+    /// runtime runs nothing until the test awaits), and the request must
+    /// still close the connection.
+    #[tokio::test]
+    async fn a_shutdown_asked_before_the_tasks_wait_still_closes_the_connection() {
+        let (client_side, _far_end) = tokio::io::duplex(8192);
+        let (incoming_tx, _incoming_rx) = mpsc::channel(64);
+        let peer = spawn_connection_tasks(fast_watchdog_config(60_000), client_side, incoming_tx);
+        peer.shutdown();
+        wait_for("the connection to close", || {
+            peer.state() == PeerState::Closed
+        })
+        .await;
     }
 }
