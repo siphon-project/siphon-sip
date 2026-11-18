@@ -2907,6 +2907,79 @@ jobs:
             siphon-srs.log
             srs-engine.log
 
+  # ── SIPREC recording server decided by a control application ───────────
+  # srs.app offers each session to a controller, which accepts (mono, or one
+  # stereo file with a live WebSocket tee), rejects, lets the handoff deadline
+  # lapse, or hangs up. A real siphon-rtp records the audio.
+  sipp-srs-control:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      - name: Start the engine, sink, siphon and the recorder application
+        run: docker compose -f sipp/docker-compose.yaml --profile srs-control up -d --wait srs-engine srs-ws-sink siphon-srs-control srs-recorder-app
+
+      - name: Run the cases
+        run: |
+          set -u
+          compose="docker compose -f sipp/docker-compose.yaml"
+          verdict() {
+            # $1 case, $2 marker, $3 service. The line prints after the SRC is
+            # done (file close, StasisEnd), so poll for it.
+            local line="" attempt
+            for attempt in $(seq 1 40); do
+              if [ "$2" = CONTROL-VERDICT ]; then
+                line="$($compose --profile srs-control logs "$3" 2>&1 | grep CONTROL-VERDICT | grep "\"case\": \"$1\"" || true)"
+              else
+                line="$($compose --profile srs-control logs "$3" 2>&1 | grep "$2" || true)"
+              fi
+              [ -n "$line" ] && break
+              sleep 1
+            done
+            if [ -z "$line" ]; then echo "no $2 for '$1'"; return 1; fi
+            if echo "$line" | grep -q '"pass": false'; then echo "case '$1' failed:"; echo "$line"; return 1; fi
+            echo "ok: $1"
+          }
+          check() { $compose --profile srs-check run --rm srs-control-recordings-check python3 /check.py "$@"; }
+          run_case() {
+            $compose --profile srs-control up --abort-on-container-exit --exit-code-from "sipp-srs-control-$1-uac" "sipp-srs-control-$1-uac"
+            verdict "$1" CONTROL-VERDICT srs-recorder-app
+          }
+          run_case accept-stereo
+          verdict accept-stereo SRS-SINK-VERDICT srs-ws-sink
+          check /recordings/stereo 1 2
+          run_case metadata-update
+          check /recordings/rs-ctl-meta 2 1
+          run_case reject
+          run_case deadline
+          run_case hangup
+
+      - name: Collect logs
+        if: always()
+        run: |
+          for service in siphon-srs-control srs-engine srs-recorder-app srs-ws-sink; do
+            docker compose -f sipp/docker-compose.yaml --profile srs-control logs "$service" > "$service.log" 2>&1 || true
+          done
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile srs-control --profile srs-check down -v --remove-orphans
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sipp-srs-control-logs
+          path: |
+            siphon-srs-control.log
+            srs-engine.log
+            srs-recorder-app.log
+            srs-ws-sink.log
+
   # ── Real siphon-rtp: rtpengine NG shim (drop-in replacement) ───────────
   # Same script, same scenarios, same assertions as sipp-siphon-rtp-native —
   # only the media backend differs. siphon's stock rtpengine client drives

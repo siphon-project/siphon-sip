@@ -14,6 +14,7 @@
 #   ./scripts/run-tests.sh --b2bua-on-failure  # Also run the @b2bua.on_failure decision cases
 #   ./scripts/run-tests.sh --b2bua-lcr         # Also run the LCR route-sequence cases
 #   ./scripts/run-tests.sh --srs        # Also run the SIPREC recording server (RFC 7866) tests
+#   ./scripts/run-tests.sh --srs-control # Also run the SIPREC recording server control-rail tests (accept/stereo/tee/metadata/reject/deadline/hangup)
 #   ./scripts/run-tests.sh --originate         # Also run the control-plane originate test
 set -euo pipefail
 
@@ -66,6 +67,7 @@ RUN_RFC4475=false
 RUN_WEBRTC=false
 RUN_LI=false
 RUN_SRS=false
+RUN_SRS_CONTROL=false
 SKIP_RUST=false
 
 # Scenario modes selected on this invocation.  Exactly one is allowed — see the
@@ -108,6 +110,7 @@ for arg in "$@"; do
     --webrtc)     RUN_WEBRTC=true;     SELECTED_MODES+=("$arg") ;;
     --li)         RUN_LI=true;         SELECTED_MODES+=("$arg") ;;
     --srs)        RUN_SRS=true;        SELECTED_MODES+=("$arg") ;;
+    --srs-control) RUN_SRS_CONTROL=true; SELECTED_MODES+=("$arg") ;;
     --skip-rust)  SKIP_RUST=true ;;
     --help|-h)
       echo "Usage: $0 [<one scenario mode>] [--skip-rust]"
@@ -119,7 +122,7 @@ for arg in "$@"; do
       echo "  --b2bua --b2bua-auth --b2bua-invite-auth --gateway --auto100 --http-auth"
       echo "  --b2bua-fork --b2bua-on-failure --b2bua-lcr --originate"
       echo "  --wedge --nohandler --banscan --reload --shutdown"
-      echo "  --security --rfc4475 --webrtc --srs"
+      echo "  --security --rfc4475 --webrtc --srs --srs-control"
       echo
       echo "  --skip-rust   skip the Rust test step (combines with any mode)"
       echo
@@ -1127,6 +1130,76 @@ if [[ "$RUN_SRS" == true ]]; then
   run_sipp docker compose -f "$COMPOSE_FILE" --profile srs-check run --rm srs-recordings-check
 
   docker compose -f "$COMPOSE_FILE" --profile srs --profile srs-check down -v --remove-orphans 2>/dev/null || true
+fi
+
+if [[ "$RUN_SRS_CONTROL" == true ]]; then
+  # SIPREC recording server whose sessions are decided by a control application
+  # (srs.app), against a REAL siphon-rtp engine. Start from nothing: `down -v`
+  # drops the recordings volume and the app's old verdicts.
+  docker compose -f "$COMPOSE_FILE" --profile srs --profile srs-control --profile srs-check down -v --remove-orphans 2>/dev/null || true
+  docker compose -f "$COMPOSE_FILE" --profile srs-control up -d --wait srs-engine srs-ws-sink siphon-srs-control srs-recorder-app
+
+  SRS_CONTROL_LOG_DIR="${SRS_CONTROL_LOG_DIR:-$(mktemp -d)}"
+  srs_control_dump_logs() {
+    docker compose -f "$COMPOSE_FILE" --profile srs-control logs srs-recorder-app > "$SRS_CONTROL_LOG_DIR/srs-recorder-app.log" 2>&1 || true
+    docker compose -f "$COMPOSE_FILE" --profile srs-control logs srs-ws-sink > "$SRS_CONTROL_LOG_DIR/srs-ws-sink.log" 2>&1 || true
+    docker compose -f "$COMPOSE_FILE" --profile srs-control logs siphon-srs-control > "$SRS_CONTROL_LOG_DIR/siphon-srs-control.log" 2>&1 || true
+    docker compose -f "$COMPOSE_FILE" --profile srs-control logs srs-engine > "$SRS_CONTROL_LOG_DIR/srs-engine.log" 2>&1 || true
+  }
+
+  # The verdict is printed after the SRC is done (it waits for the file close and
+  # StasisEnd), so poll for it. A case that never prints one is a failure too.
+  # NOTE: json.dumps writes `"key": "value"` WITH a space; match it.
+  assert_srs_verdict() {
+    local case="$1" kind="${2:-CONTROL-VERDICT}" file="${3:-srs-recorder-app.log}" line="" attempt
+    for attempt in $(seq 1 40); do
+      docker compose -f "$COMPOSE_FILE" --profile srs-control logs "${file%.log}" > "$SRS_CONTROL_LOG_DIR/$file" 2>&1 || true
+      if [[ "$kind" == "CONTROL-VERDICT" ]]; then
+        line="$(grep 'CONTROL-VERDICT' "$SRS_CONTROL_LOG_DIR/$file" | grep "\"case\": \"$case\"" || true)"
+      else
+        line="$(grep "$kind" "$SRS_CONTROL_LOG_DIR/$file" || true)"
+      fi
+      [[ -n "$line" ]] && break
+      sleep 1
+    done
+    if [[ -z "$line" ]]; then
+      echo "FAILED: no $kind for '$case' in $file"
+      srs_control_dump_logs
+      exit 1
+    fi
+    if grep -q '"pass": false' <<<"$line"; then
+      echo "FAILED: SRS control case '$case':"
+      echo "$line"
+      srs_control_dump_logs
+      exit 1
+    fi
+    echo "  ok $case: $line"
+  }
+
+  run_srs_control_case() {
+    local name="$1"
+    echo "=== SIPREC SRS control: $name ==="
+    run_sipp docker compose -f "$COMPOSE_FILE" --profile srs-control up --abort-on-container-exit --exit-code-from "sipp-srs-control-$name-uac" "sipp-srs-control-$name-uac"
+    assert_srs_verdict "$name"
+  }
+
+  run_srs_control_case accept-stereo
+  echo "=== SIPREC SRS control: the tee delivered audio to the WebSocket sink ==="
+  assert_srs_verdict accept-stereo SRS-SINK-VERDICT srs-ws-sink.log
+  echo "=== SIPREC SRS control: one stereo WAV for the two-stream session ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile srs-check run --rm srs-control-recordings-check python3 /check.py /recordings/stereo 1 2
+
+  run_srs_control_case metadata-update
+  echo "=== SIPREC SRS control: two mono WAVs for the metadata-update session ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile srs-check run --rm srs-control-recordings-check python3 /check.py /recordings/rs-ctl-meta 2 1
+
+  run_srs_control_case reject
+  run_srs_control_case deadline
+  run_srs_control_case hangup
+
+  srs_control_dump_logs
+  echo "SRS control logs: $SRS_CONTROL_LOG_DIR"
+  docker compose -f "$COMPOSE_FILE" --profile srs --profile srs-control --profile srs-check down -v --remove-orphans 2>/dev/null || true
 fi
 
 if [[ "$RUN_LI" == true ]]; then
