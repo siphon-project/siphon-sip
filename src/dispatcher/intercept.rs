@@ -207,7 +207,7 @@ fn b2bua_owner(state: &DispatcherState, call_id: &str) -> Option<crate::li::Call
 /// internal id and its Correlation ID then derive from one value.
 pub(super) fn create_b2bua_call(state: &DispatcherState, a_leg: Leg) -> String {
     #[cfg(test)]
-    super::inflight_invite::pause::checkpoint(&a_leg.dialog.call_id);
+    super::inflight_invite::pause::checkpoint("create", &a_leg.dialog.call_id);
     let reserved = state
         .li_manager
         .as_ref()

@@ -877,7 +877,7 @@ pub async fn run(
         pending_reinvite_acks: Arc::new(DashMap::new()),
         cancelled_invites: Arc::new(DashMap::new()),
         scripted_invites: Arc::new(DashMap::new()),
-        inflight_invites: Arc::new(InflightInvites::default()),
+        inflight_invites: Arc::new(InflightInviteStore::default()),
         completed_invites: CompletedInvites::default(),
         originate_groups: Arc::new(crate::dispatcher::b2bua::OriginateGroupStore::new()),
         dial_bridges: Arc::new(crate::dispatcher::b2bua::DialBridgeStore::new()),
@@ -942,6 +942,12 @@ pub async fn run(
     while let Ok(inbound) = inbound_rx.recv_async().await {
         let state = Arc::clone(&state);
 
+        // An initial INVITE is registered here, in arrival order and before any
+        // worker has it, so a CANCEL that another worker takes right behind it
+        // finds it whatever the workers' pace (see `b2bua::inflight`). The guard
+        // goes with the job and ends the registration when the job does.
+        let inflight_invite = inflight_invite::register_inbound(&inbound, &state);
+
         // Both requests and responses may invoke Python handlers
         // (on_request and on_reply), so dispatch on the fixed Python executor
         // pool rather than tokio's elastic blocking pool — the latter reaps
@@ -953,6 +959,7 @@ pub async fn run(
         // running the script for an answer that would arrive too late
         // (see `stale_shed`).
         crate::script::py_executor::spawn_with_queue_wait(move |queue_wait| {
+            let _inflight_invite = inflight_invite;
             inbound::handle_inbound_after_queue(inbound, queue_wait, &state);
         });
     }

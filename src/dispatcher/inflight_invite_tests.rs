@@ -1,9 +1,10 @@
 //! A caller's CANCEL that reaches another worker while its INVITE is still being
 //! turned into a call (RFC 3261 §9.1, §9.2).
 //!
-//! The INVITE's worker is parked just before the call is created, which is
-//! where the CANCEL overtook it on the wire, and the CANCEL is delivered
-//! whole in that window.
+//! The INVITE is registered as the dispatch loop does it, its worker is parked
+//! at a named stage, and the CANCEL is delivered whole to its own worker in
+//! that window: before the INVITE's worker has done anything with it, just
+//! before the call is created, and just after.
 
 use super::inflight_invite::pause;
 use super::test_dispatcher::{test_dispatcher_with_script, TestDispatcher};
@@ -45,6 +46,7 @@ fn cancel(call_id: &str) -> String {
         .replace("CSeq: 1 INVITE", "CSeq: 1 CANCEL")
 }
 
+/// A message handled as a worker would after the dispatch loop's registration.
 fn arrives(state: &Arc<DispatcherState>, raw: String) {
     let inbound = InboundMessage {
         client_transport: None,
@@ -88,54 +90,59 @@ fn dispatcher(script: &str) -> (Arc<DispatcherState>, flume::Receiver<OutboundMe
     (Arc::new(state), udp)
 }
 
-/// The CANCEL lands after the INVITE was taken in and before its call exists:
-/// it is answered `200` and the INVITE `487`, as for any early CANCEL, and the
-/// callee, which was never dialled, is sent nothing. Before this the CANCEL was
-/// answered `481` and the INVITE went on to ring the callee.
-#[test]
-fn a_cancel_that_overtakes_its_invite_cancels_the_call() {
-    let (state, udp) = dispatcher(DIALLING_B2BUA);
-    let call_id = "overtaken@peer.example.com";
-    let (reached, release) = pause::arm(call_id);
-
-    let invite_worker = {
-        let state = Arc::clone(&state);
-        std::thread::spawn(move || arrives(&state, invite(call_id)))
+/// The INVITE of `call_id` on its own thread, registered first as the dispatch
+/// loop does, parked at `stage`. Returns once its worker is there.
+fn parked_invite(
+    state: &Arc<DispatcherState>,
+    stage: &str,
+    call_id: &str,
+    raw: String,
+) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
+    let (reached, release) = pause::arm(stage, call_id);
+    let inbound = InboundMessage {
+        client_transport: None,
+        connection_id: ConnectionId::default(),
+        transport: Transport::Udp,
+        local_addr: state.local_addr,
+        remote_addr: CALLER.parse().expect("a literal address"),
+        data: Bytes::from(raw),
+    };
+    let registration = super::inflight_invite::register_inbound(&inbound, state);
+    assert!(registration.is_some(), "the loop registers an INVITE");
+    let worker = {
+        let state = Arc::clone(state);
+        std::thread::spawn(move || {
+            let _registration = registration;
+            super::inbound::handle_inbound_after_queue(inbound, std::time::Duration::ZERO, &state);
+        })
     };
     reached
         .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("the INVITE's worker reached the call's creation");
+        .expect("the INVITE's worker reached the stage");
+    (worker, release)
+}
 
-    arrives(&state, cancel(call_id));
-    assert_eq!(
-        wire(&udp)
-            .into_iter()
-            .filter(|(destination, label)| {
-                *destination == CALLER.parse::<SocketAddr>().unwrap() && label.starts_with("481")
-            })
-            .count(),
-        0,
-        "a CANCEL for an INVITE in flight is not answered 481 (RFC 3261 §9.2)"
-    );
+fn caller() -> SocketAddr {
+    CALLER.parse().expect("a literal address")
+}
 
-    release.send(()).expect("the INVITE's worker is parked");
-    invite_worker.join().expect("the INVITE's worker finished");
-
-    let sent = wire(&udp);
-    let caller: SocketAddr = CALLER.parse().expect("a literal address");
-    let to_caller: Vec<&str> = sent
-        .iter()
-        .filter(|(destination, _)| *destination == caller)
+fn to_caller(sent: &[(SocketAddr, String)]) -> Vec<&str> {
+    sent.iter()
+        .filter(|(destination, _)| *destination == caller())
         .map(|(_, label)| label.as_str())
-        .collect();
-    assert!(
-        to_caller.contains(&"200 CANCEL"),
-        "the CANCEL is answered 200: {sent:?}"
-    );
-    assert!(
-        to_caller.contains(&"487 INVITE"),
-        "the INVITE is answered 487: {sent:?}"
-    );
+        .collect()
+}
+
+/// What a cancelled call looks like on the wire: the CANCEL answered 200, the
+/// INVITE 487, no 481, and nothing for the callee, which was never dialled.
+fn assert_cancelled_before_dialling(
+    state: &Arc<DispatcherState>,
+    sent: &[(SocketAddr, String)],
+    call_id: &str,
+) {
+    let to_caller = to_caller(sent);
+    assert!(to_caller.contains(&"200 CANCEL"), "CANCEL 200: {sent:?}");
+    assert!(to_caller.contains(&"487 INVITE"), "INVITE 487: {sent:?}");
     assert!(
         !to_caller.iter().any(|label| label.starts_with("481")),
         "no 481 to the caller: {sent:?}"
@@ -156,58 +163,150 @@ fn a_cancel_that_overtakes_its_invite_cancels_the_call() {
     );
 }
 
-/// An INVITE that ends without ever making a call (here: handed back before
-/// the call step) still answers the CANCEL it held, once.
+/// The CANCEL is delivered to its worker before the INVITE's worker has done
+/// anything at all with the INVITE, not even parsed it. Registered by the loop,
+/// the INVITE is found all the same: the CANCEL is held, then run once the call
+/// exists.
 #[test]
-fn a_held_cancel_is_answered_when_its_invite_ends_without_a_call() {
+fn a_cancel_that_reaches_its_worker_before_the_invites_worker_has_started_is_held() {
     let (state, udp) = dispatcher(DIALLING_B2BUA);
-    let call_id = "never-a-call@peer.example.com";
-    let message = parse_sip_message_bytes(invite(call_id).as_bytes()).expect("the INVITE parses");
-    let guard = state
-        .inflight_invites
-        .begin(&message, &state)
-        .expect("an initial INVITE registers");
-    assert!(
-        state.inflight_invites.begin(&message, &state).is_none(),
-        "a copy of a registered INVITE does not register again"
-    );
+    let call_id = "not-yet-parsed@peer.example.com";
+    let (worker, release) = parked_invite(&state, "start", call_id, invite(call_id));
 
     arrives(&state, cancel(call_id));
-    assert!(
-        wire(&udp).is_empty(),
-        "the CANCEL is held, not answered yet"
-    );
+    assert!(wire(&udp).is_empty(), "the CANCEL waits for its call");
+    assert_eq!(state.inflight_invites.len(), 1);
 
-    drop(guard);
-    let sent = wire(&udp);
-    assert_eq!(sent.len(), 1, "the held CANCEL is answered once: {sent:?}");
-    assert!(sent[0].1.ends_with("CANCEL"), "{sent:?}");
-    assert_eq!(state.inflight_invites.len(), 0);
-
-    // With nothing registered a CANCEL is answered at once.
-    arrives(&state, cancel(call_id));
-    assert_eq!(wire(&udp).len(), 1);
+    release.send(()).expect("the INVITE's worker is parked");
+    worker.join().expect("the INVITE's worker finished");
+    assert_cancelled_before_dialling(&state, &wire(&udp), call_id);
 }
 
-/// Only so many CANCELs are held for one INVITE; the rest are answered.
+/// The CANCEL lands after the INVITE was taken in and before its call exists:
+/// it is answered `200` and the INVITE `487`, as for any early CANCEL, and the
+/// callee, which was never dialled, is sent nothing. Before this the CANCEL was
+/// answered `481` and the INVITE went on to ring the callee.
+#[test]
+fn a_cancel_that_overtakes_its_invite_cancels_the_call() {
+    let (state, udp) = dispatcher(DIALLING_B2BUA);
+    let call_id = "overtaken@peer.example.com";
+    let (worker, release) = parked_invite(&state, "create", call_id, invite(call_id));
+
+    arrives(&state, cancel(call_id));
+    assert!(
+        !to_caller(&wire(&udp))
+            .iter()
+            .any(|label| label.starts_with("481")),
+        "a CANCEL for an INVITE in flight is not answered 481 (RFC 3261 §9.2)"
+    );
+
+    release.send(()).expect("the INVITE's worker is parked");
+    worker.join().expect("the INVITE's worker finished");
+    assert_cancelled_before_dialling(&state, &wire(&udp), call_id);
+}
+
+/// The call exists but the handler window has not opened: the CANCEL finds the
+/// call itself, answers both parties and removes it, and `@b2bua.on_invite`
+/// then does not run for it (it used to, and set up for a call nobody would
+/// release).
+#[test]
+fn a_cancel_between_the_calls_creation_and_its_handler_cancels_it_and_skips_the_handler() {
+    let marker = std::env::temp_dir().join(format!("siphon-on-invite-ran-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let script = format!(
+        concat!(
+            "from siphon import b2bua\n",
+            "\n",
+            "@b2bua.on_invite\n",
+            "def on_invite(call):\n",
+            "    open({marker:?}, 'a').write('ran')\n",
+            "    call.dial(\"sip:bob@198.51.100.30:5060\")\n",
+        ),
+        marker = marker.to_string_lossy()
+    );
+    let (state, udp) = dispatcher(&script);
+    let call_id = "just-created@peer.example.com";
+    let (worker, release) = parked_invite(&state, "created", call_id, invite(call_id));
+    assert!(
+        state.call_actors.find_by_sip_call_id(call_id).is_some(),
+        "the call exists at this stage"
+    );
+
+    arrives(&state, cancel(call_id));
+    release.send(()).expect("the INVITE's worker is parked");
+    worker.join().expect("the INVITE's worker finished");
+
+    assert_cancelled_before_dialling(&state, &wire(&udp), call_id);
+    assert!(
+        !marker.exists(),
+        "@b2bua.on_invite does not run for a call that was cancelled before it"
+    );
+    let _ = std::fs::remove_file(&marker);
+}
+
+/// An INVITE that ends without a call, however it ends, answers the CANCEL it
+/// held, once, and releases its registration.
+#[test]
+fn a_held_cancel_is_answered_when_its_invite_is_refused_or_malformed() {
+    let refusals: [(&str, Box<dyn Fn(String) -> String>); 2] = [
+        (
+            "a Replaces naming no dialog (481)",
+            Box::new(|raw: String| {
+                raw.replace(
+                    "Contact:",
+                    "Replaces: nosuch@peer.example.com;to-tag=a;from-tag=b\r\nContact:",
+                )
+            }),
+        ),
+        (
+            "a CSeq that does not match the request line (400)",
+            Box::new(|raw: String| raw.replace("CSeq: 1 INVITE", "CSeq: 1 BYE")),
+        ),
+    ];
+    for (index, (why, rewrite)) in refusals.iter().enumerate() {
+        let (state, udp) = dispatcher(DIALLING_B2BUA);
+        let call_id = format!("refused-{index}@peer.example.com");
+        let (worker, release) = parked_invite(&state, "start", &call_id, rewrite(invite(&call_id)));
+        arrives(&state, cancel(&call_id));
+        assert!(wire(&udp).is_empty(), "{why}: the CANCEL is held");
+
+        release.send(()).expect("the INVITE's worker is parked");
+        worker.join().expect("the INVITE's worker finished");
+        let sent = wire(&udp);
+        let answers_to_cancel = to_caller(&sent)
+            .into_iter()
+            .filter(|label| label.ends_with("CANCEL"))
+            .count();
+        assert_eq!(
+            answers_to_cancel, 1,
+            "{why}: the CANCEL is answered once: {sent:?}"
+        );
+        assert_eq!(
+            state.inflight_invites.len(),
+            0,
+            "{why}: nothing is left registered"
+        );
+    }
+}
+
+/// Without a registration (nothing in flight) a CANCEL is answered at once, and
+/// only so many are held for one INVITE.
 #[test]
 fn only_a_bounded_number_of_cancels_are_held_per_invite() {
     let (state, udp) = dispatcher("");
     let call_id = "flooded@peer.example.com";
-    let message = parse_sip_message_bytes(invite(call_id).as_bytes()).expect("the INVITE parses");
-    let guard = state
-        .inflight_invites
-        .begin(&message, &state)
-        .expect("an initial INVITE registers");
+    let (worker, release) = parked_invite(&state, "start", call_id, invite(call_id));
     for _ in 0..20 {
         arrives(&state, cancel(call_id));
     }
     assert_eq!(wire(&udp).len(), 12, "twenty CANCELs, eight held");
-    drop(guard);
-    assert_eq!(
-        wire(&udp).len(),
-        8,
-        "the eight held are answered on release"
-    );
+    release.send(()).expect("the INVITE's worker is parked");
+    worker.join().expect("the INVITE's worker finished");
     assert_eq!(state.inflight_invites.len(), 0);
+
+    arrives(&state, cancel(call_id));
+    assert!(
+        !wire(&udp).is_empty(),
+        "nothing in flight: answered at once"
+    );
 }
