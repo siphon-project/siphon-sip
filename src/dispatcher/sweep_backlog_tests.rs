@@ -211,12 +211,23 @@ fn backlog_scenario() {
 
 /// A sweep that genuinely stops, its turn stuck on a lock it needs, still
 /// trips the watchdog, while the rest of the runtime is healthy.
+///
+/// The sweep runs on a runtime of its own, so that "the rest is healthy" is
+/// true by construction. A sweep blocked inside a poll on the watched runtime
+/// can take the only worker able to drive tokio's timers with it (a parked
+/// worker that did not get the driver waits for a task to wake it), and then
+/// the tokio beat, which is checked first, is owed too, depending on which
+/// worker parked last: that is a starved runtime, and the watchdog says so.
 #[test]
 fn the_watchdog_still_trips_on_a_sweep_that_stops() {
+    let sweep_runtime = runtime(1);
     let runtime = runtime(2);
     runtime.block_on(async {
         let proxy = proxy();
-        let stamp = spawn_timer_sweep(&proxy.state);
+        let stamp = {
+            let _entered = sweep_runtime.enter();
+            spawn_timer_sweep(&proxy.state)
+        };
         // A relayed request puts timers in the wheel; hold one of them, and
         // with it the shard the sweep's turn has to walk.
         proxy.request(CALLER, &register("held@example.com"));
@@ -267,6 +278,7 @@ fn the_watchdog_still_trips_on_a_sweep_that_stops() {
             .expect("the watchdog ran its samples")
             .expect("the watchdog thread");
         drop(held);
+        sweep_runtime.shutdown_background();
         assert_eq!(stalled, Some(Stalled::Loop("timer-sweep")));
     });
 }
