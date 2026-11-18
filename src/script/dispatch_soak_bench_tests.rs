@@ -102,7 +102,6 @@
 //! collating runs, with the switch, the calls the runners refused and the
 //! machine's one-minute load average at the end.
 
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -557,12 +556,13 @@ fn install_module(config: &SoakConfig) {
 }
 
 fn load_engine(config: &SoakConfig) -> Arc<ScriptEngine> {
-    let mut file = tempfile::NamedTempFile::new().unwrap();
-    file.write_all(SCRIPT.as_bytes()).unwrap();
-    file.flush().unwrap();
+    // A directory of its own, so loading purges no other test's modules.
+    let directory = tempfile::TempDir::new().unwrap();
+    let path = directory.path().join("script.py");
+    std::fs::write(&path, SCRIPT.as_bytes()).unwrap();
     Arc::new(
         ScriptEngine::new(&crate::config::ScriptConfig {
-            path: file.path().to_str().unwrap().to_owned(),
+            path: path.to_str().unwrap().to_owned(),
             reload: crate::config::ReloadMode::Sighup,
             async_pool_size: Some(config.drivers),
             sync_pool_size: config.executor_core,

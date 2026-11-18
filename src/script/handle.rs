@@ -362,18 +362,19 @@ impl std::fmt::Debug for ScriptHandle {
 mod tests {
     use super::*;
     use crate::script::engine::ScriptEngine;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
 
     fn engine_with_source(source: &str) -> Arc<ScriptEngine> {
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(source.as_bytes()).unwrap();
-        file.flush().unwrap();
+        // A directory of its own: a script directly in the system temp
+        // directory makes all of it the script directory, and loading purges
+        // every module under it, which is other tests' helper modules.
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("script.py");
+        std::fs::write(&path, source.as_bytes()).unwrap();
 
         Python::initialize();
         Arc::new(
             ScriptEngine::new(&crate::config::ScriptConfig {
-                path: file.path().to_str().unwrap().to_owned(),
+                path: path.to_str().unwrap().to_owned(),
                 reload: crate::config::ReloadMode::Sighup,
                 async_pool_size: None,
                 sync_pool_size: None,
