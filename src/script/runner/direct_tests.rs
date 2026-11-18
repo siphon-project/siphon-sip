@@ -913,11 +913,21 @@ fn a_handler_that_needs_asyncio_is_demoted_once_and_remembered() {
                 "{name} is remembered once"
             );
         }
-        assert_eq!(
-            rig.call("task_log", 0).await,
-            Ok("8,8,8,8".to_string()),
-            "the done callbacks a handler put on its task ran"
-        );
+        // The runner's own done callback was added to the task before the
+        // handler's, so the call can return before the handler's has run:
+        // wait for the callbacks, not for the call.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let log = rig.call("task_log", 0).await;
+            if log == Ok("8,8,8,8".to_string()) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the done callbacks a handler put on its task ran: {log:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         settles_to(baseline, "after the demoted handlers").await;
 
         // A reload replaces the handlers: nothing is remembered about them.
