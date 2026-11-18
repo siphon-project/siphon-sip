@@ -27,6 +27,17 @@ pub struct TimerEntry {
     pub source_local_addr: Option<SocketAddr>,
 }
 
+/// An INVITE whose `@proxy.on_request` handlers have not all returned yet: what
+/// a CANCEL arriving in that time needs to answer it (RFC 3261 §9.2, §16.10).
+pub struct ScriptedInvite {
+    /// The INVITE as received.
+    pub request: SipMessage,
+    pub transport: Transport,
+    pub source_addr: SocketAddr,
+    pub connection_id: ConnectionId,
+    pub inbound_local_addr: SocketAddr,
+}
+
 /// Shared state for the dispatcher, passed to each spawned task.
 pub struct DispatcherState {
     pub engine: Arc<ScriptEngine>,
@@ -289,6 +300,18 @@ pub struct DispatcherState {
     /// The B2BUA path needs no entry: it already answers 200 to a CANCEL for a
     /// call that is no longer Calling/Ringing.
     pub cancelled_invites: Arc<DashMap<TransactionKey, ()>>,
+    /// INVITEs still with the script, keyed by the INVITE's server transaction.
+    ///
+    /// The server transaction exists from the INVITE's arrival, but the
+    /// `ProxySession` a CANCEL is matched to is only created when the script's
+    /// decision is acted on. An `async def` handler can await for a while
+    /// (filter criteria, a lookup), and a CANCEL arriving then matched nothing
+    /// and was answered 481 while the INVITE was forwarded afterwards. A CANCEL
+    /// that takes the entry here answers itself 200 and the INVITE 487, and
+    /// [`finish_request`](super::request_script::finish_request), finding the
+    /// entry gone, forwards nothing (RFC 3261 §9.2, §16.10). Present from just
+    /// before the handlers run until they have finished.
+    pub scripted_invites: Arc<DashMap<TransactionKey, ScriptedInvite>>,
     /// Final non-2xx responses the B2BUA sent for an INVITE, kept for Timer H
     /// so a retransmitted INVITE is answered with it again and not taken for a
     /// new call (RFC 3261 §17.2.1). See [`CompletedInvites`].

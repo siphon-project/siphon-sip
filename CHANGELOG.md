@@ -58,6 +58,8 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A CANCEL that arrives while an INVITE's `@proxy.on_request` is still running is answered `200`, the INVITE `487`, and the INVITE is never forwarded (RFC 3261 §9.2, §16.10).** An `async def` handler that awaited (filter criteria, a lookup) left the INVITE with a server transaction but no proxy session, so the CANCEL matched nothing and got `481`, and the INVITE was forwarded when the handler returned: the far end answered a call the caller had abandoned and retransmitted its `200` until Timer H. `@proxy.on_cancel` runs for it, and a retransmitted CANCEL is answered `200` again.
+
 - **An in-dialog offer in a `multipart/*` body is read as its SDP part.** The whole multipart body was kept as the party's session description and, on a call the media engine answered itself, handed to the engine as the offer. The description kept from an INVITE, a re-INVITE and an UPDATE, and the offer the engine answers, are now the `application/sdp` part; a multipart body with no SDP part, or a body of another type (a service's own document in an UPDATE), offers nothing and leaves the session as it was.
 - **An offer the media engine refuses on a call it answered itself is no longer kept as the party's session description.** The `488` left the refused offer recorded as the caller's media; the description it had before stays in force (RFC 3261 §14.1).
 - **A multipart part whose `Content-Type` header is spelled in another case (`CONTENT-TYPE`, `Content-type`) is recognised** (RFC 2045 §3). Such a part was skipped, so an SDP part under it was not found.

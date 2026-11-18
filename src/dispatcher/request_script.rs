@@ -257,6 +257,24 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
         script: _,
     } = scripted;
     let state = &state;
+    // A CANCEL that came while the handlers ran took the INVITE's entry, and
+    // answered both itself and the INVITE (487). Nothing is forwarded for an
+    // INVITE the caller has abandoned (RFC 3261 §9.2, §16.10), and a second
+    // final response would break §17.2.1.
+    if method == "INVITE" {
+        if let Some(key) = &server_key {
+            if state.scripted_invites.remove(key).is_none() {
+                debug!(
+                    server_key = %key,
+                    "INVITE cancelled while its handlers ran — not forwarded (RFC 3261 §9.2)"
+                );
+                // Dropped here, detached: the callbacks' references go to pyo3's
+                // deferred pool.
+                drop((decision, reply_gate, ended_subscription));
+                return;
+            }
+        }
+    }
     let ScriptDecision {
         action,
         record_routed,

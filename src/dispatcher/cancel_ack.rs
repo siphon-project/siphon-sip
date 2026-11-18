@@ -520,6 +520,13 @@ pub(super) fn handle_cancel(
         return;
     }
 
+    // The INVITE's script is still deciding, so it has a server transaction and
+    // no session yet (RFC 3261 §9.2: still a matching INVITE, still 200).
+    if let Some((_, pending)) = state.scripted_invites.remove(&invite_server_key) {
+        handle_cancel_while_scripted(inbound, message, invite_server_key, pending, state);
+        return;
+    }
+
     // RFC 3261 §9.2: a CANCEL is matched to the INVITE's server transaction,
     // and one that matches is answered 200 whatever became of the INVITE. The
     // session goes with the INVITE's final response; its server transaction
@@ -566,6 +573,69 @@ pub(super) fn handle_cancel(
         Some(inbound.local_addr),
         state,
     );
+}
+
+/// A CANCEL for an INVITE whose `@proxy.on_request` handlers have not returned:
+/// no branch has been forwarded, and none will be (RFC 3261 §16.10). Answer the
+/// CANCEL 200 and the INVITE 487, run `@proxy.on_cancel` and write the record.
+/// The entry the caller took from `scripted_invites` is what tells
+/// `finish_request` not to forward.
+fn handle_cancel_while_scripted(
+    inbound: InboundMessage,
+    message: SipMessage,
+    invite_server_key: TransactionKey,
+    pending: ScriptedInvite,
+    state: &DispatcherState,
+) {
+    debug!(server_key = %invite_server_key, "CANCEL while the INVITE's script runs — answering 200 and 487, nothing to forward (RFC 3261 §9.2)");
+    let cancel_response = build_response(
+        &message,
+        200,
+        "OK",
+        state.identity.load().server.as_deref(),
+        &[],
+    );
+    send_message_from(
+        cancel_response,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        Some(inbound.local_addr),
+        state,
+    );
+    let response = build_response(
+        &pending.request,
+        487,
+        "Request Terminated",
+        state.identity.load().server.as_deref(),
+        &[],
+    );
+    send_final_through_server_transaction(
+        &invite_server_key,
+        response,
+        pending.transport,
+        pending.source_addr,
+        pending.connection_id,
+        pending.inbound_local_addr,
+        state,
+    );
+    if !state
+        .engine
+        .state()
+        .handlers_for(&HandlerKind::ProxyCancel)
+        .is_empty()
+    {
+        run_proxy_cancel_handlers(
+            pending.request.clone(),
+            pending.transport,
+            pending.source_addr,
+            pending.inbound_local_addr,
+            pending.connection_id,
+            state,
+        );
+    }
+    cdr_finalize_proxy_fail(state, &pending.request, 487);
+    remember_cancelled_invite(&state.cancelled_invites, invite_server_key);
 }
 
 /// Remember that a CANCEL was accepted for `key`, for the 64×T1 window a
