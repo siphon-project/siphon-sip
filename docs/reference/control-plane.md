@@ -1303,6 +1303,9 @@ siphon-rtp 0.21.0 or later (`ws_tee_multi_source`); an older engine refuses the
 tee. The audio is what the SRC sends, so `direction` is `caller` or `both`, and
 `mode: bridge` is refused. `stream_stop` detaches the tee, and the session's own
 end ends it. No other media verb applies to a recording session.
+The `accept` reply returns before the engine has the streams up, so a
+`stream_start` sent straight after it can find no live stream yet (`not_found`).
+Wait for the channel's `MediaStarted` first.
 
 An ended session's `StasisEnd` comes after its `RecordingSessionEnded`, so by the
 time a controller sees the channel end, every file it lists is complete. A file
