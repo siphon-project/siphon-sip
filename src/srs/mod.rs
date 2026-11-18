@@ -4,15 +4,16 @@
 //! metadata XML, sets up RTPEngine recording sessions, and stores
 //! recordings + metadata.
 
+mod path;
 pub mod storage;
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use dashmap::DashMap;
 use serde::Serialize;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::SrsConfig;
 use crate::sip::message::SipMessage;
@@ -132,6 +133,11 @@ pub enum CancelOutcome {
 pub struct SrsSession {
     /// Recording session ID (from the SIPREC metadata). Data only.
     pub session_id: String,
+    /// Siphon's own per-session key, and the name of the recording directory.
+    /// Never the SRC's `session_id`: that is chosen by the peer, so a directory
+    /// named from it could be shared by two sessions or escape the configured
+    /// base (`../`).
+    pub storage_key: String,
     /// SIP Call-ID of the SIPREC INVITE dialog (SRC → SRS).
     pub recording_call_id: String,
     /// Original call ID being recorded (from metadata, if available).
@@ -350,7 +356,22 @@ impl SrsManager {
 
         let session_id = metadata.session_id.clone();
         let to_tag = format!("srs-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let recording_dir = PathBuf::from(&self.config.recording_dir).join(&session_id);
+        let storage_key = uuid::Uuid::new_v4().as_simple().to_string();
+        // `path::recording_dir` is the only place a session directory is
+        // built, and it keeps it directly inside the configured directory. The
+        // key is siphon's own, so this cannot fail today; a failure leaves the
+        // session without a directory, which is reported, rather than writing
+        // somewhere unintended.
+        let recording_dir = match path::recording_dir(
+            Path::new(&self.config.recording_dir),
+            &storage_key,
+        ) {
+            Ok(dir) => Some(dir),
+            Err(error) => {
+                error!(session_id = %session_id, %error, "SRS: cannot build a recording directory");
+                None
+            }
+        };
 
         let session = SrsSession {
             session_id: session_id.clone(),
@@ -359,11 +380,12 @@ impl SrsManager {
             from_tag: from_tag.to_string(),
             to_tag: to_tag.clone(),
             invite_branch: invite_branch.to_string(),
+            storage_key,
             metadata,
             state: SrsSessionState::Pending,
             started_at: Instant::now(),
             ended_at: None,
-            recording_dir: Some(recording_dir),
+            recording_dir,
             streams: Vec::new(),
             answer_sdp: None,
             final_response: None,
@@ -856,15 +878,49 @@ mod tests {
     }
 
     #[test]
-    fn recording_dir_per_session() {
+    fn recording_dir_is_siphons_key_inside_the_configured_directory() {
         let manager = manager();
         manager
             .create_session("call-1", "tag-1", "z9hG4bK-1", test_metadata())
             .unwrap();
-        assert_eq!(
-            manager.recording_dir("call-1").unwrap(),
-            PathBuf::from("/tmp/siphon-test-recordings/test-session-001")
-        );
+        let dir = manager.recording_dir("call-1").unwrap();
+        let key = manager.get_session("call-1").unwrap().storage_key.clone();
+        assert_eq!(dir, PathBuf::from("/tmp/siphon-test-recordings").join(&key));
+        assert!(!dir.to_string_lossy().contains("test-session-001"));
+    }
+
+    /// The SRC chooses `session_id`: one built to climb out of the configured
+    /// directory names nothing on disk, and two sessions sharing one get two
+    /// directories.
+    #[test]
+    fn a_hostile_or_shared_session_id_never_names_a_directory() {
+        let manager = manager();
+        for (call_id, session_id) in [
+            ("call-1", "../../etc"),
+            ("call-2", "/absolute"),
+            ("call-3", "same"),
+            ("call-4", "same"),
+        ] {
+            let metadata = RecordingMetadata {
+                session_id: session_id.to_string(),
+                ..test_metadata()
+            };
+            manager
+                .create_session(call_id, "tag", "z9hG4bK", metadata)
+                .unwrap();
+        }
+        let dirs: Vec<PathBuf> = ["call-1", "call-2", "call-3", "call-4"]
+            .iter()
+            .map(|call_id| manager.recording_dir(call_id).unwrap())
+            .collect();
+        for dir in &dirs {
+            assert_eq!(
+                dir.parent(),
+                Some(Path::new("/tmp/siphon-test-recordings")),
+                "{dir:?}"
+            );
+        }
+        assert_ne!(dirs[2], dirs[3], "a shared session_id is two directories");
     }
 
     #[test]

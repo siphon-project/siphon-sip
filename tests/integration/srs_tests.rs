@@ -293,7 +293,6 @@ async fn srs_file_storage_writes_metadata() {
     ))
     .unwrap();
 
-    let session_id = metadata.session_id.clone();
     manager
         .create_session("cid-storage", "ftag", "z9hG4bK-storage", metadata)
         .unwrap();
@@ -306,9 +305,11 @@ async fn srs_file_storage_writes_metadata() {
     siphon::srs::storage::store_recording(&config, &record).await;
 
     // Verify file was written.
-    let metadata_path = std::path::Path::new(&config.file.as_ref().unwrap().base_dir)
-        .join(&session_id)
-        .join("metadata.json");
+    // Beside the audio, in the session's own directory under the configured
+    // one: named by siphon's key, not the SRC's session_id.
+    let session_dir = std::path::PathBuf::from(record.recording_dir.clone().unwrap());
+    assert_eq!(session_dir.parent(), Some(temp_dir.as_path()));
+    let metadata_path = session_dir.join("metadata.json");
     assert!(
         metadata_path.exists(),
         "metadata.json should exist at {:?}",
@@ -318,7 +319,10 @@ async fn srs_file_storage_writes_metadata() {
     // Parse and verify contents.
     let contents = std::fs::read_to_string(&metadata_path).unwrap();
     let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
-    assert_eq!(json["session_id"].as_str().unwrap(), session_id);
+    assert_eq!(
+        json["session_id"].as_str().unwrap(),
+        "storage-test-0000-0000-000000000000"
+    );
     assert_eq!(json["participants"].as_array().unwrap().len(), 2);
     assert_eq!(
         json["participants"][0]["aor"].as_str().unwrap(),

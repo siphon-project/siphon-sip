@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::RecordingRecord;
 use crate::config::SrsConfig;
@@ -24,14 +24,28 @@ pub async fn store_recording(config: &SrsConfig, record: &RecordingRecord) {
 }
 
 /// File backend — write JSON metadata to disk.
+///
+/// The metadata goes in the session's own directory, beside the audio it
+/// describes. That directory is named by siphon's storage key; the SRC's
+/// `session_id`, which used to name it, could climb out of the configured
+/// directory or be shared by two sessions.
 async fn store_file(config: &SrsConfig, record: &RecordingRecord) {
-    let base_dir = config
-        .file
-        .as_ref()
-        .map(|file_config| file_config.base_dir.clone())
-        .unwrap_or_else(|| config.recording_dir.clone());
-
-    let dir = Path::new(&base_dir).join(&record.session_id);
+    let Some(dir) = record.recording_dir.as_deref().map(Path::new) else {
+        error!(session_id = %record.session_id, "SRS: session has no recording directory, metadata not written");
+        return;
+    };
+    // `file.base_dir` used to pick this directory by itself, which let the
+    // metadata land in a different tree from the audio.
+    if let Some(base_dir) = config.file.as_ref().map(|file| file.base_dir.as_str()) {
+        if dir.parent() != Some(Path::new(base_dir)) {
+            warn!(
+                session_id = %record.session_id,
+                base_dir = %base_dir,
+                dir = %dir.display(),
+                "SRS: srs.file.base_dir no longer selects the metadata directory"
+            );
+        }
+    }
 
     // Create the directory if it doesn't exist.
     if let Err(error) = tokio::fs::create_dir_all(&dir).await {
@@ -333,10 +347,17 @@ mod tests {
             rtpengine_profile: "srs_recording".to_string(),
         };
 
-        let record = test_record();
+        // The session's own directory, named by siphon's key: the metadata
+        // goes there, never under the SRC's session_id.
+        let session_dir = temp_dir.join("0123456789abcdef0123456789abcdef");
+        let record = RecordingRecord {
+            recording_dir: Some(session_dir.display().to_string()),
+            ..test_record()
+        };
         store_recording(&config, &record).await;
 
-        let metadata_path = temp_dir.join("test-session-001").join("metadata.json");
+        let metadata_path = session_dir.join("metadata.json");
+        assert!(!temp_dir.join("test-session-001").exists());
         assert!(metadata_path.exists());
 
         let content = tokio::fs::read_to_string(&metadata_path).await.unwrap();
