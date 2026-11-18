@@ -132,6 +132,12 @@ async def case_accept_stereo(app, session, event, verdict) -> None:
         "accept_ok",
         await session.command("accept", {"channels": "stereo", "path": STEREO_PATH}, target=target),
     )
+    # `accept` answers as soon as the decision is taken; the engine streams exist
+    # once MediaStarted arrives, and a tee before that has nothing to attach to.
+    try:
+        await wait_for(session, channel, "MediaStarted", 10)
+    except TimeoutError as error:
+        verdict.check("media_started_after_accept", False, str(error))
     tee = await session.command(
         "stream_start",
         {"mode": "tee", "ws_uri": SINK_URI, "sample_rate": 16000},
