@@ -158,6 +158,7 @@ fn first_line(message: &str) -> &str {
 
 #[test]
 fn a_notify_ahead_of_the_2xx_reaches_the_subscription_send_returns() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let mut attempt = Attempt::start(harness, 1, 5000);
 
@@ -193,6 +194,7 @@ fn a_notify_ahead_of_the_2xx_reaches_the_subscription_send_returns() {
 
 #[test]
 fn a_notify_after_the_2xx_finds_the_subscription_as_before() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let mut attempt = Attempt::start(harness, 2, 5000);
 
@@ -215,6 +217,7 @@ fn a_notify_after_the_2xx_finds_the_subscription_as_before() {
 
 #[test]
 fn a_rejected_subscribe_leaves_nothing_behind_even_after_an_early_notify() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let dialogs_before = harness.store.local_count();
     let mut attempt = Attempt::start(harness, 3, 5000);
@@ -241,6 +244,7 @@ fn a_rejected_subscribe_leaves_nothing_behind_even_after_an_early_notify() {
 
 #[test]
 fn a_subscribe_that_times_out_leaves_nothing_behind() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let dialogs_before = harness.store.local_count();
 
@@ -262,6 +266,7 @@ fn a_subscribe_that_times_out_leaves_nothing_behind() {
 /// enters. Timer N (§4.1.2.4) only bounds the wait for that NOTIFY.
 #[test]
 fn a_notified_subscription_stands_when_the_subscribe_is_never_answered() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let dialogs_before = harness.store.local_count();
     let mut attempt = Attempt::start(harness, 5, 400);
@@ -327,6 +332,7 @@ fn terminated_exchange(sequence: u32, notify_first: bool) -> (String, String, us
 /// and learns it ended, `send()` returns its handle, and nothing is left.
 #[test]
 fn a_terminating_notify_gives_the_same_outcome_on_either_side_of_the_2xx() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let notify_first = terminated_exchange(6, true);
     let response_first = terminated_exchange(11, false);
 
@@ -346,6 +352,7 @@ fn a_terminating_notify_gives_the_same_outcome_on_either_side_of_the_2xx() {
 /// NOTIFY request with a Subscription-State of terminated."
 #[test]
 fn a_terminated_notify_destroys_an_established_subscription() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let dialogs_before = harness.store.local_count();
     let mut attempt = Attempt::start(harness, 8, 5000);
@@ -373,6 +380,7 @@ fn a_terminated_notify_destroys_an_established_subscription() {
 /// to it is ignored.
 #[test]
 fn one_send_keeps_the_first_dialog_and_refuses_other_forks() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let mut attempt = Attempt::start(harness, 9, 5000);
 
@@ -410,6 +418,7 @@ fn one_send_keeps_the_first_dialog_and_refuses_other_forks() {
 
 #[test]
 fn a_notify_from_another_fork_after_the_2xx_is_refused() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let mut attempt = Attempt::start(harness, 10, 5000);
     attempt.answer("200 OK", Some("fork-one"));
@@ -430,6 +439,7 @@ fn a_notify_from_another_fork_after_the_2xx_is_refused() {
 
 #[test]
 fn a_notify_for_another_event_package_does_not_take_the_pending_subscription() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let mut attempt = Attempt::start(harness, 7, 5000);
 
@@ -451,6 +461,7 @@ fn a_notify_for_another_event_package_does_not_take_the_pending_subscription() {
 /// script answers 481 to the one NOTIFY it asked for.
 #[test]
 fn the_notify_that_answers_an_unsubscribe_finds_the_subscription() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let dialogs_before = harness.store.local_count();
     // The store is every test's: other subscriptions stand in it.
@@ -488,6 +499,7 @@ fn the_notify_that_answers_an_unsubscribe_finds_the_subscription() {
 /// subscription a NOTIFY had established.
 #[test]
 fn a_rejection_after_send_returned_withdraws_the_subscription() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let dialogs_before = harness.store.local_count();
     let tracked_before = harness.store.outbound_count();

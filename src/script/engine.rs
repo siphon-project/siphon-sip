@@ -4609,6 +4609,8 @@ mod async_runner_tests {
             let success = Arc::clone(&success);
             handles.push(tokio::spawn(async move {
                 tokio::task::spawn_blocking(move || {
+                    // On this blocking thread, not across an await.
+                    let _serial = crate::script::async_pool::pool_test_guard();
                     Python::attach(|python| {
                         let coro = factory.bind(python).call0().unwrap();
                         run_coroutine(python, &coro)

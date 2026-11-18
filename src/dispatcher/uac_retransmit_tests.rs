@@ -646,6 +646,7 @@ fn subscribe() -> String {
 /// retransmitted from the socket the SUBSCRIBE arrived on.
 #[test]
 fn a_lost_initial_notify_is_retransmitted_and_its_200_keeps_the_subscription() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let state = &harness.state;
     let ours = |frames: Vec<(SocketAddr, Bytes)>| -> Vec<Bytes> {
