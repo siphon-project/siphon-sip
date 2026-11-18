@@ -26,12 +26,16 @@ async def handler(socket) -> None:
     frames = 0
     total = 0
     texts = []
-    async for message in socket:
-        if isinstance(message, (bytes, bytearray)):
-            frames += 1
-            total += len(message)
-        else:
-            texts.append(message[:300])
+    try:
+        async for message in socket:
+            if isinstance(message, (bytes, bytearray)):
+                frames += 1
+                total += len(message)
+            else:
+                texts.append(message[:300])
+    except websockets.exceptions.ConnectionClosed:
+        # The engine drops the socket without a close frame when the session ends.
+        pass
     print(
         "SRS-SINK-VERDICT "
         + json.dumps(
