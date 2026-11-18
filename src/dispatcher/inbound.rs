@@ -78,6 +78,11 @@ pub(super) fn handle_inbound_after_queue(
         }
     };
 
+    // An initial INVITE is registered the moment it is parsed, so a CANCEL that
+    // another worker takes right behind it finds it before its call exists
+    // (see `inflight_invite`). Held until this function returns.
+    let _inflight_invite = state.inflight_invites.begin(&message, state);
+
     // HEP capture — inbound (received from network)
     if let Some(ref hep) = state.hep_sender {
         hep.capture_inbound(

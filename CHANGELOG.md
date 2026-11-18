@@ -13,6 +13,10 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A caller's CANCEL that reaches siphon right behind its INVITE is no longer answered `481` while the INVITE goes on to ring the callee (RFC 3261 §9.2).** Requests are taken by a pool of workers, and the worker holding the INVITE still has to admit it, answer `100 Trying` and create the call before a CANCEL can be matched to it; the worker holding the CANCEL looked the call up first, found none, answered `481` and the call then rang to its end. An initial INVITE now registers as soon as it is parsed, a CANCEL that matches nothing else but finds it is held, and it runs as soon as the call exists (taking the path of a CANCEL that arrives while `@b2bua.on_invite` runs: `200` to the CANCEL, `487` to the INVITE, `on_cancel` after the handler, no B-leg INVITE). An INVITE that ends without a call answers the CANCEL it held when its worker is done.
+
 ## [1.16.0] — 2026-11-18
 
 ### Changed

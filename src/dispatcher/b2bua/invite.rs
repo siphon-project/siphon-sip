@@ -693,7 +693,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     // From here until the handler returns, a CANCEL defers `@b2bua.on_cancel`
     // to this path instead of running it beside the handler.
     let cancelled_during_handler = state.call_actors.begin_invite_handler(&call_id);
-
+    release_held_cancels(&message_arc, state);
     let mut outcome = Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
             Ok(obj) => obj,

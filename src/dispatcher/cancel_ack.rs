@@ -585,6 +585,21 @@ pub(super) fn handle_cancel(
         return;
     }
 
+    // The INVITE is on another worker, past its arrival and short of its call:
+    // its server transaction exists (RFC 3261 §9.2) though siphon has nothing
+    // to match the CANCEL to yet. Held, and run once the call exists.
+    let cancel = match state
+        .inflight_invites
+        .hold_cancel(&invite_server_key, HeldCancel { inbound, message })
+    {
+        Ok(()) => {
+            debug!(server_key = %invite_server_key, "CANCEL for an INVITE whose call is not created yet — held until it is (RFC 3261 §9.2)");
+            return;
+        }
+        Err(cancel) => cancel,
+    };
+    let HeldCancel { inbound, message } = *cancel;
+
     // No matching session or B2BUA call
     debug!(uac_branch = %uac_branch, "CANCEL for unknown transaction");
     let response = build_response(

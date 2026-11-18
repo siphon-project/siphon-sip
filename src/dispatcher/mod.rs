@@ -64,6 +64,7 @@ mod identity;
 mod in_dialog;
 mod inbound;
 mod inbound_filter;
+mod inflight_invite;
 mod intercept;
 #[cfg(test)]
 mod ipsec_dereg_tests;
@@ -240,6 +241,8 @@ mod handover_no_controller_tests;
 mod held_bye_tests;
 #[cfg(test)]
 mod inbound_drop_tests;
+#[cfg(test)]
+mod inflight_invite_tests;
 #[cfg(test)]
 mod invite_response_path_tests;
 #[cfg(test)]
@@ -529,6 +532,7 @@ use identity::*;
 use in_dialog::*;
 use inbound::*;
 use inbound_filter::*;
+use inflight_invite::*;
 use intercept::*;
 use late_answer::*;
 use liveness::*;
@@ -873,6 +877,7 @@ pub async fn run(
         pending_reinvite_acks: Arc::new(DashMap::new()),
         cancelled_invites: Arc::new(DashMap::new()),
         scripted_invites: Arc::new(DashMap::new()),
+        inflight_invites: Arc::new(InflightInvites::default()),
         completed_invites: CompletedInvites::default(),
         originate_groups: Arc::new(crate::dispatcher::b2bua::OriginateGroupStore::new()),
         dial_bridges: Arc::new(crate::dispatcher::b2bua::DialBridgeStore::new()),
