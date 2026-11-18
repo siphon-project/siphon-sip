@@ -216,8 +216,8 @@ fn a_notify_after_the_2xx_finds_the_subscription_as_before() {
 #[test]
 fn a_rejected_subscribe_leaves_nothing_behind_even_after_an_early_notify() {
     let (_turn, harness) = subscribe_harness();
-    let dialogs_before = harness.store.local_count();
     let mut attempt = Attempt::start(harness, 3, 5000);
+    let call_id = attempt.subscribe_header("Call-ID");
     assert_eq!(harness.store.pending_count(), 1);
 
     let early = attempt.notify(NOTIFIER_TAG, "reg", "active;expires=600");
@@ -232,7 +232,7 @@ fn a_rejected_subscribe_leaves_nothing_behind_even_after_an_early_notify() {
     );
 
     assert_eq!(harness.store.pending_count(), 0);
-    assert_eq!(harness.store.local_count(), dialogs_before);
+    assert!(!harness.store.holds_call_id(&call_id), "nothing left");
     // RFC 6665 §4.1.2.1: a non-2xx created no subscription, so a NOTIFY for
     // it now matches none.
     let late = attempt.notify(NOTIFIER_TAG, "reg", "active;expires=600");
@@ -242,10 +242,10 @@ fn a_rejected_subscribe_leaves_nothing_behind_even_after_an_early_notify() {
 #[test]
 fn a_subscribe_that_times_out_leaves_nothing_behind() {
     let (_turn, harness) = subscribe_harness();
-    let dialogs_before = harness.store.local_count();
 
     // Unanswered, and never notified.
     let mut silent = Attempt::start(harness, 4, 100);
+    let call_id = silent.subscribe_header("Call-ID");
     assert_eq!(harness.store.pending_count(), 1);
     let reply = silent.outcome();
     assert!(reply.starts_with("SIP/2.0 500"), "send() raises: {reply:?}");
@@ -254,7 +254,7 @@ fn a_subscribe_that_times_out_leaves_nothing_behind() {
         "got {reply:?}"
     );
     assert_eq!(harness.store.pending_count(), 0);
-    assert_eq!(harness.store.local_count(), dialogs_before);
+    assert!(!harness.store.holds_call_id(&call_id), "nothing left");
 }
 
 /// RFC 6665 §4.1.2: the NOTIFY takes the subscription out of `notify_wait`,
@@ -263,8 +263,8 @@ fn a_subscribe_that_times_out_leaves_nothing_behind() {
 #[test]
 fn a_notified_subscription_stands_when_the_subscribe_is_never_answered() {
     let (_turn, harness) = subscribe_harness();
-    let dialogs_before = harness.store.local_count();
     let mut attempt = Attempt::start(harness, 5, 400);
+    let call_id = attempt.subscribe_header("Call-ID");
 
     let early = attempt.notify(NOTIFIER_TAG, "reg", "active;expires=600");
     assert!(early.starts_with("SIP/2.0 200"), "got {early:?}");
@@ -280,7 +280,10 @@ fn a_notified_subscription_stands_when_the_subscribe_is_never_answered() {
         Some(id.as_str())
     );
     assert_eq!(harness.store.pending_count(), 0);
-    assert_eq!(harness.store.local_count(), dialogs_before + 1);
+    assert!(
+        harness.store.holds_call_id(&call_id),
+        "the subscription stands"
+    );
 
     let later = attempt.notify(NOTIFIER_TAG, "reg", "active;expires=600");
     assert_eq!(
@@ -294,8 +297,8 @@ fn a_notified_subscription_stands_when_the_subscribe_is_never_answered() {
 /// back with, for the terminating NOTIFY placed before the 2xx or after it.
 fn terminated_exchange(sequence: u32, notify_first: bool) -> (String, String, usize, usize) {
     let (_turn, harness) = subscribe_harness();
-    let dialogs_before = harness.store.local_count();
     let mut attempt = Attempt::start(harness, sequence, 5000);
+    let call_id = attempt.subscribe_header("Call-ID");
 
     let (notified, reply) = if notify_first {
         let notified = attempt.notify(NOTIFIER_TAG, "reg", "terminated;reason=timeout");
@@ -317,7 +320,7 @@ fn terminated_exchange(sequence: u32, notify_first: bool) -> (String, String, us
     (
         first_line(&notified).to_string(),
         first_line(&reply).to_string(),
-        harness.store.local_count() - dialogs_before,
+        usize::from(harness.store.holds_call_id(&call_id)),
         harness.store.pending_count(),
     )
 }
@@ -347,12 +350,15 @@ fn a_terminating_notify_gives_the_same_outcome_on_either_side_of_the_2xx() {
 #[test]
 fn a_terminated_notify_destroys_an_established_subscription() {
     let (_turn, harness) = subscribe_harness();
-    let dialogs_before = harness.store.local_count();
     let mut attempt = Attempt::start(harness, 8, 5000);
+    let call_id = attempt.subscribe_header("Call-ID");
     attempt.answer("200 OK", Some(NOTIFIER_TAG));
     let reply = attempt.outcome();
     let id = header_value(&reply, "X-Subscription").expect("the handle send() returned");
-    assert_eq!(harness.store.local_count(), dialogs_before + 1);
+    assert!(
+        harness.store.holds_call_id(&call_id),
+        "the subscription stands"
+    );
 
     let last = attempt.notify(NOTIFIER_TAG, "reg", "terminated;reason=timeout");
     assert!(last.starts_with("SIP/2.0 200"), "got {last:?}");
@@ -361,7 +367,7 @@ fn a_terminated_notify_destroys_an_established_subscription() {
         Some(id.as_str()),
         "the handler still finds the subscription the NOTIFY ends"
     );
-    assert_eq!(harness.store.local_count(), dialogs_before);
+    assert!(!harness.store.holds_call_id(&call_id), "nothing left");
 
     let stray = attempt.notify(NOTIFIER_TAG, "reg", "active;expires=600");
     assert_eq!(first_line(&stray), "SIP/2.0 481 Unknown To The Script");
@@ -452,10 +458,8 @@ fn a_notify_for_another_event_package_does_not_take_the_pending_subscription() {
 #[test]
 fn the_notify_that_answers_an_unsubscribe_finds_the_subscription() {
     let (_turn, harness) = subscribe_harness();
-    let dialogs_before = harness.store.local_count();
-    // The store is every test's: other subscriptions stand in it.
-    let tracked_before = harness.store.outbound_count();
     let mut attempt = Attempt::start_then(harness, 12, 5000, true);
+    let call_id = attempt.subscribe_header("Call-ID");
     attempt.answer("200 OK", Some(NOTIFIER_TAG));
 
     let unsubscribe = harness.next_sent("SUBSCRIBE ");
@@ -467,9 +471,8 @@ fn the_notify_that_answers_an_unsubscribe_finds_the_subscription() {
     );
     let reply = attempt.outcome();
     let id = header_value(&reply, "X-Subscription").expect("the handle send() returned");
-    assert_eq!(
-        harness.store.local_count(),
-        dialogs_before + 1,
+    assert!(
+        harness.store.holds_call_id(&call_id),
         "not over until the notifier says so"
     );
 
@@ -479,8 +482,8 @@ fn the_notify_that_answers_an_unsubscribe_finds_the_subscription() {
         header_value(&last, "X-Subscription").as_deref(),
         Some(id.as_str())
     );
-    assert_eq!(harness.store.local_count(), dialogs_before);
-    assert_eq!(harness.store.outbound_count(), tracked_before);
+    assert!(!harness.store.holds_call_id(&call_id), "nothing left");
+    assert!(!harness.store.is_tracked_outbound(&call_id));
 }
 
 /// RFC 6665 §4.1.2.1: a non-2xx says no subscription was created. It says so
@@ -489,9 +492,8 @@ fn the_notify_that_answers_an_unsubscribe_finds_the_subscription() {
 #[test]
 fn a_rejection_after_send_returned_withdraws_the_subscription() {
     let (_turn, harness) = subscribe_harness();
-    let dialogs_before = harness.store.local_count();
-    let tracked_before = harness.store.outbound_count();
     let mut attempt = Attempt::start(harness, 13, 300);
+    let call_id = attempt.subscribe_header("Call-ID");
 
     let early = attempt.notify(NOTIFIER_TAG, "reg", "active;expires=600");
     assert!(early.starts_with("SIP/2.0 200"), "got {early:?}");
@@ -500,19 +502,22 @@ fn a_rejection_after_send_returned_withdraws_the_subscription() {
         reply.starts_with("SIP/2.0 200"),
         "send() returns: {reply:?}"
     );
-    assert_eq!(harness.store.local_count(), dialogs_before + 1);
+    assert!(
+        harness.store.holds_call_id(&call_id),
+        "the subscription stands"
+    );
 
     attempt.answer("403 Forbidden", None);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while harness.store.local_count() != dialogs_before {
+    while harness.store.holds_call_id(&call_id) {
         assert!(
             std::time::Instant::now() < deadline,
             "the rejected subscription was never withdrawn"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert_eq!(harness.store.outbound_count(), tracked_before);
+    assert!(!harness.store.is_tracked_outbound(&call_id));
     let late = attempt.notify(NOTIFIER_TAG, "reg", "active;expires=600");
     assert!(late.starts_with("SIP/2.0 481"), "got {late:?}");
 }

@@ -382,6 +382,14 @@ impl SubscribeStore {
         self.dialogs.len()
     }
 
+    /// Whether L1 holds a dialog of `call_id`. A test asks about its own
+    /// dialog: the store-wide count moves whenever another test's dialog is
+    /// swept.
+    #[cfg(test)]
+    pub fn holds_call_id(&self, call_id: &str) -> bool {
+        self.dialogs.iter().any(|entry| entry.call_id == call_id)
+    }
+
     /// Reap expired or terminated dialogs from the store, returning the
     /// number removed.  A subscriber that vanishes without an un-SUBSCRIBE
     /// would otherwise pin its `SubscribeDialog` in L1 forever, which has no
