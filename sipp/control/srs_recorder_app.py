@@ -26,7 +26,7 @@ import control_app
 from control_app import Session, Verdict, heartbeat, note
 
 SINK_URI = os.environ.get("SRS_SINK_URI", "ws://172.20.0.69:9001/tee")
-SRC_IP = os.environ.get("SRS_SRC_IP", "172.20.0.253")
+SRC_IPS = json.loads(os.environ.get("SRS_SRC_IPS", "{}"))
 RECORDINGS = os.environ.get("SRS_RECORDINGS", "/var/lib/siphon/recordings")
 STEREO_PATH = f"{RECORDINGS}/stereo"
 END_TIMEOUT = float(os.environ.get("SRS_END_TIMEOUT", "30"))
@@ -70,7 +70,7 @@ def check_offer(verdict: Verdict, event: dict, user: str) -> None:
         str((body.get("invite") or {}).get("ruri")).startswith(f"sip:{user}@"),
         str((body.get("invite") or {}).get("ruri")),
     )
-    verdict.check("source_ip_is_the_src", body.get("source_ip") == SRC_IP, str(body.get("source_ip")))
+    verdict.check("source_ip_is_the_src", body.get("source_ip") == SRC_IPS.get(user), str(body.get("source_ip")))
     verdict.check("transport_udp", str(body.get("transport")).lower() == "udp", str(body.get("transport")))
     verdict.check(
         "two_participants",

@@ -10332,7 +10332,9 @@ services:
   #   172.20.0.8    siphon (SRS, control listener on :9092)
   #   172.20.0.9    recorder application
   #   172.20.0.69   WebSocket sink for the tee
-  #   172.20.0.253  SRC (the SIPp case containers run one at a time)
+  #   172.20.0.253  SRC, accept-stereo; one SRC address per case (.111 metadata-update,
+  #   .78 reject, .200 deadline, .201 hangup): SIPp containers on one address send the
+  #   same Call-ID and branch, and siphon answers the repeat from the earlier case
   #
   # Usage: scripts/run-tests.sh --srs-control
   siphon-srs-control:
@@ -10382,7 +10384,7 @@ services:
       CONTROL_CONNECTIONS: "1"
       CONTROL_READY_FILE: "/tmp/control-app-ready"
       SRS_SINK_URI: "ws://172.20.0.69:9001/tee"
-      SRS_SRC_IP: "172.20.0.253"
+      SRS_SRC_IPS: '{"accept-stereo": "172.20.0.253", "metadata-update": "172.20.0.111", "reject": "172.20.0.78", "deadline": "172.20.0.200", "hangup": "172.20.0.201"}'
     networks:
       sipnet:
         ipv4_address: 172.20.0.9
@@ -10452,7 +10454,7 @@ services:
       - .:/sipp/scenarios:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.253
+        ipv4_address: 172.20.0.111
     entrypoint:
       - sipp
       - "172.20.0.8:5060"
@@ -10478,7 +10480,7 @@ services:
       - .:/sipp/scenarios:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.253
+        ipv4_address: 172.20.0.78
     entrypoint:
       - sipp
       - "172.20.0.8:5060"
@@ -10504,7 +10506,7 @@ services:
       - .:/sipp/scenarios:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.253
+        ipv4_address: 172.20.0.200
     entrypoint:
       - sipp
       - "172.20.0.8:5060"
@@ -10530,7 +10532,7 @@ services:
       - .:/sipp/scenarios:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.253
+        ipv4_address: 172.20.0.201
     entrypoint:
       - sipp
       - "172.20.0.8:5060"
