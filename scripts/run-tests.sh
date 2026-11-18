@@ -1191,7 +1191,7 @@ if [[ "$RUN_SRS_CONTROL" == true ]]; then
 
   run_srs_control_case metadata-update
   echo "=== SIPREC SRS control: two mono WAVs for the metadata-update session ==="
-  run_sipp docker compose -f "$COMPOSE_FILE" --profile srs-check run --rm srs-control-recordings-check python3 /check.py /recordings/rs-ctl-meta 2 1
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile srs-check run --rm srs-control-recordings-check python3 /check.py session=rs-ctl-meta 2 1
 
   run_srs_control_case reject
   run_srs_control_case deadline

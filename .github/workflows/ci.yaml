@@ -2953,7 +2953,7 @@ jobs:
           verdict accept-stereo SRS-SINK-VERDICT srs-ws-sink
           check /recordings/stereo 1 2
           run_case metadata-update
-          check /recordings/rs-ctl-meta 2 1
+          check session=rs-ctl-meta 2 1
           run_case reject
           run_case deadline
           run_case hangup
