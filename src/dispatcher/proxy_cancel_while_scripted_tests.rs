@@ -122,3 +122,38 @@ async fn a_retransmitted_cancel_while_on_request_awaits_is_answered_200_again() 
     caller_cancels(&proxy, &raw);
     assert_eq!(responses_to_caller(&proxy.wire()), [200]);
 }
+
+/// A CANCEL that lands after the handlers have returned and before the session
+/// exists (the hook stands in that window) is answered 200, and the INVITE,
+/// by then forwarded, is abandoned once the session is there: 487, and the
+/// branch's CANCEL kept for its first provisional (RFC 3261 §9.1, §16.10).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_between_the_decision_and_the_session_is_answered_and_abandons_the_invite() {
+    let proxy = super::proxy_cancel_awaits_provisional_tests::relaying_proxy(DECIDING, "");
+    let raw = caller_invite("cancel-in-the-window@example.com");
+    let branch = "z9hG4bK-cancel-in-the-window@example.com".to_string();
+    let hook_proxy = Proxy {
+        state: Arc::clone(&proxy.state),
+        udp: proxy.udp.clone(),
+    };
+    let hook_raw = raw.clone();
+    *super::request_script::RELAY_WINDOW_HOOK
+        .lock()
+        .expect("hook lock") = Some((
+        branch,
+        Arc::new(move || caller_cancels(&hook_proxy, &hook_raw)),
+    ));
+
+    proxy.request(CALLER, &raw);
+    *super::request_script::RELAY_WINDOW_HOOK
+        .lock()
+        .expect("hook lock") = None;
+
+    let sent = proxy.wire();
+    assert_eq!(
+        responses_to_caller(&sent),
+        [200, 487],
+        "200 for the CANCEL, 487 for the INVITE, no 481"
+    );
+    assert!(proxy.state.scripted_invites.is_empty());
+}

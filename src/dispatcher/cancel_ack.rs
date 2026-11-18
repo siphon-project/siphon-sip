@@ -522,9 +522,33 @@ pub(super) fn handle_cancel(
 
     // The INVITE's script is still deciding, so it has a server transaction and
     // no session yet (RFC 3261 §9.2: still a matching INVITE, still 200).
-    if let Some((_, pending)) = state.scripted_invites.remove(&invite_server_key) {
-        handle_cancel_while_scripted(inbound, message, invite_server_key, pending, state);
-        return;
+    match take_scripted_invite(&state.scripted_invites, &invite_server_key, &message) {
+        ScriptedCancel::Taken(pending) => {
+            handle_cancel_while_scripted(inbound, message, invite_server_key, *pending, state);
+            return;
+        }
+        // Being forwarded this instant: the request path abandons it once its
+        // session exists. Answer the CANCEL now.
+        ScriptedCancel::Relaying => {
+            debug!(server_key = %invite_server_key, "CANCEL while the INVITE is being forwarded — answering 200, abandoned once its session exists (RFC 3261 §16.10)");
+            let response = build_response(
+                &message,
+                200,
+                "OK",
+                state.identity.load().server.as_deref(),
+                &[],
+            );
+            send_message_from(
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
+            );
+            return;
+        }
+        ScriptedCancel::Absent => {}
     }
 
     // RFC 3261 §9.2: a CANCEL is matched to the INVITE's server transaction,
@@ -573,6 +597,34 @@ pub(super) fn handle_cancel(
         Some(inbound.local_addr),
         state,
     );
+}
+
+enum ScriptedCancel {
+    Taken(Box<ScriptedInvite>),
+    Relaying,
+    Absent,
+}
+
+/// Under the entry's lock: take an INVITE still with its script, or, when its
+/// decision is already being acted on, record the CANCEL on the entry.
+fn take_scripted_invite(
+    store: &DashMap<TransactionKey, ScriptedInvite>,
+    key: &TransactionKey,
+    cancel: &SipMessage,
+) -> ScriptedCancel {
+    use dashmap::mapref::entry::Entry;
+    match store.entry(key.clone()) {
+        Entry::Occupied(mut occupied) if occupied.get().relaying => {
+            let pending = occupied.get_mut();
+            pending.cancelled = true;
+            if let Some(reasons) = cancel.headers.get_all("Reason") {
+                pending.cancel_reasons = reasons.clone();
+            }
+            ScriptedCancel::Relaying
+        }
+        Entry::Occupied(occupied) => ScriptedCancel::Taken(Box::new(occupied.remove())),
+        Entry::Vacant(_) => ScriptedCancel::Absent,
+    }
 }
 
 /// A CANCEL for an INVITE whose `@proxy.on_request` handlers have not returned:

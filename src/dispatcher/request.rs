@@ -958,6 +958,9 @@ pub(super) fn handle_request_after_queue(
                         source_addr: inbound.remote_addr,
                         connection_id: inbound.connection_id,
                         inbound_local_addr: inbound.local_addr,
+                        relaying: false,
+                        cancelled: false,
+                        cancel_reasons: Vec::new(),
                     },
                 );
             }

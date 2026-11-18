@@ -36,6 +36,15 @@ pub struct ScriptedInvite {
     pub source_addr: SocketAddr,
     pub connection_id: ConnectionId,
     pub inbound_local_addr: SocketAddr,
+    /// The handlers have returned and the decision is being acted on: a
+    /// session may appear any moment. A CANCEL now cannot take the entry
+    /// (the INVITE may already be forwarded); it sets `cancelled`, and the
+    /// request path abandons the INVITE once its session is in the store.
+    pub relaying: bool,
+    /// A CANCEL arrived while `relaying`.
+    pub cancelled: bool,
+    /// The `Reason` headers of that CANCEL (RFC 3326).
+    pub cancel_reasons: Vec<String>,
 }
 
 /// Shared state for the dispatcher, passed to each spawned task.
