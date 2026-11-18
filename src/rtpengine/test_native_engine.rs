@@ -231,6 +231,28 @@ fn grown_call_command(command: &Command, grown: &Mutex<HashSet<String>>) -> Opti
 }
 
 impl Recorded {
+    /// What the engine keeps of the command, once it has decided on it.
+    fn logged(self, refused: bool, scope: Option<String>) -> NativeCommand {
+        let profile = self.profile.as_ref();
+        NativeCommand {
+            transport_protocol: profile.and_then(|profile| profile.transport_protocol.clone()),
+            received_from: profile.and_then(|profile| profile.received_from),
+            sip_call_id: profile.and_then(|profile| profile.sip_call_id.clone()),
+            ws_uri: profile.and_then(|profile| profile.ws_uri.clone()),
+            ws_tee: profile.and_then(|profile| profile.ws_tee.clone()),
+            address_family: profile.and_then(|profile| profile.address_family.clone()),
+            name: self.name,
+            call_id: self.call_id,
+            from_tag: self.from_tag,
+            detail: self.detail,
+            repeat: self.repeat,
+            refused,
+            dtmf: self.dtmf,
+            scope,
+            profile: self.profile,
+        }
+    }
+
     fn new(name: &'static str, call_id: &str, from_tag: &str) -> Self {
         Recorded {
             name,
@@ -644,41 +666,7 @@ impl NativeTestEngine {
                             .map(|record| format!("unknown call: {}", record.call_id));
                         if let Some(record) = record {
                             if let Ok(mut log) = recorded.lock() {
-                                log.push(NativeCommand {
-                                    name: record.name,
-                                    call_id: record.call_id,
-                                    from_tag: record.from_tag,
-                                    detail: record.detail,
-                                    repeat: record.repeat,
-                                    transport_protocol: record
-                                        .profile
-                                        .as_ref()
-                                        .and_then(|profile| profile.transport_protocol.clone()),
-                                    received_from: record
-                                        .profile
-                                        .as_ref()
-                                        .and_then(|profile| profile.received_from),
-                                    sip_call_id: record
-                                        .profile
-                                        .as_ref()
-                                        .and_then(|profile| profile.sip_call_id.clone()),
-                                    ws_uri: record
-                                        .profile
-                                        .as_ref()
-                                        .and_then(|profile| profile.ws_uri.clone()),
-                                    ws_tee: record
-                                        .profile
-                                        .as_ref()
-                                        .and_then(|profile| profile.ws_tee.clone()),
-                                    refused,
-                                    dtmf: record.dtmf.clone(),
-                                    scope: scope.clone(),
-                                    address_family: record
-                                        .profile
-                                        .as_ref()
-                                        .and_then(|profile| profile.address_family.clone()),
-                                    profile: record.profile,
-                                });
+                                log.push(record.logged(refused, scope.clone()));
                             }
                         }
                         let result = match request.command {
