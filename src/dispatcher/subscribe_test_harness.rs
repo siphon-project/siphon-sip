@@ -148,6 +148,12 @@ pub(super) fn subscribe_harness() -> (MutexGuard<'static, ()>, &'static Subscrib
     // Whatever an earlier test left unread is not this test's traffic.
     while harness.udp.try_recv().is_ok() {}
     while harness.tcp.try_recv().is_ok() {}
+    // Nor are the dead dialogs it left in the store. Every dispatcher's
+    // cleanup tick sweeps the process-wide store, so a test outside this
+    // turn that sweeps would reap them in the middle of this one and move
+    // the dialog count it is comparing. Reaped here, nothing is left for a
+    // concurrent sweep to take.
+    harness.store.sweep_stale();
     (turn, harness)
 }
 
