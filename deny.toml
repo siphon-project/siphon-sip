@@ -17,6 +17,10 @@ yanked = "deny"
 ignore = [
     # paste — unmaintained transitive (no vuln); remove when the parent crate drops it.
     "RUSTSEC-2024-0436",
+    # chrono — unmaintained, informational (no vuln, no patched version). rasn's
+    # GeneralizedTime is a chrono type, so the LI ASN.1 code and every rasn user
+    # (and smpp34) carry it. Remove when rasn moves to jiff or time.
+    "RUSTSEC-2026-0543",
 ]
 
 [bans]
