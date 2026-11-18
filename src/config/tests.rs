@@ -6684,6 +6684,8 @@ fn script_gc_refuses_a_key_it_does_not_know() {
     let yaml = format!("{MINIMAL_DIRECT_DISPATCH_YAML}  gc:\n    freeze: true\n");
     let error = Config::from_str(&yaml).expect_err("a misspelled key");
     assert!(error.to_string().contains("freeze"), "{error}");
+}
+
 /// The SRS answers each recorded stream on a single-leg engine call of its own
 /// (RFC 7866 §8.1: it receives and never relays), which only the siphon-rtp
 /// backend can do. A recording server that boots on another backend would
