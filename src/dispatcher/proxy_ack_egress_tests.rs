@@ -263,3 +263,133 @@ async fn the_capture_of_a_pinned_request_names_the_socket_it_left_from() {
     );
     assert!(!capture.windows(4).any(|window| window == core));
 }
+
+/// One P-CSCF both originates and terminates a call between two of its own UEs:
+/// the caller's INVITE goes to the core, comes back from it, and is relayed
+/// over the callee's flow. Both INVITEs carry one Call-ID and From-tag, so the
+/// store holds two sessions under one dialog key, and each ACK must be routed
+/// by the session of its own leg. The terminating ACK took the originating
+/// one, whose branch went to the core, so the pin of the callee's flow was
+/// never found and the ACK left from the first listener.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_terminating_ack_of_a_call_between_two_ues_of_one_proxy_leaves_from_the_flow_socket() {
+    const CORE_NEXT_HOP: &str = "192.0.2.30:5060";
+    let dispatcher = test_dispatcher();
+    let state = &dispatcher.state;
+
+    // Originating leg: the caller's INVITE, relayed to the core.
+    let originating = invite();
+    let originating_key = TransactionKey::new(
+        "z9hG4bK-egress-invite".to_string(),
+        Method::Invite,
+        "192.0.2.20:5060".to_string(),
+    );
+    relay_request(
+        &originating,
+        Some(&format!("sip:{CORE_NEXT_HOP}")),
+        false,
+        &inbound(&originating),
+        Some(&originating_key),
+        state,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+    );
+
+    // Terminating leg: the same INVITE back from the core, over the callee's
+    // flow. Its own branch, as the core's Via names.
+    let terminating = parse(&format!(
+        concat!(
+            "INVITE sip:5111@{phone} SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.30:5060;branch=z9hG4bK-egress-term\r\n",
+            "Max-Forwards: 69\r\n",
+            "From: <sip:5222@ims.example.test>;tag=caller-tag\r\n",
+            "To: <sip:5111@ims.example.test>\r\n",
+            "Call-ID: {call_id}\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Contact: <sip:5222@192.0.2.20:5060>\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ),
+        phone = PHONE,
+        call_id = CALL_ID,
+    ));
+    let from_core = InboundMessage {
+        remote_addr: socket(CORE_NEXT_HOP),
+        ..inbound(&terminating)
+    };
+    let flow = crate::script::api::registrar::PyFlow {
+        transport: "udp".to_string(),
+        source_addr: socket(PHONE),
+        local_addr: socket(GM),
+        connection_id: 0,
+        kind: crate::script::api::registrar::FlowKind::Inbound,
+    };
+    let terminating_key = TransactionKey::new(
+        "z9hG4bK-egress-term".to_string(),
+        Method::Invite,
+        CORE_NEXT_HOP.to_string(),
+    );
+    relay_request(
+        &terminating,
+        None,
+        false,
+        &from_core,
+        Some(&terminating_key),
+        state,
+        None,
+        None,
+        None,
+        None,
+        Some(&flow),
+        None,
+        &[],
+        None,
+    );
+    let _ = drain(&dispatcher.udp);
+
+    // Each leg's ACK finds the session of its own leg.
+    let caller_leg = state
+        .session_store
+        .session_for_ack(CALL_ID, "caller-tag", socket("192.0.2.20:5060"))
+        .expect("the originating session");
+    let core_leg = state
+        .session_store
+        .session_for_ack(CALL_ID, "caller-tag", socket(CORE_NEXT_HOP))
+        .expect("the terminating session");
+    assert!(!Arc::ptr_eq(&caller_leg, &core_leg));
+
+    // The callee's 2xx is ACKed end to end by the caller, through the core.
+    let ack = ack("");
+    let session = state
+        .session_store
+        .session_for_ack(CALL_ID, "caller-tag", socket(CORE_NEXT_HOP))
+        .expect("a session routes the ACK");
+    handle_ack_via_session(
+        InboundMessage {
+            remote_addr: socket(CORE_NEXT_HOP),
+            ..inbound(&ack)
+        },
+        ack,
+        session,
+        state,
+    );
+
+    let sent = the_ack(&dispatcher);
+    assert_eq!(sent.destination, socket(PHONE));
+    assert_eq!(
+        sent.source,
+        Some(socket(GM)),
+        "from the callee's flow socket"
+    );
+    let via = sent.message.headers.get("Via").expect("a Via");
+    assert!(
+        via.starts_with("SIP/2.0/UDP 192.0.2.211:5060"),
+        "the top Via names the Gm socket: {via}"
+    );
+}

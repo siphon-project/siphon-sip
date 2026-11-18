@@ -344,7 +344,11 @@ pub(super) fn handle_request_after_queue(
                 let call_id = message.headers.get("Call-ID");
                 let from_tag = message.typed_from().ok().flatten().and_then(|na| na.tag);
                 if let (Some(cid), Some(ftag)) = (call_id, from_tag.as_deref()) {
-                    if let Some(session_arc) = state.session_store.get_by_dialog_key(cid, ftag) {
+                    if let Some(session_arc) =
+                        state
+                            .session_store
+                            .session_for_ack(cid, ftag, inbound.remote_addr)
+                    {
                         // Stamp before forwarding: the entry existed only to
                         // route this ACK, and what is still owed afterwards is
                         // absorbing a *retransmitted* ACK (the UAS sends one per

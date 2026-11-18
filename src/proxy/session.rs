@@ -253,6 +253,12 @@ pub struct ProxySessionStore {
     /// Using Call-ID alone is ambiguous when both legs of a B2BUA call
     /// (e.g. caller→proxy→FS and FS→proxy→callee) share the same Call-ID.
     by_dialog_key: DashMap<String, Arc<RwLock<ProxySession>>>,
+    /// The sessions beyond the first that share a dialog key. A proxy that sees
+    /// both legs of one call (a P-CSCF originating and terminating a call
+    /// between two of its UEs) relays two INVITEs with one Call-ID and From-tag;
+    /// `by_dialog_key` keeps the first, and the other is kept here so the ACK of
+    /// its leg can find it. See [`Self::session_for_ack`].
+    extra_dialog_sessions: DashMap<String, Vec<Arc<RwLock<ProxySession>>>>,
     /// The dialogs opened by a 2xx forwarded after its INVITE already had a
     /// final response upstream (RFC 3261 §16.7 step 5), by Call-ID and both
     /// tags, with when each was opened. See [`Self::note_late_dialog`].
@@ -302,6 +308,7 @@ impl ProxySessionStore {
             by_client_key: DashMap::new(),
             server_to_clients: DashMap::new(),
             by_dialog_key: DashMap::new(),
+            extra_dialog_sessions: DashMap::new(),
             late_dialogs: DashMap::new(),
             late_dialog_total: AtomicUsize::new(0),
             forwarded_answers: DashMap::new(),
@@ -415,9 +422,7 @@ impl ProxySessionStore {
         }
 
         if let Some(dk) = dialog_key {
-            self.by_dialog_key
-                .entry(dk)
-                .or_insert_with(|| Arc::clone(&session_arc));
+            self.index_dialog(dk, &session_arc);
         }
 
         self.server_to_clients
@@ -450,9 +455,7 @@ impl ProxySessionStore {
             // Only an INVITE reaches here (see `invite_dialog_key`).  Keep
             // `or_insert_with` so a re-INVITE that arrives before the original
             // dialog-key entry was aged out doesn't displace it.
-            self.by_dialog_key
-                .entry(dk)
-                .or_insert_with(|| Arc::clone(&session_arc));
+            self.index_dialog(dk, &session_arc);
         }
         self.server_to_clients.entry(server_key).or_default();
         session_arc
@@ -567,6 +570,72 @@ impl ProxySessionStore {
             .map(|entry| Arc::clone(entry.value()))
     }
 
+    /// Index `session` under its dialog key: the first session for the key
+    /// takes `by_dialog_key`, any other goes to `extra_dialog_sessions`.
+    fn index_dialog(&self, dialog_key: String, session: &Arc<RwLock<ProxySession>>) {
+        match self.by_dialog_key.entry(dialog_key.clone()) {
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(Arc::clone(session));
+            }
+            dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                if !Arc::ptr_eq(occupied.get(), session) {
+                    drop(occupied);
+                    self.extra_dialog_sessions
+                        .entry(dialog_key)
+                        .or_default()
+                        .push(Arc::clone(session));
+                }
+            }
+        }
+    }
+
+    /// The session an end-to-end 2xx ACK belongs to.
+    ///
+    /// One session per `(Call-ID, From-tag)` is the rule, and the answer is
+    /// then that session. A proxy on both legs of a call has two, and the ACK
+    /// is routed by the one whose INVITE came from where the ACK comes from:
+    /// the caller's ACK by the originating leg, the core's by the terminating
+    /// one. An ACK from a peer no session heard from (a second node of the same
+    /// core) falls back to the one on the same address, then to the first.
+    pub fn session_for_ack(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        from: SocketAddr,
+    ) -> Option<Arc<RwLock<ProxySession>>> {
+        let key = format!("{}\0{}", call_id, from_tag);
+        let mut candidates: Vec<Arc<RwLock<ProxySession>>> = Vec::new();
+        if let Some(first) = self.by_dialog_key.get(&key) {
+            candidates.push(Arc::clone(first.value()));
+        }
+        if let Some(extra) = self.extra_dialog_sessions.get(&key) {
+            candidates.extend(extra.value().iter().cloned());
+        }
+        let source = |session: &Arc<RwLock<ProxySession>>| {
+            session.read().ok().map(|guard| guard.source_addr)
+        };
+        let exact = candidates
+            .iter()
+            .find(|session| source(session) == Some(from));
+        let same_host = || {
+            candidates
+                .iter()
+                .find(|session| source(session).is_some_and(|addr| addr.ip() == from.ip()))
+        };
+        exact
+            .or_else(same_host)
+            .or_else(|| candidates.first())
+            .cloned()
+    }
+
+    fn forget_extra_dialog_session(&self, dialog_key: &str, session: &Arc<RwLock<ProxySession>>) {
+        if let Some(mut extra) = self.extra_dialog_sessions.get_mut(dialog_key) {
+            extra.retain(|entry| !Arc::ptr_eq(entry, session));
+        }
+        self.extra_dialog_sessions
+            .remove_if(dialog_key, |_, extra| extra.is_empty());
+    }
+
     /// Look up a session by dialog key (Call-ID + From-tag) for ACK-2xx routing.
     pub fn get_by_dialog_key(
         &self,
@@ -608,6 +677,7 @@ impl ProxySessionStore {
                         if let Some(dk) = Self::invite_dialog_key(&session.original_request) {
                             self.by_dialog_key
                                 .remove_if(&dk, |_, entry| Arc::ptr_eq(entry, session_ref.value()));
+                            self.forget_extra_dialog_session(&dk, session_ref.value());
                         }
                     }
                 }
@@ -906,6 +976,20 @@ impl ProxySessionStore {
         for dialog_key in &stale_dialog_keys {
             self.by_dialog_key.remove(dialog_key);
         }
+        // The same ageing for the sessions of a dialog's second leg.
+        for mut entry in self.extra_dialog_sessions.iter_mut() {
+            entry.value_mut().retain(|session| {
+                session.read().is_ok_and(|session| {
+                    let (since, limit) = match session.acked_at {
+                        Some(acked) => (acked, ack_grace),
+                        None => (session.created_at, ttl),
+                    };
+                    now.duration_since(since) <= limit || session.client_keys.iter().any(pending)
+                })
+            });
+        }
+        self.extra_dialog_sessions
+            .retain(|_, extra| !extra.is_empty());
 
         self.sweep_late_dialogs(now, LATE_DIALOG_BACKSTOP);
         self.sweep_forwarded_answers(now, FORWARDED_ANSWER_LIFETIME);
