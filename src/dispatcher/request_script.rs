@@ -25,6 +25,63 @@ pub(super) struct ScriptedRequest {
     pub(super) script: Arc<crate::script::engine::ScriptState>,
 }
 
+/// The INVITE's `scripted_invites` entry while its decision is acted on. When
+/// dropped, the session (if the action made one) is in the store, so the entry
+/// goes, and a CANCEL that came meanwhile is acted on: branches CANCELled, the
+/// caller answered 487 (RFC 3261 §9.2, §16.10).
+struct RelayingInvite {
+    key: TransactionKey,
+    state: Arc<DispatcherState>,
+}
+
+impl Drop for RelayingInvite {
+    fn drop(&mut self) {
+        let Some((_, entry)) = self.state.scripted_invites.remove(&self.key) else {
+            return;
+        };
+        if !entry.cancelled {
+            return;
+        }
+        match self.state.session_store.get_by_server_key(&self.key) {
+            Some(session) => {
+                abandon_pending_invite(
+                    &self.key,
+                    session,
+                    &entry.cancel_reasons,
+                    487,
+                    "Request Terminated",
+                    &self.state,
+                );
+            }
+            // The script answered the INVITE itself (or dropped it): its own
+            // final response stands, the CANCEL having no effect (§9.2).
+            None => debug!(server_key = %self.key, "cancelled INVITE has no session to abandon"),
+        }
+    }
+}
+
+/// Test hook run between marking the INVITE as relaying and acting on the
+/// decision: the window in which the session does not exist yet.
+#[cfg(test)]
+type RelayWindowHook = (String, Arc<dyn Fn() + Send + Sync>);
+#[cfg(test)]
+pub(super) static RELAY_WINDOW_HOOK: std::sync::Mutex<Option<RelayWindowHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn relay_window_hook(key: &TransactionKey) {
+    let hook = match RELAY_WINDOW_HOOK.lock() {
+        Ok(guard) => guard
+            .as_ref()
+            .filter(|(branch, _)| *branch == key.branch)
+            .map(|(_, hook)| Arc::clone(hook)),
+        Err(_) => None,
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// What the handlers left on the request, read once every one has returned.
 pub(super) struct ScriptDecision {
     action: RequestAction,
@@ -257,6 +314,42 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
         script: _,
     } = scripted;
     let state = &state;
+    // A CANCEL that came while the handlers ran took the INVITE's entry, and
+    // answered both itself and the INVITE (487). Nothing is forwarded for an
+    // INVITE the caller has abandoned (RFC 3261 §9.2, §16.10), and a second
+    // final response would break §17.2.1. Otherwise the entry stays, marked,
+    // until the session is in the store: a CANCEL in between is answered 200
+    // and acted on by `RelayingInvite` below, never 481.
+    let _relaying = if method == "INVITE" {
+        match &server_key {
+            Some(key) => {
+                let marked = state
+                    .scripted_invites
+                    .get_mut(key)
+                    .map(|mut entry| entry.relaying = true)
+                    .is_some();
+                if !marked {
+                    debug!(
+                        server_key = %key,
+                        "INVITE cancelled while its handlers ran — not forwarded (RFC 3261 §9.2)"
+                    );
+                    // Dropped here, detached: the callbacks' references go to
+                    // pyo3's deferred pool.
+                    drop((decision, reply_gate, ended_subscription));
+                    return;
+                }
+                #[cfg(test)]
+                relay_window_hook(key);
+                Some(RelayingInvite {
+                    key: key.clone(),
+                    state: Arc::clone(state),
+                })
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     let ScriptDecision {
         action,
         record_routed,

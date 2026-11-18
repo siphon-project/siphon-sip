@@ -945,6 +945,31 @@ pub(super) fn handle_request_after_queue(
         gate
     });
 
+    // From here until the handlers have returned a CANCEL has no session to
+    // find, only this (RFC 3261 §9.2): see `DispatcherState::scripted_invites`.
+    if let (true, Some(key)) = (method == "INVITE", server_key.as_ref()) {
+        match message_arc.lock() {
+            Ok(guard) => {
+                state.scripted_invites.insert(
+                    key.clone(),
+                    ScriptedInvite {
+                        request: guard.clone(),
+                        transport: inbound.transport,
+                        source_addr: inbound.remote_addr,
+                        connection_id: inbound.connection_id,
+                        inbound_local_addr: inbound.local_addr,
+                        relaying: false,
+                        cancelled: false,
+                        cancel_reasons: Vec::new(),
+                    },
+                );
+            }
+            Err(_) => {
+                error!("message_arc lock poisoned; a CANCEL during the script cannot be matched")
+            }
+        }
+    }
+
     // Call Python handlers. An `async def` one that suspends finishes this
     // request later, as another executor job, and frees this worker now.
     let scripted = ScriptedRequest {

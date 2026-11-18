@@ -305,6 +305,8 @@ mod proxy_cancel_awaits_provisional_tests;
 #[cfg(test)]
 mod proxy_cancel_upstream_tests;
 #[cfg(test)]
+mod proxy_cancel_while_scripted_tests;
+#[cfg(test)]
 mod proxy_cancel_wire_tests;
 #[cfg(test)]
 mod proxy_dialog_state_tests;
@@ -858,6 +860,7 @@ pub async fn run(
         held_byes: Arc::new(DashMap::new()),
         pending_reinvite_acks: Arc::new(DashMap::new()),
         cancelled_invites: Arc::new(DashMap::new()),
+        scripted_invites: Arc::new(DashMap::new()),
         completed_invites: CompletedInvites::default(),
         originate_groups: Arc::new(crate::dispatcher::b2bua::OriginateGroupStore::new()),
         dial_bridges: Arc::new(crate::dispatcher::b2bua::DialBridgeStore::new()),
