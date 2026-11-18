@@ -333,6 +333,22 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     ]);
   });
 
+  it("acceptRecording sends only what is set", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.acceptRecording();
+    await call.acceptRecording({ format: "ogg_opus", bitrateBps: 24000, path: "/srv/tenant-a" });
+    expect(transport.calls).toEqual([
+      { module: MODULE_SIP, verb: "accept", target: { channel: "ch1" }, args: {} },
+      {
+        module: MODULE_SIP,
+        verb: "accept",
+        target: { channel: "ch1" },
+        args: { format: "ogg_opus", bitrate_bps: 24000, path: "/srv/tenant-a" },
+      },
+    ]);
+  });
+
   it("answerAnchored always carries anchor, so no options still anchors", async () => {
     // With no options this has to mean "answer through the media engine on its
     // default profile" — an empty arg object would be indistinguishable from a

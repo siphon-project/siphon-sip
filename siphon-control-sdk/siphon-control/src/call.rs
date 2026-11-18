@@ -293,6 +293,34 @@ impl Call {
         })
     }
 
+    /// Accept a recording session (a channel whose ``StasisStart`` has
+    /// ``kind == "siprec"``): siphon answers the recording client and records
+    /// each stream. ``profile`` names a media profile in place of
+    /// ``srs.rtpengine_profile``, ``format`` is ``"wav"`` (the default) or
+    /// ``"ogg_opus"`` with an optional ``bitrate_bps``, and ``path`` is an
+    /// absolute directory siphon writes the files to. Refuse one with
+    /// ``reject``; doing neither within the handoff deadline refuses it 503.
+    #[pyo3(signature = (profile=None, format=None, bitrate_bps=None, path=None))]
+    fn accept_recording<'py>(
+        &self,
+        py: Python<'py>,
+        profile: Option<String>,
+        format: Option<String>,
+        bitrate_bps: Option<u32>,
+        path: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let recording = siphon_control_client::RecordingAccept {
+            profile,
+            format: extract_record_format(format)?,
+            bitrate_bps,
+            path,
+        };
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.accept_recording(&recording).await.map_err(to_pyerr)
+        })
+    }
+
     #[pyo3(signature = (code, reason=None))]
     fn reject<'py>(
         &self,

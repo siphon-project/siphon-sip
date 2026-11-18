@@ -311,6 +311,16 @@ impl ControlBus {
     }
 
     /// Whether `app` is a known, configured control application.
+    /// The control-loss policy `app` is configured with (`hangup` when it
+    /// names none, or the app is unknown).
+    pub fn app_on_lost(&self, app: &str) -> String {
+        self.app_config
+            .get(app)
+            .and_then(|config| config.on_lost.clone())
+            .filter(|on_lost| !on_lost.is_empty())
+            .unwrap_or_else(|| "hangup".to_string())
+    }
+
     pub fn app_configured(&self, app: &str) -> bool {
         self.app_config.contains_key(app)
     }
@@ -425,10 +435,13 @@ impl ControlBus {
             // set it — `Config::validate_control_apps`, `call.handover(on_lost=…)`
             // and the `originate` verb — so it cannot reach here.
             _ => {
-                crate::dispatcher::b2bua_terminate_call(
-                    &sip_call_id,
-                    Some("control plane owner lost"),
-                );
+                // A recording session ends from siphon's side: its SRC is BYEd.
+                if !crate::dispatcher::srs::srs_terminate_session(&sip_call_id, "owner_lost") {
+                    crate::dispatcher::b2bua_terminate_call(
+                        &sip_call_id,
+                        Some("control plane owner lost"),
+                    );
+                }
             }
         }
     }

@@ -6719,3 +6719,43 @@ fn a_disabled_srs_block_needs_no_backend() {
     Config::from_str(&backend_yaml("srs:\n  enabled: false\n"))
         .expect("srs turned off is held to nothing");
 }
+
+/// `srs.app` hands every recording session to a control application; one
+/// nothing serves would refuse every recording at its deadline.
+#[test]
+fn rejects_srs_app_naming_an_unknown_control_app() {
+    let error = Config::from_str(&backend_yaml(concat!(
+        "media:\n  backend: siphon-rtp\n",
+        "control:\n  listen: \"127.0.0.1:9092\"\n  apps:\n    - name: recorder\n      token: \"t\"\n",
+        "srs:\n  enabled: true\n  app: typo\n",
+    )))
+    .expect_err("an unknown srs.app must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("srs.app") && message.contains("recorder"),
+        "the error should name the setting and the apps that exist: {message}"
+    );
+}
+
+#[test]
+fn rejects_srs_app_without_a_control_block() {
+    let error = Config::from_str(&backend_yaml(
+        "media:\n  backend: siphon-rtp\nsrs:\n  enabled: true\n  app: recorder\n",
+    ))
+    .expect_err("srs.app without control must be rejected");
+    assert!(error.to_string().contains("srs.app"), "{error}");
+}
+
+#[test]
+fn accepts_srs_app_naming_a_control_app() {
+    let config = Config::from_str(&backend_yaml(concat!(
+        "media:\n  backend: siphon-rtp\n",
+        "control:\n  listen: \"127.0.0.1:9092\"\n  apps:\n    - name: recorder\n      token: \"t\"\n",
+        "srs:\n  enabled: true\n  app: recorder\n",
+    )))
+    .expect("srs.app naming a configured app is valid");
+    assert_eq!(
+        config.srs.and_then(|srs| srs.app).as_deref(),
+        Some("recorder")
+    );
+}

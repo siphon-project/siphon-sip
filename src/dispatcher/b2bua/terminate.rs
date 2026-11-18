@@ -307,12 +307,18 @@ pub fn control_notify_terminated_with_cause(
 ) {
     // The library tests install no process bus; they read the teardown's
     // StasisEnd here, where it is published.
+    // Recorded as the bus sends it: the cause beside the reason when there is one.
     #[cfg(test)]
-    crate::control::channel_event_capture::record(
-        sip_call_id,
-        "StasisEnd",
-        &serde_json::json!({ "reason": reason }),
-    );
+    crate::control::channel_event_capture::record(sip_call_id, "StasisEnd", &{
+        let mut payload = serde_json::json!({ "reason": reason });
+        if let Some(code) = code {
+            payload["code"] = serde_json::json!(code);
+        }
+        if let Some(response) = response {
+            payload["response"] = serde_json::json!(response);
+        }
+        payload
+    });
     if let Some(bus) = crate::control::ControlBus::global() {
         bus.on_call_terminated_with_cause(sip_call_id, reason, code, response);
     }

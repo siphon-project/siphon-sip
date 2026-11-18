@@ -680,6 +680,26 @@ impl Call {
         self.sip(SipVerb::Reject, args).await.map(drop)
     }
 
+    /// Accept a recording session (a channel whose `StasisStart` has `kind:
+    /// "siprec"`): siphon answers the recording client and records each stream
+    /// as `recording` says. Refuse one with [`reject`](Self::reject).
+    pub async fn accept_recording(&self, recording: &RecordingAccept) -> Result<(), ControlError> {
+        let mut args = json!({});
+        if let Some(profile) = &recording.profile {
+            args["profile"] = json!(profile);
+        }
+        if let Some(format) = recording.format {
+            args["format"] = json!(format.as_str());
+        }
+        if let Some(bitrate_bps) = recording.bitrate_bps {
+            args["bitrate_bps"] = json!(bitrate_bps);
+        }
+        if let Some(path) = &recording.path {
+            args["path"] = json!(path);
+        }
+        self.sip(SipVerb::Accept, args).await.map(drop)
+    }
+
     /// Hang up: BYE an answered call, or reject an unanswered one.
     pub async fn hangup(&self) -> Result<(), ControlError> {
         self.sip(SipVerb::Hangup, json!({})).await.map(drop)
@@ -1427,6 +1447,20 @@ impl SipServer {
 // Tests — the emitted `route` frame shape (recording CommandTransport).
 // ---------------------------------------------------------------------------
 
+/// How an accepted recording session is recorded. Every field is optional:
+/// unset, siphon's `srs:` configuration decides.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordingAccept {
+    /// A media profile in place of `srs.rtpengine_profile`.
+    pub profile: Option<String>,
+    /// The file format; unset is `wav`.
+    pub format: Option<crate::recording::RecordFormat>,
+    /// Opus target bitrate (`ogg_opus` only).
+    pub bitrate_bps: Option<u32>,
+    /// An absolute directory siphon writes the files to; it names them.
+    pub path: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1751,6 +1785,33 @@ mod tests {
                 "{absent} should be absent: {args}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn accept_recording_sends_only_what_is_set() {
+        let recorder = Arc::new(RecordingTransport {
+            calls: Mutex::new(Vec::new()),
+            result: json!({ "state": "accepted" }),
+        });
+        let call = make_call(recorder.clone());
+        call.accept_recording(&RecordingAccept::default())
+            .await
+            .expect("accept ok");
+        call.accept_recording(&RecordingAccept {
+            format: Some(crate::recording::RecordFormat::OggOpus),
+            bitrate_bps: Some(24000),
+            path: Some("/srv/tenant-a".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("accept ok");
+        let recorded = lock(&recorder.calls).clone();
+        assert_eq!(recorded[0].verb, "accept");
+        assert_eq!(recorded[0].args, json!({}));
+        assert_eq!(
+            recorded[1].args,
+            json!({ "format": "ogg_opus", "bitrate_bps": 24000, "path": "/srv/tenant-a" })
+        );
     }
 
     #[tokio::test]

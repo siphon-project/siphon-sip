@@ -238,6 +238,13 @@ export const SipVerb = {
   RecordStart: "record_start",
   /** Stop one recording by id, or every recording on the call. */
   RecordStop: "record_stop",
+  /**
+   * Accept a recording session (a channel whose `StasisStart` has
+   * `kind: "siprec"`): siphon answers the recording client 200 and records each
+   * stream. {@link SipVerb.Reject} refuses one; neither within the handoff
+   * deadline refuses it `503`.
+   */
+  Accept: "accept",
 } as const;
 
 /** A value of {@link SipVerb}. */

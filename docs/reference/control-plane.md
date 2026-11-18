@@ -1228,6 +1228,62 @@ Rules:
 A worked attended transfer between two bridged calls is in the
 [call transfer cookbook](../cookbook/call-transfer.md#attended-transfer-between-calls-a-controller-bridged).
 
+## Recording sessions (SIPREC)
+
+With `srs.app` naming a `control.apps` entry, every recording session a
+remote SRC opens (RFC 7866) is offered to that application before siphon
+answers it or anchors any media. Without `srs.app` nothing changes: the
+`@srs.*` script hooks decide, as before.
+
+```yaml
+srs:
+  enabled: true
+  app: recorder        # a control.apps name
+```
+
+The offer is a channel like a handed-over call, its `StasisStart` marked
+`kind: "siprec"`:
+
+```json
+{ "kind": "siprec",
+  "invite": { "method": "INVITE", "ruri": "sip:rec@tenant-a.example.com",
+              "headers": [["To", "<sip:rec@tenant-a.example.com>"], ["From", "..."]] },
+  "source_ip": "198.51.100.20", "source_port": 5061, "transport": "tls",
+  "recording_session": {
+    "session_id": "...", "sip_session_ids": ["..."], "datamode": "complete",
+    "participants": [{ "participant_id": "p-a", "aor": "sip:alice@example.com", "name": "Alice" }],
+    "streams": [{ "stream_id": "s-0", "label": "1", "media": "audio" }],
+    "participant_stream": [{ "participant_id": "p-a", "send": ["s-0"], "recv": ["s-1"] }] } }
+```
+
+`invite.ruri` and the headers are the request as received, so a multi-tenant
+controller can file the recording under the tenant its Request-URI host
+names. `source_ip` / `source_port` are the SRC's own address. On a listener
+behind a PROXY-protocol front, that is the address the PROXY header named,
+exactly as a call's `StasisStart` reports it. `participant_stream` is the parsed
+`participantstreamassoc`, which says which participant sends which stream.
+
+The application answers with one of two verbs within the handoff deadline
+(`control.limits.handoff_deadline_ms`):
+
+| verb | args | effect |
+|---|---|---|
+| `accept` | `profile`, `format` (`wav` \| `ogg_opus`), `bitrate_bps` (`ogg_opus` only), `path` (an absolute directory; siphon names the files) | 200 to the SRC, each stream answered recvonly on its own engine call and recorded to a file of its own |
+| `reject` | `code` (3xx-6xx, default 603), `reason` | that final response; nothing is anchored |
+
+`format` and `bitrate_bps` are checked as `record_start` checks them, and an
+unknown `profile` is refused. `channels: "stereo"` is refused for now: each
+stream is recorded to its own file. No decision by the deadline is a `503 No
+Controller Response`, and no connected application is a `503 No Controller
+Available`; neither answers 200.
+
+Once accepted, `hangup` BYEs the SRC and ends the recording. The channel ends
+with `StasisEnd`: `bye` when the SRC hung up, `hangup` for the application's
+own, `rejected` (with `code`) for a refused session, `cancelled` (487) when the
+SRC cancelled first, `unacknowledged` when it never ACKed the 200, and
+`owner_lost` when the application's connection is lost and its `on_lost` is
+`hangup`.
+
 ## Placing a call: `originate`
 
 Every verb above acts on a call that already arrived. `originate` is the one that
