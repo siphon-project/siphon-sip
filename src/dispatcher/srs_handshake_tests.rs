@@ -455,9 +455,12 @@ async fn a_cancelled_invite_gets_487_and_leaves_nothing_behind() {
     let directory = scratch_dir("cancel");
     let (state, udp) = srs_state(&engine, &directory);
     let call_id = "cancel@198.51.100.20";
-    // The CANCEL is processed before the task answering the INVITE runs: the
-    // test runtime's other worker is held until both are in.
+    // The engine holds its answers, so the INVITE's media set-up is provably
+    // still pending when the CANCEL arrives.
+    engine.hold_answers();
     send(&state, &siprec_invite(call_id, 2, true));
+    let mut seen = Vec::new();
+    await_response(&udp, &mut seen, 100, "INVITE").await;
     send(
         &state,
         &request(
@@ -471,7 +474,6 @@ async fn a_cancelled_invite_gets_487_and_leaves_nothing_behind() {
             true,
         ),
     );
-    let mut seen = Vec::new();
     await_response(&udp, &mut seen, 200, "CANCEL").await;
     let terminated = await_response(&udp, &mut seen, 487, "INVITE").await;
     assert!(
@@ -481,6 +483,8 @@ async fn a_cancelled_invite_gets_487_and_leaves_nothing_behind() {
             .is_some_and(|to| to.contains("tag=")),
         "a final response carries siphon's To-tag"
     );
+    // The set-up the CANCEL overtook finishes, and is undone.
+    engine.release_answers();
     assert!(
         eventually(|| srs(&state).session_count() == 0).await,
         "the session ends"

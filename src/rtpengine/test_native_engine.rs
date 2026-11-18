@@ -391,6 +391,9 @@ pub(crate) struct NativeTestEngine {
     address: SocketAddr,
     commands: Arc<Mutex<Vec<NativeCommand>>>,
     live: LiveCalls,
+    /// Open (the default) lets `answer_local` answer; closed holds every answer
+    /// until it opens, so a test can act while a set-up is provably pending.
+    answers: tokio::sync::watch::Sender<bool>,
 }
 
 /// The calls the engine holds, keyed the way the engine keys a call:
@@ -419,6 +422,7 @@ impl NativeTestEngine {
         // The calls `offer_far` grew a far leg on, which `answer` completes
         // with the caller's own answer and a `delete` with a `to_tag` drops.
         let grown: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let (answers, answers_open) = tokio::sync::watch::channel(true);
         let next_play_id = Arc::new(std::sync::atomic::AtomicU64::new(
             NATIVE_ENGINE_FIRST_PLAY_ID,
         ));
@@ -429,6 +433,7 @@ impl NativeTestEngine {
                 let held = Arc::clone(&held);
                 let grown = Arc::clone(&grown);
                 let next_play_id = Arc::clone(&next_play_id);
+                let mut answers_open = answers_open.clone();
                 tokio::spawn(async move {
                     let mut buffer = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -693,6 +698,9 @@ impl NativeTestEngine {
                                 stats: None,
                             },
                         };
+                        if matches!(request.command, Command::AnswerLocal { .. }) {
+                            let _ = answers_open.wait_for(|open| *open).await;
+                        }
                         let Ok(bytes) = frame::encode(&Response {
                             id: request.id,
                             result,
@@ -710,7 +718,18 @@ impl NativeTestEngine {
             address,
             commands,
             live,
+            answers,
         }
+    }
+
+    /// Hold every `answer_local` answer until [`release_answers`](Self::release_answers).
+    pub(crate) fn hold_answers(&self) {
+        self.answers.send_replace(false);
+    }
+
+    /// Answer the held `answer_local`s, and every one after.
+    pub(crate) fn release_answers(&self) {
+        self.answers.send_replace(true);
     }
 
     /// Whether the engine holds the unscoped `call_id`: created and not
