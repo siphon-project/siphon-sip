@@ -7,6 +7,7 @@
 
 pub mod metadata;
 pub mod multipart;
+pub mod srs_sdp;
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -853,81 +854,6 @@ pub fn split_dual_sdp(sdp: &[u8]) -> (Vec<u8>, Vec<u8>) {
     };
 
     (sdp1.into_bytes(), sdp2.into_bytes())
-}
-
-/// Combine two RTPEngine response SDPs into a single SDP with 2 m= lines.
-///
-/// Takes the offer response (caller ports) and answer response (callee ports),
-/// merges them into a single SDP body with `a=recvonly` direction (the SRS
-/// receives media from the SRC) and `a=label:N` on each m= section.
-pub fn combine_srs_answer_sdps(offer_sdp: &[u8], answer_sdp: &[u8]) -> Vec<u8> {
-    let offer_str = String::from_utf8_lossy(offer_sdp);
-    let answer_str = String::from_utf8_lossy(answer_sdp);
-
-    let mut result = String::new();
-
-    // Take session-level headers from the offer response.
-    for line in offer_str.lines() {
-        if line.starts_with("m=") {
-            break;
-        }
-        result.push_str(line);
-        result.push_str("\r\n");
-    }
-
-    // Append offer media section (label 0, recvonly).
-    append_srs_media_section(&mut result, &offer_str, "0");
-
-    // Append answer media section (label 1, recvonly).
-    append_srs_media_section(&mut result, &answer_str, "1");
-
-    result.into_bytes()
-}
-
-/// Extract the first m= section from an RTPEngine response SDP and append it
-/// with `a=recvonly` direction and the given label.
-fn append_srs_media_section(result: &mut String, sdp: &str, label: &str) {
-    let mut in_media = false;
-    let mut has_label = false;
-    let mut has_direction = false;
-
-    for line in sdp.lines() {
-        if line.starts_with("m=") {
-            if in_media {
-                break; // Only take the first m= section.
-            }
-            in_media = true;
-            result.push_str(line);
-            result.push_str("\r\n");
-            continue;
-        }
-        if !in_media {
-            continue;
-        }
-        if line.starts_with("a=sendonly")
-            || line.starts_with("a=recvonly")
-            || line.starts_with("a=sendrecv")
-            || line.starts_with("a=inactive")
-        {
-            if !has_direction {
-                result.push_str("a=recvonly\r\n");
-                has_direction = true;
-            }
-        } else if line.starts_with("a=label:") {
-            has_label = true;
-            result.push_str(&format!("a=label:{label}\r\n"));
-        } else {
-            result.push_str(line);
-            result.push_str("\r\n");
-        }
-    }
-
-    if in_media && !has_label {
-        result.push_str(&format!("a=label:{label}\r\n"));
-    }
-    if in_media && !has_direction {
-        result.push_str("a=recvonly\r\n");
-    }
 }
 
 /// Build a sendonly SDP from the call's SDP for the SIPREC INVITE.
@@ -1876,47 +1802,6 @@ mod tests {
 
         let (sdp1, sdp2) = split_dual_sdp(sdp.as_bytes());
         assert_eq!(sdp1, sdp2, "single m= SDP should be duplicated");
-    }
-
-    #[test]
-    fn combine_srs_answer_sdps_produces_recvonly_labeled() {
-        let offer_sdp = concat!(
-            "v=0\r\n",
-            "o=- 1 1 IN IP4 10.0.0.1\r\n",
-            "s=-\r\n",
-            "t=0 0\r\n",
-            "m=audio 20000 RTP/AVP 8\r\n",
-            "c=IN IP4 10.0.0.1\r\n",
-            "a=sendrecv\r\n",
-        );
-        let answer_sdp = concat!(
-            "v=0\r\n",
-            "o=- 2 2 IN IP4 10.0.0.1\r\n",
-            "s=-\r\n",
-            "t=0 0\r\n",
-            "m=audio 20100 RTP/AVP 8\r\n",
-            "c=IN IP4 10.0.0.1\r\n",
-            "a=sendrecv\r\n",
-        );
-
-        let combined = combine_srs_answer_sdps(offer_sdp.as_bytes(), answer_sdp.as_bytes());
-        let result = String::from_utf8_lossy(&combined);
-
-        // Two m= lines.
-        assert_eq!(result.matches("m=audio").count(), 2);
-        assert!(result.contains("m=audio 20000"));
-        assert!(result.contains("m=audio 20100"));
-
-        // Both recvonly (SRS receives from SRC).
-        assert_eq!(result.matches("a=recvonly").count(), 2);
-        assert!(!result.contains("a=sendrecv"));
-
-        // Labeled 0 and 1.
-        assert!(result.contains("a=label:0"));
-        assert!(result.contains("a=label:1"));
-
-        // Session headers from offer only (no duplicates).
-        assert_eq!(result.matches("v=0").count(), 1);
     }
 
     #[test]

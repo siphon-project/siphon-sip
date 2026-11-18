@@ -483,10 +483,17 @@ pub fn sweep_unacked_uas_2xx(state: &DispatcherState) {
         // The dialog is part of its call only while one of the call's legs still
         // carries it: a transfer or a takeover can release the party the 2xx went
         // to while the call goes on without it.
-        let dialog_ended = !state
-            .call_actors
-            .get_call(&unacked.internal_call_id)
-            .is_some_and(|call| call.carries_dialog(&dialog_call_id));
+        // A recording dialog the SRS answers has no call actor: it is the SRS
+        // session that carries it.
+        let srs_dialog = state
+            .srs_manager
+            .as_ref()
+            .is_some_and(|srs_manager| srs_manager.is_srs_session(&dialog_call_id));
+        let dialog_ended = !srs_dialog
+            && !state
+                .call_actors
+                .get_call(&unacked.internal_call_id)
+                .is_some_and(|call| call.carries_dialog(&dialog_call_id));
         // A dialog that ended with its BYE held for this ACK is still owed its 2xx,
         // until the ACK or 64×T1 (RFC 3261 §13.3.1.4, §15).
         let still_owed = !dialog_ended || state.held_byes.contains_key(&dialog_call_id);
@@ -512,6 +519,10 @@ pub fn sweep_unacked_uas_2xx(state: &DispatcherState) {
         }
         if dialog_ended {
             debug!(call_id = %unacked.internal_call_id, "2xx retransmission stopped: its dialog already ended");
+            continue;
+        }
+        if srs_dialog {
+            crate::dispatcher::srs_unacked_answer_terminate(&dialog_call_id, state);
             continue;
         }
         warn!(

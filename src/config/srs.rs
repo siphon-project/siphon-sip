@@ -52,7 +52,10 @@ pub struct SrsConfig {
 /// SRS file backend — writes JSON metadata alongside audio files.
 #[derive(Debug, Deserialize, Clone)]
 pub struct SrsFileConfig {
-    /// Base directory for metadata JSON files.
+    /// Retained for compatibility; it no longer selects where metadata goes.
+    /// The metadata is written into the session's own recording directory
+    /// under `recording_dir`, beside the audio; a different value is reported
+    /// at `warn` when a recording is stored.
     #[serde(default = "default_srs_recording_dir")]
     pub base_dir: String,
 }

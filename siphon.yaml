@@ -2130,11 +2130,17 @@ auth:
 #   @srs.on_invite                    # accept/reject incoming recording
 #   @srs.on_session_end               # post-processing after recording ends
 #
+# Session Recording Server (RFC 7866): siphon receives recordings a remote SRC
+# offers. An INVITE is taken as a recording session only with `Require: siprec`
+# and `+sip.src` on its Contact (RFC 7866 6.2); each offered stream is answered
+# recvonly on a siphon-rtp engine call of its own and recorded to a WAV file in
+# the session's directory. Requires media.backend: siphon-rtp.
+#
 # srs:
 #   enabled: false                    # master switch (disabled by default)
 #   recording_dir: "/var/lib/siphon/recordings"  # base directory for recordings
 #   max_sessions: 1000                # maximum concurrent recording sessions
-#   rtpengine_profile: "srs_recording"  # RTPEngine media profile to use
+#   rtpengine_profile: "srs_recording"  # media profile each stream is answered with (built-in or media.profiles)
 #   backend: file                     # storage backend: "file" or "http"
 #   file:
 #     base_dir: "/var/lib/siphon/recordings"

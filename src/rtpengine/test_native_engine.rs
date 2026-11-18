@@ -231,6 +231,28 @@ fn grown_call_command(command: &Command, grown: &Mutex<HashSet<String>>) -> Opti
 }
 
 impl Recorded {
+    /// What the engine keeps of the command, once it has decided on it.
+    fn logged(self, refused: bool, scope: Option<String>) -> NativeCommand {
+        let profile = self.profile.as_ref();
+        NativeCommand {
+            transport_protocol: profile.and_then(|profile| profile.transport_protocol.clone()),
+            received_from: profile.and_then(|profile| profile.received_from),
+            sip_call_id: profile.and_then(|profile| profile.sip_call_id.clone()),
+            ws_uri: profile.and_then(|profile| profile.ws_uri.clone()),
+            ws_tee: profile.and_then(|profile| profile.ws_tee.clone()),
+            address_family: profile.and_then(|profile| profile.address_family.clone()),
+            name: self.name,
+            call_id: self.call_id,
+            from_tag: self.from_tag,
+            detail: self.detail,
+            repeat: self.repeat,
+            refused,
+            dtmf: self.dtmf,
+            scope,
+            profile: self.profile,
+        }
+    }
+
     fn new(name: &'static str, call_id: &str, from_tag: &str) -> Self {
         Recorded {
             name,
@@ -330,6 +352,42 @@ fn seat_command(command: &Command) -> (Option<Recorded>, Option<String>, bool, b
     }
 }
 
+/// The id an accepted `start_recording` is answered with: `rec-<n>`, from the
+/// counter the play ids come from.
+fn recording_id_for(
+    command: &Command,
+    refused: bool,
+    counter: &std::sync::atomic::AtomicU64,
+) -> Option<String> {
+    (!refused && matches!(command, Command::StartRecording { .. })).then(|| {
+        format!(
+            "rec-{}",
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        )
+    })
+}
+
+/// A recording on a call the engine holds: `detail` is the file it writes.
+fn recording_command(command: &Command) -> (Option<Recorded>, Option<String>, bool, bool) {
+    match command {
+        Command::StartRecording {
+            call_id,
+            from_tag,
+            path,
+            ..
+        } => (
+            Some(Recorded {
+                detail: path.clone(),
+                ..Recorded::new("start_recording", call_id, from_tag)
+            }),
+            None,
+            false,
+            true,
+        ),
+        _ => (None, None, false, false),
+    }
+}
+
 /// The engine's refusal of a `conference_seat` into a full room: one whose id
 /// starts `full-`.
 fn seat_refusal(command: &Command) -> Option<String> {
@@ -355,6 +413,9 @@ pub(crate) struct NativeTestEngine {
     address: SocketAddr,
     commands: Arc<Mutex<Vec<NativeCommand>>>,
     live: LiveCalls,
+    /// Open (the default) lets `answer_local` answer; closed holds every answer
+    /// until it opens, so a test can act while a set-up is provably pending.
+    answers: tokio::sync::watch::Sender<bool>,
 }
 
 /// The calls the engine holds, keyed the way the engine keys a call:
@@ -383,6 +444,7 @@ impl NativeTestEngine {
         // The calls `offer_far` grew a far leg on, which `answer` completes
         // with the caller's own answer and a `delete` with a `to_tag` drops.
         let grown: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let (answers, answers_open) = tokio::sync::watch::channel(true);
         let next_play_id = Arc::new(std::sync::atomic::AtomicU64::new(
             NATIVE_ENGINE_FIRST_PLAY_ID,
         ));
@@ -393,6 +455,7 @@ impl NativeTestEngine {
                 let held = Arc::clone(&held);
                 let grown = Arc::clone(&grown);
                 let next_play_id = Arc::clone(&next_play_id);
+                let mut answers_open = answers_open.clone();
                 tokio::spawn(async move {
                     let mut buffer = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -574,6 +637,7 @@ impl NativeTestEngine {
                             Command::AttachX3 { .. } | Command::DetachX3 { .. } => {
                                 x3_command(&request.command)
                             }
+                            Command::StartRecording { .. } => recording_command(&request.command),
                             Command::ConferenceSeat { .. }
                             | Command::ConferenceJoin { .. }
                             | Command::ConferenceLeave { .. } => seat_command(&request.command),
@@ -595,46 +659,14 @@ impl NativeTestEngine {
                                 next_play_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
                             );
                         }
+                        let recording_id =
+                            recording_id_for(&request.command, refused, &next_play_id);
                         let unknown_call = record
                             .as_ref()
                             .map(|record| format!("unknown call: {}", record.call_id));
                         if let Some(record) = record {
                             if let Ok(mut log) = recorded.lock() {
-                                log.push(NativeCommand {
-                                    name: record.name,
-                                    call_id: record.call_id,
-                                    from_tag: record.from_tag,
-                                    detail: record.detail,
-                                    repeat: record.repeat,
-                                    transport_protocol: record
-                                        .profile
-                                        .as_ref()
-                                        .and_then(|profile| profile.transport_protocol.clone()),
-                                    received_from: record
-                                        .profile
-                                        .as_ref()
-                                        .and_then(|profile| profile.received_from),
-                                    sip_call_id: record
-                                        .profile
-                                        .as_ref()
-                                        .and_then(|profile| profile.sip_call_id.clone()),
-                                    ws_uri: record
-                                        .profile
-                                        .as_ref()
-                                        .and_then(|profile| profile.ws_uri.clone()),
-                                    ws_tee: record
-                                        .profile
-                                        .as_ref()
-                                        .and_then(|profile| profile.ws_tee.clone()),
-                                    refused,
-                                    dtmf: record.dtmf.clone(),
-                                    scope: scope.clone(),
-                                    address_family: record
-                                        .profile
-                                        .as_ref()
-                                        .and_then(|profile| profile.address_family.clone()),
-                                    profile: record.profile,
-                                });
+                                log.push(record.logged(refused, scope.clone()));
                             }
                         }
                         let result = match request.command {
@@ -649,11 +681,14 @@ impl NativeTestEngine {
                                 sdp,
                                 duration_ms: None,
                                 play_id,
-                                recording_id: None,
+                                recording_id,
                                 to_tag: None,
                                 stats: None,
                             },
                         };
+                        if matches!(request.command, Command::AnswerLocal { .. }) {
+                            let _ = answers_open.wait_for(|open| *open).await;
+                        }
                         let Ok(bytes) = frame::encode(&Response {
                             id: request.id,
                             result,
@@ -671,7 +706,18 @@ impl NativeTestEngine {
             address,
             commands,
             live,
+            answers,
         }
+    }
+
+    /// Hold every `answer_local` answer until [`release_answers`](Self::release_answers).
+    pub(crate) fn hold_answers(&self) {
+        self.answers.send_replace(false);
+    }
+
+    /// Answer the held `answer_local`s, and every one after.
+    pub(crate) fn release_answers(&self) {
+        self.answers.send_replace(true);
     }
 
     /// Whether the engine holds the unscoped `call_id`: created and not

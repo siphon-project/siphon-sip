@@ -481,6 +481,11 @@ pub(super) fn handle_cancel(
         }
     }
 
+    // A CANCEL of a SIPREC INVITE the SRS is answering (RFC 3261 §9.2).
+    if handle_srs_cancel(&inbound, &message, uac_branch, state) {
+        return;
+    }
+
     // --- Try ProxySession-based CANCEL routing first ---
     // CANCEL shares the same Via branch as the INVITE it cancels.
     // Build the server key for the original INVITE transaction.

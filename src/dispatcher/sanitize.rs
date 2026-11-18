@@ -617,33 +617,3 @@ pub(super) fn sdp_origin_identity(sdp: &[u8]) -> Option<(u64, u64)> {
     }
     Some((fields[1].parse().ok()?, fields[2].parse().ok()?))
 }
-
-/// Flip SDP direction attributes for an SRS answer.
-///
-/// The SRC offers `a=sendonly` (it sends forked media to the SRS).  The SRS
-/// answer must mirror this as `a=recvonly` (RFC 3264 §5: answerer reverses
-/// the direction).  RTPEngine's `offer` response preserves the offer direction,
-/// so we flip it before placing the SDP in the 200 OK.
-pub(super) fn fix_srs_answer_sdp_direction(body: &mut Vec<u8>) {
-    let Ok(text) = std::str::from_utf8(body) else {
-        return;
-    };
-    // Quick check: nothing to do if no direction attributes.
-    if !text.contains("a=sendonly") && !text.contains("a=recvonly") {
-        return;
-    }
-    let mut result = String::with_capacity(text.len());
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed == "a=sendonly" {
-            result.push_str("a=recvonly");
-            result.push_str(&line[trimmed.len()..]);
-        } else if trimmed == "a=recvonly" {
-            result.push_str("a=sendonly");
-            result.push_str(&line[trimmed.len()..]);
-        } else {
-            result.push_str(line);
-        }
-    }
-    *body = result.into_bytes();
-}
