@@ -114,6 +114,10 @@ async fn dispatch_capturing(
         .with_writer(log.clone())
         .finish();
     let guard = tracing::subscriber::set_default(subscriber);
+    // A callsite first hit on another test's thread, with no subscriber that
+    // wants it, caches its interest as "never"; that cache is global, so this
+    // thread's subscriber would never see the line. Rebuild it under ours.
+    tracing::callsite::rebuild_interest_cache();
     let result = dispatch(
         &bus,
         &adapters(extra_adapter),
