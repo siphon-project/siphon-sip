@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.16.0] — 2026-11-18
+
 ### Changed
 
 - **`b2bua.reoffer()` waits out a `491` and sends again (RFC 3261 §14.1).** It used to resolve to `491` at once, for the script to retry. A `491` from the party, or siphon's own when an INVITE toward the party was already in progress, is now followed by the random wait of §14.1 (0 to 2 seconds on a dialog whose Call-ID the party generated, 2.1 to 4 seconds on one siphon generated) and a new re-INVITE, up to three times within `timeout_ms`. It resolves to `491` only when the glare outlasted that. A script that retried by itself keeps working and can drop its loop.
