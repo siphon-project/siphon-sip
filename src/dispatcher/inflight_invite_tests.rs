@@ -244,23 +244,23 @@ fn a_cancel_between_the_calls_creation_and_its_handler_cancels_it_and_skips_the_
     let _ = std::fs::remove_file(&marker);
 }
 
+/// How a test breaks an INVITE.
+type Rewrite = fn(String) -> String;
+
 /// An INVITE that ends without a call, however it ends, answers the CANCEL it
 /// held, once, and releases its registration.
 #[test]
 fn a_held_cancel_is_answered_when_its_invite_is_refused_or_malformed() {
-    let refusals: [(&str, Box<dyn Fn(String) -> String>); 2] = [
-        (
-            "a Replaces naming no dialog (481)",
-            Box::new(|raw: String| {
-                raw.replace(
-                    "Contact:",
-                    "Replaces: nosuch@peer.example.com;to-tag=a;from-tag=b\r\nContact:",
-                )
-            }),
-        ),
+    let refusals: [(&str, Rewrite); 2] = [
+        ("a Replaces naming no dialog (481)", |raw: String| {
+            raw.replace(
+                "Contact:",
+                "Replaces: nosuch@peer.example.com;to-tag=a;from-tag=b\r\nContact:",
+            )
+        }),
         (
             "a CSeq that does not match the request line (400)",
-            Box::new(|raw: String| raw.replace("CSeq: 1 INVITE", "CSeq: 1 BYE")),
+            |raw: String| raw.replace("CSeq: 1 INVITE", "CSeq: 1 BYE"),
         ),
     ];
     for (index, (why, rewrite)) in refusals.iter().enumerate() {
