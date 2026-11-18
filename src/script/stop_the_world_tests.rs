@@ -115,7 +115,20 @@ pub(crate) fn interpreter_build() -> &'static str {
 /// pressure on a thread that is attached and briefly blocked, so they stay
 /// back to back.
 pub(crate) fn collect_garbage_until(stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
-    let gil_build = interpreter_build() == "GIL";
+    collect(stop, true)
+}
+
+/// [`collect_garbage_until`] that never leaves a gap, on either build: for a
+/// scenario that holds the interpreter on purpose and needs the collector
+/// stuck behind it, which a gap on a GIL build would let through.
+pub(crate) fn collect_garbage_back_to_back_until(
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    collect(stop, false)
+}
+
+fn collect(stop: Arc<AtomicBool>, gaps_on_gil: bool) -> std::thread::JoinHandle<()> {
+    let gap = gaps_on_gil && interpreter_build() == "GIL";
     std::thread::spawn(move || {
         let source = std::ffi::CString::new(
             "import gc\nfor _ in range(200):\n    a = []\n    a.append(a)\ngc.collect()\n",
@@ -125,7 +138,7 @@ pub(crate) fn collect_garbage_until(stop: Arc<AtomicBool>) -> std::thread::JoinH
             pyo3::Python::attach(|python| {
                 let _ = python.run(source.as_c_str(), None, None);
             });
-            if gil_build {
+            if gap {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
