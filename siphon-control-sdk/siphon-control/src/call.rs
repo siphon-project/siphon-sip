@@ -297,22 +297,26 @@ impl Call {
     /// ``kind == "siprec"``): siphon answers the recording client and records
     /// each stream. ``profile`` names a media profile in place of
     /// ``srs.rtpengine_profile``, ``format`` is ``"wav"`` (the default) or
-    /// ``"ogg_opus"`` with an optional ``bitrate_bps``, and ``path`` is an
+    /// ``"ogg_opus"`` with an optional ``bitrate_bps``, ``channels="stereo"``
+    /// writes a two-stream session as one file (a participant per channel),
+    /// and ``path`` is an
     /// absolute directory siphon writes the files to. Refuse one with
     /// ``reject``; doing neither within the handoff deadline refuses it 503.
-    #[pyo3(signature = (profile=None, format=None, bitrate_bps=None, path=None))]
+    #[pyo3(signature = (profile=None, format=None, bitrate_bps=None, channels=None, path=None))]
     fn accept_recording<'py>(
         &self,
         py: Python<'py>,
         profile: Option<String>,
         format: Option<String>,
         bitrate_bps: Option<u32>,
+        channels: Option<String>,
         path: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let recording = siphon_control_client::RecordingAccept {
             profile,
             format: extract_record_format(format)?,
             bitrate_bps,
+            channels: extract_record_channels(channels)?,
             path,
         };
         let call = self.inner.clone();

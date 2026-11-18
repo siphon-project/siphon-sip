@@ -18,30 +18,49 @@ use super::result_kind;
 /// What an engine that writes Ogg Opus lists in `node_info.features`.
 const RECORD_OGG_OPUS_FEATURE: &str = "record_ogg_opus";
 
-/// Whether a recording in `format` needs the engine checked first.
-pub(super) fn needs_feature_check(format: RecordingFormat) -> bool {
-    format == RecordingFormat::OggOpus
+/// What an engine that records several calls into one file lists.
+const RECORD_MULTI_SOURCE_FEATURE: &str = "record_multi_source";
+
+/// The `node_info` features a recording of `request` needs the engine to list
+/// first: Ogg Opus, and several sources. Empty when it needs none.
+pub(super) fn required_features(request: &RecordingRequest<'_>) -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if request.format == RecordingFormat::OggOpus {
+        features.push(RECORD_OGG_OPUS_FEATURE);
+    }
+    if !request.additional_sources.is_empty() {
+        features.push(RECORD_MULTI_SOURCE_FEATURE);
+    }
+    features
 }
 
-/// Whether a `node_info` answer lists the Ogg Opus feature.
-pub(super) fn require_ogg_opus(result: CmdResult) -> Result<(), RtpEngineError> {
+/// Whether a `node_info` answer lists every one of `features`; `what` names
+/// the verb for the refusal.
+pub(super) fn require_features(
+    result: CmdResult,
+    features: &[&str],
+    what: &str,
+) -> Result<(), RtpEngineError> {
     match result {
-        CmdResult::NodeInfo { node }
-            if node
-                .features
+        CmdResult::NodeInfo { node } => {
+            let missing: Vec<&str> = features
                 .iter()
-                .any(|feature| feature == RECORD_OGG_OPUS_FEATURE) =>
-        {
-            Ok(())
+                .copied()
+                .filter(|wanted| !node.features.iter().any(|feature| feature == wanted))
+                .collect();
+            if missing.is_empty() {
+                Ok(())
+            } else {
+                Err(RtpEngineError::Protocol(format!(
+                    "{what} needs the engine (version {}) to list {} in node_info features; \
+                     the multi-source verbs need siphon-rtp 0.21.0 or later, ogg_opus 0.15.0",
+                    node.version,
+                    missing.join(", ")
+                )))
+            }
         }
-        CmdResult::NodeInfo { node } => Err(RtpEngineError::Protocol(format!(
-            "an ogg_opus recording was asked for but the engine (version {}) does not list \
-             '{RECORD_OGG_OPUS_FEATURE}' in node_info features; it needs siphon-rtp 0.15.0 \
-             or later",
-            node.version
-        ))),
         CmdResult::Error { reason } => Err(RtpEngineError::EngineError(format!(
-            "node_info refused while checking for ogg_opus recording: {reason}"
+            "node_info refused while checking the engine for {what}: {reason}"
         ))),
         other => Err(RtpEngineError::Protocol(format!(
             "unexpected '{}' response for node_info",
@@ -77,6 +96,14 @@ pub(super) fn start_command(
         silence_ms: request.silence_ms,
         path: request.path.map(str::to_string),
         bitrate_bps: request.bitrate_bps,
+        additional_sources: request
+            .additional_sources
+            .iter()
+            .map(|source| siphon_rtp_proto::RecordingSource {
+                call_id: source.call_id.clone(),
+                from_tag: source.from_tag.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -101,21 +128,100 @@ mod tests {
     }
 
     #[test]
-    fn only_ogg_opus_asks_the_engine_first() {
-        assert!(needs_feature_check(RecordingFormat::OggOpus));
-        assert!(!needs_feature_check(RecordingFormat::Wav));
+    fn only_ogg_opus_and_several_sources_ask_the_engine_first() {
+        assert_eq!(
+            required_features(&RecordingRequest {
+                format: RecordingFormat::OggOpus,
+                ..Default::default()
+            }),
+            ["record_ogg_opus"]
+        );
+        assert!(required_features(&RecordingRequest::default()).is_empty());
+        let sources = [crate::rtpengine::events::MediaSource {
+            call_id: "c~1".into(),
+            from_tag: "t".into(),
+        }];
+        assert_eq!(
+            required_features(&RecordingRequest {
+                format: RecordingFormat::OggOpus,
+                additional_sources: &sources,
+                ..Default::default()
+            }),
+            ["record_ogg_opus", "record_multi_source"]
+        );
     }
 
     #[test]
-    fn the_feature_is_read_off_node_info() {
-        assert!(require_ogg_opus(node_info(&["relay", "record_ogg_opus"])).is_ok());
-        let missing = require_ogg_opus(node_info(&["relay"])).unwrap_err();
-        assert!(missing.to_string().contains("0.14.0"), "{missing}");
-        let refused = require_ogg_opus(CmdResult::Error {
-            reason: "busy".into(),
-        })
+    fn the_features_are_read_off_node_info() {
+        let wanted = ["record_ogg_opus", "record_multi_source"];
+        assert!(require_features(
+            node_info(&["relay", "record_ogg_opus", "record_multi_source"]),
+            &wanted,
+            "a recording"
+        )
+        .is_ok());
+        let missing = require_features(
+            node_info(&["relay", "record_ogg_opus"]),
+            &wanted,
+            "a recording",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing.contains("0.14.0"),
+            "the engine's version: {missing}"
+        );
+        assert!(missing.contains("record_multi_source"), "{missing}");
+        assert!(
+            !missing.contains("record_ogg_opus,"),
+            "only what is missing: {missing}"
+        );
+        let refused = require_features(
+            CmdResult::Error {
+                reason: "busy".into(),
+            },
+            &wanted,
+            "a recording",
+        )
         .unwrap_err();
         assert!(refused.to_string().contains("busy"), "{refused}");
+    }
+
+    #[test]
+    fn the_command_carries_the_additional_sources_in_order() {
+        let sources = [
+            crate::rtpengine::events::MediaSource {
+                call_id: "c~1".into(),
+                from_tag: "t".into(),
+            },
+            crate::rtpengine::events::MediaSource {
+                call_id: "c~2".into(),
+                from_tag: "t".into(),
+            },
+        ];
+        let command = start_command(
+            "c~0",
+            "t",
+            &RecordingRequest {
+                additional_sources: &sources,
+                ..Default::default()
+            },
+        );
+        let json = serde_json::to_value(&command).expect("encodes");
+        assert_eq!(json["call_id"], "c~0");
+        assert_eq!(
+            json["additional_sources"],
+            serde_json::json!([
+                { "call_id": "c~1", "from_tag": "t" },
+                { "call_id": "c~2", "from_tag": "t" }
+            ])
+        );
+        let single = serde_json::to_value(start_command("c~0", "t", &RecordingRequest::default()))
+            .expect("encodes");
+        assert!(
+            single.get("additional_sources").is_none(),
+            "omitted when empty: {single}"
+        );
     }
 
     #[test]

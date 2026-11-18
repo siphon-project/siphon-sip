@@ -1,0 +1,53 @@
+# siphon.srs-control-test.yaml — SIPREC recording server driven by a control app
+#
+# Used with: sipp/docker-compose.yaml (srs-control profile)
+# Scenarios: sipp/srs_control_*_uac.xml
+# The `recorder` application (sipp/control/srs_recorder_app.py) decides every
+# recording session: accept (mono or stereo), reject, hangup. Media is a REAL
+# siphon-rtp engine writing under srs.recording_dir, a volume shared with it at
+# the same path.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.8"
+    - "127.0.0.1"
+
+advertised_address: "172.20.0.8"
+
+script:
+  path: "scripts/proxy_default.py"
+  reload: auto
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "172.20.0.149:8080"
+    timeout_ms: 2000
+
+srs:
+  enabled: true
+  app: recorder
+  recording_dir: "/var/lib/siphon/recordings"
+  max_sessions: 16
+  backend: file
+  rtpengine_profile: "srs_recording"
+
+control:
+  listen: "0.0.0.0:9092"
+  apps:
+    - name: "recorder"
+      token: "recorder-token"
+      per_call_connect: false
+      on_lost: "hangup"
+  limits:
+    # Short on purpose: the deadline case waits it out.
+    handoff_deadline_ms: 1500
+
+log:
+  level: debug
+  format: pretty

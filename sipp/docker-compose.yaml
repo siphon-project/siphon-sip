@@ -10204,7 +10204,7 @@ services:
   #
   # Usage: scripts/run-tests.sh --srs
   srs-engine:
-    image: ghcr.io/siphon-project/siphon-rtp:0.19.1
+    image: ghcr.io/siphon-project/siphon-rtp:0.21.0
     container_name: srs-engine
     command:
       - "--control"
@@ -10233,6 +10233,7 @@ services:
       start_period: 2s
     profiles:
       - srs
+      - srs-control
 
   siphon-srs:
     image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
@@ -10319,6 +10320,243 @@ services:
       - srs-recordings:/recordings:ro
       - ./srs_check_recordings.py:/check.py:ro
     command: ["python3", "/check.py", "/recordings", "rs-sipp-test", "2"]
+    profiles:
+      - srs-check
+
+  # ── SIPREC recording server decided by a control application ───────────────
+  # Same engine as the srs profile (siphon-rtp 0.21.0), but siphon's srs.app
+  # offers every session to the `recorder` application, which accepts (mono or
+  # stereo, with a live WebSocket tee), rejects, lets the deadline lapse, or
+  # hangs up. One SIPp scenario per case, the case picked by the R-URI user.
+  #   172.20.0.149  siphon-rtp engine (the srs-engine service)
+  #   172.20.0.8    siphon (SRS, control listener on :9092)
+  #   172.20.0.9    recorder application
+  #   172.20.0.69   WebSocket sink for the tee
+  #   172.20.0.253  SRC, accept-stereo; one SRC address per case (.111 metadata-update,
+  #   .78 reject, .200 deadline, .201 hangup): SIPp containers on one address send the
+  #   same Call-ID and branch, and siphon answers the repeat from the earlier case
+  #
+  # Usage: scripts/run-tests.sh --srs-control
+  siphon-srs-control:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
+    build:
+      context: ..
+    container_name: siphon-srs-control-test
+    depends_on:
+      srs-engine:
+        condition: service_healthy
+      srs-ws-sink:
+        condition: service_healthy
+    volumes:
+      - ./configs/siphon.srs-control-test.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - srs-recordings:/var/lib/siphon/recordings
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.8
+    healthcheck:
+      # Both rails: the control listener for the application, SIP for the SRC.
+      test: ["CMD-SHELL", "python3 -c \"import socket; socket.create_connection(('127.0.0.1',9092),2).close(); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    profiles:
+      - srs-control
+
+  # The recorder application: dials siphon's control listener, decides each
+  # session by its R-URI user, prints one CONTROL-VERDICT per case.
+  srs-recorder-app:
+    image: python:3.12-slim
+    container_name: srs-recorder-app
+    depends_on:
+      siphon-srs-control:
+        condition: service_healthy
+    volumes:
+      - ./control:/app:ro
+    working_dir: /app
+    command: ["sh", "-c", "pip install --quiet --no-cache-dir websockets && exec python3 srs_recorder_app.py"]
+    environment:
+      CONTROL_MODE: "inbound"
+      CONTROL_APP: "recorder"
+      CONTROL_TOKEN: "recorder-token"
+      CONTROL_URL: "ws://172.20.0.8:9092/control/ws"
+      CONTROL_CONNECTIONS: "1"
+      CONTROL_READY_FILE: "/tmp/control-app-ready"
+      SRS_SINK_URI: "ws://172.20.0.69:9001/tee"
+      SRS_SRC_IPS: '{"accept-stereo": "172.20.0.253", "metadata-update": "172.20.0.111", "reject": "172.20.0.78", "deadline": "172.20.0.200", "hangup": "172.20.0.201"}'
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.9
+    healthcheck:
+      test: ["CMD-SHELL", "test -n \"$$(find /tmp/control-app-ready -newermt '-10 seconds' 2>/dev/null)\""]
+      interval: 2s
+      timeout: 3s
+      retries: 6
+      start_period: 25s
+    profiles:
+      - srs-control
+
+  # Receives the live tee of the accepted stereo session and counts the audio.
+  srs-ws-sink:
+    image: python:3.12-slim
+    container_name: srs-ws-sink
+    volumes:
+      - .:/app:ro
+    working_dir: /app
+    command: ["sh", "-c", "pip install --quiet --no-cache-dir websockets && exec python3 srs_ws_sink.py"]
+    environment:
+      SRS_SINK_MIN_BYTES: "32000"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.69
+    healthcheck:
+      test: ["CMD-SHELL", "test -n \"$$(find /tmp/srs-sink-ready -newermt '-10 seconds' 2>/dev/null)\""]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 25s
+    profiles:
+      - srs-control
+
+  sipp-srs-control-accept-stereo-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-srs-control:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.253
+    entrypoint:
+      - sipp
+      - "172.20.0.8:5060"
+      - -sf
+      - /sipp/scenarios/srs_control_accept_stereo_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - srs-control
+
+  sipp-srs-control-metadata-update-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-srs-control:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.111
+    entrypoint:
+      - sipp
+      - "172.20.0.8:5060"
+      - -sf
+      - /sipp/scenarios/srs_control_metadata_update_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - srs-control
+
+  sipp-srs-control-reject-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-srs-control:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.78
+    entrypoint:
+      - sipp
+      - "172.20.0.8:5060"
+      - -sf
+      - /sipp/scenarios/srs_control_reject_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - srs-control
+
+  sipp-srs-control-deadline-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-srs-control:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.200
+    entrypoint:
+      - sipp
+      - "172.20.0.8:5060"
+      - -sf
+      - /sipp/scenarios/srs_control_deadline_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - srs-control
+
+  sipp-srs-control-hangup-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-srs-control:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.201
+    entrypoint:
+      - sipp
+      - "172.20.0.8:5060"
+      - -sf
+      - /sipp/scenarios/srs_control_hangup_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - srs-control
+
+  # Asserts the WAV files one control case left (count, channels, audio).
+  # Usage: docker compose --profile srs-check run --rm srs-control-recordings-check \
+  #          python3 /check.py /recordings/<dir> <files> <channels>
+  srs-control-recordings-check:
+    image: python:3.12-slim
+    volumes:
+      - srs-recordings:/recordings:ro
+      - ./srs_check_control.py:/check.py:ro
     profiles:
       - srs-check
 

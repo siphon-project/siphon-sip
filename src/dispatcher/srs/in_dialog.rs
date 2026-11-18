@@ -51,6 +51,9 @@ async fn renegotiate(
         source_ip: inbound.remote_addr.ip(),
         recording_dir: &recording_dir,
         recording: &recording,
+        left_label: srs_manager
+            .metadata(&call_id)
+            .and_then(|metadata| media::left_label(&metadata)),
     };
     match media::anchor_streams(
         state,
@@ -165,26 +168,34 @@ pub(super) fn handle_update(
 /// A session taken out of the store, its engine calls still to end.
 pub(super) struct Ended {
     pub(super) record: crate::srs::RecordingRecord,
-    pub(super) metadata: crate::siprec::metadata::RecordingMetadata,
     pub(super) streams: Vec<crate::srs::SrsStream>,
     pub(super) from_tag: String,
+    /// Notified once every recording of the session is closed.
+    pub(super) done: Arc<tokio::sync::Notify>,
 }
 
-/// Take a session out of the store and stop the 2xx still waiting for an ACK.
-fn take_session(call_id: &str, srs_manager: &SrsManager, state: &DispatcherState) -> Option<Ended> {
+/// End a session for `reason` and hold it until its recordings close
+/// ([`SrsManager::stop_into_closing`]), and stop the 2xx still waiting for an
+/// ACK.
+fn take_session(
+    call_id: &str,
+    reason: &str,
+    srs_manager: &SrsManager,
+    state: &DispatcherState,
+) -> Option<Ended> {
     // Read before the session is removed; the guard ends with the statement.
-    let (from_tag, metadata) = srs_manager
+    let from_tag = srs_manager
         .get_session(call_id)
-        .map(|session| (session.from_tag.clone(), session.metadata.clone()))?;
-    let (record, streams) = srs_manager.stop_session(call_id)?;
+        .map(|session| session.from_tag.clone())?;
+    let (record, streams, done) = srs_manager.stop_into_closing(call_id, reason)?;
     if let Some((_, unacked)) = state.uas_2xx_retransmits.remove(call_id) {
         unacked.cancel.notify_one();
     }
     Some(Ended {
         record,
-        metadata,
         streams,
         from_tag,
+        done,
     })
 }
 
@@ -198,7 +209,7 @@ pub(super) fn handle_bye(
 ) {
     info!(call_id = %call_id, "SRS: received BYE from SRC");
     respond(&inbound, &message, 200, "OK", None, &[], state);
-    let Some(ended) = take_session(&call_id, &srs_manager, state) else {
+    let Some(ended) = take_session(&call_id, "bye", &srs_manager, state) else {
         return;
     };
     let state = Arc::clone(state);
@@ -343,7 +354,7 @@ pub(super) fn end_from_siphon(call_id: &str, reason: &str, state: &Arc<Dispatche
     };
     info!(call_id = %call_id, reason, "SRS: ending the recording session");
     send_bye_to_src(call_id, &srs_manager, state);
-    let Some(ended) = take_session(call_id, &srs_manager, state) else {
+    let Some(ended) = take_session(call_id, reason, &srs_manager, state) else {
         return;
     };
     let reason = reason.to_string();
@@ -373,7 +384,7 @@ pub(in crate::dispatcher) fn srs_unacked_answer_terminate(call_id: &str, state: 
     warn!(call_id = %call_id, "RFC 3261 §13.3.1.4: the SRC never ACKed the 2xx within 64*T1, ending the recording");
     send_bye_to_src(call_id, &srs_manager, state);
     srs_manager.fail_session(call_id, "2xx never acknowledged");
-    let Some(ended) = take_session(call_id, &srs_manager, state) else {
+    let Some(ended) = take_session(call_id, "unacknowledged", &srs_manager, state) else {
         return;
     };
     // The sweep runs on the script executor, where the hook can run in place.

@@ -25,7 +25,11 @@ mod script;
 
 #[cfg(test)]
 pub(crate) use control::srs_control_verb_in;
-pub(crate) use control::{srs_control_verb, srs_terminate_session, SRS_ACTOR_PREFIX};
+#[cfg(test)]
+pub(crate) use control::srs_media_target_in;
+pub(crate) use control::{
+    srs_control_verb, srs_media_target, srs_terminate_session, SrsMediaTarget, SRS_ACTOR_PREFIX,
+};
 pub(in crate::dispatcher) use events::srs_recording_finished;
 pub(super) use in_dialog::{handle_srs_cancel, srs_unacked_answer_terminate};
 

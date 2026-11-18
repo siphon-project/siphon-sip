@@ -19,6 +19,14 @@ pub(super) fn engine_event_channel(
     engine_call_id: &str,
     tag: &str,
 ) -> Option<String> {
+    // A recording session's stream calls report on the session's channel.
+    if let Some(recording_call_id) = state
+        .srs_manager
+        .as_ref()
+        .and_then(|srs_manager| srs_manager.session_for_engine_call(engine_call_id))
+    {
+        return Some(recording_call_id);
+    }
     match state.rtpengine_sessions.as_ref() {
         Some(store) => store.event_party(engine_call_id, tag),
         None => Some(engine_call_id.to_string()),

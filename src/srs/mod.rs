@@ -75,6 +75,9 @@ pub struct SrsStream {
     pub engine_answer: Option<String>,
     /// The file the recording is written to.
     pub recording_path: Option<String>,
+    /// The channel the stream is in its file: 0, or 1 for the right of a
+    /// stereo file.
+    pub recording_channel: usize,
 }
 
 /// A recording the engine is writing for a session, kept until the engine
@@ -87,6 +90,9 @@ pub struct TrackedRecording {
     pub stream_index: usize,
     /// That m-line's `a=label`.
     pub label: Option<String>,
+    /// Every m-line the file holds, by label, in channel order: one, or two
+    /// for a stereo file.
+    pub labels: Vec<String>,
     /// The file.
     pub path: Option<String>,
     /// Its format.
@@ -158,6 +164,9 @@ pub struct RecordingOptions {
     pub format: crate::rtpengine::events::RecordingFormat,
     /// Opus target bitrate (`ogg_opus` only).
     pub bitrate_bps: Option<u32>,
+    /// `Stereo` writes a two-stream session as one file, a participant per
+    /// channel; `Mono` (and any other stream count) writes a file per stream.
+    pub channels: crate::rtpengine::events::RecordingChannels,
     /// A directory in place of the session's directory under
     /// `srs.recording_dir`; siphon names the files in it.
     pub directory: Option<PathBuf>,
@@ -543,17 +552,29 @@ impl SrsManager {
             return;
         };
         let format = session.recording.format;
-        for stream in &streams {
-            if let Some(recording_id) = &stream.recording_id {
-                self.recordings
-                    .entry(recording_id.clone())
-                    .or_insert_with(|| TrackedRecording {
-                        recording_call_id: recording_call_id.to_string(),
-                        stream_index: stream.index,
-                        label: stream.label.clone(),
-                        path: stream.recording_path.clone(),
-                        format,
-                    });
+        // Streams sharing a recording (a stereo file) are one entry: the
+        // first stream's, with every stream's label in channel order.
+        let mut ordered: Vec<&SrsStream> = streams.iter().collect();
+        ordered.sort_by_key(|stream| stream.recording_channel);
+        for stream in ordered {
+            let Some(recording_id) = &stream.recording_id else {
+                continue;
+            };
+            let mut tracked = self
+                .recordings
+                .entry(recording_id.clone())
+                .or_insert_with(|| TrackedRecording {
+                    recording_call_id: recording_call_id.to_string(),
+                    stream_index: stream.index,
+                    label: stream.label.clone(),
+                    labels: Vec::new(),
+                    path: stream.recording_path.clone(),
+                    format,
+                });
+            if let Some(label) = &stream.label {
+                if !tracked.labels.contains(label) {
+                    tracked.labels.push(label.clone());
+                }
             }
         }
         session.streams = streams;
@@ -591,6 +612,43 @@ impl SrsManager {
             .closing_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.begin_closing_locked(recording_call_id, reason, record, metadata)
+    }
+
+    /// End a live session and hold it until its recordings close, as one step
+    /// against [`close_recording`](Self::close_recording): a file reported
+    /// closed at any moment finds its session, live or closing, never neither.
+    /// Returns its record, its streams, and what is notified once every file
+    /// is closed.
+    pub fn stop_into_closing(
+        &self,
+        recording_call_id: &str,
+        reason: &str,
+    ) -> Option<(
+        RecordingRecord,
+        Vec<SrsStream>,
+        std::sync::Arc<tokio::sync::Notify>,
+    )> {
+        let _closing = self
+            .closing_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let metadata = self
+            .sessions
+            .get(recording_call_id)
+            .map(|session| session.metadata.clone())?;
+        let (record, streams) = self.stop_session(recording_call_id)?;
+        let done = self.begin_closing_locked(recording_call_id, reason, record.clone(), metadata);
+        Some((record, streams, done))
+    }
+
+    fn begin_closing_locked(
+        &self,
+        recording_call_id: &str,
+        reason: &str,
+        record: RecordingRecord,
+        metadata: RecordingMetadata,
+    ) -> std::sync::Arc<tokio::sync::Notify> {
         let outstanding: std::collections::HashSet<String> = self
             .recordings
             .iter()
@@ -839,6 +897,18 @@ impl SrsManager {
         Some((record, session.streams))
     }
 
+    /// The recording dialog an engine call terminates a stream of
+    /// ([`SrsStream::engine_call_id_for`]), live or closing.
+    pub fn session_for_engine_call(&self, engine_call_id: &str) -> Option<String> {
+        let (recording_call_id, index) = engine_call_id.rsplit_once('~')?;
+        if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        (self.sessions.contains_key(recording_call_id)
+            || self.closing.contains_key(recording_call_id))
+        .then(|| recording_call_id.to_string())
+    }
+
     /// Check if a Call-ID belongs to an active SRS session.
     pub fn is_srs_session(&self, call_id: &str) -> bool {
         self.sessions.contains_key(call_id)
@@ -1034,6 +1104,7 @@ mod tests {
             offered_section: "m=audio 40000 RTP/AVP 0\r\n".to_string(),
             engine_answer: None,
             recording_path: None,
+            recording_channel: 0,
         }];
         manager.set_streams("call-1", streams.clone(), b"v=0\r\n".to_vec());
         manager.activate_session("call-1");
@@ -1362,6 +1433,7 @@ mod tests {
             offered_section: String::new(),
             engine_answer: None,
             recording_path: Some(format!("/rec/{id}.wav")),
+            recording_channel: 0,
         };
         manager.set_streams(
             "call-1",
@@ -1417,8 +1489,9 @@ mod tests {
         assert!(!manager.note_closed("call-1", "x", serde_json::json!({})));
     }
 
-    /// A file reported closed while its session starts closing is never lost
-    /// between the two: every race of the pair ends with nothing outstanding.
+    /// A file reported closed while its session stops is never lost between
+    /// the two: every race of the pair ends with nothing outstanding, and the
+    /// report always finds the session's metadata.
     #[test]
     fn a_close_racing_the_start_of_closing_is_never_lost() {
         let manager = std::sync::Arc::new(manager());
@@ -1438,20 +1511,27 @@ mod tests {
                     offered_section: String::new(),
                     engine_answer: None,
                     recording_path: None,
+                    recording_channel: 0,
                 }],
                 Vec::new(),
             );
-            let metadata = manager.metadata(&call_id).unwrap();
-            let (record, _) = manager.stop_session(&call_id).unwrap();
             let closer = {
                 let manager = std::sync::Arc::clone(&manager);
                 let recording_id = recording_id.clone();
                 std::thread::spawn(move || {
-                    manager.close_recording(&recording_id, |_, _| serde_json::json!({}));
+                    let mut saw_metadata = true;
+                    manager.close_recording(&recording_id, |_, metadata| {
+                        saw_metadata = !metadata.session_id.is_empty();
+                        serde_json::json!({})
+                    });
+                    saw_metadata
                 })
             };
-            let done = manager.begin_closing(&call_id, "bye", record, metadata);
-            closer.join().unwrap();
+            let (_, _, done) = manager.stop_into_closing(&call_id, "bye").unwrap();
+            assert!(
+                closer.join().unwrap(),
+                "round {round}: the closed file was reported without its session's metadata"
+            );
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
                 .build()
@@ -1465,5 +1545,20 @@ mod tests {
             manager.finish_closing(&call_id);
         }
         assert_eq!(manager.tracked_counts(), (0, 0));
+    }
+
+    #[test]
+    fn an_engine_call_names_its_session() {
+        let manager = manager();
+        manager
+            .create_session("call-1@h", "tag", "z9hG4bK", test_metadata())
+            .unwrap();
+        assert_eq!(
+            manager.session_for_engine_call("call-1@h~1").as_deref(),
+            Some("call-1@h")
+        );
+        assert_eq!(manager.session_for_engine_call("call-1@h"), None);
+        assert_eq!(manager.session_for_engine_call("call-1@h~x"), None);
+        assert_eq!(manager.session_for_engine_call("other~0"), None);
     }
 }

@@ -407,6 +407,10 @@ mod srs_events_tests;
 #[cfg(test)]
 mod srs_handshake_tests;
 #[cfg(test)]
+mod srs_stereo_tests;
+#[cfg(test)]
+mod srs_tee_tests;
+#[cfg(test)]
 mod stale_in_dialog_request_tests;
 #[cfg(test)]
 mod stale_shed_tests;

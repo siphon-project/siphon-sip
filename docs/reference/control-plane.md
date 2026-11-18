@@ -1268,12 +1268,11 @@ The application answers with one of two verbs within the handoff deadline
 
 | verb | args | effect |
 |---|---|---|
-| `accept` | `profile`, `format` (`wav` \| `ogg_opus`), `bitrate_bps` (`ogg_opus` only), `path` (an absolute directory; siphon names the files) | 200 to the SRC, each stream answered recvonly on its own engine call and recorded to a file of its own |
+| `accept` | `profile`, `format` (`wav` \| `ogg_opus`), `bitrate_bps` (`ogg_opus` only), `channels` (`mono` \| `stereo`), `path` (an absolute directory; siphon names the files) | 200 to the SRC, each stream answered recvonly on its own engine call and recorded. `mono` (the default) writes a file per stream. `stereo` on a two-stream session writes one file, a participant per channel: left is the stream the first `participantstreamassoc` sends, falling back to stream order. With one stream, three or more, or an engine older than siphon-rtp 0.21.0, `stereo` falls back to a file per stream. |
 | `reject` | `code` (3xx-6xx, default 603), `reason` | that final response; nothing is anchored |
 
 `format` and `bitrate_bps` are checked as `record_start` checks them, and an
-unknown `profile` is refused. `channels: "stereo"` is refused for now: each
-stream is recorded to its own file. No decision by the deadline is a `503 No
+unknown `profile` is refused. No decision by the deadline is a `503 No
 Controller Response`, and no connected application is a `503 No Controller
 Available`; neither answers 200.
 
@@ -1288,9 +1287,25 @@ While it records, and when it ends, the channel gets:
 
 | event | payload | when |
 |---|---|---|
-| `RecordingFinished` | `{recording_id, path, format, stream_ids, label, participant_ids, duration_ms, reason}` | the engine has closed a file. `label` is the stream's `a=label`. `stream_ids` and `participant_ids` come from the metadata: the `<stream>` with that label, and the participants whose `participantstreamassoc` sends it. `reason` is the engine's (`call_ended`, `stopped`, `max_duration`, `silence`, `error`). |
+| `RecordingFinished` | `{recording_id, path, format, channels, stream_ids, label, labels, participant_ids, duration_ms, reason}` | the engine has closed a file. `label` is the stream's `a=label`. `stream_ids` and `participant_ids` come from the metadata: the `<stream>` with that label, and the participants whose `participantstreamassoc` sends it. `reason` is the engine's (`call_ended`, `stopped`, `max_duration`, `silence`, `error`). |
 | `RecordingMetadataUpdated` | `{session_id, datamode, metadata}` | a re-INVITE or UPDATE carried metadata. `datamode` is the update's own, and `metadata` is the merged snapshot, in the offer's `recording_session` shape. |
 | `RecordingSessionEnded` | `{session_id, sip_session_ids, reason, metadata, recordings}` | every file of an ended session is closed. `recordings` holds the `RecordingFinished` payloads, and `metadata` is the final snapshot. |
+
+A stereo file is reported once, with `channels: "stereo"`, both labels in
+`labels` and both stream ids in `stream_ids`, left first.
+
+An accepted session can also be streamed live to a WebSocket with
+`stream_start {mode: "tee", ws_uri, channels, sample_rate}`, as a call can,
+with or without a recording. The tee carries every live stream, one channel
+each, starting with the stream the first participant sends. Two streams are
+one stereo stream unless `channels` says otherwise. More than one stream needs
+siphon-rtp 0.21.0 or later (`ws_tee_multi_source`); an older engine refuses the
+tee. The audio is what the SRC sends, so `direction` is `caller` or `both`, and
+`mode: bridge` is refused. `stream_stop` detaches the tee, and the session's own
+end ends it. No other media verb applies to a recording session.
+The `accept` reply returns before the engine has the streams up, so a
+`stream_start` sent straight after it can find no live stream yet (`not_found`).
+Wait for the channel's `MediaStarted` first.
 
 An ended session's `StasisEnd` comes after its `RecordingSessionEnded`, so by the
 time a controller sees the channel end, every file it lists is complete. A file

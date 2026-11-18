@@ -998,6 +998,33 @@ impl MediaBackend {
         }
     }
 
+    /// One WebSocket tee fed by several calls, one channel each in order
+    /// (`sources[0]` the call it is attached to). `siphon-rtp` only.
+    pub async fn attach_ws_tee_sources(
+        &self,
+        sources: &[crate::rtpengine::events::MediaSource],
+        ws_uri: &str,
+        direction: WsTeeDirection,
+        channels: Option<u8>,
+        sample_rate: Option<u32>,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => {
+                client
+                    .attach_ws_tee_sources(sources, ws_uri, direction, channels, sample_rate)
+                    .await
+            }
+            Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
+                operation: "attach_ws_tee",
+                backend: "rtpengine",
+            }),
+            Self::RtpProxy(_) => Err(RtpEngineError::Unsupported {
+                operation: "attach_ws_tee",
+                backend: "rtpproxy",
+            }),
+        }
+    }
+
     /// Detach a call's WebSocket tee.  Idempotent on `siphon-rtp`; unsupported
     /// on the other backends for the same reason as [`Self::attach_ws_tee`].
     pub async fn detach_ws_tee(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {

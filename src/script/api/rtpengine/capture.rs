@@ -120,6 +120,7 @@ pub(super) async fn start(
         max_duration_ms: options.max_duration_ms,
         silence_ms: options.silence_ms,
         path: options.path.as_deref(),
+        additional_sources: &[],
     };
     let recording_id = client
         .start_recording(call_id, from_tag, &request)

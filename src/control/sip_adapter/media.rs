@@ -22,6 +22,22 @@ pub(super) async fn apply_media_verb(command: AdapterCommand) -> ControlResult {
         Err(result) => return result,
     };
 
+    // A recording session's media is what the SRC sends: it can be streamed
+    // out, and nothing else applies to it.
+    if let Some(recording_call_id) = channel
+        .call_actor_id
+        .strip_prefix(crate::dispatcher::srs::SRS_ACTOR_PREFIX)
+    {
+        return match command.verb.as_str() {
+            "stream_start" => recording_stream_start(&channel, recording_call_id, &command.args).await,
+            "stream_stop" => recording_stream_stop(&channel, recording_call_id, &command.args).await,
+            other => ControlResult::error(
+                ControlErrorCode::InvalidState,
+                format!("'{other}' does not apply to a recording session: it can only be streamed (stream_start / stream_stop, mode tee)"),
+            ),
+        };
+    }
+
     match command.verb.as_str() {
         "play" => play(&channel, &command.args).await,
         "stop" => stop(&channel).await,
@@ -577,6 +593,7 @@ pub(super) async fn record_start(channel: &ChannelRef, args: &serde_json::Value)
         max_duration_ms: args.get("max_duration_ms").and_then(|v| v.as_u64()),
         silence_ms: args.get("silence_ms").and_then(|v| v.as_u64()),
         path: path.as_deref(),
+        additional_sources: &[],
     };
 
     let (backend, call_id, from_tag) = match media_target(channel) {
@@ -889,6 +906,146 @@ pub(super) async fn stream_start(channel: &ChannelRef, args: &serde_json::Value)
         }
         Err(error) => media_error(error),
     }
+}
+
+/// `stream_start` on a recording session (#891): a tee of every live stream,
+/// one channel each, the first participant's first. Two streams are one stereo
+/// stream by default. Mode `tee` only, and the audio is what the SRC sends, so
+/// `direction` is `caller` or `both`.
+async fn recording_stream_start(
+    channel: &ChannelRef,
+    recording_call_id: &str,
+    args: &serde_json::Value,
+) -> ControlResult {
+    let target = crate::dispatcher::srs::srs_media_target(recording_call_id);
+    recording_stream_start_on(channel, recording_call_id, args, target).await
+}
+
+/// [`recording_stream_start`] on a target already resolved.
+pub(crate) async fn recording_stream_start_on(
+    channel: &ChannelRef,
+    recording_call_id: &str,
+    args: &serde_json::Value,
+    target: Result<crate::dispatcher::srs::SrsMediaTarget, &'static str>,
+) -> ControlResult {
+    let bad =
+        |message: &str| ControlResult::error(ControlErrorCode::BadRequest, message.to_string());
+    let Some(template) = args.get("ws_uri").and_then(|value| value.as_str()) else {
+        return bad("stream_start requires args.ws_uri");
+    };
+    if !matches!(
+        args.get("mode").and_then(|value| value.as_str()),
+        None | Some("tee")
+    ) {
+        return bad("a recording session can only be streamed as a tee (mode tee)");
+    }
+    let direction = match args.get("direction").and_then(|value| value.as_str()) {
+        None | Some("both") => crate::rtpengine::profile::WsTeeDirection::Both,
+        Some("caller") => crate::rtpengine::profile::WsTeeDirection::Caller,
+        Some(other) => {
+            return bad(&format!(
+                "a recording session's audio is what the SRC sends: direction caller or both, not '{other}'"
+            ))
+        }
+    };
+    let channels = match parse_stream_channels(args.get("channels")) {
+        Ok(channels) => channels,
+        Err(message) => return bad(&message),
+    };
+    let sample_rate = match args.get("sample_rate").and_then(|value| value.as_u64()) {
+        None => None,
+        Some(rate) => match u32::try_from(rate)
+            .map_err(|_| "out of range".to_string())
+            .and_then(|rate| {
+                crate::rtpengine::profile::validate_ws_sample_rate(rate).map(|()| rate)
+            }) {
+            Ok(rate) => Some(rate),
+            Err(reason) => return bad(&format!("stream_start args.sample_rate {reason}")),
+        },
+    };
+    let (backend, sources) = match target {
+        Ok(target) => target,
+        Err(reason) => return ControlResult::error(ControlErrorCode::NotFound, reason),
+    };
+    let from_tag = sources
+        .first()
+        .map(|source| source.from_tag.clone())
+        .unwrap_or_default();
+    let ws_uri = match stream_uri(template, recording_call_id, &from_tag, (None, None)) {
+        Ok(ws_uri) => ws_uri,
+        Err(result) => return result,
+    };
+    let attached = match sources.as_slice() {
+        [only] => {
+            backend
+                .attach_ws_tee(
+                    &only.call_id,
+                    &only.from_tag,
+                    &ws_uri,
+                    direction,
+                    channels,
+                    sample_rate,
+                )
+                .await
+        }
+        several => {
+            backend
+                .attach_ws_tee_sources(several, &ws_uri, direction, channels, sample_rate)
+                .await
+        }
+    };
+    match attached {
+        Ok(()) => ControlResult::Ok(
+            serde_json::json!({ "channel": channel.channel_id, "state": "streaming", "sources": sources.len() }),
+        ),
+        Err(error) => media_error(error),
+    }
+}
+
+/// `stream_stop` on a recording session: detach its tee. Idempotent, as a
+/// call's is.
+async fn recording_stream_stop(
+    channel: &ChannelRef,
+    recording_call_id: &str,
+    args: &serde_json::Value,
+) -> ControlResult {
+    recording_stream_stop_on(
+        channel,
+        args,
+        crate::dispatcher::srs::srs_media_target(recording_call_id),
+    )
+    .await
+}
+
+/// [`recording_stream_stop`] on a target already resolved.
+pub(crate) async fn recording_stream_stop_on(
+    channel: &ChannelRef,
+    args: &serde_json::Value,
+    target: Result<crate::dispatcher::srs::SrsMediaTarget, &'static str>,
+) -> ControlResult {
+    if !matches!(
+        args.get("mode").and_then(|value| value.as_str()),
+        None | Some("tee")
+    ) {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "a recording session is only ever streamed as a tee (mode tee)",
+        );
+    }
+    let (backend, sources) = match target {
+        Ok(target) => target,
+        Err(reason) => return ControlResult::error(ControlErrorCode::NotFound, reason),
+    };
+    // The tee is attached to the first source; detaching the others is a no-op.
+    for source in &sources {
+        if let Err(error) = backend
+            .detach_ws_tee(&source.call_id, &source.from_tag)
+            .await
+        {
+            return media_error(error);
+        }
+    }
+    ControlResult::Ok(serde_json::json!({ "channel": channel.channel_id, "state": "detached" }))
 }
 
 /// `stream_start`'s `ws_uri` with its placeholders expanded for the channel's
