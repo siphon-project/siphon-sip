@@ -272,6 +272,7 @@ async fn hangup_ends_an_accepted_session_with_a_bye() {
         &request("ACK", call_id, "z9hG4bK-ack", 1, Some(&tag), None, "", true),
     );
 
+    let streams = srs(&state).streams(call_id).expect("the session");
     ok(verb(&state, call_id, "hangup", serde_json::json!({})));
     seen.extend(super::srs_handshake_tests::drain(&udp));
     let bye = seen
@@ -281,12 +282,10 @@ async fn hangup_ends_an_accepted_session_with_a_bye() {
     assert!(bye.headers.from().is_some_and(|from| from.contains(&tag)));
     assert!(eventually(|| engine.held_count() == 0).await);
     assert_eq!(srs(&state).session_count(), 0);
-    let ended: Vec<_> = channel_event_capture::take(call_id)
-        .into_iter()
-        .filter(|(event, _)| event == "StasisEnd")
-        .collect();
+    files_close(&state, &streams).await;
+    let ended = stasis_ends(call_id).await;
     assert_eq!(ended.len(), 1, "{ended:?}");
-    assert_eq!(ended[0].1["reason"], "hangup");
+    assert_eq!(ended[0]["reason"], "hangup");
     let _ = std::fs::remove_dir_all(directory);
 }
 
@@ -307,19 +306,60 @@ async fn the_srcs_bye_ends_the_channel() {
     let mut seen = Vec::new();
     let answered = await_response(&udp, &mut seen, 200, "INVITE").await;
     let tag = to_tag(&answered);
+    let streams = srs(&state).streams(call_id).expect("the session");
     send(
         &state,
         &request("BYE", call_id, "z9hG4bK-bye", 2, Some(&tag), None, "", true),
     );
     await_response(&udp, &mut seen, 200, "BYE").await;
-    let ended: Vec<_> = channel_event_capture::take(call_id)
-        .into_iter()
-        .filter(|(event, _)| event == "StasisEnd")
-        .collect();
+    files_close(&state, &streams).await;
+    let ended = stasis_ends(call_id).await;
     assert_eq!(ended.len(), 1, "{ended:?}");
-    assert_eq!(ended[0].1["reason"], "bye");
+    assert_eq!(ended[0]["reason"], "bye");
     assert!(eventually(|| engine.held_count() == 0).await);
     let _ = std::fs::remove_dir_all(directory);
+}
+
+/// The engine reports every file of `streams` closed, as it does once their
+/// calls are deleted.
+async fn files_close(state: &DispatcherState, streams: &[crate::srs::SrsStream]) {
+    for stream in streams {
+        if let (Some(engine_call_id), Some(recording_id)) =
+            (&stream.engine_call_id, &stream.recording_id)
+        {
+            super::rtpengine_events::on_recording_finished(
+                state,
+                crate::rtpengine::events::RecordingFinished {
+                    call_id: engine_call_id.clone(),
+                    from_tag: "src-tag".to_string(),
+                    recording_id: recording_id.clone(),
+                    path: None,
+                    reason: "call_ended",
+                    duration_ms: 1000,
+                },
+                None,
+            )
+            .await;
+        }
+    }
+}
+
+/// The `StasisEnd`s the channel of `call_id` got, once there is one: it comes
+/// after the session's files are closed.
+async fn stasis_ends(call_id: &str) -> Vec<serde_json::Value> {
+    let collected = std::sync::Mutex::new(Vec::new());
+    eventually(|| {
+        let mut collected = collected.lock().expect("the collected events");
+        collected.extend(
+            channel_event_capture::take(call_id)
+                .into_iter()
+                .filter(|(event, _)| event == "StasisEnd")
+                .map(|(_, payload)| payload),
+        );
+        !collected.is_empty()
+    })
+    .await;
+    collected.into_inner().expect("the collected events")
 }
 
 /// A verb on a recording channel reaches the SRS, never the B2BUA: the SIP

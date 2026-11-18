@@ -138,80 +138,87 @@ async fn store_http(config: &SrsConfig, record: &RecordingRecord) {
         }
     };
 
-    let should_upload_audio = http_config.upload_audio && record.recording_dir.is_some();
-
-    let request_builder = if should_upload_audio {
-        // Multipart upload: metadata JSON + audio files.
-        let recording_dir = record.recording_dir.as_ref().unwrap();
-        let audio_files = collect_audio_files(recording_dir).await;
-
-        let mut form = reqwest::multipart::Form::new().part(
-            "metadata",
-            reqwest::multipart::Part::text(json)
-                .mime_str("application/json")
-                .unwrap_or_else(|_| reqwest::multipart::Part::text("{}")),
-        );
-
-        for (index, (filename, data)) in audio_files.into_iter().enumerate() {
-            let mime_type = mime_for_extension(&filename);
-            let part_name = format!("audio_{index}");
-            let part = reqwest::multipart::Part::bytes(data)
-                .file_name(filename.clone())
-                .mime_str(&mime_type)
-                .unwrap_or_else(|_| reqwest::multipart::Part::bytes(Vec::new()));
-
-            form = form.part(part_name, part);
-            info!(
-                session_id = %record.session_id,
-                filename = %filename,
-                "SRS: attaching audio file to upload"
-            );
-        }
-
-        let mut builder = client.post(&http_config.url).multipart(form);
-        if let Some(auth_header) = &http_config.auth_header {
-            builder = builder.header("Authorization", auth_header);
-        }
-        builder
-    } else {
-        // Metadata-only JSON POST.
-        let mut builder = client
-            .post(&http_config.url)
-            .header("Content-Type", "application/json")
-            .body(json);
+    // Read once: every attempt sends the same files.
+    let audio_files = match (http_config.upload_audio, record.recording_dir.as_ref()) {
+        (true, Some(recording_dir)) => Some(collect_audio_files(recording_dir).await),
+        _ => None,
+    };
+    let request = || {
+        let mut builder = match &audio_files {
+            // Multipart upload: metadata JSON + audio files.
+            Some(audio_files) => {
+                let mut form = reqwest::multipart::Form::new().part(
+                    "metadata",
+                    reqwest::multipart::Part::text(json.clone())
+                        .mime_str("application/json")
+                        .unwrap_or_else(|_| reqwest::multipart::Part::text("{}")),
+                );
+                for (index, (filename, data)) in audio_files.iter().enumerate() {
+                    let part = reqwest::multipart::Part::bytes(data.clone())
+                        .file_name(filename.clone())
+                        .mime_str(&mime_for_extension(filename))
+                        .unwrap_or_else(|_| reqwest::multipart::Part::bytes(Vec::new()));
+                    form = form.part(format!("audio_{index}"), part);
+                }
+                client.post(&http_config.url).multipart(form)
+            }
+            // Metadata-only JSON POST.
+            None => client
+                .post(&http_config.url)
+                .header("Content-Type", "application/json")
+                .body(json.clone()),
+        };
         if let Some(auth_header) = &http_config.auth_header {
             builder = builder.header("Authorization", auth_header);
         }
         builder
     };
+    post_with_retry(
+        request,
+        &HTTP_RETRY_BACKOFF,
+        &record.session_id,
+        &http_config.url,
+    )
+    .await;
+}
 
-    match request_builder.send().await {
-        Ok(response) => {
-            let status = response.status();
-            if status.is_success() {
-                info!(
-                    session_id = %record.session_id,
-                    url = %http_config.url,
-                    status = %status,
-                    upload_audio = should_upload_audio,
-                    "SRS: recording posted to webhook"
-                );
-            } else {
-                error!(
-                    session_id = %record.session_id,
-                    url = %http_config.url,
-                    status = %status,
-                    "SRS: webhook returned non-success status"
-                );
+/// The waits between attempts to post a recording: four attempts in all.
+const HTTP_RETRY_BACKOFF: [std::time::Duration; 3] = [
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+];
+
+/// Post `request()` until it succeeds, retrying after each of `backoff` a
+/// failure that may pass: no response at all, a 5xx, or a 429. A 4xx otherwise
+/// says the request itself is wrong, so it is not sent again. `true` once the
+/// endpoint took it.
+async fn post_with_retry(
+    request: impl Fn() -> reqwest::RequestBuilder,
+    backoff: &[std::time::Duration],
+    session_id: &str,
+    url: &str,
+) -> bool {
+    let mut waits = backoff.iter();
+    loop {
+        let retryable = match request().send().await {
+            Ok(response) if response.status().is_success() => {
+                info!(%session_id, %url, status = %response.status(), "SRS: recording posted to webhook");
+                return true;
             }
-        }
-        Err(error) => {
-            error!(
-                session_id = %record.session_id,
-                url = %http_config.url,
-                error = %error,
-                "SRS: failed to POST recording to webhook"
-            );
+            Ok(response) => {
+                let status = response.status();
+                error!(%session_id, %url, %status, "SRS: webhook returned non-success status");
+                status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            }
+            Err(error) => {
+                error!(%session_id, %url, %error, "SRS: failed to POST recording to webhook");
+                true
+            }
+        };
+        match waits.next() {
+            Some(wait) if retryable => tokio::time::sleep(*wait).await,
+            _ => return false,
         }
     }
 }
@@ -437,5 +444,70 @@ mod tests {
         assert!(json.contains("\"streams\""));
         assert!(json.contains("\"duration_secs\""));
         assert!(json.contains("\"state\""));
+    }
+
+    /// An endpoint answering `statuses` in turn, one per connection; returns
+    /// its URL and how many requests it got.
+    async fn scripted_endpoint(
+        statuses: Vec<u16>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/recordings", listener.local_addr().unwrap());
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&served);
+        tokio::spawn(async move {
+            for status in statuses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = vec![0u8; 65536];
+                let _ = stream.read(&mut buffer).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            }
+        });
+        (url, served)
+    }
+
+    fn post(url: &str) -> reqwest::RequestBuilder {
+        reqwest::Client::new().post(url).body("{}")
+    }
+
+    const NO_WAIT: [std::time::Duration; 3] = [std::time::Duration::ZERO; 3];
+
+    #[tokio::test]
+    async fn a_server_error_is_retried_until_the_endpoint_takes_it() {
+        let (url, served) = scripted_endpoint(vec![503, 500, 200]).await;
+        assert!(post_with_retry(|| post(&url), &NO_WAIT, "s", &url).await);
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_client_error_is_not_sent_again() {
+        let (url, served) = scripted_endpoint(vec![400, 200]).await;
+        assert!(!post_with_retry(|| post(&url), &NO_WAIT, "s", &url).await);
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn too_many_requests_is_retried() {
+        let (url, served) = scripted_endpoint(vec![429, 200]).await;
+        assert!(post_with_retry(|| post(&url), &NO_WAIT, "s", &url).await);
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retries_end_with_the_backoff() {
+        let (url, served) = scripted_endpoint(vec![503; 6]).await;
+        assert!(!post_with_retry(|| post(&url), &NO_WAIT, "s", &url).await);
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "one attempt and one per wait"
+        );
     }
 }
