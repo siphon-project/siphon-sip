@@ -44,6 +44,7 @@ mod tombstone_tests;
 mod tombstones;
 mod transfer;
 
+pub use events::HangupInitiator;
 pub use queue::{OutboundFrame, OutboundQueue, PushOutcome, SlowConsumerPolicy};
 pub use tombstones::CHANNEL_TOMBSTONE_GRACE;
 pub use transfer::{TransferOutcome, TransferReferrer, TransferStage};

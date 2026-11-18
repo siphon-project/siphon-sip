@@ -405,6 +405,8 @@ mod stale_in_dialog_request_tests;
 #[cfg(test)]
 mod stale_shed_tests;
 #[cfg(test)]
+mod stasis_end_initiator_tests;
+#[cfg(test)]
 mod stop_the_world_tests;
 #[cfg(test)]
 mod subscribe_notify_before_2xx_tests;

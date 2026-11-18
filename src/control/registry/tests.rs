@@ -1191,6 +1191,43 @@ fn stasis_end_without_a_cause_is_byte_identical_to_the_legacy_frame() {
     assert_eq!(event.payload, serde_json::json!({ "reason": "bye" }));
 }
 
+#[test]
+fn stasis_end_for_a_bye_names_the_party_that_sent_it() {
+    for (initiator, wire) in [
+        (crate::control::HangupInitiator::Caller, "caller"),
+        (crate::control::HangupInitiator::Callee, "callee"),
+    ] {
+        let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+        let conn = bus.register_connection("ivr-app");
+        bus.register_channel(
+            "cb-1",
+            &conn,
+            "call-uuid",
+            "sipcid@host",
+            "hangup",
+            HashMap::new(),
+        );
+        bus.on_call_hung_up("sipcid@host", initiator);
+        let frames = futures_executor_block_on_recv(&conn);
+        let event = frames
+            .iter()
+            .find_map(|frame| match frame {
+                OutboundFrame::Event(event) if event.event == "StasisEnd" => Some(event),
+                _ => None,
+            })
+            .expect("StasisEnd must be queued");
+        assert_eq!(
+            event.payload,
+            serde_json::json!({ "reason": "bye", "initiator": wire }),
+            "reason stays `bye` for apps matching on it; no code, no status was sent"
+        );
+        assert!(
+            !bus.channel_exists("cb-1"),
+            "the channel must drain with the call"
+        );
+    }
+}
+
 /// Drain a connection's queue without an async runtime: the queue is
 /// already populated by the synchronous `try_push_event`, so one poll is
 /// enough.

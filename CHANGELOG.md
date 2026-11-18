@@ -148,6 +148,7 @@ entry, but a working config keeps working.
   CPython does not expose how many objects the collector tracks without a walk
   of the heap, so there is no gauge of that.
 
+- **`StasisEnd` for a call ended by a BYE says which party sent it.** The payload carries `initiator: "caller" | "callee"` beside `reason: "bye"`, relative to the call the app owns: the A leg of a received call is the caller; on an originated call whoever hangs up is a callee. `reason` is unchanged, and a teardown nobody sent a BYE for carries no `initiator`.
 - Inbound Diameter requests can be answered by Rust handlers registered at
   server start (`SiphonServer::register_diameter_handlers`); the
   `siphon_diameter_inbound_*` metrics gain a `path` label (`script` | `native`).

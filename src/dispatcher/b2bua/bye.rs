@@ -159,7 +159,7 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
     b2bua_abandon_leg_replacements(&call_id, state);
 
     // Extract the rest from the DashMap ref and drop it before entering Python
-    let (a_leg_invite, a_leg_source_ip, a_leg_transport, a_leg_call_id, a_leg_flow) =
+    let (a_leg_invite, a_leg_source_ip, a_leg_transport, a_leg_call_id, a_leg_flow, originated) =
         match state.call_actors.get_call(&call_id) {
             Some(call) => (
                 call.a_leg_invite.clone(),
@@ -167,6 +167,7 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
                 format!("{}", call.a_leg.transport.transport).to_lowercase(),
                 call.a_leg.dialog.call_id.clone(),
                 py_flow_from_leg(&call.a_leg.transport),
+                call.originated,
             ),
             None => return,
         };
@@ -183,9 +184,12 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
     dial_bridge_call_ended(&a_leg_call_id, state);
 
     // Control plane: emit StasisEnd if this call was controlled (keyed on the
-    // A-leg Call-ID, so a BYE from either leg reaches the owning app). No-op
-    // otherwise.
-    control_notify_terminated(&a_leg_call_id, "bye");
+    // A-leg Call-ID, so a BYE from either leg reaches the owning app), naming
+    // the party that sent the BYE. No-op otherwise.
+    control_notify_hung_up(
+        &a_leg_call_id,
+        crate::control::HangupInitiator::from_bye(from_a_leg, originated),
+    );
 
     // Invoke @b2bua.on_bye handlers with (PyCall, PyByeInitiator)
     let engine_state = state.engine.state();

@@ -62,9 +62,9 @@ pub use protocol::{
     PROTOCOL_VERSION, SUBPROTOCOL,
 };
 pub use registry::{
-    ChannelRef, ConnHandle, ControlBus, ControlCommand, OfferOutcome, OutboundFrame, OutboundQueue,
-    Ownership, PushOutcome, SlowConsumerPolicy, TransferOutcome, TransferReferrer, TransferStage,
-    CHANNEL_TOMBSTONE_GRACE,
+    ChannelRef, ConnHandle, ControlBus, ControlCommand, HangupInitiator, OfferOutcome,
+    OutboundFrame, OutboundQueue, Ownership, PushOutcome, SlowConsumerPolicy, TransferOutcome,
+    TransferReferrer, TransferStage, CHANNEL_TOMBSTONE_GRACE,
 };
 
 /// Push an event to the control channel owning `sip_call_id`, if the call is
