@@ -19,16 +19,18 @@ const RUNTIME_THREAD: &str = "xfrm-wave-rt";
 const WORKER_THREAD: &str = "xfrm-wave";
 const RUNTIME_WORKERS: usize = 4;
 
-/// Threads of this process whose name starts with `prefix`.
-fn threads_named(prefix: &str) -> usize {
+/// Thread names of this process, read in one pass so two counts taken from it
+/// describe the same instant (two separate scans could straddle a thread
+/// starting, and count it in one and not the other).
+fn thread_names() -> Vec<String> {
     let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
-        return 0;
+        return Vec::new();
     };
     tasks
         .filter_map(Result::ok)
         .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
-        .filter(|name| name.trim_end().starts_with(prefix))
-        .count()
+        .map(|name| name.trim_end().to_string())
+        .collect()
 }
 
 /// `Threads:` of /proc/self/status.
@@ -116,13 +118,26 @@ fn a_register_wave_of_pair_installs_keeps_the_thread_count_flat() {
         );
         move || {
             while !stop.load(Ordering::SeqCst) {
-                // `xfrm-wave-rt` also starts with `xfrm-wave`.
-                let runtime_threads = threads_named(RUNTIME_THREAD);
+                // `xfrm-wave-rt` also starts with `xfrm-wave`: the pool's
+                // threads are `xfrm-wave-<index>`, counted from the same
+                // snapshot as the runtime's.
+                let names = thread_names();
+                let runtime_threads = names
+                    .iter()
+                    .filter(|name| name.starts_with(RUNTIME_THREAD))
+                    .count();
+                let worker_threads = names
+                    .iter()
+                    .filter(|name| {
+                        name.strip_prefix(WORKER_THREAD)
+                            .and_then(|rest| rest.strip_prefix('-'))
+                            .is_some_and(|index| {
+                                !index.is_empty() && index.chars().all(|c| c.is_ascii_digit())
+                            })
+                    })
+                    .count();
                 peak_runtime.fetch_max(runtime_threads, Ordering::SeqCst);
-                peak_workers.fetch_max(
-                    threads_named(WORKER_THREAD).saturating_sub(runtime_threads),
-                    Ordering::SeqCst,
-                );
+                peak_workers.fetch_max(worker_threads, Ordering::SeqCst);
                 peak_process.fetch_max(process_threads(), Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(1));
             }

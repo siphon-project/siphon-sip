@@ -13,6 +13,10 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Diameter connection asked to close is closed even when its reader, writer or watchdog task is between two awaits at that instant.** The request used to be a broadcast to whichever task was waiting, so one that missed it left the connection open (and listed in the peer directory) until the far end closed it. The request is now latched.
+
 ## [1.16.0] — 2026-11-18
 
 ### Changed
