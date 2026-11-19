@@ -306,13 +306,27 @@ async fn a_change_on_one_node_notifies_a_subscription_made_on_another_exactly_on
 async fn the_sweep_keeps_a_subscription_another_node_refreshed() {
     let shared = MemoryShared::default();
     let (a, b) = (node(&shared, 1000), node(&shared, 1000));
-    a.add_subscription(dialog("sub-1", "call-1", 2));
+    a.add_subscription(dialog("sub-1", "call-1", 600));
     settled(&a, "sub-1").await;
     assert_eq!(b.subscriptions_for(AOR).len(), 1, "b holds it");
 
+    // The lifetime it was made with has run out, in b's memory and in the
+    // store. It is set rather than waited for: the store keeps expiry in
+    // whole unix seconds, so a 2 s lifetime made 1 s of it, and the clock
+    // crossing a second between the write and b's read dropped it unseen.
+    b.subscriptions
+        .get_mut("sub-1")
+        .expect("b holds it")
+        .expires = Duration::ZERO;
+    {
+        let mut stored = shared.subscriptions.lock().expect("subscriptions");
+        let json = stored.get_mut("sub-1").expect("stored");
+        let mut value: serde_json::Value = serde_json::from_str(json).expect("json");
+        value["expires_at_unix"] = serde_json::json!(super::persist::unix_now().saturating_sub(10));
+        *json = value.to_string();
+    }
     assert!(a.refresh_subscription("sub-1", Duration::from_secs(600)));
     settled(&a, "sub-1").await;
-    tokio::time::sleep(Duration::from_millis(2300)).await;
 
     b.expire_stale();
     assert!(

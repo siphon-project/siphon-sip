@@ -658,14 +658,18 @@ fn a_lost_initial_notify_is_retransmitted_and_its_200_keeps_the_subscription() {
             })
             .collect()
     };
-    let subscriptions = harness.store.local_count();
+    let call_id = "lost-notify@example.com";
+    assert!(!harness.store.holds_call_id(call_id), "a fresh Call-ID");
 
     harness.receive_request(&subscribe(), SUBSCRIBER);
     let sent = ours(harness.frames());
     assert_eq!(sent.len(), 2, "the 200 and the initial NOTIFY");
     assert!(sent[0].starts_with(b"SIP/2.0 200"));
     assert!(sent[1].starts_with(b"NOTIFY "));
-    assert_eq!(harness.store.local_count(), subscriptions + 1);
+    assert!(
+        harness.store.holds_call_id(call_id),
+        "the SUBSCRIBE made a dialog"
+    );
 
     // That NOTIFY never reaches the subscriber.
     let lost = sent[1].clone();
@@ -705,9 +709,8 @@ fn a_lost_initial_notify_is_retransmitted_and_its_200_keeps_the_subscription() {
     let timer_k = timer(TimerName::K).expect("Timer K");
     fire_expired_timers_at(state, timer_k.fires_at);
     assert!(ours(harness.frames()).is_empty(), "no NOTIFY after its 200");
-    assert_eq!(
-        harness.store.local_count(),
-        subscriptions + 1,
+    assert!(
+        harness.store.holds_call_id(call_id),
         "the subscription stands"
     );
     assert!(!state.transaction_manager.contains(&key));

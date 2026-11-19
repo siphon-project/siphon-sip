@@ -247,11 +247,7 @@ async fn key_never_reaches_a_log_line() {
         .wait_for("the echoing fetch", |log| !log.is_empty())
         .await;
     // A transport error, whose message names the URL unless stripped.
-    let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("a port");
-    let closed_url = format!("http://{}", closed.local_addr().expect("its address"));
-    drop(closed);
+    let closed_url = super::refusing_url();
     let _unreachable = client(closed_url, "echo-secret-two", 3600).spawn_poller();
     // A reload to another key on the first poller.
     control.apply(ApiBanParams::from_config(&config(
