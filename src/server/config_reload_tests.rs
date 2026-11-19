@@ -700,11 +700,7 @@ async fn the_runtime_security_fields_apply_and_the_rest_wait_for_a_restart() {
 
 /// An APIBAN poller that never reaches a feed: a closed loopback port.
 async fn offline_apiban(api_key: &str) -> crate::apiban::ApiBanControl {
-    let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("a port");
-    let url = format!("http://{}", closed.local_addr().expect("its address"));
-    drop(closed);
+    let url = crate::apiban::refusing_url();
     crate::apiban::ApiBanClient::new(
         &crate::config::ApiBanConfig {
             api_key: api_key.to_owned(),
