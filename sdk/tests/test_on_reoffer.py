@@ -160,6 +160,54 @@ def toggle(call, offer):
     assert offer.decision == ("answer", session + "a=record:on\r\n")
 
 
+class TestRejectBodyAndHeaders:
+    """``offer.reject(code, reason, body=…, content_type=…, headers=…)``."""
+
+    def test_a_body_and_warning_go_on_the_refusal(self, harness):
+        harness.load_source(
+            """
+from siphon import b2bua
+
+@b2bua.on_reoffer
+def on_reoffer(call, offer):
+    offer.reject(403, "Forbidden", body="<mcpttinfo/>",
+                 content_type="application/vnd.3gpp.mcptt-info+xml",
+                 headers={"Warning": '399 mcx.example.com "not allowed"'})
+"""
+        )
+        offer = harness.send_reoffer(sdp=HELD, previous_sdp=TALKING)
+        assert offer.decision == ("reject", 403, "Forbidden")
+        assert offer.answer_extras == {
+            "content_type": "application/vnd.3gpp.mcptt-info+xml",
+            "body": b"<mcpttinfo/>",
+            "headers": {"Warning": '399 mcx.example.com "not allowed"'},
+        }
+
+    @pytest.mark.parametrize("owned", [
+        "Via", "From", "To", "Call-ID", "CSeq", "Contact", "Content-Type",
+        "Require", "Supported", "k",
+    ])
+    def test_an_owned_header_is_refused_and_nothing_is_decided(self, owned):
+        offer = Reoffer(sdp=HELD, previous_sdp=TALKING)
+        with pytest.raises(ValueError, match="offer.reject"):
+            offer.reject(403, "Forbidden", headers={owned: "x"})
+        assert offer.decision == ("relay",)
+
+    def test_what_cannot_be_sent_is_refused(self):
+        offer = Reoffer(sdp=HELD, previous_sdp=TALKING)
+        with pytest.raises(TypeError):
+            offer.reject(403, "Forbidden", headers={"Warning": 399})
+        with pytest.raises(ValueError, match="go together"):
+            offer.reject(403, "Forbidden", body="<info/>")
+        with pytest.raises(ValueError, match="go together"):
+            offer.reject(403, "Forbidden", content_type="text/plain")
+        with pytest.raises(ValueError, match="empty"):
+            offer.reject(403, "Forbidden", body="", content_type="text/plain")
+        with pytest.raises(ValueError, match="line break"):
+            offer.reject(403, "Forbidden", body="x", content_type="text/plain\r\nX: 1")
+        assert offer.decision == ("relay",)
+
+
 class TestAnswerBodyAndHeaders:
     """``offer.answer(body=…, content_type=…, headers=…)``."""
 

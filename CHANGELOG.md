@@ -15,6 +15,8 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`offer.reject(code, reason, body=None, content_type=None, headers=None)` on `@b2bua.on_reoffer`.** A refusal can now say why: the body goes on it as given and the headers (`Warning`, `Retry-After`) after it, checked against the same owned-header list as `offer.answer(headers=)`. An MCPTT controlling function needs it to answer an emergency upgrade it may not grant with a 403 that carries its `application/vnd.3gpp.mcptt-info+xml` and a `Warning` (TS 24.379 §6.3.3.1.14); before, the client got a bare 403 and could not tell why. The session in force stays as it was (RFC 3261 §14.2).
+
 - **`srs.backend: none` stores nothing when a recording session ends.** It is for a control application (`srs.app`) that stores each recording itself from `RecordingFinished` and `RecordingSessionEnded`. The built-in backend runs after the session's `StasisEnd`, so with `file` an application that had already imported the audio and removed the session's directory got the directory back, holding a `metadata.json` with the participants' addresses and names that nothing was told about.
 
 ### Changed
@@ -23,6 +25,7 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **The `@b2bua.on_reoffer` docstring said the hook is not called on a call siphon answered itself.** It is, and on a leg the script placed with `b2bua.originate()`; only the legs of a controller bridge are not shown it. The docstring and the call reference now say so, and a test covers the originated leg.
 - **A caller's CANCEL that reaches siphon right behind its INVITE is no longer answered `481` while the INVITE goes on to ring the callee (RFC 3261 §9.2).** Requests are taken by a pool of workers, and the worker holding the INVITE still has to admit it, answer `100 Trying` and create the call before a CANCEL can be matched to it; the worker holding the CANCEL looked the call up first, found none, answered `481` and the call then rang to its end. The dispatch loop now registers every initial INVITE (key read from the raw bytes, before any worker has it), a CANCEL that matches nothing else but finds the registration is held, and it runs as soon as the call exists, taking the path of a CANCEL that arrives while `@b2bua.on_invite` runs (`200` to the CANCEL, `487` to the INVITE, no B-leg INVITE). An INVITE that ends without a call (refused, malformed, shed) answers the CANCEL it held when its worker is done. A CANCEL that lands between the call's creation and the start of `@b2bua.on_invite` now also stops the handler from running for the dead call.
 - **A Diameter connection asked to close is closed even when its reader, writer or watchdog task is between two awaits at that instant.** The request used to be a broadcast to whichever task was waiting, so one that missed it left the connection open (and listed in the peer directory) until the far end closed it. The request is now latched.
 

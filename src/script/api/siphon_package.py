@@ -902,26 +902,31 @@ class _B2buaNamespace:
 
     @staticmethod
     def on_reoffer(fn):
-        """Register handler for an in-dialog offer on a bridged call.
+        """Register handler for an in-dialog offer on a call.
 
         Called with ``(call, offer)`` when either party sends a re-INVITE or
-        an UPDATE (RFC 3311, the early-dialog UPDATE included) that siphon
-        would relay to the other party, before it is relayed. ``offer`` is a
+        an UPDATE (RFC 3311, the early-dialog UPDATE included), before siphon
+        relays or answers it: on a bridged call, on a call siphon answered
+        itself (``call.answer()`` with the media engine, a conference seat),
+        and on a leg the script placed with ``b2bua.originate()``. ``offer`` is a
         ``Reoffer``: ``offer.side`` says who sent it, ``offer.sdp`` is the
         offer, ``offer.request`` the request for its headers, and
         ``offer.kind`` reads it against the session in force (``"hold"``,
         ``"resume"``, ``"refresh"``, ``"change"``).
 
         The handler decides what happens to it: nothing relays it, as
-        without the hook; ``offer.reject(code, reason)`` refuses it;
-        ``offer.answer(sdp=None)`` answers it here and relays nothing, so
-        the other party can be put on an announcement. Every request is
-        answered: a handler that raises (or an async one that times out)
-        decides nothing, and the offer is relayed.
+        without the hook; ``offer.reject(code, reason, body=None,
+        content_type=None, headers=None)`` refuses it, with a body and
+        headers (``Warning``) that say why; ``offer.answer(sdp=None)``
+        answers it here and relays nothing, so the other party can be put on
+        an announcement. Every request is answered: a handler that raises (or
+        an async one that times out) decides nothing, and the offer is
+        relayed.
 
         Not called for a 491 siphon answers to a crossing offer
-        (RFC 3261 §14.1), nor on a call siphon itself answered or one a
-        controller bridged.
+        (RFC 3261 §14.1), nor on the legs of a controller bridge
+        (``b2bua.bridge()``, a control-plane ``dial`` that bridges), whose
+        offers siphon relays between the two calls itself.
 
         Usage:
             @b2bua.on_reoffer

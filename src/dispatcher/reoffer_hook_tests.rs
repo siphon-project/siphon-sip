@@ -307,6 +307,70 @@ async fn a_refused_offer_is_answered_with_the_scripts_status_and_relayed_nowhere
     assert!(!offered.contains("491"), "{offered}");
 }
 
+/// A refusal carries the script's body and `Warning` (an MCPTT controlling
+/// function's 403 to an emergency upgrade it may not grant, TS 24.379
+/// §6.3.3.1.14), and the session in force stays as it was (RFC 3261 §14.2):
+/// the next offer is read against the description the caller had before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_carries_the_scripts_body_and_warning_and_keeps_the_session() {
+    let call = call_deciding(
+        83045,
+        concat!(
+            "offer.reject(403, \"Forbidden\", body=\"<mcpttinfo/>\", ",
+            "content_type=\"application/vnd.3gpp.mcptt-info+xml\", ",
+            "headers={\"Warning\": '399 mcx.example.com \"not allowed\"'})",
+        ),
+    );
+    let caller = caller_of(&call);
+    acks(&call.dispatcher.state, &caller);
+    let in_force = call
+        .dispatcher
+        .state
+        .call_actors
+        .get_call(&call.call_id())
+        .and_then(|actor| actor.a_leg.last_sdp.clone());
+
+    let sent = offers(
+        &call,
+        &caller,
+        "INVITE",
+        2,
+        Some(&caller_sdp(&call, "a=sendonly\r\n")),
+    );
+    assert!(
+        sent_with(&sent, call.b.1, Method::Invite).is_none(),
+        "nothing relayed"
+    );
+    let refusal = final_to(&sent, call.a.1).expect("the caller is answered");
+    assert_eq!(refusal.status_code(), Some(403));
+    assert_eq!(
+        refusal.headers.get("Content-Type").map(String::as_str),
+        Some("application/vnd.3gpp.mcptt-info+xml")
+    );
+    assert_eq!(body_of(&refusal), "<mcpttinfo/>");
+    assert_eq!(
+        refusal.headers.get("Content-Length").map(String::as_str),
+        Some("12")
+    );
+    assert_eq!(
+        refusal.headers.get("Warning").map(String::as_str),
+        Some("399 mcx.example.com \"not allowed\"")
+    );
+    assert_eq!(
+        call.dispatcher
+            .state
+            .call_actors
+            .get_call(&call.call_id())
+            .and_then(|actor| actor.a_leg.last_sdp.clone()),
+        in_force,
+        "the refused offer never became the caller's session"
+    );
+    assert_eq!(
+        written(&call, "X-Answered").as_deref(),
+        Some("INVITE a hold 403 None True")
+    );
+}
+
 /// `offer.answer()` takes a hold over: siphon answers the caller from the
 /// session it has in force toward it, `recvonly`, with its own `o=` and
 /// Contact, and the callee is sent nothing.
