@@ -13,6 +13,14 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **`srs.backend: none` stores nothing when a recording session ends.** It is for a control application (`srs.app`) that stores each recording itself from `RecordingFinished` and `RecordingSessionEnded`. The built-in backend runs after the session's `StasisEnd`, so with `file` an application that had already imported the audio and removed the session's directory got the directory back, holding a `metadata.json` with the participants' addresses and names that nothing was told about.
+
+### Changed
+
+- **An `srs.backend` other than `file`, `http` or `none` is refused at startup** while `srs.enabled` is true. Any other value used to be taken as `file`, so a misspelt `http` wrote metadata files and sent nothing.
+
 ### Fixed
 
 - **A caller's CANCEL that reaches siphon right behind its INVITE is no longer answered `481` while the INVITE goes on to ring the callee (RFC 3261 §9.2).** Requests are taken by a pool of workers, and the worker holding the INVITE still has to admit it, answer `100 Trying` and create the call before a CANCEL can be matched to it; the worker holding the CANCEL looked the call up first, found none, answered `481` and the call then rang to its end. The dispatch loop now registers every initial INVITE (key read from the raw bytes, before any worker has it), a CANCEL that matches nothing else but finds the registration is held, and it runs as soon as the call exists, taking the path of a CANCEL that arrives while `@b2bua.on_invite` runs (`200` to the CANCEL, `487` to the INVITE, no B-leg INVITE). An INVITE that ends without a call (refused, malformed, shed) answers the CANCEL it held when its worker is done. A CANCEL that lands between the call's creation and the start of `@b2bua.on_invite` now also stops the handler from running for the dead call.

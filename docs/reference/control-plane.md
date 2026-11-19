@@ -1314,6 +1314,12 @@ without it. The `file` and `http` storage backends also run only after the files
 close. `http` retries a failed post three times (after 1, 2 and 4 s) when there
 was no response, a 5xx or a 429.
 
+They run after the channel's `StasisEnd`, so an application that stores each
+recording itself sets `srs.backend: none`. With `file`, siphon writes the
+session's `metadata.json` into the session's directory after the application
+has seen the session end, and recreates the directory if the application has
+already removed it.
+
 ## Placing a call: `originate`
 
 Every verb above acts on a call that already arrived. `originate` is the one that

@@ -2143,7 +2143,9 @@ auth:
 #   rtpengine_profile: "srs_recording"  # media profile each stream is answered with (built-in or media.profiles)
 #   app: recorder                     # optional: offer each session to this control.apps
 #                                     # entry (StasisStart kind: siprec); it accepts or rejects
-#   backend: file                     # storage backend: "file" or "http"
+#   backend: file                     # storage backend: "file", "http" or "none"; "none"
+#                                     # stores nothing, for an app that stores each recording
+#                                     # itself (anything else is refused at startup)
 #   file:
 #     base_dir: "/var/lib/siphon/recordings"
 #   http:
