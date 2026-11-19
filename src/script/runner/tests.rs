@@ -11,7 +11,7 @@ use pyo3::prelude::*;
 
 use super::{Fate, Message, RunnerOwner, RunnerShared, Work, DRAIN_ITEM_BUDGET, PULL_BATCH};
 use crate::script::async_pool::{test_pools_runtime, AsyncPool};
-use crate::script::stop_the_world_tests::{collect_garbage_until, in_child};
+use crate::script::stop_the_world_tests::{collect_garbage_back_to_back_until, in_child};
 
 /// A pool of its own, so a test can stop it without touching the shared one.
 fn private_pool() -> AsyncPool {
@@ -138,7 +138,7 @@ fn a_post_does_not_wait_for_a_stopped_world() {
         .recv_timeout(Duration::from_secs(10))
         .expect("the holder attached");
     let stop = Arc::new(AtomicBool::new(false));
-    let collector = collect_garbage_until(Arc::clone(&stop));
+    let collector = collect_garbage_back_to_back_until(Arc::clone(&stop));
 
     // The fixture is only worth anything if an attach really is stuck: a
     // thread that keeps attaching must stop making progress.
