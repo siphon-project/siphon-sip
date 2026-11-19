@@ -1,8 +1,12 @@
 //! SRS storage backends — persist recording metadata after session ends.
 //!
-//! Two backends are supported:
+//! Three backends are supported:
 //! - **File**: Writes a JSON metadata file per session alongside the audio files.
 //! - **HTTP**: POSTs JSON metadata to a webhook endpoint.
+//! - **None**: Stores nothing, for a control application (`srs.app`) that stores
+//!   each recording itself from `RecordingFinished` / `RecordingSessionEnded`.
+//!   This runs after the session's channel has ended, so with `file` a
+//!   controller that removed the session's directory would get it back.
 
 use std::path::Path;
 
@@ -19,6 +23,9 @@ const HTTP_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 pub async fn store_recording(config: &SrsConfig, record: &RecordingRecord) {
     match config.backend.as_str() {
         "http" => store_http(config, record).await,
+        "none" => {}
+        // `file`, and anything else a config that skipped `SrsConfig::validate`
+        // carries: the default, as before.
         _ => store_file(config, record).await,
     }
 }
@@ -377,6 +384,44 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["session_id"], "test-session-001");
         assert_eq!(parsed["duration_secs"], 120);
+    }
+
+    #[tokio::test]
+    async fn none_backend_stores_nothing_where_file_would_write_metadata() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let temp_dir = directory.path().to_path_buf();
+        let session = |key: &str| {
+            let dir = temp_dir.join(key);
+            (
+                dir.clone(),
+                RecordingRecord {
+                    recording_dir: Some(dir.display().to_string()),
+                    ..test_record()
+                },
+            )
+        };
+        let config = |backend: &str| SrsConfig {
+            enabled: true,
+            recording_dir: temp_dir.display().to_string(),
+            max_sessions: 100,
+            backend: backend.to_string(),
+            file: None,
+            http: None,
+            rtpengine_profile: "srs_recording".to_string(),
+            app: Some("recorder".to_string()),
+        };
+
+        // A controller that owns the recording has already imported the audio and removed the
+        // session's directory: with `none` nothing brings it back.
+        let (removed, record) = session("0123456789abcdef0123456789abcdef");
+        store_recording(&config("none"), &record).await;
+        assert!(!removed.exists(), "none created {}", removed.display());
+
+        // The control: the same session with `file` gets its directory and metadata.json back,
+        // which is exactly what `none` exists to prevent.
+        let (written, record) = session("fedcba9876543210fedcba9876543210");
+        store_recording(&config("file"), &record).await;
+        assert!(written.join("metadata.json").exists());
     }
 
     #[tokio::test]

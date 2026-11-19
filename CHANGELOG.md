@@ -13,6 +13,14 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **`srs.backend: none` stores nothing when a recording session ends.** It is for a control application (`srs.app`) that stores each recording itself from `RecordingFinished` and `RecordingSessionEnded`. The built-in backend runs after the session's `StasisEnd`, so with `file` an application that had already imported the audio and removed the session's directory got the directory back, holding a `metadata.json` with the participants' addresses and names that nothing was told about.
+
+### Changed
+
+- **An `srs.backend` other than `file`, `http` or `none` is refused at startup** while `srs.enabled` is true. Any other value used to be taken as `file`, so a misspelt `http` wrote metadata files and sent nothing.
+
 ### Fixed
 
 - **A Diameter connection asked to close is closed even when its reader, writer or watchdog task is between two awaits at that instant.** The request used to be a broadcast to whichever task was waiting, so one that missed it left the connection open (and listed in the peer directory) until the far end closed it. The request is now latched.

@@ -17,7 +17,7 @@ use serde::Deserialize;
 ///   enabled: true
 ///   recording_dir: "/var/lib/siphon/recordings"
 ///   max_sessions: 1000
-///   backend: file
+///   backend: file        # file, http or none
 ///   file:
 ///     base_dir: "/var/lib/siphon/recordings"
 ///   http:
@@ -37,7 +37,10 @@ pub struct SrsConfig {
     /// Maximum concurrent recording sessions. Default: 1000.
     #[serde(default = "default_srs_max_sessions")]
     pub max_sessions: usize,
-    /// Backend type: "file" or "http". Default: "file".
+    /// What stores a finished session: `file` (a `metadata.json` beside the
+    /// audio), `http` (a webhook) or `none` (nothing, for a control
+    /// application that stores the recording itself from its events).
+    /// Default: "file". Any other value is refused at startup.
     #[serde(default = "default_srs_backend")]
     pub backend: String,
     /// File backend settings.
@@ -84,6 +87,9 @@ fn default_srs_recording_dir() -> String {
 fn default_srs_max_sessions() -> usize {
     1000
 }
+/// The storage backends `srs.backend` may name.
+pub const SRS_BACKENDS: [&str; 3] = ["file", "http", "none"];
+
 fn default_srs_backend() -> String {
     "file".to_string()
 }
@@ -101,6 +107,9 @@ impl SrsConfig {
     /// can only relay, so on them every recording would be refused, and a node
     /// that boots like that is worse than one that does not.
     ///
+    /// `backend` must be one siphon has ([`SRS_BACKENDS`]): an unknown one used
+    /// to be taken as `file`, so a misspelt `http` wrote files instead.
+    ///
     /// `app` must be one of the configured control apps (`apps`): every
     /// session would otherwise be offered to an application that cannot
     /// connect, and refused at its deadline.
@@ -117,6 +126,13 @@ impl SrsConfig {
                 backend.as_str(),
             ));
         }
+        if !SRS_BACKENDS.contains(&self.backend.as_str()) {
+            return Err(format!(
+                "srs.backend is {:?}, which is not a storage backend siphon has: use one of {}.",
+                self.backend,
+                SRS_BACKENDS.join(", "),
+            ));
+        }
         match &self.app {
             Some(app) if !apps.contains(&app.as_str()) => Err(format!(
                 "srs.app is {app:?}, which is not one of the configured control.apps ({}). \
@@ -126,5 +142,60 @@ impl SrsConfig {
             )),
             _ => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MediaBackendKind;
+
+    fn config(backend: &str) -> SrsConfig {
+        SrsConfig {
+            enabled: true,
+            recording_dir: default_srs_recording_dir(),
+            max_sessions: default_srs_max_sessions(),
+            backend: backend.to_string(),
+            file: None,
+            http: None,
+            rtpengine_profile: default_srs_rtpengine_profile(),
+            app: None,
+        }
+    }
+
+    #[test]
+    fn every_backend_siphon_has_is_accepted() {
+        for backend in SRS_BACKENDS {
+            assert_eq!(
+                config(backend).validate(MediaBackendKind::SiphonRtp, &[]),
+                Ok(()),
+                "{backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_backend_siphon_does_not_have_is_refused_naming_it() {
+        // The control is the test above: the same block with a backend siphon has passes.
+        for backend in ["htpp", "File", "", "s3"] {
+            let refused = config(backend)
+                .validate(MediaBackendKind::SiphonRtp, &[])
+                .expect_err(backend);
+            assert!(refused.contains("srs.backend"), "{refused}");
+            assert!(refused.contains(&format!("{backend:?}")), "{refused}");
+        }
+    }
+
+    #[test]
+    fn the_backend_is_not_checked_while_srs_is_off() {
+        let mut off = config("htpp");
+        off.enabled = false;
+        assert_eq!(off.validate(MediaBackendKind::SiphonRtp, &[]), Ok(()));
+    }
+
+    #[test]
+    fn the_default_backend_is_file() {
+        let parsed: SrsConfig = crate::config::yaml::from_str("enabled: true").expect("srs block");
+        assert_eq!(parsed.backend, "file");
     }
 }
