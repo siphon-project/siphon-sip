@@ -134,6 +134,11 @@ async def run(engine, invite_orig, invite_term, reply_orig, reply_term, bye):
 /// Run `code`'s `run(engine, *messages)` the way a script handler awaits it.
 async fn drive(namespace: PyRtpEngine, code: &'static str) -> PyResult<()> {
     tokio::task::spawn_blocking(move || {
+        // The handler runs on the process-wide async pool, whose drivers
+        // other tests hold for seconds at a time; a handler submitted
+        // meanwhile waits out their hold against the pool's coroutine
+        // timeout. Taken on this blocking thread, not across an await.
+        let _serial = crate::script::async_pool::pool_test_guard();
         Python::attach(|python| {
             let engine = Bound::new(python, namespace)?;
             let request = |message: Arc<Mutex<SipMessage>>| {

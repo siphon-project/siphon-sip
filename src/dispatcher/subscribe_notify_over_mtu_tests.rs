@@ -105,6 +105,7 @@ fn notify_over_tcp(harness: &SubscribeHarness, subscriber: SocketAddr) -> SipMes
 /// over TCP whole instead of as one oversized datagram.
 #[test]
 fn an_initial_notify_over_the_mtu_leaves_over_tcp() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let (subscriber, _listener) = listening_subscriber();
 
@@ -128,6 +129,7 @@ fn an_initial_notify_over_the_mtu_leaves_over_tcp() {
 /// One under the threshold stays where it was: behind the 200, over UDP.
 #[test]
 fn an_initial_notify_under_the_mtu_stays_on_udp() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let (subscriber, listener) = listening_subscriber();
     listener.set_nonblocking(true).expect("non-blocking");
@@ -149,6 +151,7 @@ fn an_initial_notify_under_the_mtu_stays_on_udp() {
 /// RFC 3261 §18.1.1), still behind the 200.
 #[test]
 fn an_initial_notify_over_the_mtu_to_a_udp_only_subscriber_stays_on_udp() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let (subscriber, _held) = udp_only_subscriber();
 
@@ -175,6 +178,7 @@ fn an_initial_notify_over_the_mtu_to_a_udp_only_subscriber_stays_on_udp() {
 /// the MTU (here by the length of the dialog's URIs) it leaves over TCP.
 #[test]
 fn the_notify_of_an_expired_subscription_over_the_mtu_leaves_over_tcp() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let (subscriber, _listener) = listening_subscriber();
     harness.receive_request(

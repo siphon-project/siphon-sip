@@ -674,6 +674,7 @@ async fn a_takeover_on_an_anchored_call_sends_the_media_engine_nothing() {
 /// An async handler decides the same way a synchronous one does.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_async_handler_decides_the_offer() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let script = concat!(
         "pass\n",
         "\n",

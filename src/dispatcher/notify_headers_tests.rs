@@ -125,6 +125,7 @@ fn subscription_stands(harness: &SubscribeHarness, call_id: &str, local_tag: &st
 
 #[test]
 fn headers_a_script_adds_reach_the_wire_on_notify_and_on_terminate() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let call_id = "notify-headers@example.com";
     let local_tag = subscribed(harness, call_id);
@@ -155,6 +156,7 @@ fn headers_a_script_adds_reach_the_wire_on_notify_and_on_terminate() {
 
 #[test]
 fn a_header_siphon_owns_is_refused_and_nothing_is_sent() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let call_id = "notify-owned-headers@example.com";
     let local_tag = subscribed(harness, call_id);
@@ -199,6 +201,7 @@ fn a_header_siphon_owns_is_refused_and_nothing_is_sent() {
 
 #[test]
 fn a_header_value_that_is_not_a_str_raises_type_error_and_nothing_is_sent() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let call_id = "notify-header-types@example.com";
     let local_tag = subscribed(harness, call_id);

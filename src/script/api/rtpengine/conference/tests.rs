@@ -50,6 +50,10 @@ async fn with_namespace<T: Send + 'static>(
     body: impl FnOnce(Python<'_>, &Bound<'_, PyRtpEngine>) -> T + Send + 'static,
 ) -> T {
     tokio::task::spawn_blocking(move || {
+        // Scripts run on the process-wide async pool, whose drivers other
+        // tests hold for seconds at a time; held here, on this blocking thread
+        // and not across an await, so a handler is not starved meanwhile.
+        let _serial = crate::script::async_pool::pool_test_guard();
         Python::attach(|python| {
             let namespace = Bound::new(python, namespace).expect("bound");
             body(python, &namespace)

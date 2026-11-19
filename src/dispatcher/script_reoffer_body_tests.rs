@@ -494,6 +494,21 @@ async fn the_reoffers_of_ended_calls_are_swept() {
     assert!(left.is_empty(), "entries never released: {left:?}");
 }
 
+/// The sweep of one dispatcher drops only the re-offers of its own calls: the
+/// table is process-wide, and a call another dispatcher owns is not "ended"
+/// for not being in this one's store.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sweep_leaves_the_reoffers_of_another_dispatchers_calls() {
+    let mine = seated("reoffer-sweep-mine@192.0.2.10", &script("")).await;
+    let other = seated("reoffer-sweep-other@192.0.2.10", &script("")).await;
+    let (branch, status) = sent(reoffers(&mine, None, &AnswerExtras::default()));
+    sweep_ended_reoffers(&other.dispatcher.state);
+    assert!(is_script_reoffer(&branch), "another dispatcher's sweep");
+    let request = reinvite(&mine);
+    answers(&mine, &request, 200, Some(&refresh()));
+    assert_eq!(status.await, Ok(200));
+}
+
 /// A leg whose `pending_reinvite` flag another path holds (a bridge claims it
 /// for a pairing as a whole) is not refused its re-INVITE for it: only a
 /// script's re-INVITE in progress on the dialog draws the 491.

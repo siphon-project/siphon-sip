@@ -82,6 +82,7 @@ fn held(harness: &SubscribeHarness, case: &str, notify: &str) -> bool {
 
 #[test]
 fn a_481_to_the_notify_removes_the_subscription() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let case = "notify-answered-481";
     let notify = subscribed(harness, case);
@@ -111,6 +112,7 @@ fn a_481_to_the_notify_removes_the_subscription() {
 
 #[test]
 fn a_200_to_the_notify_keeps_the_subscription() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let (_turn, harness) = subscribe_harness();
     let case = "notify-answered-200";
     let notify = subscribed(harness, case);
