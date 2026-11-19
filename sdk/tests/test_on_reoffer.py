@@ -208,6 +208,46 @@ def on_reoffer(call, offer):
         assert offer.decision == ("relay",)
 
 
+class TestAnswerSupported:
+    """``offer.answer(supported=[…])``."""
+
+    def test_option_tags_go_on_the_200_once_each(self, harness):
+        harness.load_source(
+            """
+from siphon import b2bua
+
+@b2bua.on_reoffer
+def on_reoffer(call, offer):
+    offer.answer(supported=["tdialog", "norefersub", "TDIALOG"])
+"""
+        )
+        offer = harness.send_reoffer(sdp=TALKING, previous_sdp=TALKING)
+        assert offer.decision == ("answer", None)
+        assert offer.answer_supported == ["tdialog", "norefersub"]
+
+    def test_none_without_the_argument_or_after_a_reject(self):
+        offer = Reoffer(sdp=HELD, previous_sdp=TALKING)
+        assert offer.answer_supported == []
+        offer.answer(supported=["tdialog"])
+        offer.reject(488, "Not Acceptable Here")
+        assert offer.answer_supported == []
+
+    @pytest.mark.parametrize("refused", ["timer", "100rel", "Timer", "two words", ""])
+    def test_a_tag_siphon_owns_or_not_a_token_is_refused(self, refused):
+        offer = Reoffer(sdp=HELD, previous_sdp=TALKING)
+        with pytest.raises(ValueError, match="supported"):
+            offer.answer(supported=[refused])
+        assert offer.decision == ("relay",)
+
+    def test_not_a_list_of_str_is_a_type_error(self):
+        offer = Reoffer(sdp=HELD, previous_sdp=TALKING)
+        with pytest.raises(TypeError):
+            offer.answer(supported="tdialog")
+        with pytest.raises(TypeError):
+            offer.answer(supported=[5])
+        assert offer.decision == ("relay",)
+
+
 class TestAnswerBodyAndHeaders:
     """``offer.answer(body=…, content_type=…, headers=…)``."""
 

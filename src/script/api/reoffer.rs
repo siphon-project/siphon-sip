@@ -313,12 +313,21 @@ impl PyReoffer {
     /// ``Route``, ``Content-Length``, ``Content-Type``, ``RSeq``, ``RAck``,
     /// ``Require``, ``Supported``, ``Session-Expires`` and ``Min-SE``.
     ///
+    /// ``supported`` is a list of option tags added to the ``Supported``
+    /// siphon writes on the 200 (RFC 3261 §20.37), after its own and each
+    /// once: an extension the service behind the script implements, such as
+    /// ``tdialog`` (RFC 4538) or ``norefersub`` (RFC 4488). ``Require`` stays
+    /// siphon's. ``100rel`` and ``timer`` are siphon's to negotiate and raise
+    /// ``ValueError``.
+    ///
     /// Raises ``RuntimeError`` in ``@b2bua.on_reoffer_answered``;
-    /// ``ValueError`` for an owned header, ``body`` without ``content_type``
-    /// or the reverse, an empty ``body``, an answer given both in ``sdp`` and
-    /// in the body, or a ``multipart/*`` body without a ``boundary`` or a part
-    /// delimited by it; ``TypeError`` for a header name or value that is not
-    /// a str. Nothing is decided when it raises.
+    /// ``ValueError`` for an owned header, an option tag that is not a token
+    /// or is siphon's, ``body`` without ``content_type`` or the reverse, an
+    /// empty ``body``, an answer given both in ``sdp`` and in the body, or a
+    /// ``multipart/*`` body without a ``boundary`` or a part delimited by it;
+    /// ``TypeError`` for a header name or value that is not a str, or a
+    /// ``supported`` that is not a list of str. Nothing is decided when it
+    /// raises.
     ///
     /// ```python
     /// @b2bua.on_reoffer
@@ -331,18 +340,22 @@ impl PyReoffer {
     ///     if offer.request.get_header("Resource-Priority"):
     ///         offer.answer(body=service_info_xml,
     ///                      content_type="application/vnd.example.info+xml",
-    ///                      headers={"Resource-Priority": "example.0"})
+    ///                      headers={"Resource-Priority": "example.0"},
+    ///                      supported=["tdialog", "norefersub"])
     /// ```
-    #[pyo3(signature = (sdp=None, body=None, content_type=None, headers=None))]
+    #[pyo3(signature = (sdp=None, body=None, content_type=None, headers=None, supported=None))]
     fn answer(
         &mut self,
         sdp: Option<String>,
         body: Option<&Bound<'_, PyAny>>,
         content_type: Option<&str>,
         headers: Option<&Bound<'_, pyo3::types::PyDict>>,
+        supported: Option<Vec<String>>,
     ) -> PyResult<()> {
         self.still_open("answer")?;
         let headers = super::call::uas_response_headers("offer.answer", headers)?;
+        let supported = crate::b2bua::reoffer::option_tags(supported.unwrap_or_default())
+            .map_err(|why| PyValueError::new_err(format!("offer.answer(supported=…): {why}")))?;
         let body = match (body, content_type) {
             (None, None) => None,
             (Some(body), Some(content_type)) => Some((
@@ -355,8 +368,9 @@ impl PyReoffer {
                 ))
             }
         };
-        let (sdp, extras) = AnswerExtras::checked(sdp, body, headers)
+        let (sdp, mut extras) = AnswerExtras::checked(sdp, body, headers)
             .map_err(|why| PyValueError::new_err(format!("offer.answer(): {why}")))?;
+        extras.supported = supported;
         self.decision = ReofferDecision::TakeOver { sdp, extras };
         Ok(())
     }
@@ -496,6 +510,7 @@ mod tests {
                             ),
                             ("Retry-After".to_string(), "30".to_string()),
                         ],
+                        supported: Vec::new(),
                     },
                 }
             );
@@ -567,7 +582,7 @@ mod tests {
         Python::initialize();
         Python::attach(|python| {
             let mut offer = PyReoffer::offered(facts(), request(python));
-            offer.answer(None, None, None, None).expect("open");
+            offer.answer(None, None, None, None, None).expect("open");
             assert_eq!(
                 offer.decision(),
                 &ReofferDecision::TakeOver {
@@ -576,7 +591,7 @@ mod tests {
                 }
             );
             offer
-                .answer(Some("v=0\r\n".to_string()), None, None, None)
+                .answer(Some("v=0\r\n".to_string()), None, None, None, None)
                 .expect("open");
             assert_eq!(
                 offer.decision(),
@@ -605,6 +620,7 @@ mod tests {
                     Some(body.as_any()),
                     Some("application/vnd.example.info+xml"),
                     Some(&headers),
+                    None,
                 )
                 .expect("open");
             assert_eq!(
@@ -620,9 +636,64 @@ mod tests {
                             ("Resource-Priority".to_string(), "example.0".to_string()),
                             ("X-Second".to_string(), "2".to_string()),
                         ],
+                        supported: Vec::new(),
                     }
                 }
             );
+        });
+    }
+
+    #[test]
+    fn answer_takes_option_tags_for_the_supported_of_the_200() {
+        Python::initialize();
+        Python::attach(|python| {
+            let mut offer = PyReoffer::offered(facts(), request(python));
+            offer
+                .answer(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(vec![
+                        "tdialog".to_string(),
+                        "norefersub".to_string(),
+                        "tdialog".to_string(),
+                    ]),
+                )
+                .expect("open");
+            assert_eq!(
+                offer.decision(),
+                &ReofferDecision::TakeOver {
+                    sdp: None,
+                    extras: AnswerExtras {
+                        body: None,
+                        headers: Vec::new(),
+                        supported: vec!["tdialog".to_string(), "norefersub".to_string()],
+                    }
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn answer_refuses_an_option_tag_siphon_owns_and_decides_nothing() {
+        Python::initialize();
+        Python::attach(|python| {
+            let mut offer = PyReoffer::offered(facts(), request(python));
+            for refused in ["timer", "100rel", "not a token"] {
+                let error = offer
+                    .answer(None, None, None, None, Some(vec![refused.to_string()]))
+                    .expect_err(refused);
+                assert!(
+                    error.is_instance_of::<PyValueError>(python),
+                    "{refused}: {error}"
+                );
+                assert!(
+                    error.to_string().contains("offer.answer(supported="),
+                    "{refused}: {error}"
+                );
+            }
+            assert_eq!(offer.decision(), &ReofferDecision::Relay);
         });
     }
 
@@ -655,7 +726,7 @@ mod tests {
                 let headers = pyo3::types::PyDict::new(python);
                 headers.set_item(owned, "x").expect("set");
                 let error = offer
-                    .answer(None, None, None, Some(&headers))
+                    .answer(None, None, None, Some(&headers), None)
                     .expect_err(owned);
                 assert!(
                     error.is_instance_of::<PyValueError>(python),
@@ -671,12 +742,16 @@ mod tests {
             let headers = pyo3::types::PyDict::new(python);
             headers.set_item("X-Number", 5).expect("set");
             let error = offer
-                .answer(None, None, None, Some(&headers))
+                .answer(None, None, None, Some(&headers), None)
                 .expect_err("not a str");
             assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(python));
             // A body and its type go together.
-            assert!(offer.answer(None, Some(body.as_any()), None, None).is_err());
-            assert!(offer.answer(None, None, Some("text/plain"), None).is_err());
+            assert!(offer
+                .answer(None, Some(body.as_any()), None, None, None)
+                .is_err());
+            assert!(offer
+                .answer(None, None, Some("text/plain"), None, None)
+                .is_err());
             // An answer given twice.
             let sdp = pyo3::types::PyString::new(python, "v=0\r\n");
             let error = offer
@@ -685,12 +760,19 @@ mod tests {
                     Some(sdp.as_any()),
                     Some("application/sdp"),
                     None,
+                    None,
                 )
                 .expect_err("twice");
             assert!(error.to_string().contains("pass one"), "{error}");
             // A multipart body with no boundary to put the SDP part under.
             let error = offer
-                .answer(None, Some(body.as_any()), Some("multipart/mixed"), None)
+                .answer(
+                    None,
+                    Some(body.as_any()),
+                    Some("multipart/mixed"),
+                    None,
+                    None,
+                )
                 .expect_err("no boundary");
             assert!(error.to_string().contains("boundary"), "{error}");
             assert_eq!(offer.decision(), &ReofferDecision::Relay);
@@ -720,7 +802,7 @@ mod tests {
             assert!(offer
                 .reject(488, "Not Acceptable Here", None, None, None)
                 .is_err());
-            assert!(offer.answer(None, None, None, None).is_err());
+            assert!(offer.answer(None, None, None, None, None).is_err());
         });
         assert_eq!(offer.decision(), &ReofferDecision::Relay);
     }

@@ -656,6 +656,14 @@ What the handler can do with it:
   `Content-Type`, `RSeq`, `RAck`, `Require`, `Supported`, `Session-Expires`
   and `Min-SE`. A name or value that is not a `str` raises `TypeError`.
   Nothing is decided when `offer.answer()` raises.
+- **`offer.answer(supported=[…])`**: option tags added to the `Supported`
+  siphon writes on the 200 (RFC 3261 §20.37), after its own (`timer` when it
+  negotiated a session timer) and each once: an extension the service behind
+  the script implements, such as `tdialog` (RFC 4538) and `norefersub`
+  (RFC 4488), which an MCPTT controlling function advertises on its 200 to a
+  re-INVITE (TS 24.379 §10.1.1.4.7). `Require` stays siphon's. `100rel` and
+  `timer` are siphon's to negotiate and raise `ValueError`, as does a tag that
+  is not a token; a value that is not a list of `str` raises `TypeError`.
 
 ```python
 @b2bua.on_reoffer

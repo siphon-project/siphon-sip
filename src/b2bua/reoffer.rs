@@ -110,6 +110,42 @@ pub struct AnswerExtras {
     /// headers siphon owns on a response it sends
     /// ([`crate::b2bua::uas_headers::validate`]) before they get here.
     pub headers: Vec<(String, String)>,
+    /// Option tags the script adds to the `Supported` siphon writes on the
+    /// 2xx (RFC 3261 §20.37), checked by [`option_tags`]: an extension the
+    /// service behind the script implements, such as `tdialog` (RFC 4538)
+    /// or `norefersub` (RFC 4488), which an MCPTT controlling function
+    /// advertises on its 200 to a re-INVITE (TS 24.379 §10.1.1.4.7).
+    pub supported: Vec<String>,
+}
+
+/// The option tags siphon negotiates itself, which a script cannot add to the
+/// `Supported` of a response siphon sends: `100rel` (RFC 3262 §3) and `timer`
+/// (RFC 4028 §9).
+const OWNED_OPTION_TAGS: &[&str] = &["100rel", "timer"];
+
+/// Check the option tags a script asked to add to `Supported`, and drop the
+/// repeats (option tags compare case-insensitively, RFC 3261 §19.2). `Err`
+/// names the first tag refused: one that is not an RFC 3261 §25.1 `token`
+/// (the `option-tag` of §20.37), or one siphon negotiates itself.
+pub fn option_tags(tags: Vec<String>) -> Result<Vec<String>, String> {
+    let mut kept: Vec<String> = Vec::with_capacity(tags.len());
+    for tag in tags {
+        if !crate::b2bua::uas_headers::is_token(&tag) {
+            return Err(format!("{tag:?} is not an option tag"));
+        }
+        if OWNED_OPTION_TAGS
+            .iter()
+            .any(|owned| owned.eq_ignore_ascii_case(&tag))
+        {
+            return Err(format!(
+                "{tag} is an option tag siphon negotiates itself (RFC 3262 §3, RFC 4028 §9)"
+            ));
+        }
+        if !kept.iter().any(|seen| seen.eq_ignore_ascii_case(&tag)) {
+            kept.push(tag);
+        }
+    }
+    Ok(kept)
 }
 
 impl AnswerExtras {
@@ -128,7 +164,11 @@ impl AnswerExtras {
                 return Err("body is empty".to_string());
             }
         }
-        Ok(Self { body, headers })
+        Ok(Self {
+            body,
+            headers,
+            supported: Vec::new(),
+        })
     }
 
     /// Sort what a script gave `offer.answer()` into the answer's SDP and the
@@ -153,6 +193,7 @@ impl AnswerExtras {
                 Self {
                     body: None,
                     headers,
+                    supported: Vec::new(),
                 },
             ));
         };
@@ -171,6 +212,7 @@ impl AnswerExtras {
                 Self {
                     body: None,
                     headers,
+                    supported: Vec::new(),
                 },
             ));
         }
@@ -191,6 +233,7 @@ impl AnswerExtras {
             Self {
                 body: Some((content_type, body)),
                 headers,
+                supported: Vec::new(),
             },
         ))
     }
@@ -229,6 +272,11 @@ impl AnswerExtras {
         }
         for (name, value) in &self.headers {
             response.headers.add(name, value.clone());
+        }
+        // After siphon's own tags (`timer` from the session timer it
+        // negotiated), each once.
+        for tag in &self.supported {
+            crate::b2bua::session_timer::add_option_tag(&mut response.headers, "Supported", tag);
         }
         Ok(())
     }
@@ -401,6 +449,59 @@ mod tests {
     }
 
     #[test]
+    fn option_tags_are_kept_once_and_siphons_own_are_refused() {
+        let tags = |list: &[&str]| list.iter().map(|tag| tag.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            option_tags(tags(&["tdialog", "norefersub", "TDialog"])),
+            Ok(tags(&["tdialog", "norefersub"]))
+        );
+        assert_eq!(option_tags(Vec::new()), Ok(Vec::new()));
+        for owned in ["timer", "100rel", "Timer", "100REL"] {
+            let refusal = option_tags(tags(&["tdialog", owned])).expect_err(owned);
+            assert!(refusal.starts_with(owned), "{refusal}");
+        }
+        for broken in ["", "two words", "a,b", "tag\r\nVia: x"] {
+            assert!(option_tags(tags(&[broken])).is_err(), "{broken:?}");
+        }
+    }
+
+    #[test]
+    fn the_scripts_tags_join_siphons_supported_once_each() {
+        let mut response = crate::sip::parser::parse_sip_message_bytes(
+            concat!(
+                "SIP/2.0 200 OK\r\n",
+                "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-supported\r\n",
+                "From: <sip:alice@example.com>;tag=a\r\n",
+                "To: <sip:bob@example.com>;tag=b\r\n",
+                "Call-ID: supported@192.0.2.10\r\n",
+                "CSeq: 2 INVITE\r\n",
+                "Supported: timer\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n",
+            )
+            .as_bytes(),
+        )
+        .expect("parses");
+        let extras = AnswerExtras {
+            body: None,
+            headers: Vec::new(),
+            supported: vec!["tdialog".to_string(), "norefersub".to_string()],
+        };
+        extras.apply(&mut response, None).expect("applies");
+        // Applied twice, as a retransmitted answer would be: still once each.
+        extras.apply(&mut response, None).expect("applies");
+        let listed: Vec<String> = response
+            .headers
+            .get_all("Supported")
+            .expect("a Supported")
+            .iter()
+            .flat_map(|value| value.split(','))
+            .map(|tag| tag.trim().to_string())
+            .collect();
+        assert_eq!(listed, ["timer", "tdialog", "norefersub"]);
+    }
+
+    #[test]
     fn a_refusal_carries_its_body_as_given_and_refuses_what_would_break_it() {
         let info = (
             "application/vnd.3gpp.mcptt-info+xml".to_string(),
@@ -416,6 +517,7 @@ mod tests {
             AnswerExtras {
                 body: Some(info.clone()),
                 headers: warning,
+                supported: Vec::new(),
             }
         );
         // No SDP joins a refusal: the body goes as it is, even a multipart one.
@@ -446,6 +548,7 @@ mod tests {
                 b"<info/>".to_vec(),
             )),
             headers: Vec::new(),
+            supported: Vec::new(),
         };
         // No SDP to send: the script's body goes as it is.
         assert_eq!(
@@ -492,6 +595,7 @@ mod tests {
                 ("Resource-Priority".to_string(), "example.5".to_string()),
                 ("X-Second".to_string(), "2".to_string()),
             ],
+            supported: Vec::new(),
         };
         extras.apply(&mut response, Some(TALKING)).expect("applies");
         assert_eq!(
@@ -520,6 +624,7 @@ mod tests {
         let broken = AnswerExtras {
             body: Some(("multipart/mixed".to_string(), b"--b--\r\n".to_vec())),
             headers: vec![("X-Third".to_string(), "3".to_string())],
+            supported: Vec::new(),
         };
         let before = response.to_bytes();
         assert!(broken.apply(&mut response, Some(TALKING)).is_err());

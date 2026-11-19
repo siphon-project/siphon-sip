@@ -237,6 +237,31 @@ def sdp_and_body(
     return sdp, (content_type, raw)
 
 
+_TOKEN = re.compile(r"^[A-Za-z0-9.!%*_+`'~-]+$")
+_OWNED_OPTION_TAGS = ("100rel", "timer")
+
+def _option_tags(tags: Optional[list[str]]) -> list[str]:
+    """Check the option tags of ``offer.answer(supported=…)`` as siphon does,
+    and drop the repeats (option tags compare case-insensitively)."""
+    if tags is None:
+        return []
+    if isinstance(tags, (str, bytes)) or not isinstance(tags, (list, tuple)):
+        raise TypeError("offer.answer(supported=…) takes a list of str option tags")
+    kept: list[str] = []
+    for tag in tags:
+        if not isinstance(tag, str):
+            raise TypeError("offer.answer(supported=…) takes a list of str option tags")
+        if not _TOKEN.match(tag):
+            raise ValueError(f"offer.answer(supported=…): {tag!r} is not an option tag")
+        if tag.lower() in _OWNED_OPTION_TAGS:
+            raise ValueError(
+                f"offer.answer(supported=…): {tag} is an option tag siphon "
+                "negotiates itself (RFC 3262 §3, RFC 4028 §9)"
+            )
+        if tag.lower() not in (seen.lower() for seen in kept):
+            kept.append(tag)
+    return kept
+
 class Reoffer:
     """An in-dialog offer from one party of a bridged call.
 
@@ -271,6 +296,7 @@ class Reoffer:
         self._request: Optional[Request] = request
         self._decision: tuple = ("relay",)
         self._answer_extras: Optional[dict] = None
+        self._answer_supported: list[str] = []
         self._status_code: Optional[int] = None
         self._answer_sdp: Optional[str] = None
         self._answered_locally = False
@@ -419,6 +445,7 @@ class Reoffer:
             if not raw:
                 raise ValueError("offer.reject(): body is empty")
         self._decision = ("reject", code, reason)
+        self._answer_supported = []
         self._answer_extras = None if raw is None and not checked else {
             "content_type": content_type if raw is not None else None,
             "body": raw,
@@ -431,6 +458,7 @@ class Reoffer:
         body: Optional[Union[str, bytes]] = None,
         content_type: Optional[str] = None,
         headers: Optional[dict[str, str]] = None,
+        supported: Optional[list[str]] = None,
     ) -> None:
         """Answer the offer here and relay nothing.
 
@@ -469,6 +497,12 @@ class Reoffer:
         ``Content-Type``, ``RSeq``, ``RAck``, ``Require``, ``Supported``,
         ``Session-Expires`` and ``Min-SE``.
 
+        ``supported`` is a list of option tags added to the ``Supported``
+        siphon writes on the 200 (RFC 3261 §20.37), after its own and each
+        once: an extension the service behind the script implements, such as
+        ``tdialog`` (RFC 4538) or ``norefersub`` (RFC 4488). ``Require``
+        stays siphon's. ``100rel`` and ``timer`` are siphon's to negotiate.
+
         Example::
 
             @b2bua.on_reoffer
@@ -476,22 +510,27 @@ class Reoffer:
                 if offer.request.get_header("Resource-Priority"):
                     offer.answer(body=service_info_xml,
                                  content_type="application/vnd.example.info+xml",
-                                 headers={"Resource-Priority": "example.0"})
+                                 headers={"Resource-Priority": "example.0"},
+                                 supported=["tdialog", "norefersub"])
 
         Raises:
             RuntimeError: in ``@b2bua.on_reoffer_answered``.
-            ValueError: for an owned header, ``body`` without
+            ValueError: for an owned header, an option tag that is not a
+                token or is ``100rel`` or ``timer``, ``body`` without
                 ``content_type`` or the reverse, an empty ``body``, an answer
                 given both in ``sdp`` and in the body, or a ``multipart/*``
                 body without a ``boundary`` or a part delimited by it.
-            TypeError: for a header name or value that is not a ``str``.
+            TypeError: for a header name or value that is not a ``str``, or a
+                ``supported`` that is not a list of ``str``.
 
         Nothing is decided when it raises.
         """
         self._still_open("answer")
         checked = _uas_response_headers("offer.answer", headers)
+        tags = _option_tags(supported)
         sdp, extras_body = sdp_and_body("offer.answer", sdp, body, content_type)
         self._decision = ("answer", sdp)
+        self._answer_supported = tags
         self._answer_extras = {
             "content_type": extras_body[0] if extras_body else None,
             "body": extras_body[1] if extras_body else None,
@@ -510,6 +549,12 @@ class Reoffer:
         ``{"content_type": str | None, "body": bytes | None, "headers":
         dict}``; ``None`` unless the decision is an answer."""
         return self._answer_extras
+
+    @property
+    def answer_supported(self) -> list[str]:
+        """Mock-only: the option tags ``offer.answer(supported=…)`` adds to
+        the ``Supported`` of the 200, repeats dropped; ``[]`` otherwise."""
+        return list(self._answer_supported)
 
     def _still_open(self, what: str) -> None:
         if self._answered:
