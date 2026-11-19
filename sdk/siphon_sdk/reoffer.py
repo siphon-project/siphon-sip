@@ -365,19 +365,65 @@ class Reoffer:
 
     # -- decisions (on_reoffer) --------------------------------------------
 
-    def reject(self, code: int, reason: str) -> None:
+    def reject(
+        self,
+        code: int,
+        reason: str,
+        body: Optional[Union[str, bytes]] = None,
+        content_type: Optional[str] = None,
+        headers: Optional[dict[str, str]] = None,
+    ) -> None:
         """Refuse the offer with ``code`` (300-699); nothing is relayed and the
-        session stays as it was (RFC 3261 §14.1).
+        session stays as it was (RFC 3261 §14.2).
+
+        ``body`` with its ``content_type`` goes on the refusal as given, for a
+        service that says why in a document of its own (an MCPTT controlling
+        function's ``application/vnd.3gpp.mcptt-info+xml``, TS 24.379
+        §6.3.3.1.14). ``headers`` is added to the refusal, in its order, such
+        as ``Warning`` (RFC 3261 §20.43) or ``Retry-After``; the headers
+        siphon owns on a response it sends are refused, as on
+        :meth:`answer`.
+
+        Example::
+
+            @b2bua.on_reoffer
+            def upgrade(call, offer):
+                if not may_upgrade(call):
+                    offer.reject(403, "Forbidden",
+                                 body=refusal_info_xml,
+                                 content_type="application/vnd.example.info+xml",
+                                 headers={"Warning": '399 example.com "not allowed"'})
 
         Raises:
-            ValueError: for a code outside 300-699.
+            ValueError: for a code outside 300-699, an owned header, ``body``
+                without ``content_type`` or the reverse, or an empty ``body``.
+            TypeError: for a header name or value that is not a ``str``, or a
+                ``body`` that is neither ``str`` nor ``bytes``.
             RuntimeError: in ``@b2bua.on_reoffer_answered``.
+
+        Nothing is decided when it raises.
         """
         self._still_open("reject")
         if not 300 <= code <= 699:
             raise ValueError(f"offer.reject() takes a final non-2xx status, 300-699, not {code}")
+        checked = _uas_response_headers("offer.reject", headers)
+        if (body is None) != (content_type is None):
+            raise ValueError("offer.reject(body=…) and content_type=… go together")
+        raw = None
+        if body is not None and content_type is not None:
+            if not isinstance(body, (str, bytes)):
+                raise TypeError("body must be str or bytes")
+            if any(character in content_type for character in "\r\n\0"):
+                raise ValueError("offer.reject(): content_type contains a line break or NUL")
+            raw = body.encode() if isinstance(body, str) else body
+            if not raw:
+                raise ValueError("offer.reject(): body is empty")
         self._decision = ("reject", code, reason)
-        self._answer_extras = None
+        self._answer_extras = None if raw is None and not checked else {
+            "content_type": content_type if raw is not None else None,
+            "body": raw,
+            "headers": checked,
+        }
 
     def answer(
         self,

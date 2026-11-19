@@ -191,28 +191,73 @@ impl PyReoffer {
     }
 
     /// Refuse the offer with ``code`` (300-699) and ``reason``; nothing is
-    /// relayed and the session in force stays as it was (RFC 3261 §14.1).
+    /// relayed and the session in force stays as it was (RFC 3261 §14.2).
     /// ``488`` refuses the media, ``403`` the request.
     ///
-    /// Raises ``ValueError`` for a code outside 300-699, and ``RuntimeError``
-    /// in ``@b2bua.on_reoffer_answered``.
+    /// ``body`` (str or bytes) with its ``content_type`` goes on the refusal
+    /// as given, for a service that says why in a document of its own (an
+    /// MCPTT controlling function's ``application/vnd.3gpp.mcptt-info+xml``,
+    /// TS 24.379 §6.3.3.1.14).
+    ///
+    /// ``headers`` is a ``{name: value}`` mapping added to the refusal, in its
+    /// order, such as ``Warning`` (RFC 3261 §20.43) or ``Retry-After``. The
+    /// headers siphon owns on a response it sends raise ``ValueError``, as on
+    /// ``offer.answer()``.
+    ///
+    /// Raises ``RuntimeError`` in ``@b2bua.on_reoffer_answered``;
+    /// ``ValueError`` for a code outside 300-699, an owned header, ``body``
+    /// without ``content_type`` or the reverse, or an empty ``body``;
+    /// ``TypeError`` for a header name or value that is not a str. Nothing is
+    /// decided when it raises.
     ///
     /// ```python
     /// @b2bua.on_reoffer
     /// def no_video(call, offer):
     ///     if offer.sdp and "m=video" in offer.sdp:
     ///         offer.reject(488, "Not Acceptable Here")
+    ///
+    /// @b2bua.on_reoffer
+    /// def upgrade(call, offer):
+    ///     if not may_upgrade(call):
+    ///         offer.reject(403, "Forbidden",
+    ///                      body=refusal_info_xml,
+    ///                      content_type="application/vnd.example.info+xml",
+    ///                      headers={"Warning": '399 example.com "not allowed"'})
     /// ```
-    fn reject(&mut self, code: u16, reason: &str) -> PyResult<()> {
+    #[pyo3(signature = (code, reason, body=None, content_type=None, headers=None))]
+    fn reject(
+        &mut self,
+        code: u16,
+        reason: &str,
+        body: Option<&Bound<'_, PyAny>>,
+        content_type: Option<&str>,
+        headers: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<()> {
         self.still_open("reject")?;
         if !(300..=699).contains(&code) {
             return Err(PyValueError::new_err(format!(
                 "offer.reject() takes a final non-2xx status, 300-699, not {code}"
             )));
         }
+        let headers = super::call::uas_response_headers("offer.reject", headers)?;
+        let body = match (body, content_type) {
+            (None, None) => None,
+            (Some(body), Some(content_type)) => Some((
+                content_type.to_string(),
+                super::request::extract_body_bytes(body)?,
+            )),
+            _ => {
+                return Err(PyValueError::new_err(
+                    "offer.reject(body=…) and content_type=… go together",
+                ))
+            }
+        };
+        let extras = AnswerExtras::refusal(body, headers)
+            .map_err(|why| PyValueError::new_err(format!("offer.reject(): {why}")))?;
         self.decision = ReofferDecision::Refuse {
             code,
             reason: reason.to_string(),
+            extras,
         };
         Ok(())
     }
@@ -394,20 +439,126 @@ mod tests {
         Python::initialize();
         Python::attach(|python| {
             let mut offer = PyReoffer::offered(facts(), request(python));
-            assert!(offer.reject(200, "OK").is_err());
-            assert!(offer.reject(183, "Session Progress").is_err());
-            assert!(offer.reject(700, "Beyond").is_err());
+            assert!(offer.reject(200, "OK", None, None, None).is_err());
+            assert!(offer
+                .reject(183, "Session Progress", None, None, None)
+                .is_err());
+            assert!(offer.reject(700, "Beyond", None, None, None).is_err());
             assert_eq!(offer.decision(), &ReofferDecision::Relay);
             offer
-                .reject(488, "Not Acceptable Here")
+                .reject(488, "Not Acceptable Here", None, None, None)
                 .expect("488 is a refusal");
             assert_eq!(
                 offer.decision(),
                 &ReofferDecision::Refuse {
                     code: 488,
-                    reason: "Not Acceptable Here".to_string()
+                    reason: "Not Acceptable Here".to_string(),
+                    extras: AnswerExtras::default(),
                 }
             );
+        });
+    }
+
+    #[test]
+    fn reject_takes_a_body_and_headers_for_the_refusal() {
+        Python::initialize();
+        Python::attach(|python| {
+            let mut offer = PyReoffer::offered(facts(), request(python));
+            let headers = pyo3::types::PyDict::new(python);
+            headers
+                .set_item("Warning", "399 mcx.example.com \"not allowed\"")
+                .expect("set");
+            headers.set_item("Retry-After", "30").expect("set");
+            let body = pyo3::types::PyString::new(python, "<mcpttinfo/>");
+            offer
+                .reject(
+                    403,
+                    "Forbidden",
+                    Some(body.as_any()),
+                    Some("application/vnd.3gpp.mcptt-info+xml"),
+                    Some(&headers),
+                )
+                .expect("open");
+            assert_eq!(
+                offer.decision(),
+                &ReofferDecision::Refuse {
+                    code: 403,
+                    reason: "Forbidden".to_string(),
+                    extras: AnswerExtras {
+                        body: Some((
+                            "application/vnd.3gpp.mcptt-info+xml".to_string(),
+                            b"<mcpttinfo/>".to_vec()
+                        )),
+                        headers: vec![
+                            (
+                                "Warning".to_string(),
+                                "399 mcx.example.com \"not allowed\"".to_string()
+                            ),
+                            ("Retry-After".to_string(), "30".to_string()),
+                        ],
+                    },
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn reject_refuses_what_it_cannot_send_and_decides_nothing() {
+        Python::initialize();
+        Python::attach(|python| {
+            let mut offer = PyReoffer::offered(facts(), request(python));
+            for owned in [
+                "Via",
+                "From",
+                "To",
+                "Call-ID",
+                "CSeq",
+                "Contact",
+                "Content-Length",
+                "Content-Type",
+                "Require",
+                "Supported",
+            ] {
+                let headers = pyo3::types::PyDict::new(python);
+                headers.set_item(owned, "x").expect("set");
+                let error = offer
+                    .reject(403, "Forbidden", None, None, Some(&headers))
+                    .expect_err(owned);
+                assert!(
+                    error.is_instance_of::<PyValueError>(python),
+                    "{owned}: {error}"
+                );
+                assert!(error.to_string().contains(owned), "{owned}: {error}");
+                assert!(
+                    error.to_string().contains("offer.reject"),
+                    "{owned}: {error}"
+                );
+            }
+            let headers = pyo3::types::PyDict::new(python);
+            headers.set_item("Warning", 399).expect("set");
+            let error = offer
+                .reject(403, "Forbidden", None, None, Some(&headers))
+                .expect_err("not a str");
+            assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(python));
+            let body = pyo3::types::PyString::new(python, "<info/>");
+            let empty = pyo3::types::PyString::new(python, "");
+            assert!(offer
+                .reject(403, "Forbidden", Some(body.as_any()), None, None)
+                .is_err());
+            assert!(offer
+                .reject(403, "Forbidden", None, Some("text/plain"), None)
+                .is_err());
+            let error = offer
+                .reject(
+                    403,
+                    "Forbidden",
+                    Some(empty.as_any()),
+                    Some("text/plain"),
+                    None,
+                )
+                .expect_err("empty");
+            assert!(error.to_string().contains("empty"), "{error}");
+            assert_eq!(offer.decision(), &ReofferDecision::Relay);
         });
     }
 
@@ -566,7 +717,9 @@ mod tests {
         Python::initialize();
         Python::attach(|python| {
             assert!(offer.request(python).is_none());
-            assert!(offer.reject(488, "Not Acceptable Here").is_err());
+            assert!(offer
+                .reject(488, "Not Acceptable Here", None, None, None)
+                .is_err());
             assert!(offer.answer(None, None, None, None).is_err());
         });
         assert_eq!(offer.decision(), &ReofferDecision::Relay);

@@ -80,8 +80,15 @@ pub enum ReofferDecision {
     #[default]
     Relay,
     /// Refuse it with this final response. The session stays as it was
-    /// (RFC 3261 §14.1).
-    Refuse { code: u16, reason: String },
+    /// (RFC 3261 §14.2). `extras` is what the refusal carries: a body that
+    /// says why (an MCPTT controlling function's
+    /// `application/vnd.3gpp.mcptt-info+xml`, TS 24.379 §6.3.3.1.14) and
+    /// headers such as `Warning` (RFC 3261 §20.43) or `Retry-After`.
+    Refuse {
+        code: u16,
+        reason: String,
+        extras: AnswerExtras,
+    },
     /// Answer it here and relay nothing. `sdp` is the script's answer, or
     /// `None` to have siphon answer from the session in force toward the
     /// offerer (RFC 3264 §6). `extras` is what the 2xx carries beside it.
@@ -106,6 +113,24 @@ pub struct AnswerExtras {
 }
 
 impl AnswerExtras {
+    /// Check what a script gave `offer.reject()`: the body goes on the
+    /// refusal as it was given, with no SDP to join, so it is checked only
+    /// for what would break the response (a `Content-Type` that ends its
+    /// header early, an empty body). `headers` are checked by the caller
+    /// against the headers siphon owns.
+    pub fn refusal(
+        body: Option<(String, Vec<u8>)>,
+        headers: Vec<(String, String)>,
+    ) -> Result<Self, String> {
+        if let Some((content_type, body)) = &body {
+            check_content_type(content_type)?;
+            if body.is_empty() {
+                return Err("body is empty".to_string());
+            }
+        }
+        Ok(Self { body, headers })
+    }
+
     /// Sort what a script gave `offer.answer()` into the answer's SDP and the
     /// body that goes with it. `sdp` is its `sdp=`, `body` its `content_type=`
     /// and `body=`.
@@ -131,12 +156,7 @@ impl AnswerExtras {
                 },
             ));
         };
-        if content_type
-            .bytes()
-            .any(|byte| matches!(byte, b'\r' | b'\n' | 0))
-        {
-            return Err("content_type contains a line break or NUL".to_string());
-        }
+        check_content_type(&content_type)?;
         if body.is_empty() {
             return Err("body is empty".to_string());
         }
@@ -212,6 +232,18 @@ impl AnswerExtras {
         }
         Ok(())
     }
+}
+
+/// `Err` when `content_type` carries a line break or NUL, which would end the
+/// `Content-Type` header early and start another.
+fn check_content_type(content_type: &str) -> Result<(), String> {
+    if content_type
+        .bytes()
+        .any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+    {
+        return Err("content_type contains a line break or NUL".to_string());
+    }
+    Ok(())
 }
 
 /// The final response the offerer got, as `@b2bua.on_reoffer_answered` is
@@ -366,6 +398,38 @@ mod tests {
         assert!(
             refused(None, "multipart/mixed;boundary=b", b"<info/>").contains("no part delimited")
         );
+    }
+
+    #[test]
+    fn a_refusal_carries_its_body_as_given_and_refuses_what_would_break_it() {
+        let info = (
+            "application/vnd.3gpp.mcptt-info+xml".to_string(),
+            b"<mcpttinfo/>".to_vec(),
+        );
+        let warning = vec![(
+            "Warning".to_string(),
+            "399 mcx.example.com \"not allowed\"".to_string(),
+        )];
+        let extras = AnswerExtras::refusal(Some(info.clone()), warning.clone()).expect("fine");
+        assert_eq!(
+            extras,
+            AnswerExtras {
+                body: Some(info.clone()),
+                headers: warning,
+            }
+        );
+        // No SDP joins a refusal: the body goes as it is, even a multipart one.
+        assert_eq!(extras.body_with(None), Ok(Some(info)));
+        assert_eq!(
+            AnswerExtras::refusal(None, Vec::new()),
+            Ok(AnswerExtras::default())
+        );
+        let refused = |content_type: &str, body: &[u8]| {
+            AnswerExtras::refusal(Some((content_type.to_string(), body.to_vec())), Vec::new())
+                .expect_err("refused")
+        };
+        assert!(refused("text/plain\r\nX-Injected: 1", b"x").contains("line break"));
+        assert!(refused("text/plain", b"").contains("empty"));
     }
 
     #[test]

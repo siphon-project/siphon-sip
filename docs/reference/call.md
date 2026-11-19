@@ -614,7 +614,15 @@ What the handler can do with it:
 
 - **Nothing**: the offer is relayed as without the hook.
 - **`offer.reject(code, reason)`** (300-699): siphon answers the offerer and
-  relays nothing; the session stays as it was.
+  relays nothing; the session stays as it was (RFC 3261 §14.2).
+- **`offer.reject(code, reason, body=…, content_type=…, headers={…})`**: the
+  refusal says why. The body goes on it as given (an MCPTT controlling
+  function's `application/vnd.3gpp.mcptt-info+xml`, TS 24.379 §6.3.3.1.14),
+  and the headers, such as `Warning` (RFC 3261 §20.43) or `Retry-After`, in
+  the mapping's order. The owned headers raise `ValueError` as on
+  `offer.answer(headers=…)` below, as do `body` without `content_type` or the
+  reverse and an empty `body`; a name or value that is not a `str` raises
+  `TypeError`. Nothing is decided when it raises.
 - **`offer.answer(sdp=None)`**: siphon answers the offerer itself and relays
   nothing. Without `sdp` the answer is the session in force toward the
   offerer (what siphon last sent it, the media engine's ports on an anchored
@@ -663,11 +671,13 @@ def upgrade(call, offer):
 Every request is answered. A handler that raises, or an async one that runs
 past `script.handler_timeout_secs`, decides nothing and the offer is relayed.
 A crossing offer is answered `491 Request Pending` (RFC 3261 §14.1) before the
-script would see it. Not shown: a leg of a controller bridge. Shown, with
-nobody to relay to: a conference seat and a call the engine answered itself
-(both above), and a call merged into a room with `b2bua.adopt_replaced`, whose
-far party's offer is answered from the session in force when the handler
-leaves it.
+script would see it. Not shown: a leg of a controller bridge
+(`b2bua.bridge()`, a control-plane `dial` that bridges), whose offers siphon
+relays between the two calls itself. Shown, with nobody to relay to: a
+conference seat and a call the engine answered itself (both above), a leg the
+script placed with `b2bua.originate()` and has not bridged, and a call merged
+into a room with `b2bua.adopt_replaced`, whose far party's offer is answered
+from the session in force when the handler leaves it.
 
 **Several handlers.** Every registered `@b2bua.on_reoffer` handler runs, in
 registration order, on the same `offer` object. Each `offer.answer()` or

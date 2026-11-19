@@ -11,8 +11,8 @@
 //! * **relay** (the default, and what a raise or a timeout leaves): the offer
 //!   goes on as it would without the hook, with any header or body the script
 //!   set on `offer.request`;
-//! * **refuse**: siphon answers the offerer with the script's status and
-//!   relays nothing; the session stays as it was;
+//! * **refuse**: siphon answers the offerer with the script's status, and the
+//!   body and headers it gave, and relays nothing; the session stays as it was;
 //! * **take over**: siphon answers the offerer itself and relays nothing
 //!   ([`answer_reoffer_here`]).
 //!
@@ -383,15 +383,26 @@ pub fn decide_reoffer_here(
     state: &DispatcherState,
 ) -> SipMessage {
     let response = match decision {
-        ReofferDecision::Refuse { code, reason } => {
+        ReofferDecision::Refuse {
+            code,
+            reason,
+            extras,
+        } => {
             debug!(call_id = %call_id, code, "B2BUA: on_reoffer refused the offer");
-            build_response(
+            let mut response = build_response(
                 message,
                 *code,
                 reason,
                 state.identity.load().server.as_deref(),
                 &[],
-            )
+            );
+            // The script's body goes as given (no SDP joins a refusal), with
+            // its headers, which `offer.reject()` checked against the ones
+            // siphon owns.
+            if let Err(why) = extras.apply(&mut response, None) {
+                error!(call_id = %call_id, code, "B2BUA: on_reoffer's refusal could not carry the script's body: {why}; sent without it");
+            }
+            response
         }
         ReofferDecision::TakeOver { sdp, extras } => answer_reoffer_here(
             message,

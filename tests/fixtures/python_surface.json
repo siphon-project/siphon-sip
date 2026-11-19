@@ -1939,7 +1939,7 @@
       "reject": {
         "doc": "Refuse the offer with ``code`` (300-699) and ``reason``; nothing is",
         "kind": "method_descriptor",
-        "sig": "($self, code, reason)"
+        "sig": "($self, code, reason, body=None, content_type=None, headers=None)"
       },
       "request": {
         "doc": "The re-INVITE or UPDATE as it arrived, for its headers. Only in",
