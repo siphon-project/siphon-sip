@@ -952,11 +952,13 @@ mod tests {
         std::fs::write(&path, first).unwrap();
         let store = Arc::new(ScriptConfigStore::from_file(&path).unwrap());
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reading = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let readers: Vec<_> = (0..8)
             .map(|_| {
                 let store = Arc::clone(&store);
                 let stop = Arc::clone(&stop);
+                let reading = Arc::clone(&reading);
                 std::thread::spawn(move || {
                     let mut reads = 0u64;
                     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -965,11 +967,22 @@ mod tests {
                         let secondary = lookup(&snapshot, "secondary").unwrap().as_str();
                         assert_eq!(primary, secondary, "a snapshot mixed two documents");
                         reads += 1;
+                        if reads == 1 {
+                            reading.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
                     }
                     reads
                 })
             })
             .collect();
+        // The writer starts once every reader is reading: the 200 rounds
+        // take milliseconds, and a reader the scheduler has not run yet by
+        // then has seen nothing swap.
+        while reading.load(std::sync::atomic::Ordering::SeqCst) < readers.len()
+            && !readers.iter().any(std::thread::JoinHandle::is_finished)
+        {
+            std::thread::yield_now();
+        }
 
         for round in 0..200 {
             std::fs::write(&path, if round % 2 == 0 { second } else { first }).unwrap();

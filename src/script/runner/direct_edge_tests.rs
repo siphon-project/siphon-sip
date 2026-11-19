@@ -2,7 +2,7 @@
 //! point of a coroutine's life, a loop handlers must not be stepped on, what
 //! an awaitable keeps alive, and a driver shutting down under its coroutines.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -370,6 +370,10 @@ fn shutdown_closes_suspended_coroutines(collect: bool) {
     ));
     let runner = Arc::clone(pool.runner(0).expect("the pool has one driver"));
     let dropped_before = NEVER_DROPPED.load(Ordering::SeqCst);
+    // Taken before anything starts: the driver is running the first
+    // coroutines while the rest are still being posted.
+    let demoted_before = crate::script::runner::demotions();
+    let started_before = NEVER_STARTED.load(Ordering::SeqCst);
 
     let (module, drives) = Python::attach(|python| {
         let module = PyModule::from_code(
@@ -403,11 +407,15 @@ fn shutdown_closes_suspended_coroutines(collect: bool) {
                 // Most stay direct; a few are tasks by the time the driver stops.
                 let name = if index % 6 == 5 { "demoted" } else { "wedged" };
                 let coroutine = module.getattr(name).unwrap().call1((index,)).unwrap();
+                // Each is remembered by its own coroutine: by their shared
+                // code, the first `demoted` to hand itself over would make
+                // the driver refuse the rest, which are still being started.
+                let identity = Arc::new(coroutine.clone().unbind());
                 crate::script::runner::start(
                     &pool,
                     python,
                     &coroutine,
-                    None,
+                    Some(&identity),
                     crate::script::runner::Admit::Bounded,
                 )
                 .expect("admitted")
@@ -419,13 +427,22 @@ fn shutdown_closes_suspended_coroutines(collect: bool) {
 
     // The handed-over ones are their task's from then on; the direct ones
     // stay the runner's, each suspended on a tracked awaitable.
+    // Every one has been started on the driver, has reached its awaitable
+    // (whose future ran its first poll: one dropped unpolled holds nothing to
+    // count), and the demoted ones are tasks already.
     let direct = COROUTINES - COROUTINES / 6;
     let deadline = Instant::now() + Duration::from_secs(20);
-    while runner.stats().awaitables < direct {
+    while runner.stats().awaitables < direct
+        || runner.stats().drives < COROUTINES
+        || NEVER_STARTED.load(Ordering::SeqCst) - started_before < COROUTINES
+        || crate::script::runner::demotions() - demoted_before < (COROUTINES / 6) as u64
+    {
         assert!(
             Instant::now() < deadline,
-            "every coroutine suspended: {:?}",
-            runner.stats()
+            "every coroutine suspended: {:?}, {} awaitable futures polled, {} handed over",
+            runner.stats(),
+            NEVER_STARTED.load(Ordering::SeqCst) - started_before,
+            crate::script::runner::demotions() - demoted_before,
         );
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -487,6 +504,9 @@ fn shutdown_closes_suspended_coroutines(collect: bool) {
     }
 }
 
+/// Futures of `never_for_shutdown` that have been polled once.
+static NEVER_STARTED: AtomicUsize = AtomicUsize::new(0);
+
 struct CountsDrop;
 
 impl Drop for CountsDrop {
@@ -499,6 +519,7 @@ impl Drop for CountsDrop {
 fn never_for_shutdown(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     crate::script::awaitable(py, async move {
         let _guard = CountsDrop;
+        NEVER_STARTED.fetch_add(1, Ordering::SeqCst);
         std::future::pending::<()>().await;
         Ok(0i64)
     })

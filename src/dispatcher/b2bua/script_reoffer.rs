@@ -87,6 +87,14 @@ struct PendingReoffer {
     /// The call it is on, and whether on the caller's dialog.
     call_id: String,
     on_a_leg: bool,
+    /// The call store that holds `call_id`: the table is process-wide, and a
+    /// sweep may only call a re-offer ended by looking in its own store.
+    store: usize,
+}
+
+/// Identity of the call store of `state`, for [`PendingReoffer::store`].
+fn store_identity(state: &DispatcherState) -> usize {
+    Arc::as_ptr(&state.call_actors) as usize
 }
 
 fn pending_reoffers() -> &'static dashmap::DashMap<String, PendingReoffer> {
@@ -282,6 +290,7 @@ pub fn reoffer_leg_with(
                     session_in_force,
                     call_id: internal_call_id.to_string(),
                     on_a_leg,
+                    store: store_identity(state),
                 },
             );
             sent_branch = Some(branch.to_string());
@@ -511,7 +520,10 @@ pub fn script_reoffer_in_progress(call_id: &str, on_a_leg: bool) -> bool {
 /// Drop the re-offers of calls that ended before their INVITE got a final
 /// response: nothing will settle them. Run with the periodic sweeps.
 pub fn sweep_ended_reoffers(state: &DispatcherState) {
-    pending_reoffers().retain(|_, pending| state.call_actors.get_call(&pending.call_id).is_some());
+    let store = store_identity(state);
+    pending_reoffers().retain(|_, pending| {
+        pending.store != store || state.call_actors.get_call(&pending.call_id).is_some()
+    });
 }
 
 /// Hand the final status of the re-INVITE sent on `branch` to the script that
@@ -540,6 +552,7 @@ mod tests {
                 session_in_force: false,
                 call_id: format!("call-of-{branch}"),
                 on_a_leg: true,
+                store: 0,
             },
         );
         receiver

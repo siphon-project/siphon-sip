@@ -161,6 +161,7 @@ def chained_handler():
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn suspending_async_handler_error_keeps_the_traceback() {
+        let _serial = crate::script::async_pool::pool_test_guard();
         Python::initialize();
         Python::attach(|python| {
             let coroutine = probe(python)
