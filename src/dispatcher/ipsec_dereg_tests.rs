@@ -117,6 +117,26 @@ async fn gone_within(manager: &IpsecManager, ue: SocketAddr, within: Duration) -
     !manager.has_sa(&ue.ip(), ue.port())
 }
 
+/// The pair is gone and its teardown has run to its last step. The pair leaves
+/// the manager's map first; its SPIs, kernel objects and the bar on its two
+/// ports follow (`tear_down_removed`). A test that reads them as soon as
+/// `has_sa` is false reads a teardown still under way.
+async fn torn_down_within(manager: &IpsecManager, ue: SocketAddr, within: Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if !manager.has_sa(&ue.ip(), ue.port())
+            && manager.test_spi_owner_count() == 0
+            && manager.deleted_flow_count() >= 2
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// The 200 leaves over the pair; the binding the script cached and never
 /// cleared goes with it; the pair goes once the server transaction is over,
 /// and with it its kernel objects, its SPIs and the pair count the
@@ -306,7 +326,7 @@ async fn register_and_de_register_cycles_return_every_store_to_baseline() {
             "",
         );
         assert!(
-            gone_within(&manager, ue, Duration::from_secs(2)).await,
+            torn_down_within(&manager, ue, Duration::from_secs(2)).await,
             "cycle {cycle}: the de-registered pair goes"
         );
         let deleted_flows = manager.deleted_flow_count();

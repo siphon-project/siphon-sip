@@ -149,6 +149,16 @@ pub(super) fn assert_branch_released(state: &DispatcherState, branch: &str) {
     );
 }
 
+/// What went to the losing branch's carrier. The wire is shared with the
+/// answered call: once T1 has passed, a response to its caller is sent again
+/// (RFC 3261 §13.3.1.4) and lands among the frames read, which a loaded
+/// machine makes happen. The caller's frames are not the branch's.
+fn to_the_loser(sent: Vec<Sent>) -> Vec<Sent> {
+    sent.into_iter()
+        .filter(|frame| frame.destination == socket(SECOND_CARRIER))
+        .collect()
+}
+
 /// A parallel fork whose first branch answered while the second had sent
 /// nothing. Returns the fork and the second branch's INVITE.
 fn fork_won_beside_a_silent_branch() -> (Sequence, SipMessage) {
@@ -201,7 +211,10 @@ async fn a_losing_fork_branch_that_has_not_responded_is_cancelled_on_its_first_p
     let sent = drain(&dispatcher.udp);
     let cancel = the_cancel(&sent, SECOND_CARRIER, &silent);
     assert!(
-        sent.iter().all(|frame| frame.destination != socket(CALLER)),
+        sent.iter().all(|frame| {
+            frame.destination != socket(CALLER)
+                || !frame.message.status_code().is_some_and(|code| code < 200)
+        }),
         "the loser's provisional is not relayed to the answered caller"
     );
 
@@ -215,7 +228,12 @@ async fn a_losing_fork_branch_that_has_not_responded_is_cancelled_on_its_first_p
         None,
     );
     let sent = wire_until(dispatcher, |_| true).await;
-    assert_eq!(sent.len(), 1, "the ACK of the 487 and nothing else");
+    let sent = to_the_loser(sent);
+    assert_eq!(
+        sent.len(),
+        1,
+        "the ACK of the 487 and nothing else: {sent:?}"
+    );
     assert!(sent[0].is(Method::Ack));
     assert_eq!(branch_of(&sent[0].message), branch);
     assert!(!sequence.call_is_gone(), "the answered call stands");
@@ -264,7 +282,7 @@ async fn a_losing_fork_branch_that_fails_without_a_provisional_is_acked_and_noth
         "Temporarily Unavailable",
         None,
     );
-    let sent = wire_until(dispatcher, |_| true).await;
+    let sent = to_the_loser(wire_until(dispatcher, |_| true).await);
     assert_eq!(sent.len(), 1, "the ACK and nothing else: {sent:?}");
     assert!(sent[0].is(Method::Ack));
     assert_eq!(branch_of(&sent[0].message), branch);
