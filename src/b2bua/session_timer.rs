@@ -492,7 +492,7 @@ fn lists_timer(headers: &SipHeaders, name: &str) -> bool {
 
 /// Add `tag` to an option-tag header unless it already lists it, merging it into
 /// the first value rather than adding a second header line.
-fn add_option_tag(headers: &mut SipHeaders, name: &str, tag: &str) {
+pub(crate) fn add_option_tag(headers: &mut SipHeaders, name: &str, tag: &str) {
     let mut values = headers.get_all(name).cloned().unwrap_or_default();
     let listed = values
         .iter()

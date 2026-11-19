@@ -73,7 +73,7 @@ pub fn framework_owned_reason(name: &str) -> Option<&'static str> {
 }
 
 /// An RFC 3261 §25.1 `token`: what a header field name is made of.
-fn is_token(name: &str) -> bool {
+pub(crate) fn is_token(name: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()

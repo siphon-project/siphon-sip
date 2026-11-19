@@ -371,6 +371,49 @@ async fn a_refusal_carries_the_scripts_body_and_warning_and_keeps_the_session() 
     );
 }
 
+/// `offer.answer(supported=…)`: the 200 siphon answers a re-INVITE with
+/// advertises the script's option tags (an MCPTT controlling function's
+/// `tdialog` and `norefersub`, TS 24.379 §10.1.1.4.7) after the `timer` siphon
+/// writes for the session timer it negotiated, each once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_takeover_advertises_the_scripts_option_tags_beside_siphons_own() {
+    let mut call = call_deciding(
+        83047,
+        "offer.answer(supported=[\"tdialog\", \"norefersub\", \"TDIALOG\"])",
+    );
+    // A `session_timer:` block, so siphon answers the refresh with a timer of
+    // its own and writes `timer` in `Supported` (RFC 4028 §9).
+    call.dispatcher.state.session_timer_config = Some(
+        crate::config::yaml::from_str("session_expires: 1800\n").expect("a session timer config"),
+    );
+    let caller = caller_of(&call);
+    acks(&call.dispatcher.state, &caller);
+
+    let (raw, mut message) = request_from(&caller, "INVITE", 2, Some(&caller_sdp(&call, "")));
+    message.headers.set("Supported", "timer".to_string());
+    message
+        .headers
+        .set("Session-Expires", "1800;refresher=uac".to_string());
+    let arrived = inbound(&caller.address, &raw);
+    tokio::task::block_in_place(|| handle_b2bua_reinvite(arrived, message, &call.dispatcher.state));
+    let sent = wire(&call.dispatcher);
+    assert!(
+        sent_with(&sent, call.b.1, Method::Invite).is_none(),
+        "nothing relayed"
+    );
+    let answer = final_to(&sent, call.a.1).expect("the caller is answered");
+    assert_eq!(answer.status_code(), Some(200));
+    let listed: Vec<String> = answer
+        .headers
+        .get_all("Supported")
+        .expect("a Supported")
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(|tag| tag.trim().to_string())
+        .collect();
+    assert_eq!(listed, ["timer", "tdialog", "norefersub"]);
+}
+
 /// `offer.answer()` takes a hold over: siphon answers the caller from the
 /// session it has in force toward it, `recvonly`, with its own `o=` and
 /// Contact, and the callee is sent nothing.

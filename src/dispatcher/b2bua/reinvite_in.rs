@@ -1069,6 +1069,7 @@ pub fn send_one_legged_ok_with(
         let alone = AnswerExtras {
             body: None,
             headers: extras.headers.clone(),
+            supported: extras.supported.clone(),
         };
         if let Err(why) = alone.apply(&mut response, sdp) {
             error!(call_id = %call_id, "B2BUA: the answer could not be framed: {why}");

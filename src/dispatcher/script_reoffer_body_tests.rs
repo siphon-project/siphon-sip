@@ -26,6 +26,7 @@ fn info_and_priority() -> AnswerExtras {
     AnswerExtras {
         body: Some((INFO_TYPE.to_string(), INFO.as_bytes().to_vec())),
         headers: vec![("Resource-Priority".to_string(), "mcpttp.5".to_string())],
+        supported: Vec::new(),
     }
 }
 
@@ -202,6 +203,7 @@ async fn a_multipart_body_takes_the_sdp_part_or_is_refused_unsent() {
             format!("--own\r\nContent-Type: {INFO_TYPE}\r\n\r\n{INFO}\r\n--own--\r\n").into_bytes(),
         )),
         headers: Vec::new(),
+        supported: Vec::new(),
     };
     let (_, status) = sent(reoffers(&seat, None, &own));
     let request = reinvite(&seat);
@@ -221,6 +223,7 @@ async fn a_multipart_body_takes_the_sdp_part_or_is_refused_unsent() {
     let broken = AnswerExtras {
         body: Some(("multipart/mixed".to_string(), b"--own--\r\n".to_vec())),
         headers: Vec::new(),
+        supported: Vec::new(),
     };
     let refused = tokio::task::block_in_place(|| {
         reoffer_leg_with(
