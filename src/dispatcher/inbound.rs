@@ -9,6 +9,8 @@ use super::*;
 /// Handle a single inbound SIP message (request or response).
 #[cfg(test)]
 pub(super) fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
+    // What the dispatch loop does before it hands the message to a worker.
+    let _inflight_invite = register_inbound(&inbound, state);
     handle_inbound_after_queue(inbound, std::time::Duration::ZERO, state);
 }
 
@@ -21,6 +23,8 @@ pub(super) fn handle_inbound_after_queue(
     queue_wait: std::time::Duration,
     state: &Arc<DispatcherState>,
 ) {
+    #[cfg(test)]
+    super::inflight_invite::pause::checkpoint_raw("start", &inbound.data);
     // Defensive drop of payloads that cannot be a SIP message at all — stray
     // CRLF (RFC 3261 §7.5), a vendor's all-NUL UDP NAT keepalive, or a datagram
     // too short to hold a start line.  Stream transports (TCP/TLS/WSS/pool)

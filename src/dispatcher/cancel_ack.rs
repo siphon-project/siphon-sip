@@ -585,6 +585,13 @@ pub(super) fn handle_cancel(
         return;
     }
 
+    // The INVITE is registered and has no call yet: its server transaction
+    // exists (RFC 3261 §9.2) though siphon has nothing to match the CANCEL to.
+    // Held, and run once the call exists.
+    let Some((inbound, message)) = hold_cancel(inbound, message, state) else {
+        return;
+    };
+
     // No matching session or B2BUA call
     debug!(uac_branch = %uac_branch, "CANCEL for unknown transaction");
     let response = build_response(

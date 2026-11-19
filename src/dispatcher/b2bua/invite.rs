@@ -692,8 +692,9 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
 
     // From here until the handler returns, a CANCEL defers `@b2bua.on_cancel`
     // to this path instead of running it beside the handler.
-    let cancelled_during_handler = state.call_actors.begin_invite_handler(&call_id);
-
+    let Some(cancelled_during_handler) = begin_invite_window(&message_arc, &call_id, state) else {
+        return;
+    };
     let mut outcome = Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
             Ok(obj) => obj,
@@ -743,8 +744,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     let call_exists = state
         .call_actors
         .finish_invite_handler(&call_id, Arc::clone(&message_arc));
-    let cancelled =
-        cancelled_during_handler.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
+    let cancelled = cancelled_during_handler.load(std::sync::atomic::Ordering::SeqCst);
     if cancelled {
         info!(
             call_id = %call_id,

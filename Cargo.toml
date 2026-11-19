@@ -272,6 +272,10 @@ name = "flow_over_mtu"      # RFC 3261 §18.1.1 over a UE's SA flow: the per-req
 harness = false
 
 [[bench]]
+name = "inflight_invite"    # dispatch loop: classify every message, register an initial INVITE so its CANCEL finds it
+harness = false
+
+[[bench]]
 name = "dispatch_await"     # an async handler call through the script handle: 0/1/4 awaits, direct dispatch off vs on
 harness = false
 

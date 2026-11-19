@@ -157,6 +157,7 @@ pub(super) fn test_dispatcher_with_uac_mtu(
         pending_reinvite_acks: Arc::new(DashMap::new()),
         cancelled_invites: Arc::new(DashMap::new()),
         scripted_invites: Arc::new(DashMap::new()),
+        inflight_invites: Arc::new(InflightInviteStore::default()),
         completed_invites: crate::dispatcher::completed_invite::CompletedInvites::default(),
         originate_groups: Arc::new(crate::dispatcher::b2bua::OriginateGroupStore::new()),
         dial_bridges: Arc::new(crate::dispatcher::b2bua::DialBridgeStore::new()),

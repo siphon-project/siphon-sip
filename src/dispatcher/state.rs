@@ -321,6 +321,10 @@ pub struct DispatcherState {
     /// entry gone, forwards nothing (RFC 3261 §9.2, §16.10). Present from just
     /// before the handlers run until they have finished.
     pub scripted_invites: Arc<DashMap<TransactionKey, ScriptedInvite>>,
+    /// INVITEs between their arrival and their call, and the CANCELs that
+    /// overtook them on another worker. See
+    /// [`InflightInvites`](crate::b2bua::inflight::InflightInvites).
+    pub inflight_invites: Arc<super::inflight_invite::InflightInviteStore>,
     /// Final non-2xx responses the B2BUA sent for an INVITE, kept for Timer H
     /// so a retransmitted INVITE is answered with it again and not taken for a
     /// new call (RFC 3261 §17.2.1). See [`CompletedInvites`].
