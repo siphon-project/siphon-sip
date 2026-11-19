@@ -33,6 +33,7 @@ fn subscribe() -> String {
 
 #[test]
 fn the_initial_notify_leaves_after_the_200_that_accepted_the_subscription() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     // The script is the harness's: its SUBSCRIBE handler accepts the
     // subscription and awaits the initial NOTIFY.
     let (_turn, harness) = subscribe_harness();

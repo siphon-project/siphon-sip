@@ -185,6 +185,7 @@ async fn on_early_media_alone_still_skips_a_provisional_without_sdp() {
 /// An awaiting handler is driven to completion before the response is relayed.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_async_on_provisional_is_awaited() {
+    let _serial = crate::script::async_pool::pool_test_guard();
     let script = concat!(
         "import asyncio\n",
         "from siphon import b2bua\n",
