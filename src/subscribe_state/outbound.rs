@@ -481,6 +481,14 @@ impl SubscribeStore {
         self.outbound.len()
     }
 
+    /// Whether an outbound subscription is tracked under `call_id`. A test
+    /// asks about its own dialog: the store-wide count moves whenever another
+    /// test's subscription is swept.
+    #[cfg(test)]
+    pub fn is_tracked_outbound(&self, call_id: &str) -> bool {
+        self.outbound.contains_key(call_id)
+    }
+
     /// Place an inbound NOTIFY against the outbound subscriptions.
     ///
     /// It corresponds to one of our SUBSCRIBEs when it has that Call-ID, a To

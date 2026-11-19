@@ -366,14 +366,26 @@ fn a_contact_two_aors_share_is_found_under_both_and_owned_by_neither() {
 /// over Contacts the AoRs share, leave an index a rebuild would agree with.
 #[test]
 fn concurrent_mutation_leaves_the_index_in_step() {
-    let registrar = Arc::new(Registrar::default());
+    const DEVICES: u32 = 7;
+    const ADDRESSES: u32 = 5;
+    // An AoR can hold every device at every address at once, depending on how
+    // the threads interleave: a limit below that rejects a REGISTER at random,
+    // and the per-AoR limit is not what this test is about.
+    let registrar = Arc::new(Registrar::new(RegistrarConfig {
+        max_contacts: (DEVICES * ADDRESSES) as usize,
+        ..RegistrarConfig::default()
+    }));
     let threads: Vec<_> = (0..8)
         .map(|thread| {
             let registrar = Arc::clone(&registrar);
             std::thread::spawn(move || {
                 for round in 0..200u32 {
                     let aor = format!("sip:user{}@example.invalid", (thread + round) % 16);
-                    let contact = format!("sip:device{}@192.0.2.{}", round % 7, 1 + round % 5);
+                    let contact = format!(
+                        "sip:device{}@192.0.2.{}",
+                        round % DEVICES,
+                        1 + round % ADDRESSES
+                    );
                     match round % 5 {
                         0 | 1 => register(&registrar, &aor, &contact, 3600, None, None),
                         2 => register(&registrar, &aor, &contact, 0, None, None),

@@ -1000,3 +1000,43 @@ mod tests {
 #[cfg(test)]
 #[path = "reload_tests.rs"]
 mod reload_tests;
+
+/// A loopback URL that refuses every connection for as long as the process
+/// runs, for a poller that must never reach a feed.
+///
+/// Binding a listener and dropping it only borrows a port: under a parallel
+/// test run another process can bind it before the poller dials, and the
+/// "unreachable" feed becomes a live connection (an extra pooled connection
+/// task, a fetch that succeeds or hangs). A socket bound but never listening
+/// keeps the port taken and answers every connect with a reset.
+#[cfg(test)]
+pub(crate) fn refusing_url() -> String {
+    let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+    socket
+        .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("a loopback port");
+    let address = socket.local_addr().expect("its address");
+    // Held to the end of the process, so the port is never free again.
+    Box::leak(Box::new(socket));
+    format!("http://{address}")
+}
+
+#[cfg(test)]
+mod refusing_url_tests {
+    use super::refusing_url;
+
+    #[test]
+    fn nothing_else_can_bind_the_port_and_a_connect_is_refused() {
+        let url = refusing_url();
+        let address: std::net::SocketAddr = url
+            .trim_start_matches("http://")
+            .parse()
+            .expect("an address");
+        assert!(
+            std::net::TcpListener::bind(address).is_err(),
+            "another listener took the reserved port"
+        );
+        let error = std::net::TcpStream::connect(address).expect_err("refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+    }
+}

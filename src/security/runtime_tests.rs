@@ -383,11 +383,7 @@ fn measure_security_reload_cycles() {
         ));
         // An APIBAN poller pointed at a closed port: every reload changes its
         // parameters and wakes it, and it must stay the one task.
-        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a port");
-        let closed_url = format!("http://{}", closed.local_addr().expect("its address"));
-        drop(closed);
+        let closed_url = crate::apiban::refusing_url();
         let apiban = crate::apiban::ApiBanClient::new(
             &crate::config::ApiBanConfig {
                 api_key: "leak-key-one".to_owned(),
