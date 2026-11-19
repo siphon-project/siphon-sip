@@ -102,7 +102,33 @@ pub(crate) fn interpreter_build() -> &'static str {
 /// collects it until `stop` is set. On a free-threaded build every collection
 /// waits for each attached thread to reach a safe point, which is exactly what
 /// a thread blocked while attached never does.
+///
+/// On a GIL build it sleeps between collections. A thread that detaches and
+/// attaches again at once keeps the interpreter from every other thread (each
+/// waiter needs a scheduler wake-up and a switch interval to get a turn), and
+/// on a loaded machine the scenario's own thread, importing `asyncio` and
+/// calling in, took 20 s to start. Its peers' waits for it then ran out and a
+/// round's NOTIFY went unanswered. A collection every few milliseconds is
+/// still hundreds of stop-the-worlds a second, and a thread blocked while
+/// attached wedges the first of them whatever the gap. A free-threaded build
+/// has no such handoff, and there back-to-back collections are the strongest
+/// pressure on a thread that is attached and briefly blocked, so they stay
+/// back to back.
 pub(crate) fn collect_garbage_until(stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+    collect(stop, true)
+}
+
+/// [`collect_garbage_until`] that never leaves a gap, on either build: for a
+/// scenario that holds the interpreter on purpose and needs the collector
+/// stuck behind it, which a gap on a GIL build would let through.
+pub(crate) fn collect_garbage_back_to_back_until(
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    collect(stop, false)
+}
+
+fn collect(stop: Arc<AtomicBool>, gaps_on_gil: bool) -> std::thread::JoinHandle<()> {
+    let gap = gaps_on_gil && interpreter_build() == "GIL";
     std::thread::spawn(move || {
         let source = std::ffi::CString::new(
             "import gc\nfor _ in range(200):\n    a = []\n    a.append(a)\ngc.collect()\n",
@@ -112,6 +138,9 @@ pub(crate) fn collect_garbage_until(stop: Arc<AtomicBool>) -> std::thread::JoinH
             pyo3::Python::attach(|python| {
                 let _ = python.run(source.as_c_str(), None, None);
             });
+            if gap {
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
     })
 }

@@ -209,7 +209,15 @@ fn scenario() {
             }
         });
     }
-    // Garbage collections back to back: each one stops the world.
+    // Garbage collections back to back: each one stops the world. On a GIL
+    // build a collector that detaches and attaches again at once keeps the
+    // interpreter from every handler thread (each needs a scheduler wake-up
+    // and a switch interval for a turn), and the 40 REGISTERs, all of which
+    // arrive, took 15 to 30 s on an idle machine, so on that build it leaves
+    // a few ms between collections, as `collect_garbage_until` does. A
+    // free-threaded build has no handoff to starve, so there they stay back
+    // to back.
+    let gil_build = crate::script::stop_the_world_tests::interpreter_build() == "GIL";
     let collector = {
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
@@ -219,6 +227,9 @@ fn scenario() {
                         .import("gc")
                         .and_then(|gc| gc.call_method0("collect"));
                 });
+                if gil_build {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
         })
     };
