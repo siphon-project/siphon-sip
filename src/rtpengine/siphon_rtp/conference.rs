@@ -35,8 +35,8 @@ impl SiphonRtpClient {
     ///
     /// siphon-rtp refuses a `scope` on a `conference_*` verb rather than
     /// dropping it (a room is named by its own id, so there is nothing to tell
-    /// apart; `docs/control/json.md`, "Call scope"). When this node gains a
-    /// scope for its call frames, this path must stay unscoped.
+    /// apart; `docs/control/json.md`, "Call scope"). The frame encoder leaves
+    /// the node's scope off every verb the protocol says names a room.
     async fn conference_request(&self, command: Command) -> Result<CmdResult, RtpEngineError> {
         self.request(command).await
     }
