@@ -128,6 +128,25 @@ impl LiManager {
             .attempt
     }
 
+    /// Whether `attempt` is still the attempt in progress on a leg of an
+    /// engine call: siphon has not ended that engine call since, and the
+    /// call's record has not been released. Looks, and records nothing.
+    pub fn x3_attempt_in_progress(
+        &self,
+        call_id: &str,
+        scope: Option<&CallScope>,
+        attempt: u64,
+    ) -> bool {
+        self.x3_attachments.get(call_id).is_some_and(|content| {
+            content
+                .legs
+                .iter()
+                .find(|leg| leg.scope.as_ref() == scope)
+                .map_or(0, |leg| leg.attempt)
+                == attempt
+        })
+    }
+
     /// Record an attachment that is about to be asked of the engine, under the
     /// `attempt` it was decided in. `false`, and nothing recorded, when the
     /// same `(leg, warrant, destination)` is already recorded or siphon has
@@ -419,6 +438,24 @@ mod tests {
             "an attach that never took has no end to wait for"
         );
         assert!(!manager.x3_delivery_ended(CALL, None).by_siphon);
+    }
+
+    #[test]
+    fn an_attempt_is_in_progress_until_siphon_ends_its_engine_call() {
+        let (manager, _iri, _audit) = manager();
+        assert!(
+            !manager.x3_attempt_in_progress(CALL, None, 0),
+            "a call with no record has nothing in progress"
+        );
+        assert_eq!(manager.x3_call_count(), 0, "and asking recorded nothing");
+        let attempt = manager.x3_attempt(CALL, None);
+        manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt);
+        assert!(manager.x3_attempt_in_progress(CALL, None, attempt));
+        manager.x3_media_ended_by_siphon(CALL, None);
+        assert!(!manager.x3_attempt_in_progress(CALL, None, attempt));
+        assert!(manager.x3_attempt_in_progress(CALL, None, attempt + 1));
+        manager.forget_x3_call(CALL);
+        assert!(!manager.x3_attempt_in_progress(CALL, None, attempt + 1));
     }
 
     #[test]

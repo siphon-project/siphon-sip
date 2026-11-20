@@ -580,6 +580,140 @@ async fn echo_is_refused_on_an_intercepted_call_and_an_echoing_call_is_a_fault()
     }
 }
 
+// ── An attach the engine says to ask again ──────────────────────────────────
+
+/// An offered, intercepted proxy call on `call_id` whose first attach the
+/// engine refuses `refusals` times as a call that is being re-answered.
+async fn attach_refused_for_now(
+    call_id: &str,
+    refusals: u32,
+) -> (
+    Arc<DispatcherState>,
+    NativeTestEngine,
+    crate::li::LiManager,
+    tokio::sync::mpsc::Receiver<crate::li::AuditEntry>,
+) {
+    let (state, engine, li, _iri, audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    // The engine has said what it lists, so the attach is asked at the offer.
+    backend_of(&state)
+        .learn_x3_feature(
+            crate::rtpengine::siphon_rtp::X3Feature::AttachAtOffer,
+            call_id,
+            None,
+        )
+        .await
+        .expect("the engine answers node_info");
+    engine.refuse_attaches_for_now(refusals);
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, call_id));
+    backend_of(&state)
+        .offer(call_id, "caller-tag", b"v=0\r\n", &NgFlags::default())
+        .await
+        .expect("offered");
+    (state, engine, li, audit)
+}
+
+/// The retries of one attach are over within about a second.
+async fn retries_are_over() {
+    tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
+}
+
+/// The engine refuses an attach while the call is being re-answered and says
+/// to ask again. siphon does, and the third try is taken: one delivery, one
+/// audit record, no failed attempt and no fault.
+#[tokio::test]
+async fn an_attach_refused_for_now_is_asked_again_until_it_is_taken() {
+    const CALL: &str = "attach-retried@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, mut audit) = attach_refused_for_now(CALL, 2).await;
+    retries_are_over().await;
+
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+    assert_eq!(engine.commands("attach_x3").len(), 3, "taken at the third");
+    assert_eq!(li.x3_attachments_for(CALL).len(), 1);
+    assert_eq!(faults_reported(&log), 0, "{}", log.rendered());
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("deleted");
+}
+
+/// An engine that keeps refusing is asked four times within about a second,
+/// and then warranted content is not being delivered: a fault, once.
+#[tokio::test]
+async fn an_attach_refused_every_time_is_a_fault_when_the_retries_run_out() {
+    const CALL: &str = "attach-retries-exhausted@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, mut audit) = attach_refused_for_now(CALL, 100).await;
+    retries_are_over().await;
+
+    assert_eq!(
+        attach_outcomes(&mut audit).await,
+        (1, 1),
+        "one failed attempt"
+    );
+    assert_eq!(
+        engine.commands("attach_x3").len(),
+        4,
+        "the first and three more"
+    );
+    assert!(li.x3_attachments_for(CALL).is_empty());
+    assert_eq!(faults_reported(&log), 1, "{}", log.rendered());
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("deleted");
+}
+
+/// A refusal that says nothing of asking again is a fault at once.
+#[tokio::test]
+async fn an_attach_refused_for_good_is_not_asked_again() {
+    const CALL: &str = "attach-refused-for-good@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let (state, engine, _li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3_at_offer().await).await;
+    backend_of(&state)
+        .answer_local(CALL, "caller-tag", "v=0\r\n", &NgFlags::default())
+        .await
+        .expect("answered by the engine");
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 1));
+    assert_eq!(engine.commands("attach_x3").len(), 1);
+    assert_eq!(faults_reported(&log), 1, "{}", log.rendered());
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("deleted");
+}
+
+/// siphon releases the call's media while the attach is being retried (the
+/// caller gave up): the retry stops, nothing more is asked of an engine call
+/// that is gone, and nothing is a fault.
+#[tokio::test]
+async fn an_attach_being_retried_is_given_up_when_siphon_ends_the_call() {
+    const CALL: &str = "attach-retry-abandoned@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, mut audit) = attach_refused_for_now(CALL, 100).await;
+    // The first try is refused; the call is released before the second.
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    assert_eq!(engine.commands("attach_x3").len(), 1);
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("deleted");
+    retries_are_over().await;
+
+    assert_eq!(
+        attach_outcomes(&mut audit).await,
+        (0, 0),
+        "no failed attempt"
+    );
+    assert_eq!(engine.commands("attach_x3").len(), 1, "not asked again");
+    assert_eq!(li.x3_attachment_count(), 0, "nothing left on record");
+    assert_eq!(faults_reported(&log), 0, "{}", log.rendered());
+}
+
 /// The local tag siphon holds on the caller's dialog of `internal_id`.
 fn siphon_tag(state: &Arc<DispatcherState>, internal_id: &str) -> String {
     state

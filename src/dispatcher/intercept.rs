@@ -564,23 +564,48 @@ pub(super) fn attach_x3(
         let seat = site.seat.clone();
         tokio::spawn(async move {
             let delivery_address = delivery.to_string();
-            let attached = match seat.as_ref() {
-                // A room verb: no scope, on the engine that holds the room.
-                Some(seat) => {
-                    backend
-                        .attach_x3_seat(seat, &delivery_address, xid, correlation_id, target_leg)
+            let ask = || async {
+                match seat.as_ref() {
+                    // A room verb: no scope, on the engine that holds the room.
+                    Some(seat) => {
+                        let (delivery, leg) = (&delivery_address, target_leg);
+                        backend
+                            .attach_x3_seat(seat, delivery, xid, correlation_id, leg)
+                            .await
+                    }
+                    None => {
+                        leg.run(backend.attach_x3(
+                            leg.call_id(),
+                            &from_tag,
+                            &delivery_address,
+                            xid,
+                            correlation_id,
+                            target_leg,
+                        ))
                         .await
+                    }
                 }
-                None => {
-                    leg.run(backend.attach_x3(
-                        leg.call_id(),
-                        &from_tag,
-                        &delivery_address,
-                        xid,
-                        correlation_id,
-                        target_leg,
-                    ))
-                    .await
+            };
+            // The engine refuses an attach while the call is changing shape
+            // under it (a re-answer, a pipeline being rebuilt) and says to ask
+            // again. That passes in a moment, so it is asked again a few times
+            // before it is a fault. Nothing is held across the wait, and the
+            // attempt is given up once siphon has ended its engine call.
+            let mut delays = X3_ATTACH_RETRY_DELAYS.into_iter();
+            let attached = loop {
+                let attached = ask().await;
+                let retryable = matches!(&attached, Err(error) if error.is_x3_attach_retryable());
+                let Some(delay) = delays.next().filter(|_| retryable) else {
+                    break attached;
+                };
+                tokio::time::sleep(delay).await;
+                if !li.x3_attempt_in_progress(&record, leg.scope(), attempt) {
+                    li.x3_attach_failed(&record, leg.scope(), x_id, d_id, attempt);
+                    debug!(
+                        %x_id, %d_id, %call_id,
+                        "LI: the media was released while an X3 attach was being retried"
+                    );
+                    return;
                 }
             };
             let error = match attached {
@@ -640,6 +665,14 @@ pub(super) fn attach_x3(
         });
     }
 }
+
+/// How long to wait before each further try of an attach the engine refused
+/// for a reason that passes: three more within a second.
+const X3_ATTACH_RETRY_DELAYS: [std::time::Duration; 3] = [
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(300),
+    std::time::Duration::from_millis(600),
+];
 
 /// The From-tag of `message`.
 fn from_tag(message: &SipMessage) -> Option<String> {

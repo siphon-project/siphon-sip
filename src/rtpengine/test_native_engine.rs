@@ -352,6 +352,10 @@ pub(crate) const NATIVE_ENGINE_CLOSING_ROOM: &str = "closing-";
 pub(crate) const NATIVE_ENGINE_ECHO_REFUSED: &str = "echo: a lawful-interception delivery is \
     attached to this call and echo bypasses its tap; detach_x3 first";
 
+/// The engine's refusal of an `attach_x3` on a call that is being re-answered.
+pub(crate) const NATIVE_ENGINE_ATTACH_RETRY: &str =
+    "attach_x3: the call is being re-answered; retry the attach once it is";
+
 /// What the engine keeps of its interceptions, to answer as siphon-rtp 0.25.2
 /// does: the seats that joined a room, the calls and seats with an
 /// interception attached, and the calls in echo mode.
@@ -360,6 +364,8 @@ struct X3Model {
     /// Whether `node_info` lists `x3_conference_seat` and `x3_single_leg`.
     conference_seat: bool,
     single_leg: bool,
+    /// How many more `attach_x3` to refuse with a reason that says to retry.
+    retry_refusals: Mutex<u32>,
     seats: Mutex<HashSet<(String, String)>>,
     intercepted: Mutex<HashSet<(Option<String>, String)>>,
     echoing: Mutex<HashSet<(Option<String>, String)>>,
@@ -404,7 +410,17 @@ impl X3Model {
             set.lock()
                 .is_ok_and(|set| set.contains(&(scope.clone(), call_id.clone())))
         };
+        let refused_for_now = || {
+            self.retry_refusals.lock().is_ok_and(|mut left| {
+                let refuse = *left > 0;
+                *left = left.saturating_sub(1);
+                refuse
+            })
+        };
         match command {
+            Command::AttachX3 { .. } if refused_for_now() => {
+                Some(NATIVE_ENGINE_ATTACH_RETRY.to_string())
+            }
             Command::AttachX3 { call_id, .. } if holds(&self.echoing, call_id) => {
                 Some("attach_x3: the call is in echo mode, which bypasses the tap".to_string())
             }
@@ -640,6 +656,7 @@ pub(crate) struct NativeTestEngine {
     address: SocketAddr,
     commands: Arc<Mutex<Vec<NativeCommand>>>,
     live: LiveCalls,
+    x3: Arc<X3Model>,
     /// Open (the default) lets `answer_local` answer; closed holds every answer
     /// until it opens, so a test can act while a set-up is provably pending.
     answers: tokio::sync::watch::Sender<bool>,
@@ -696,6 +713,7 @@ impl NativeTestEngine {
         // The calls `answer_local` created: the engine is their far side.
         let local: LiveCalls = Arc::new(Mutex::new(HashSet::new()));
         let x3 = Arc::new(X3Model::listing(&features));
+        let x3_model = Arc::clone(&x3);
         let (answers, answers_open) = tokio::sync::watch::channel(true);
         let next_play_id = Arc::new(std::sync::atomic::AtomicU64::new(
             NATIVE_ENGINE_FIRST_PLAY_ID,
@@ -707,7 +725,7 @@ impl NativeTestEngine {
                 let held = Arc::clone(&held);
                 let grown = Arc::clone(&grown);
                 let local = Arc::clone(&local);
-                let x3 = Arc::clone(&x3);
+                let x3 = Arc::clone(&x3_model);
                 let next_play_id = Arc::clone(&next_play_id);
                 let mut answers_open = answers_open.clone();
                 tokio::spawn(async move {
@@ -979,7 +997,16 @@ impl NativeTestEngine {
             address,
             commands,
             live,
+            x3,
             answers,
+        }
+    }
+
+    /// Refuse the next `count` `attach_x3` as a call being re-answered is:
+    /// with a reason that says to ask again.
+    pub(crate) fn refuse_attaches_for_now(&self, count: u32) {
+        if let Ok(mut left) = self.x3.retry_refusals.lock() {
+            *left = count;
         }
     }
 
