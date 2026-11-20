@@ -1060,7 +1060,10 @@ async fn on_x3_loss(
     if let Some(li) = state.li_manager.as_ref() {
         // A joined conference seat's delivery is recorded under the seat.
         let record = li.x3_record_of_event(&loss.call_id, &loss.from_tag);
-        for attachment in li.x3_attachments_for_leg(&record, scope.as_ref()) {
+        // The one delivery the engine names, or, from an engine that holds
+        // one per call and names none, the leg's.
+        let losing = li.x3_attachments_losing(&record, scope.as_ref(), loss.delivery.as_ref());
+        for attachment in losing {
             let li = li.clone();
             let detail = format!(
                 "X3 delivery loss on task {}{}: {} packet(s) dropped, {} \

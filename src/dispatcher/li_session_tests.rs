@@ -479,6 +479,7 @@ async fn the_far_end_hanging_up_stops_content_capture() {
         crate::li::ActiveIntercept {
             x_id: li.tasks().list()[0].details.x_id,
             d_id: li.tasks().list()[0].details.list_of_dids[0],
+            delivery: "192.0.2.50:42069".to_string(),
             from_tag: "caller-tag".to_string(),
             correlation_id: correlation_from_call_id(&internal_id),
             session_id: Arc::from(internal_id.as_str()),
@@ -732,6 +733,7 @@ async fn one_legs_x3_end_leaves_the_other_legs_record() {
             crate::li::ActiveIntercept {
                 x_id: task.x_id,
                 d_id: task.list_of_dids[0],
+                delivery: "192.0.2.50:42069".to_string(),
                 from_tag: "caller-tag".to_string(),
                 correlation_id: 7,
                 session_id: Arc::from(PROXY_CALL_ID),
@@ -749,6 +751,7 @@ async fn one_legs_x3_end_leaves_the_other_legs_record() {
             orderly: true,
             delivered: 10,
             dropped: 0,
+            delivery: None,
         })
     };
     events
@@ -1087,6 +1090,7 @@ fn delivery_ended(reason: &str, delivered: u64) -> crate::rtpengine::events::Rtp
         orderly: reason == "Detached",
         delivered,
         dropped: 0,
+        delivery: None,
     })
 }
 
@@ -1626,7 +1630,11 @@ async fn a_leg_on_an_engine_without_the_feature_is_attached_at_the_ack() {
 /// the first warrant's is left alone.
 #[tokio::test]
 async fn a_warrant_activated_after_the_offer_is_attached_at_the_ack() {
-    let (state, engine, li, mut audit) = intercepting_on_an_engine(true).await;
+    // On an engine that carries several deliveries on a call. One that holds
+    // a single delivery cannot take a second warrant's beside the first
+    // (`li_multi_delivery_tests`).
+    let (state, engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3_026().await).await;
     invite_arrives(&state, true);
     script_offers(&state).await;
     assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
@@ -1819,6 +1827,7 @@ fn only_a_detach_or_a_call_siphon_ended_ends_a_delivery_cleanly() {
             orderly,
             delivered,
             dropped,
+            delivery: None,
         };
     let with_the_call = X3_ENDED_WITH_THE_CALL;
 
@@ -1911,6 +1920,7 @@ async fn completed_rerouted_and_failed_calls_drain_every_map_to_baseline() {
                         orderly: reason == "Detached",
                         delivered: 10,
                         dropped: 0,
+                        delivery: None,
                     },
                 )
             };

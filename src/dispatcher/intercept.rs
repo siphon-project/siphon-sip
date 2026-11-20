@@ -150,7 +150,7 @@ pub(super) fn intercept_message(
         // made when that offer reaches the engine ([`watch_engine_calls`]), or
         // at the ACK, below, on an engine that cannot take it that early.
         if event_type == crate::li::IriEventType::End {
-            detach_x3(&session, state);
+            super::x3_delivery::detach_x3(&session, state);
         }
     }
 
@@ -190,11 +190,11 @@ pub(super) fn intercept_message(
     // the engine, and it is in-dialog so it cannot be confused with the
     // INVITE.
     //
-    // Either way each `(leg, warrant, destination)` is asked for once per
-    // engine call: the request is recorded before it is sent, and the ACK asks
-    // only for what has no record ([`attach_x3`]). That matters because a
-    // failed attempt is a compliance signal reported to the ADMF and must not
-    // be routine.
+    // Either way each delivery (a leg, a warrant, a destination and the
+    // session's Correlation ID) is asked for once per engine call: the request
+    // is recorded before it is sent, and the ACK asks only for what has no
+    // record ([`attach_x3`]). That matters because a failed attempt is a
+    // compliance signal reported to the ADMF and must not be routine.
     //
     // Only an ACK on the session's anchoring dialog. The engine knows the
     // call by that dialog's Call-ID and keys the interception on its
@@ -316,7 +316,7 @@ fn when_seats_are_interceptable(
 /// Where a content delivery is attached at the engine, and what it is
 /// recorded under.
 pub(super) struct X3Site {
-    /// The key of its record ([`crate::li::LiManager::register_x3_attachment`]).
+    /// The key of its record ([`crate::li::LiManager::x3_register`]).
     record: String,
     /// The joined conference seat it is on; `None` for an engine call.
     seat: Option<crate::rtpengine::backend::ConferenceSeat>,
@@ -502,13 +502,18 @@ pub(super) fn create_b2bua_call(state: &DispatcherState, a_leg: Leg) -> String {
 /// just anchored, or the conference seat a party of the session joined, which
 /// the engine knows by its room and its tag and holds no call for.
 ///
-/// Each `(leg, warrant, destination)` is recorded before the engine is asked,
-/// and asked only when it had no record: an offer and an ACK, or two ACKs (a
-/// re-INVITE has its own), then ask once between them, and a delivery end
-/// that beats the engine's answer finds its attachment. Attaching twice would
-/// open a second interception on the same leg and deliver every packet to the
-/// agency twice. Nothing is asked for a leg whose engine call siphon has ended
-/// since the caller looked.
+/// Each delivery (a leg, a warrant, a destination, the session's Correlation
+/// ID) is recorded before the engine is asked, and asked only when it had no
+/// record: an offer and an ACK, or two ACKs (a re-INVITE has its own), then
+/// ask once between them, and a delivery end that beats the engine's answer
+/// finds its attachment. Attaching twice would have the engine end the
+/// delivery it holds and start it again. Nothing is asked for a leg whose
+/// engine call siphon has ended since the caller looked.
+///
+/// How many of them one engine call carries is the engine's to say
+/// ([`super::x3_delivery`]): one for each warrant, destination and session
+/// on a siphon-rtp that lists `x3_multi_delivery`, and one in all before
+/// that, where a second is reported to the ADMF and never asked for.
 ///
 /// Every leg of the call is tapped: on a proxy that anchored both legs of one
 /// call under per-call scopes there is no single engine call that carries all
@@ -548,7 +553,6 @@ pub(super) fn attach_x3(
     }
 
     let correlation_id = li.correlation_for(&matched.task, &session.session_id);
-    let xid = x_id.as_bytes();
     // TS 103 221-2 §5.2.6 measures a delivered packet's direction against the
     // target, so which end the warrant names is load-bearing rather than
     // cosmetic: getting it wrong inverts the direction on every packet.
@@ -568,185 +572,25 @@ pub(super) fn attach_x3(
         let Some(delivery) = destination.details.delivery_address.socket_addr() else {
             continue;
         };
-        let d_id = destination.details.d_id;
-        let attempt = *attempt;
-        let registered = li.x3_register(
-            record,
-            crate::li::ActiveIntercept {
+        let ask = super::x3_delivery::X3Ask {
+            record: record.to_string(),
+            seat: site.seat.clone(),
+            call_id: call_id.to_string(),
+            attachment: crate::li::ActiveIntercept {
                 x_id,
-                d_id,
+                d_id: destination.details.d_id,
+                delivery: delivery.to_string(),
                 from_tag: from_tag.to_string(),
                 correlation_id,
                 session_id: Arc::clone(&session.session_id),
                 scope: scope.clone(),
             },
-            attempt,
-        );
-        match registered {
-            crate::li::X3Registration::Recorded => {}
-            crate::li::X3Registration::Known => continue,
-            crate::li::X3Registration::OtherCorrelation { held } => {
-                // An engine that keys its deliveries by Correlation ID as well
-                // takes this attach beside the first: send it from here.
-                second_correlation_undeliverable(li, (x_id, d_id), call_id, held, correlation_id);
-                continue;
-            }
-        }
-        let leg = backend.leg(call_id, scope.as_ref());
-        let backend = Arc::clone(backend);
-        let li = li.clone();
-        let call_id = call_id.to_string();
-        let from_tag = from_tag.to_string();
-        let record = record.to_string();
-        let seat = site.seat.clone();
-        tokio::spawn(async move {
-            let delivery_address = delivery.to_string();
-            let ask = || async {
-                match seat.as_ref() {
-                    // A room verb: no scope, on the engine that holds the room.
-                    Some(seat) => {
-                        let (delivery, leg) = (&delivery_address, target_leg);
-                        backend
-                            .attach_x3_seat(seat, delivery, xid, correlation_id, leg)
-                            .await
-                    }
-                    None => {
-                        leg.run(backend.attach_x3(
-                            leg.call_id(),
-                            &from_tag,
-                            &delivery_address,
-                            xid,
-                            correlation_id,
-                            target_leg,
-                        ))
-                        .await
-                    }
-                }
-            };
-            // The engine refuses an attach while the call is changing shape
-            // under it (a re-answer, a pipeline being rebuilt) and says to ask
-            // again. That passes in a moment, so it is asked again a few times
-            // before it is a fault. Nothing is held across the wait, and the
-            // attempt is given up once siphon has ended its engine call.
-            let mut delays = X3_ATTACH_RETRY_DELAYS.into_iter();
-            let attached = loop {
-                let attached = ask().await;
-                let retryable = matches!(&attached, Err(error) if error.is_x3_attach_retryable());
-                let Some(delay) = delays.next().filter(|_| retryable) else {
-                    break attached;
-                };
-                tokio::time::sleep(delay).await;
-                if !li.x3_attempt_in_progress(&record, leg.scope(), attempt) {
-                    li.x3_attach_failed(&record, leg.scope(), x_id, d_id, attempt);
-                    debug!(
-                        %x_id, %d_id, %call_id,
-                        "LI: the media was released while an X3 attach was being retried"
-                    );
-                    return;
-                }
-            };
-            let error = match attached {
-                Ok(()) => {
-                    info!(
-                        %x_id, %d_id, %call_id, %delivery, correlation_id,
-                        scope = leg.scope().map(crate::rtpengine::CallScope::as_str),
-                        "X3 content delivery attached"
-                    );
-                    li.audit(
-                        crate::li::AuditOperation::MediaCaptureStarted,
-                        Some(&x_id.to_string()),
-                        format!(
-                            "X3 attached call_id={call_id} leg={} destination={delivery}",
-                            leg_name(leg.scope())
-                        ),
-                    );
-                    return;
-                }
-                Err(error) => error,
-            };
-            // The record goes either way: nothing is being delivered on it.
-            let failed = li.x3_attach_failed(&record, leg.scope(), x_id, d_id, attempt);
-            if failed == crate::li::FailedAttach::EndedBySiphon && error.is_call_not_found() {
-                // siphon deleted the engine call while the attach was on its
-                // way (a CANCEL, a rejection): there is no call to intercept
-                // and nothing warranted went undelivered.
-                debug!(
-                    %x_id, %d_id, %call_id, %error,
-                    "LI: the media was released before X3 could attach, no content to deliver"
-                );
-                return;
-            }
-            // Warranted content is not being delivered. The ADMF has to
-            // hear about it — this is the whole point of the
-            // network-element-to-ADMF direction.
-            error!(
-                %x_id, %d_id, %call_id, %error,
-                "could not attach X3 content delivery — warranted content is \
-                 NOT being delivered for this call"
-            );
-            li.audit(
-                crate::li::AuditOperation::MediaCaptureStarted,
-                Some(&x_id.to_string()),
-                format!(
-                    "X3 attach FAILED call_id={call_id} leg={}: {error}",
-                    leg_name(leg.scope())
-                ),
-            );
-            report_destination_fault(
-                &li,
-                d_id,
-                crate::li::x1::types::TaskReportType::TerminatingFault,
-                format!("could not attach X3 delivery for task {x_id}: {error}"),
-            )
-            .await;
-        });
+            attempt: *attempt,
+            target_leg,
+        };
+        super::x3_delivery::ask_for(li, backend, ask, None);
     }
 }
-
-/// Two sessions share one engine call (two calls bridged onto it) and the same
-/// warrant covers both: each is owed the content under its own Correlation
-/// ID, to the same destination. The engine holds one delivery of a warrant
-/// per engine call, and a second attach would replace the first, so the
-/// second session's content cannot be delivered under its Correlation ID.
-/// That is warranted content not being delivered as the warrant's records
-/// say, and the ADMF is told, naming both: the mediation function can then
-/// tie the X2 records of `wanted` to the X3 delivered under `held`.
-fn second_correlation_undeliverable(
-    li: &crate::li::LiManager,
-    (x_id, d_id): (crate::li::x1::types::XId, crate::li::x1::types::DId),
-    call_id: &str,
-    held: u64,
-    wanted: u64,
-) {
-    error!(
-        %x_id, %d_id, %call_id, held, wanted,
-        "X3 content of a second session on one engine call is NOT being delivered under \
-         its own Correlation ID: the engine holds one delivery of a warrant per engine call"
-    );
-    let detail = format!(
-        "X3 for task {x_id} cannot be delivered under correlation {wanted}: its content is on \
-         an engine call shared with the session of correlation {held}, and is delivered \
-         under {held} only"
-    );
-    li.audit(
-        crate::li::AuditOperation::MediaCaptureStarted,
-        Some(&x_id.to_string()),
-        format!("X3 attach FAILED call_id={call_id}: {detail}"),
-    );
-    let li = li.clone();
-    tokio::spawn(async move {
-        let fault = crate::li::x1::types::TaskReportType::TerminatingFault;
-        report_destination_fault(&li, d_id, fault, detail).await;
-    });
-}
-
-/// How long to wait before each further try of an attach the engine refused
-/// for a reason that passes: three more within a second.
-const X3_ATTACH_RETRY_DELAYS: [std::time::Duration; 3] = [
-    std::time::Duration::from_millis(100),
-    std::time::Duration::from_millis(300),
-    std::time::Duration::from_millis(600),
-];
 
 /// The From-tag of `message`.
 fn from_tag(message: &SipMessage) -> Option<String> {
@@ -1058,101 +902,6 @@ pub(super) fn intercepted_legs(
         legs.insert(0, None);
     }
     legs
-}
-
-/// How an audit record names a leg: its per-call scope, or `call` for the
-/// call's own media.
-fn leg_name(scope: Option<&crate::rtpengine::CallScope>) -> &str {
-    scope.map_or("call", crate::rtpengine::CallScope::as_str)
-}
-
-/// Stop content delivery for a session, if any was attached: on its engine
-/// call, each leg on the leg it was attached on, and on each conference seat
-/// a party of it joined.
-///
-/// What is detached stays on record until the engine reports its delivery
-/// ended ([`LiManager::x3_detaching`]): that report says whether content was
-/// dropped on the way out, and a transport failure can beat the detach to it.
-/// Either is a fault, and a fault needs the warrant it is reported against.
-///
-/// Not on an engine call whose leg sits in a conference room: see below.
-pub(super) fn detach_x3(session: &crate::li::SessionView, state: &Arc<DispatcherState>) {
-    let Some(li) = state.li_manager.as_ref() else {
-        return;
-    };
-    let call_id: &str = &session.engine_call_id;
-    // A call whose leg was moved into a conference room
-    // (`b2bua.adopt_replaced`) goes on without the dialog that was merged
-    // away, and a BYE on that dialog, or on any other of the session, is not
-    // the end of the media the engine delivers from the room. Detached there,
-    // the delivery would stop cleanly and silently with the target still in
-    // the room. Its interception ends with the engine call and with nothing
-    // else: siphon's `delete`, whose `call_ended` is then clean, or the
-    // engine's own, which is a fault.
-    let seated = crate::rtpengine::MediaBackend::seated_call_room(call_id).is_some();
-    let on_call = match seated {
-        true => Vec::new(),
-        false => li.x3_detaching(call_id),
-    };
-    let on_seats: Vec<_> = session
-        .seats
-        .iter()
-        .map(|seat| (seat.clone(), li.x3_detaching(&seat.record())))
-        .filter(|(_, attachments)| !attachments.is_empty())
-        .collect();
-    if on_call.is_empty() && on_seats.is_empty() {
-        return;
-    }
-    let Some(backend) = state.rtpengine_set.as_ref() else {
-        return;
-    };
-    let backend = Arc::clone(backend);
-    let li = li.clone();
-    let call_id = call_id.to_string();
-    tokio::spawn(async move {
-        for attachment in on_call {
-            // Each leg's delivery is detached on the leg it was attached on.
-            let leg = backend.leg(&call_id, attachment.scope.as_ref());
-            // Idempotent on the engine, so a duplicate teardown is harmless.
-            let detached = leg.run(backend.detach_x3(leg.call_id(), &attachment.from_tag));
-            if let Err(error) = detached.await {
-                warn!(
-                    x_id = %attachment.x_id, %call_id, %error,
-                    "could not detach X3 content delivery"
-                );
-            }
-            li.audit(
-                crate::li::AuditOperation::MediaCaptureStopped,
-                Some(&attachment.x_id.to_string()),
-                format!(
-                    "X3 detached call_id={call_id} leg={}",
-                    leg_name(attachment.scope.as_ref())
-                ),
-            );
-        }
-        for (seat, attachments) in on_seats {
-            let held = crate::rtpengine::backend::ConferenceSeat {
-                conference_id: seat.conference_id.to_string(),
-                from_tag: seat.tag.to_string(),
-            };
-            for attachment in attachments {
-                if let Err(error) = backend.detach_x3_seat(&held).await {
-                    warn!(
-                        x_id = %attachment.x_id, conference_id = %seat.conference_id, %error,
-                        "could not detach X3 content delivery from a conference seat"
-                    );
-                }
-                li.audit(
-                    crate::li::AuditOperation::MediaCaptureStopped,
-                    Some(&attachment.x_id.to_string()),
-                    format!(
-                        "X3 detached conference_id={} seat={}",
-                        seat.conference_id, seat.tag
-                    ),
-                );
-            }
-        }
-    });
 }
 
 /// Raise a destination-level report toward the ADMF.

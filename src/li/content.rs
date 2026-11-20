@@ -21,10 +21,23 @@
 //! afresh without waiting for the engine to report anything.
 //!
 //! **The engine's report of a delivery ending is matched oldest first.** The
-//! engine ends one delivery per engine call, in the order the calls ended. A
-//! report for a leg with an attempt siphon ended belongs to the oldest of
-//! those, and is the call ending as siphon asked. A report for a leg with none
-//! belongs to the live attempt, which nothing of siphon's ended.
+//! engine ends a call's deliveries in the order the calls ended. A report for
+//! a leg with an attempt siphon ended belongs to the oldest of those, and is
+//! the call ending as siphon asked. A report for a leg with none belongs to
+//! the live attempt, which nothing of siphon's ended.
+//!
+//! **A report that names its delivery is that delivery's, and no other's.** An
+//! engine that carries several deliveries on one call (siphon-rtp 0.26.0, one
+//! per warrant, destination and Correlation ID) names the one on every end
+//! and loss it reports. Such a report takes that one attachment off the
+//! record, from the oldest attempt that holds it, and leaves the leg's other
+//! deliveries where they are. The same warrant, destination and Correlation
+//! ID asked for again is the engine replacing that delivery by itself, and it
+//! reports the one it replaced ended, `detached`. That end is the older
+//! one's: the one siphon detached, when it did, and otherwise nothing on
+//! record, since a detach siphon asks for is recorded before it is sent. The
+//! delivery asked for since stays on record either way. A report from an
+//! engine before that names none and is the whole leg's, as it was.
 //!
 //! A call's entry stays until its lawful-intercept session is released
 //! ([`LiManager::forget_x3_call`]), so that an attach still in flight compares
@@ -34,7 +47,7 @@ use std::collections::VecDeque;
 
 use super::x1::types::{DId, XId};
 use super::{ActiveIntercept, LiManager};
-use crate::rtpengine::events::X3EndedEvent;
+use crate::rtpengine::events::{X3Delivery, X3EndedEvent};
 use crate::rtpengine::CallScope;
 
 /// One leg of an engine call: the call's own media (`None`) or the leg
@@ -48,15 +61,32 @@ struct Leg {
     /// The deliveries siphon ended, is ending or detached, whose end the
     /// engine has not reported yet, oldest first.
     ended: VecDeque<Ended>,
-    /// The `(warrant, destination)` pairs the engine refused for good on the
-    /// attempt in progress. They are not asked for again on this engine call:
-    /// the answer would be the same, and so would the report. A new attempt
-    /// is a new engine call, and starts with none.
-    refused: Vec<(XId, DId)>,
-    /// The `(warrant, destination, Correlation ID)` a second session on the
-    /// engine call asked for and the engine cannot deliver beside the first,
-    /// each reported once.
-    undeliverable: Vec<(XId, DId, u64)>,
+    /// The deliveries the engine refused for good on the attempt in
+    /// progress. They are not asked for again on this engine call: the answer
+    /// would be the same, and so would the report. A new attempt is a new
+    /// engine call, and starts with none.
+    refused: Vec<Asked>,
+    /// The deliveries asked for on an engine call that holds one and cannot
+    /// carry another beside it, each reported once.
+    undeliverable: Vec<Asked>,
+}
+
+/// One delivery as it is asked of the engine: a warrant, a destination and
+/// the Correlation ID of the session it is for.
+type Asked = (XId, DId, u64);
+
+fn asked(attachment: &ActiveIntercept) -> Asked {
+    (attachment.x_id, attachment.d_id, attachment.correlation_id)
+}
+
+/// Whether `attachment` is the delivery an engine event names; any, for an
+/// event that names none.
+fn named_by(attachment: &ActiveIntercept, named: Option<&X3Delivery>) -> bool {
+    named.is_none_or(|named| {
+        attachment.x_id.as_bytes() == named.xid
+            && attachment.correlation_id == named.correlation_id
+            && attachment.delivery == named.address
+    })
 }
 
 /// Whether siphon ended the engine call a delivery was on.
@@ -83,13 +113,14 @@ struct Ended {
     detached: bool,
     engine_call: EngineCallEnd,
     attachments: Vec<ActiveIntercept>,
-    /// The engine's report of this delivery ending, when it arrived while the
-    /// end siphon asked for was still unanswered. Whether that end is clean
-    /// depends on the answer, so the report waits for it. One per attempt.
-    held: Option<X3EndedEvent>,
-    /// The pairs the engine had refused for good on the attempt, put back
-    /// when the end siphon asked for fails and the attempt goes on.
-    refused: Vec<(XId, DId)>,
+    /// The engine's reports of these deliveries ending that arrived while the
+    /// end siphon asked for was still unanswered, each with the attachments it
+    /// is the end of. Whether that end is clean depends on the answer, so the
+    /// reports wait for it. An attachment is in one place or the other.
+    held: Vec<(X3EndedEvent, Vec<ActiveIntercept>)>,
+    /// The deliveries the engine had refused for good on the attempt, put
+    /// back when the end siphon asked for fails and the attempt goes on.
+    refused: Vec<Asked>,
 }
 
 /// How many end reports whose record was released under them are kept for
@@ -122,12 +153,25 @@ pub enum X3Registration {
     /// good on this engine call, or the attempt it was decided in is over.
     Known,
     /// The same warrant and destination is on record on this engine call
-    /// under another session's Correlation ID (`held`): two calls bridged
-    /// onto one engine call, both of the same target. Told once per pair.
+    /// under another session's Correlation ID (`held`), and the engine holds
+    /// one delivery per call: two calls bridged onto one engine call, both
+    /// of the same target. Told once per delivery asked for.
     OtherCorrelation {
         /// The Correlation ID the engine call's delivery carries.
         held: u64,
     },
+    /// Another warrant's delivery, or this warrant's to another destination,
+    /// is on record on this engine call, and the engine holds one delivery
+    /// per call: asking for this one would end that one. Told once per
+    /// delivery asked for.
+    OtherDelivery {
+        /// The warrant and the destination of the delivery that is there.
+        held: (XId, DId),
+    },
+    /// A delivery is on record on this engine call and nothing says yet
+    /// whether the engine carries another beside it. Nothing is recorded:
+    /// ask the engine what it lists, and ask again here.
+    Undecided,
 }
 
 /// The content deliveries of one engine call-id.
@@ -167,35 +211,62 @@ impl CallContent {
     /// delivery's engine call is one siphon has asked the engine to end and
     /// the engine has not answered. With no `report` to keep it is judged as
     /// it stands.
+    ///
+    /// A report that names its delivery is the end of that one attachment,
+    /// taken from the oldest attempt that holds it. One that names none is
+    /// the end of everything the oldest attempt holds.
     fn end_reported(
         &mut self,
         scope: Option<&CallScope>,
         report: Option<&X3EndedEvent>,
     ) -> Option<EndedDelivery> {
+        let named = report.and_then(|report| report.delivery.as_ref());
         let leg = self.leg(scope);
-        let oldest = leg
-            .ended
-            .iter()
-            .position(|ended| !ended.attachments.is_empty() && ended.held.is_none());
+        let oldest = leg.ended.iter().position(|ended| {
+            ended
+                .attachments
+                .iter()
+                .any(|attachment| named_by(attachment, named))
+        });
         let Some(index) = oldest else {
+            // A `detached` end is a detach siphon asked for, and each of
+            // those is on record above before it is sent. One that names a
+            // delivery and finds none there is the engine ending the older
+            // of two deliveries of one name for the newer: an attach of what
+            // a call already carries replaces it. The registration is the
+            // newer one's, which goes on, and is left where it is.
+            if named.is_some() && report.is_some_and(|report| report.orderly) {
+                return Some(EndedDelivery::unknown());
+            }
+            let (ended, others) =
+                std::mem::take(&mut self.attachments)
+                    .into_iter()
+                    .partition(|attachment| {
+                        attachment.scope.as_ref() == scope && named_by(attachment, named)
+                    });
+            self.attachments = others;
             return Some(EndedDelivery {
                 by_siphon: false,
-                attachments: self.take_leg(scope),
+                attachments: ended,
             });
         };
         let ended = &mut leg.ended[index];
+        let (reported, waiting) = std::mem::take(&mut ended.attachments)
+            .into_iter()
+            .partition(|attachment| named_by(attachment, named));
+        ended.attachments = waiting;
         let asked = ended.engine_call == EngineCallEnd::Asked;
         if let (true, Some(report)) = (asked, report) {
-            ended.held = Some(report.clone());
+            ended.held.push((report.clone(), reported));
             return None;
         }
         let delivery = EndedDelivery {
             by_siphon: ended.engine_call != EngineCallEnd::No,
-            attachments: std::mem::take(&mut ended.attachments),
+            attachments: reported,
         };
         // An end still being asked for keeps its place, for the command's
         // outcome to find.
-        if !asked {
+        if !asked && ended.attachments.is_empty() {
             leg.ended.remove(index);
         }
         Some(delivery)
@@ -208,14 +279,13 @@ impl CallContent {
         self.legs
             .into_iter()
             .flat_map(|leg| leg.ended)
-            .filter_map(|ended| {
-                Some(HeldEnd {
-                    ended: ended.held?,
-                    delivery: EndedDelivery {
-                        by_siphon: false,
-                        attachments: ended.attachments,
-                    },
-                })
+            .flat_map(|ended| ended.held)
+            .map(|(ended, attachments)| HeldEnd {
+                ended,
+                delivery: EndedDelivery {
+                    by_siphon: false,
+                    attachments,
+                },
             })
             .collect()
     }
@@ -228,7 +298,35 @@ impl CallContent {
                 .legs
                 .iter()
                 .flat_map(|leg| &leg.ended)
-                .any(|ended| !ended.attachments.is_empty())
+                .any(|ended| !ended.attachments.is_empty() || !ended.held.is_empty())
+    }
+
+    /// The attachments a loss the engine reported on a leg is a loss of: the
+    /// one it names, live or ended and not reported ended yet, else every
+    /// live one of the leg.
+    fn losing(
+        &self,
+        scope: Option<&CallScope>,
+        named: Option<&X3Delivery>,
+    ) -> Vec<ActiveIntercept> {
+        let live = self
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.scope.as_ref() == scope);
+        if named.is_none() {
+            return live.cloned().collect();
+        }
+        let ended = self
+            .legs
+            .iter()
+            .filter(|leg| leg.scope.as_ref() == scope)
+            .flat_map(|leg| &leg.ended)
+            .flat_map(|ended| &ended.attachments);
+        live.chain(ended)
+            .find(|attachment| named_by(attachment, named))
+            .into_iter()
+            .cloned()
+            .collect()
     }
 }
 
@@ -303,62 +401,85 @@ impl LiManager {
 
     /// Record an attachment that is about to be asked of the engine, under the
     /// `attempt` it was decided in. `false`, and nothing recorded, when the
-    /// same `(leg, warrant, destination)` is already recorded or siphon has
-    /// ended that attempt's engine call since.
+    /// same delivery of the leg is already recorded or siphon has ended that
+    /// attempt's engine call since.
+    ///
+    /// Records whatever is a delivery of its own, as an engine that carries
+    /// several on one call takes them. What a given engine can carry is for
+    /// [`Self::x3_register`].
     pub fn register_x3_attachment(
         &self,
         call_id: &str,
         attachment: ActiveIntercept,
         attempt: u64,
     ) -> bool {
-        self.x3_register(call_id, attachment, attempt) == X3Registration::Recorded
+        self.x3_register(call_id, attachment, attempt, Some(true)) == X3Registration::Recorded
     }
 
-    /// [`Self::register_x3_attachment`], saying why nothing was recorded.
+    /// [`Self::register_x3_attachment`], saying why nothing was recorded, on
+    /// an engine that carries several deliveries on one call (`several`) or
+    /// holds one; `None` while the engine has not said which.
     ///
     /// An attachment is one warrant delivering to one destination from one leg
     /// *under one session's Correlation ID*. Two calls of one target bridged
     /// onto one engine call are two sessions with a Correlation ID each, and
-    /// each is owed its content under its own.
+    /// each is owed its content under its own. An engine that carries several
+    /// deliveries takes each as it is asked. One that holds a single delivery
+    /// per call would end the one it has for the next, in silence, so there a
+    /// second is never recorded, and never asked for: the caller is told what
+    /// is in its way, once.
     pub fn x3_register(
         &self,
         call_id: &str,
         attachment: ActiveIntercept,
         attempt: u64,
+        several: Option<bool>,
     ) -> X3Registration {
         let mut content = self.x3_attachments.entry(call_id.to_string()).or_default();
         let scope = attachment.scope.clone();
-        let pair = (attachment.x_id, attachment.d_id);
+        let wanted = asked(&attachment);
         let leg = content.leg(scope.as_ref());
-        if leg.refused.contains(&pair) || leg.attempt != attempt {
+        if leg.refused.contains(&wanted) || leg.attempt != attempt {
             return X3Registration::Known;
         }
-        let other = content
-            .attachments
-            .iter()
-            .find(|known| (known.x_id, known.d_id) == pair && known.scope == scope)
-            .map(|known| known.correlation_id);
-        match other {
-            None => {
+        let on_leg = || {
+            content
+                .attachments
+                .iter()
+                .filter(|known| known.scope == scope)
+        };
+        // The delivery that is there is this one: the session's own, or
+        // another session's under the one Correlation ID the ADMF gave the
+        // task. One delivery serves it.
+        if on_leg().any(|known| asked(known) == wanted) {
+            return X3Registration::Known;
+        }
+        // Any other Correlation ID is content that would go out under one its
+        // X2 records do not carry: another session's, or, were a session ever
+        // to lose its own, the same one's. Never taken for what is there.
+        let in_the_way = on_leg()
+            .find(|known| (known.x_id, known.d_id) == (wanted.0, wanted.1))
+            .map(|known| X3Registration::OtherCorrelation {
+                held: known.correlation_id,
+            })
+            .or_else(|| {
+                on_leg().next().map(|known| X3Registration::OtherDelivery {
+                    held: (known.x_id, known.d_id),
+                })
+            });
+        match (in_the_way, several) {
+            (None, _) | (Some(_), Some(true)) => {
                 content.attachments.push(attachment);
                 X3Registration::Recorded
             }
-            // The delivery that is there carries this Correlation ID: the
-            // session's own, or another session's under the one the ADMF
-            // gave the task. One delivery serves it.
-            Some(held) if held == attachment.correlation_id => X3Registration::Known,
-            // Any other Correlation ID is content that would go out under
-            // one its X2 records do not carry: another session's, or, were a
-            // session ever to lose its own, the same one's. Never taken for
-            // what is already there.
-            Some(held) => {
-                let told = (pair.0, pair.1, attachment.correlation_id);
+            (Some(_), None) => X3Registration::Undecided,
+            (Some(in_the_way), Some(false)) => {
                 let leg = content.leg(scope.as_ref());
-                if leg.undeliverable.contains(&told) {
+                if leg.undeliverable.contains(&wanted) {
                     return X3Registration::Known;
                 }
-                leg.undeliverable.push(told);
-                X3Registration::OtherCorrelation { held }
+                leg.undeliverable.push(wanted);
+                in_the_way
             }
         }
     }
@@ -410,7 +531,7 @@ impl LiManager {
             detached: false,
             engine_call: EngineCallEnd::Asked,
             attachments,
-            held: None,
+            held: Vec::new(),
             refused,
         });
         leg.attempt += 1;
@@ -430,12 +551,12 @@ impl LiManager {
                 continue;
             }
             ended.engine_call = EngineCallEnd::Yes;
-            if let Some(report) = ended.held.take() {
+            for (report, attachments) in ended.held.drain(..) {
                 released.push(HeldEnd {
                     ended: report,
                     delivery: EndedDelivery {
                         by_siphon: true,
-                        attachments: std::mem::take(&mut ended.attachments),
+                        attachments,
                     },
                 });
             }
@@ -474,15 +595,14 @@ impl LiManager {
             if put_aside {
                 reopened = Some((ended.attempt, std::mem::take(&mut ended.refused)));
             }
-            if let Some(report) = ended.held.take() {
+            for (report, attachments) in ended.held.drain(..) {
                 released.push(HeldEnd {
                     ended: report,
                     delivery: EndedDelivery {
                         by_siphon: false,
-                        attachments: std::mem::take(&mut ended.attachments),
+                        attachments,
                     },
                 });
-                return false;
             }
             if put_aside {
                 restored.append(&mut ended.attachments);
@@ -498,16 +618,23 @@ impl LiManager {
         released
     }
 
-    /// siphon is detaching every delivery of a call's attempts in progress
-    /// (`detach_x3`): they stop being live, and stay on record until the
-    /// engine reports each ended. A detach that dropped content, or lost the
-    /// race to a transport failure, is then still reported against its
-    /// warrant. Returns what to detach.
-    pub fn x3_detaching(&self, call_id: &str) -> Vec<ActiveIntercept> {
+    /// siphon is detaching the deliveries of the session `session_id` on a
+    /// call's attempts in progress (`detach_x3`): they stop being live, and
+    /// stay on record until the engine reports each ended. A detach that
+    /// dropped content, or lost the race to a transport failure, is then
+    /// still reported against its warrant. Returns what to detach.
+    ///
+    /// Only that session's. Another session with media on the same engine
+    /// call (two calls bridged onto it) keeps its deliveries, on record and at
+    /// the engine.
+    pub fn x3_detaching(&self, call_id: &str, session_id: &str) -> Vec<ActiveIntercept> {
         let Some(mut content) = self.x3_attachments.get_mut(call_id) else {
             return Vec::new();
         };
-        let detached = std::mem::take(&mut content.attachments);
+        let (detached, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut content.attachments)
+            .into_iter()
+            .partition(|attachment| &*attachment.session_id == session_id);
+        content.attachments = kept;
         let mut scopes: Vec<Option<CallScope>> = Vec::new();
         for attachment in &detached {
             if !scopes.contains(&attachment.scope) {
@@ -526,7 +653,7 @@ impl LiManager {
                 detached: true,
                 engine_call: EngineCallEnd::No,
                 attachments,
-                held: None,
+                held: Vec::new(),
                 refused: Vec::new(),
             });
         }
@@ -535,24 +662,24 @@ impl LiManager {
 
     /// The engine refused or failed an attach asked under `attempt`, for
     /// good: drop its record, and say whether that attempt is still the one
-    /// in progress. If it is, the pair is not asked for again on this engine
-    /// call.
+    /// in progress. If it is, the delivery is not asked for again on this
+    /// engine call.
     ///
-    /// Only the record of that attempt goes. The same warrant and destination
-    /// on another attempt of the leg, ended and waiting for the engine's
-    /// report, is a delivery of its own.
+    /// Only the record of that attempt goes. The same delivery on another
+    /// attempt of the leg, ended and waiting for the engine's report, is a
+    /// delivery of its own.
     pub fn x3_attach_failed(
         &self,
         call_id: &str,
         scope: Option<&CallScope>,
-        x_id: XId,
-        d_id: DId,
+        (x_id, d_id, correlation_id): (XId, DId, u64),
         attempt: u64,
     ) -> FailedAttach {
         let Some(mut content) = self.x3_attachments.get_mut(call_id) else {
             return FailedAttach::Live;
         };
-        let same = |known: &ActiveIntercept| known.x_id == x_id && known.d_id == d_id;
+        let failed = (x_id, d_id, correlation_id);
+        let same = |known: &ActiveIntercept| asked(known) == failed;
         let live = content.leg(scope).attempt == attempt;
         if live {
             content
@@ -567,13 +694,15 @@ impl LiManager {
             }
         }
         leg.ended.retain(|ended| {
-            !ended.attachments.is_empty() || ended.engine_call == EngineCallEnd::Asked
+            !ended.attachments.is_empty()
+                || !ended.held.is_empty()
+                || ended.engine_call == EngineCallEnd::Asked
         });
         if !live {
             return FailedAttach::EndedBySiphon;
         }
-        if !leg.refused.contains(&(x_id, d_id)) {
-            leg.refused.push((x_id, d_id));
+        if !leg.refused.contains(&failed) {
+            leg.refused.push(failed);
         }
         FailedAttach::Live
     }
@@ -630,6 +759,22 @@ impl LiManager {
             true => seat.into(),
             false => call_id.into(),
         }
+    }
+
+    /// The attachments a loss the engine reported on a leg of a call is a
+    /// loss of: the one delivery it names, else, for a report that names
+    /// none (an engine that holds one delivery per call), every live one of
+    /// the leg.
+    pub fn x3_attachments_losing(
+        &self,
+        call_id: &str,
+        scope: Option<&CallScope>,
+        named: Option<&X3Delivery>,
+    ) -> Vec<ActiveIntercept> {
+        self.x3_attachments
+            .get(call_id)
+            .map(|content| content.losing(scope, named))
+            .unwrap_or_default()
     }
 
     /// Every interception of a call's attempts in progress, asked for or live.
@@ -762,16 +907,31 @@ impl LiManager {
     }
 
     /// The Correlation ID the content of the warrant `x_id` is going out
-    /// under on the engine call `call_id`, if a delivery of it is on record
-    /// there.
-    pub(super) fn x3_correlation_in_use(&self, call_id: &str, x_id: XId) -> Option<u64> {
-        self.x3_attachments.get(call_id).and_then(|content| {
-            content
-                .attachments
-                .iter()
-                .find(|known| known.x_id == x_id)
-                .map(|known| known.correlation_id)
-        })
+    /// under on the engine call `call_id` for the session `session_id`, if a
+    /// delivery of it is on record there. Without one of that session's, the
+    /// one Correlation ID the warrant's content goes out under there; none
+    /// when two sessions' do, since nothing says which is this one's.
+    pub(super) fn x3_correlation_in_use(
+        &self,
+        call_id: &str,
+        x_id: XId,
+        session_id: &str,
+    ) -> Option<u64> {
+        let content = self.x3_attachments.get(call_id)?;
+        let mut of_warrant = content
+            .attachments
+            .iter()
+            .filter(|known| known.x_id == x_id);
+        if let Some(own) = of_warrant
+            .clone()
+            .find(|known| &*known.session_id == session_id)
+        {
+            return Some(own.correlation_id);
+        }
+        let first = of_warrant.next()?.correlation_id;
+        of_warrant
+            .all(|known| known.correlation_id == first)
+            .then_some(first)
     }
 
     /// Release every record no delivery hangs on: when the sessions they
@@ -829,13 +989,20 @@ mod tests {
             orderly: reason == "Detached",
             delivered: 10,
             dropped: 0,
+            delivery: None,
         }
+    }
+
+    /// The address a test destination is dialled at: one per destination.
+    fn delivery_of(d_id: DId) -> String {
+        format!("mdf-{d_id}.example.net:8090")
     }
 
     fn attachment(d_id: DId, scope: Option<&str>) -> ActiveIntercept {
         ActiveIntercept {
             x_id: x_id(),
             d_id,
+            delivery: delivery_of(d_id),
             from_tag: "caller-tag".to_string(),
             correlation_id: 9,
             session_id: std::sync::Arc::from("session-1"),
@@ -906,7 +1073,7 @@ mod tests {
         let attempt = manager.x3_attempt(CALL, None);
         assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), attempt));
         assert_eq!(
-            manager.x3_attach_failed(CALL, None, x_id, d_id, attempt),
+            manager.x3_attach_failed(CALL, None, (x_id, d_id, 9), attempt),
             FailedAttach::Live
         );
         assert!(
@@ -922,7 +1089,7 @@ mod tests {
         assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), attempt));
         manager.x3_media_ended_by_siphon(CALL, None);
         assert_eq!(
-            manager.x3_attach_failed(CALL, None, x_id, d_id, attempt),
+            manager.x3_attach_failed(CALL, None, (x_id, d_id, 9), attempt),
             FailedAttach::EndedBySiphon
         );
         assert_eq!(
@@ -1036,7 +1203,7 @@ mod tests {
         manager.x3_media_ended_by_siphon(CALL, None);
 
         assert_eq!(
-            manager.x3_attach_failed(CALL, None, x_id, d_id, second),
+            manager.x3_attach_failed(CALL, None, (x_id, d_id, 9), second),
             FailedAttach::EndedBySiphon
         );
         let ended = manager.x3_delivery_ended(CALL, None);
@@ -1061,7 +1228,7 @@ mod tests {
         let (x_id, d_id) = (x_id(), DId::generate());
         let attempt = manager.x3_attempt(CALL, None);
         assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), attempt));
-        manager.x3_attach_failed(CALL, None, x_id, d_id, attempt);
+        manager.x3_attach_failed(CALL, None, (x_id, d_id, 9), attempt);
         assert!(!manager.register_x3_attachment(CALL, attachment(d_id, None), attempt));
         assert!(
             manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt),
@@ -1089,7 +1256,7 @@ mod tests {
         let (manager, _iri, _audit) = manager();
         let attempt = manager.x3_attempt(CALL, None);
         manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt);
-        assert_eq!(manager.x3_detaching(CALL).len(), 1);
+        assert_eq!(manager.x3_detaching(CALL, "session-1").len(), 1);
         assert!(
             manager.x3_attachments_for(CALL).is_empty(),
             "no longer live"
@@ -1106,7 +1273,7 @@ mod tests {
 
         // Detached and then deleted: the engine may report either first.
         manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt);
-        manager.x3_detaching(CALL);
+        manager.x3_detaching(CALL, "session-1");
         manager.x3_media_ending(CALL, None);
         let ended = manager.x3_delivery_ended(CALL, None);
         assert!(ended.by_siphon, "the call's end is siphon's");
@@ -1189,7 +1356,7 @@ mod tests {
         let (x_id, d_id) = (x_id(), DId::generate());
         let attempt = manager.x3_attempt(CALL, None);
         manager.register_x3_attachment(CALL, attachment(d_id, None), attempt);
-        manager.x3_attach_failed(CALL, None, x_id, d_id, attempt);
+        manager.x3_attach_failed(CALL, None, (x_id, d_id, 9), attempt);
 
         manager.x3_media_ending(CALL, None);
         manager.x3_media_end_failed(CALL, None);
@@ -1223,29 +1390,32 @@ mod tests {
             ..attachment(d_id, None)
         };
         assert_eq!(
-            manager.x3_register(CALL, attachment(d_id, None), attempt),
+            manager.x3_register(CALL, attachment(d_id, None), attempt, Some(false)),
             X3Registration::Recorded
         );
         assert_eq!(
-            manager.x3_register(CALL, attachment(d_id, None), attempt),
+            manager.x3_register(CALL, attachment(d_id, None), attempt, Some(false)),
             X3Registration::Known
         );
         assert_eq!(
-            manager.x3_register(CALL, drifted, attempt),
+            manager.x3_register(CALL, drifted, attempt, Some(false)),
             X3Registration::OtherCorrelation { held: 9 }
         );
         assert_eq!(manager.x3_attachments_for(CALL)[0].correlation_id, 9);
-        assert_eq!(manager.x3_correlation_in_use(CALL, x_id()), Some(9));
         assert_eq!(
-            manager.x3_correlation_in_use("another@example.com", x_id()),
+            manager.x3_correlation_in_use(CALL, x_id(), "session-1"),
+            Some(9)
+        );
+        assert_eq!(
+            manager.x3_correlation_in_use("another@example.com", x_id(), "session-1"),
             None
         );
         assert_eq!(
-            manager.x3_register(CALL, other.clone(), attempt),
+            manager.x3_register(CALL, other.clone(), attempt, Some(false)),
             X3Registration::OtherCorrelation { held: 9 }
         );
         assert_eq!(
-            manager.x3_register(CALL, other.clone(), attempt),
+            manager.x3_register(CALL, other.clone(), attempt, Some(false)),
             X3Registration::Known,
             "reported once"
         );
@@ -1253,7 +1423,7 @@ mod tests {
         manager.x3_media_ended_by_siphon(CALL, None);
         let next = manager.x3_attempt(CALL, None);
         assert_eq!(
-            manager.x3_register(CALL, other, next),
+            manager.x3_register(CALL, other, next, Some(false)),
             X3Registration::Recorded
         );
     }
@@ -1359,5 +1529,371 @@ mod tests {
             MAX_UNANSWERED_X3_ENDS - 64,
             "and the rest, still there for the next"
         );
+    }
+
+    /// What an engine that names its deliveries says of `attachment`.
+    fn naming(attachment: &ActiveIntercept) -> X3Delivery {
+        X3Delivery {
+            xid: attachment.x_id.as_bytes(),
+            address: attachment.delivery.clone(),
+            correlation_id: attachment.correlation_id,
+        }
+    }
+
+    fn named_report(reason: &str, attachment: &ActiveIntercept) -> X3EndedEvent {
+        X3EndedEvent {
+            delivery: Some(naming(attachment)),
+            ..ended_report(reason)
+        }
+    }
+
+    /// The same warrant and destination for a second session, under its own
+    /// Correlation ID.
+    fn of_second_session(d_id: DId) -> ActiveIntercept {
+        ActiveIntercept {
+            correlation_id: 10,
+            session_id: std::sync::Arc::from("session-2"),
+            ..attachment(d_id, None)
+        }
+    }
+
+    /// On an engine that carries several deliveries on a call, another
+    /// destination and another session's Correlation ID are each a delivery
+    /// of their own. On one that holds a single delivery each is told to be
+    /// in the way of what is there, once, and nothing is recorded; and while
+    /// the engine has not said which it is, nothing is decided.
+    #[test]
+    fn what_a_call_can_carry_decides_a_second_delivery() {
+        let (manager, _iri, _audit) = manager();
+        let (first, second) = (DId::generate(), DId::generate());
+        let attempt = manager.x3_attempt(CALL, None);
+        let register = |attachment: ActiveIntercept, several| {
+            manager.x3_register(CALL, attachment, attempt, several)
+        };
+        assert_eq!(
+            register(attachment(first, None), None),
+            X3Registration::Recorded,
+            "the first delivery of a call needs no answer from the engine"
+        );
+        assert_eq!(
+            register(attachment(first, None), None),
+            X3Registration::Known
+        );
+
+        assert_eq!(
+            register(attachment(second, None), None),
+            X3Registration::Undecided
+        );
+        assert_eq!(
+            register(of_second_session(first), None),
+            X3Registration::Undecided
+        );
+        assert_eq!(
+            manager.x3_attachments_for(CALL).len(),
+            1,
+            "nothing recorded"
+        );
+
+        // An engine that holds one delivery per call.
+        assert_eq!(
+            register(attachment(second, None), Some(false)),
+            X3Registration::OtherDelivery {
+                held: (x_id(), first)
+            }
+        );
+        assert_eq!(
+            register(attachment(second, None), Some(false)),
+            X3Registration::Known,
+            "told once"
+        );
+        assert_eq!(
+            register(of_second_session(first), Some(false)),
+            X3Registration::OtherCorrelation { held: 9 }
+        );
+        assert_eq!(manager.x3_attachments_for(CALL).len(), 1);
+        let scoped = attachment(second, Some("orig"));
+        let scoped_attempt = manager.x3_attempt(CALL, scoped.scope.as_ref());
+        assert_eq!(
+            manager.x3_register(CALL, scoped, scoped_attempt, Some(false)),
+            X3Registration::Recorded,
+            "another leg is another engine call"
+        );
+
+        // An engine that carries several.
+        assert_eq!(
+            register(attachment(second, None), Some(true)),
+            X3Registration::Recorded
+        );
+        assert_eq!(
+            register(of_second_session(first), Some(true)),
+            X3Registration::Recorded
+        );
+        assert_eq!(
+            register(of_second_session(first), Some(true)),
+            X3Registration::Known
+        );
+        assert_eq!(manager.x3_attachments_for_leg(CALL, None).len(), 3);
+    }
+
+    /// An end that names its delivery takes that one attachment and leaves
+    /// the leg's others, live or ended by siphon. One that names none is the
+    /// end of everything the attempt holds.
+    #[test]
+    fn an_end_that_names_its_delivery_is_that_deliverys_alone() {
+        let (manager, _iri, _audit) = manager();
+        let (first, second) = (
+            attachment(DId::generate(), None),
+            of_second_session(DId::generate()),
+        );
+        let attempt = manager.x3_attempt(CALL, None);
+        for one in [&first, &second] {
+            assert!(manager.register_x3_attachment(CALL, one.clone(), attempt));
+        }
+
+        // The engine ends one on its own.
+        let ended = manager
+            .x3_delivery_end_reported(CALL, None, &named_report("TransportError", &first))
+            .expect("judged");
+        assert!(!ended.by_siphon);
+        assert_eq!(ended.attachments.len(), 1);
+        assert_eq!(ended.attachments[0].d_id, first.d_id);
+        let left = manager.x3_attachments_for(CALL);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].d_id, second.d_id, "the other is still live");
+        let again = manager
+            .x3_delivery_end_reported(CALL, None, &named_report("TransportError", &first))
+            .expect("judged");
+        assert!(again.attachments.is_empty(), "nothing on record for it now");
+        assert_eq!(manager.x3_attachments_for(CALL).len(), 1);
+
+        // siphon ends the call with both attached: each end is its own.
+        assert!(manager.register_x3_attachment(CALL, first.clone(), attempt));
+        manager.x3_media_ended_by_siphon(CALL, None);
+        let ended = manager
+            .x3_delivery_end_reported(CALL, None, &named_report("CallEnded", &second))
+            .expect("judged");
+        assert!(ended.by_siphon);
+        assert_eq!(ended.attachments.len(), 1);
+        assert_eq!(ended.attachments[0].d_id, second.d_id);
+        assert_eq!(manager.x3_attachment_count(), 1, "the first's end is owed");
+        let ended = manager
+            .x3_delivery_end_reported(CALL, None, &named_report("CallEnded", &first))
+            .expect("judged");
+        assert!(ended.by_siphon);
+        assert_eq!(manager.x3_attachment_count(), 0);
+
+        // An end that names none takes the whole attempt, as it always did.
+        let next = manager.x3_attempt(CALL, None);
+        for one in [&first, &second] {
+            assert!(manager.register_x3_attachment(CALL, one.clone(), next));
+        }
+        let ended = manager
+            .x3_delivery_end_reported(CALL, None, &ended_report("TransportError"))
+            .expect("judged");
+        assert_eq!(ended.attachments.len(), 2);
+        assert_eq!(manager.x3_attachment_count(), 0);
+    }
+
+    /// Named ends reported while siphon's end of the call is unanswered wait
+    /// for the answer one by one, each with its own delivery.
+    #[test]
+    fn named_ends_wait_for_the_answer_each_with_its_own_delivery() {
+        let (manager, _iri, _audit) = manager();
+        let (first, second) = (
+            attachment(DId::generate(), None),
+            of_second_session(DId::generate()),
+        );
+        for taken in [true, false] {
+            let attempt = manager.x3_attempt(CALL, None);
+            for one in [&first, &second] {
+                assert!(manager.register_x3_attachment(CALL, one.clone(), attempt));
+            }
+            manager.x3_media_ending(CALL, None);
+            for one in [&first, &second] {
+                assert!(manager
+                    .x3_delivery_end_reported(CALL, None, &named_report("CallEnded", one))
+                    .is_none());
+            }
+            assert_eq!(manager.x3_attachment_count(), 1, "held, still on record");
+            let released = match taken {
+                true => manager.x3_media_end_committed(CALL, None),
+                false => manager.x3_media_end_failed(CALL, None),
+            };
+            assert_eq!(released.len(), 2);
+            for (held, one) in released.iter().zip([&first, &second]) {
+                assert_eq!(held.delivery.by_siphon, taken);
+                assert_eq!(held.delivery.attachments.len(), 1);
+                assert_eq!(held.delivery.attachments[0].d_id, one.d_id);
+                assert_eq!(held.ended.delivery, Some(naming(one)));
+            }
+            assert_eq!(manager.x3_attachment_count(), 0);
+        }
+
+        // One reported and one not when the end fails: the one that was not
+        // is live again, and the one that was did end.
+        let attempt = manager.x3_attempt(CALL, None);
+        for one in [&first, &second] {
+            assert!(manager.register_x3_attachment(CALL, one.clone(), attempt));
+        }
+        manager.x3_media_ending(CALL, None);
+        assert!(manager
+            .x3_delivery_end_reported(CALL, None, &named_report("TransportError", &first))
+            .is_none());
+        let released = manager.x3_media_end_failed(CALL, None);
+        assert_eq!(released.len(), 1);
+        assert!(!released[0].delivery.by_siphon);
+        let live = manager.x3_attachments_for(CALL);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].d_id, second.d_id);
+
+        // And a record released under held ends gives each up.
+        manager.x3_media_ending(CALL, None);
+        assert!(manager
+            .x3_delivery_end_reported(CALL, None, &named_report("CallEnded", &second))
+            .is_none());
+        manager.forget_x3_call(CALL);
+        let unanswered = manager.take_unanswered_x3_ends(usize::MAX);
+        assert_eq!(unanswered.len(), 1);
+        assert_eq!(unanswered[0].delivery.attachments[0].d_id, second.d_id);
+    }
+
+    /// A session ending detaches its own deliveries and leaves another
+    /// session's on the same engine call live.
+    #[test]
+    fn a_session_detaches_its_own_deliveries_only() {
+        let (manager, _iri, _audit) = manager();
+        let d_id = DId::generate();
+        let attempt = manager.x3_attempt(CALL, None);
+        assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), attempt));
+        assert!(manager.register_x3_attachment(CALL, of_second_session(d_id), attempt));
+
+        let detached = manager.x3_detaching(CALL, "session-2");
+        assert_eq!(detached.len(), 1);
+        assert_eq!(detached[0].correlation_id, 10);
+        let live = manager.x3_attachments_for(CALL);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].correlation_id, 9, "the other session's goes on");
+        assert!(manager.x3_detaching(CALL, "session-2").is_empty());
+
+        // Its end is its own, and clean; the other's is untouched by it.
+        let ended = manager
+            .x3_delivery_end_reported(CALL, None, &named_report("Detached", &detached[0]))
+            .expect("judged");
+        assert_eq!(ended.attachments.len(), 1);
+        assert_eq!(ended.attachments[0].correlation_id, 10);
+        assert_eq!(manager.x3_attachments_for(CALL).len(), 1);
+        assert_eq!(
+            manager.x3_correlation_in_use(CALL, x_id(), "session-1"),
+            Some(9)
+        );
+    }
+
+    /// The Correlation ID in use for a warrant on an engine call is asked for
+    /// a session: its own when it has a delivery there, the only one there is
+    /// when it has none, and none when two sessions' are.
+    #[test]
+    fn the_correlation_in_use_is_the_sessions_own() {
+        let (manager, _iri, _audit) = manager();
+        let d_id = DId::generate();
+        let attempt = manager.x3_attempt(CALL, None);
+        assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), attempt));
+        assert_eq!(
+            manager.x3_correlation_in_use(CALL, x_id(), "session-3"),
+            Some(9)
+        );
+        assert!(manager.register_x3_attachment(CALL, of_second_session(d_id), attempt));
+        assert_eq!(
+            manager.x3_correlation_in_use(CALL, x_id(), "session-1"),
+            Some(9)
+        );
+        assert_eq!(
+            manager.x3_correlation_in_use(CALL, x_id(), "session-2"),
+            Some(10)
+        );
+        assert_eq!(
+            manager.x3_correlation_in_use(CALL, x_id(), "session-3"),
+            None
+        );
+    }
+
+    /// A `detached` end siphon asked for is on record before the detach is
+    /// sent. One that names a delivery siphon did not detach is the engine
+    /// ending the one a later attach of the same delivery replaced: the
+    /// registration stays. After siphon detached it, the end is the detached
+    /// one's and the one asked for since stays as well.
+    #[test]
+    fn a_detached_end_siphon_did_not_ask_for_leaves_the_registration() {
+        let (manager, _iri, _audit) = manager();
+        let one = attachment(DId::generate(), None);
+        let attempt = manager.x3_attempt(CALL, None);
+        assert!(manager.register_x3_attachment(CALL, one.clone(), attempt));
+
+        let replaced = manager
+            .x3_delivery_end_reported(CALL, None, &named_report("Detached", &one))
+            .expect("judged");
+        assert!(replaced.attachments.is_empty(), "nothing to report against");
+        assert_eq!(manager.x3_attachments_for(CALL).len(), 1, "not consumed");
+        // Any other end of it is the live delivery's.
+        let failed = manager
+            .x3_delivery_end_reported(CALL, None, &named_report("MediationClosed", &one))
+            .expect("judged");
+        assert_eq!(failed.attachments.len(), 1);
+        assert!(manager.x3_attachments_for(CALL).is_empty());
+
+        // Detached by siphon, then asked for again.
+        assert!(manager.register_x3_attachment(CALL, one.clone(), attempt));
+        assert_eq!(manager.x3_detaching(CALL, "session-1").len(), 1);
+        assert!(manager.register_x3_attachment(CALL, one.clone(), attempt));
+        let detached = manager
+            .x3_delivery_end_reported(CALL, None, &named_report("Detached", &one))
+            .expect("judged");
+        assert_eq!(detached.attachments.len(), 1, "the detached one's end");
+        assert_eq!(
+            manager.x3_attachments_for(CALL).len(),
+            1,
+            "the new one stays"
+        );
+        assert_eq!(manager.x3_attachment_count(), 1);
+
+        // An engine that names nothing detaches the leg's, as it always did.
+        let unnamed = manager.x3_delivery_ended(CALL, None);
+        assert_eq!(unnamed.attachments.len(), 1);
+        assert_eq!(manager.x3_attachment_count(), 0);
+    }
+
+    /// A loss that names its delivery is that one's, live or detached and not
+    /// reported ended yet; one that names none is every live one's of the leg.
+    #[test]
+    fn a_loss_is_attributed_to_the_delivery_it_names() {
+        let (manager, _iri, _audit) = manager();
+        let (first, second) = (
+            attachment(DId::generate(), None),
+            of_second_session(DId::generate()),
+        );
+        let attempt = manager.x3_attempt(CALL, None);
+        for one in [&first, &second] {
+            assert!(manager.register_x3_attachment(CALL, one.clone(), attempt));
+        }
+        let losing = |named: Option<&X3Delivery>| manager.x3_attachments_losing(CALL, None, named);
+        assert_eq!(losing(None).len(), 2);
+        let named = losing(Some(&naming(&second)));
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].d_id, second.d_id);
+
+        manager.x3_detaching(CALL, "session-2");
+        assert_eq!(losing(None).len(), 1, "live ones only");
+        assert_eq!(
+            losing(Some(&naming(&second))).len(),
+            1,
+            "a loss on the way out still names its warrant"
+        );
+        let unknown = X3Delivery {
+            correlation_id: 77,
+            ..naming(&second)
+        };
+        assert!(losing(Some(&unknown)).is_empty());
+        assert!(manager
+            .x3_attachments_losing("another@example.com", None, None)
+            .is_empty());
     }
 }

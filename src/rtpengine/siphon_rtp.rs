@@ -2600,6 +2600,85 @@ mod tests {
         assert_eq!(json["from_tag"], "leg-a");
     }
 
+    /// A detach of one delivery names it by the three values its attach
+    /// carried; a detach of the call names none, as before 0.26.0.
+    #[tokio::test]
+    async fn a_detach_of_one_delivery_names_its_warrant_address_and_correlation() {
+        use crate::rtpengine::events::X3Delivery;
+        use crate::rtpengine::test_native_engine::NativeTestEngine;
+        let engine = NativeTestEngine::start_with_x3_026().await;
+        let backend = engine.backend();
+        let delivery = X3Delivery {
+            xid: [0x11; 16],
+            address: "192.0.2.50:42069".to_string(),
+            correlation_id: 0x0102_0304_0506_0708,
+        };
+        backend
+            .detach_x3_delivery("call-x3", "leg-a", &delivery)
+            .await
+            .expect("idempotent on a call with no interception");
+        backend
+            .detach_x3("call-x3", "leg-a")
+            .await
+            .expect("idempotent");
+        let detached = engine.commands("detach_x3");
+        assert_eq!(detached.len(), 2);
+        assert_eq!(detached[0].x3_delivery.as_ref(), Some(&delivery));
+        assert_eq!(detached[1].x3_delivery, None, "the whole call");
+        assert_eq!(
+            (detached[0].call_id.as_str(), detached[0].from_tag.as_str()),
+            ("call-x3", "leg-a")
+        );
+    }
+
+    /// An engine that carries several deliveries names the one a loss or an
+    /// end is about. One from before it names none, and an event with only
+    /// part of a name names no delivery either.
+    #[test]
+    fn an_x3_loss_and_end_carry_the_delivery_the_engine_names() {
+        use crate::rtpengine::events::X3Delivery;
+        let xid = [0x22; 16];
+        let named = X3Delivery {
+            xid,
+            address: "192.0.2.50:42069".to_string(),
+            correlation_id: 4242,
+        };
+        let ended = |xid: Option<Xid>, delivery: Option<&str>, correlation_id| match convert_event(
+            Event::X3Ended {
+                call_id: "call-x3".into(),
+                from_tag: "leg-a".into(),
+                xid,
+                delivery: delivery.map(str::to_string),
+                correlation_id,
+                reason: X3EndReason::Detached,
+                delivered: 1,
+                dropped: 0,
+            },
+        ) {
+            RtpEngineEvent::X3Ended(ended) => ended.delivery,
+            other => panic!("expected X3Ended, got {other:?}"),
+        };
+        let (some_xid, address) = (Some(Xid::from_bytes(xid)), Some("192.0.2.50:42069"));
+        assert_eq!(ended(some_xid, address, Some(4242)), Some(named.clone()));
+        assert_eq!(ended(None, None, None), None, "an engine before 0.26.0");
+        assert_eq!(ended(some_xid, address, None), None);
+        assert_eq!(ended(None, address, Some(4242)), None);
+
+        match convert_event(Event::X3Loss {
+            call_id: "call-x3".into(),
+            from_tag: "leg-a".into(),
+            xid: some_xid,
+            delivery: address.map(str::to_string),
+            correlation_id: Some(4242),
+            dropped: 1,
+            delivered: 2,
+            dropped_since_ms: 3,
+        }) {
+            RtpEngineEvent::X3Loss(loss) => assert_eq!(loss.delivery, Some(named)),
+            other => panic!("expected X3Loss, got {other:?}"),
+        }
+    }
+
     #[test]
     fn x3_started_converts_with_its_identifiers_intact() {
         let xid = [

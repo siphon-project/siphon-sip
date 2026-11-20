@@ -20,7 +20,21 @@
 //! `x3_conference_seat`; a call it answered itself is attached on one that
 //! lists `x3_single_leg` and refused on any other; `conference_seat` is taken
 //! on an intercepted call; an `echo` on an intercepted call, and an attach on
-//! an echoing one, are refused. It reports no events: a test sends those.
+//! an echoing one, are refused.
+//!
+//! And what 0.26.0 does, on an engine that lists `x3_multi_delivery`: a call
+//! or a seat carries one delivery per warrant, delivery address and
+//! Correlation ID, an attach of the same three replaces only itself and ends
+//! the one it replaces with `detached`, a `detach_x3` ends what its selectors
+//! name, and every end names its delivery. An engine that does not list it
+//! holds one delivery per call: any further attach replaces it, a detach
+//! ends it whatever it names, and an end names nothing. On one that lists
+//! `x3_ws_takeover` a call whose audio goes to a `ws_uri` server is attached;
+//! on any other it is refused.
+//!
+//! It sends no events. It keeps the `x3_ended` the real engine would have
+//! sent for what it was asked ([`NativeTestEngine::take_x3_ends`]), and a
+//! test passes them on, or sends one of its own.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -155,6 +169,9 @@ pub(crate) struct NativeCommand {
     /// The whole profile a command carried, for a test asserting on a
     /// processing setting (`echo_cancellation`, the VAD knobs).
     pub(crate) profile: Option<siphon_rtp_proto::ProfileFlags>,
+    /// The delivery an `attach_x3` asked for, or the one a `detach_x3` named
+    /// with all three selectors. `None` on a detach of the whole call.
+    pub(crate) x3_delivery: Option<crate::rtpengine::events::X3Delivery>,
 }
 
 /// What a recorded command carried, before the engine decides on it.
@@ -168,6 +185,7 @@ struct Recorded {
     dtmf: Option<String>,
     sources: Vec<String>,
     channels: Option<String>,
+    x3_delivery: Option<crate::rtpengine::events::X3Delivery>,
 }
 
 /// What the engine makes of a command on a call `offer_far` grew (or the
@@ -266,6 +284,7 @@ impl Recorded {
             channels: self.channels,
             scope,
             profile: self.profile,
+            x3_delivery: self.x3_delivery,
         }
     }
 
@@ -280,8 +299,23 @@ impl Recorded {
             dtmf: None,
             sources: Vec::new(),
             channels: None,
+            x3_delivery: None,
         }
     }
+}
+
+/// The delivery an X3 command names with a warrant, an address and a
+/// Correlation ID; none when it leaves any of them out.
+fn named_delivery(
+    xid: Option<siphon_rtp_proto::Xid>,
+    delivery: Option<&String>,
+    correlation_id: Option<u64>,
+) -> Option<crate::rtpengine::events::X3Delivery> {
+    Some(crate::rtpengine::events::X3Delivery {
+        xid: *xid?.as_bytes(),
+        address: delivery?.clone(),
+        correlation_id: correlation_id?,
+    })
 }
 
 /// What the engine records of an X3 attach or detach, and whether it needs the
@@ -294,12 +328,15 @@ fn x3_command(command: &Command, on_seat: bool) -> (Option<Recorded>, Option<Str
             call_id,
             from_tag,
             target_leg,
-            ..
+            xid,
+            delivery,
+            correlation_id,
         } => (
             Some(Recorded {
                 detail: serde_json::to_value(target_leg)
                     .ok()
                     .and_then(|value| value.as_str().map(str::to_string)),
+                x3_delivery: named_delivery(Some(*xid), Some(delivery), Some(*correlation_id)),
                 ..Recorded::new("attach_x3", call_id, from_tag)
             }),
             None,
@@ -307,9 +344,16 @@ fn x3_command(command: &Command, on_seat: bool) -> (Option<Recorded>, Option<Str
             !on_seat,
         ),
         Command::DetachX3 {
-            call_id, from_tag, ..
+            call_id,
+            from_tag,
+            xid,
+            delivery,
+            correlation_id,
         } => (
-            Some(Recorded::new("detach_x3", call_id, from_tag)),
+            Some(Recorded {
+                x3_delivery: named_delivery(*xid, delivery.as_ref(), *correlation_id),
+                ..Recorded::new("detach_x3", call_id, from_tag)
+            }),
             None,
             false,
             false,
@@ -358,20 +402,48 @@ pub(crate) const NATIVE_ENGINE_ECHO_REFUSED: &str = "echo: a lawful-interception
 pub(crate) const NATIVE_ENGINE_ATTACH_RETRY: &str =
     "attach_x3: the call is being re-answered; retry the attach once it is";
 
-/// What the engine keeps of its interceptions, to answer as siphon-rtp 0.25.2
-/// does: the seats that joined a room, the calls and seats with an
-/// interception attached, and the calls in echo mode.
+/// What a siphon-rtp 0.26.0 provisioned for X3 lists on top: several
+/// deliveries on one call, and an interception on a WebSocket-takeover call.
+pub(crate) const NATIVE_ENGINE_X3_MULTI_DELIVERY: &str = "x3_multi_delivery";
+pub(crate) const NATIVE_ENGINE_X3_WS_TAKEOVER: &str = "x3_ws_takeover";
+
+/// The engine's refusal of an `attach_x3` on a WebSocket-takeover call,
+/// before 0.26.0.
+pub(crate) const NATIVE_ENGINE_WS_TAKEOVER_REFUSED: &str =
+    "attach_x3: a WebSocket-takeover call (ws_uri) has no relayed second party to intercept";
+
+/// One content delivery the engine holds: the call or the seat it is on, and
+/// the three values its attach named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeldDelivery {
+    scope: Option<String>,
+    call_id: String,
+    from_tag: String,
+    xid: siphon_rtp_proto::Xid,
+    delivery: String,
+    correlation_id: u64,
+}
+
+/// What the engine keeps of its interceptions, to answer as siphon-rtp does:
+/// the seats that joined a room, the deliveries it holds, the calls in echo
+/// mode and the calls whose audio goes to a WebSocket server.
 #[derive(Default)]
 struct X3Model {
     /// Whether `node_info` lists `x3_conference_seat` and `x3_single_leg`.
     conference_seat: bool,
     single_leg: bool,
+    /// Whether it lists `x3_multi_delivery` and `x3_ws_takeover`.
+    multi_delivery: bool,
+    ws_takeover: bool,
+    deliveries: Mutex<Vec<HeldDelivery>>,
+    /// The `x3_ended` the engine would have sent, oldest first.
+    ends: Mutex<Vec<crate::rtpengine::events::X3EndedEvent>>,
+    ws_calls: Mutex<HashSet<(Option<String>, String)>>,
     /// The verbs whose next command is refused, once each.
     refuse_next: Mutex<Vec<&'static str>>,
     /// How many more `attach_x3` to refuse with a reason that says to retry.
     retry_refusals: Mutex<u32>,
     seats: Mutex<HashSet<(String, String)>>,
-    intercepted: Mutex<HashSet<(Option<String>, String)>>,
     echoing: Mutex<HashSet<(Option<String>, String)>>,
 }
 
@@ -381,8 +453,54 @@ impl X3Model {
         X3Model {
             conference_seat: lists(NATIVE_ENGINE_X3_CONFERENCE_SEAT),
             single_leg: lists(NATIVE_ENGINE_X3_SINGLE_LEG),
+            multi_delivery: lists(NATIVE_ENGINE_X3_MULTI_DELIVERY),
+            ws_takeover: lists(NATIVE_ENGINE_X3_WS_TAKEOVER),
             ..X3Model::default()
         }
+    }
+
+    /// End the deliveries `ends` picks, each with `reason`, and keep the
+    /// `x3_ended` of each. An engine that carries several deliveries names
+    /// the one that ended; one that holds a single delivery names none.
+    fn end_where(
+        &self,
+        deliveries: &mut Vec<HeldDelivery>,
+        reason: &str,
+        ends: impl Fn(&HeldDelivery) -> bool,
+    ) {
+        let (ended, kept): (Vec<_>, Vec<_>) = std::mem::take(deliveries)
+            .into_iter()
+            .partition(|held| ends(held));
+        *deliveries = kept;
+        let Ok(mut reported) = self.ends.lock() else {
+            return;
+        };
+        for held in ended {
+            reported.push(crate::rtpengine::events::X3EndedEvent {
+                call_id: held.call_id,
+                from_tag: held.from_tag,
+                delivery: self
+                    .multi_delivery
+                    .then(|| crate::rtpengine::events::X3Delivery {
+                        xid: *held.xid.as_bytes(),
+                        address: held.delivery,
+                        correlation_id: held.correlation_id,
+                    }),
+                reason: reason.to_string(),
+                orderly: reason == "Detached",
+                delivered: 10,
+                dropped: 0,
+            });
+        }
+    }
+
+    /// Whether the engine holds a delivery on the call `call_id` in `scope`.
+    fn intercepts(&self, scope: &Option<String>, call_id: &str) -> bool {
+        self.deliveries.lock().is_ok_and(|deliveries| {
+            deliveries
+                .iter()
+                .any(|held| &held.scope == scope && held.call_id == call_id)
+        })
     }
 
     /// Whether an X3 command names a seat that joined a room, on an engine
@@ -442,18 +560,36 @@ impl X3Model {
             Command::AttachX3 { call_id, .. } if holds(&self.echoing, call_id) => {
                 Some("attach_x3: the call is in echo mode, which bypasses the tap".to_string())
             }
+            // Before 0.26.0 a call whose audio goes to a WebSocket server had
+            // no second party to intercept.
+            Command::AttachX3 { call_id, .. }
+                if !self.ws_takeover && holds(&self.ws_calls, call_id) =>
+            {
+                Some(NATIVE_ENGINE_WS_TAKEOVER_REFUSED.to_string())
+            }
+            // Either can be shared by two warrants, so neither names a
+            // delivery without the warrant.
+            Command::DetachX3 {
+                xid: None,
+                delivery,
+                correlation_id,
+                ..
+            } if self.multi_delivery && (delivery.is_some() || correlation_id.is_some()) => Some(
+                "detach_x3: delivery and correlation_id select within xid; name the xid"
+                    .to_string(),
+            ),
             // Before 0.25.2 a call the engine answered itself, and that no
             // `offer_far` grew a far leg on, had no second party to intercept.
             Command::AttachX3 { call_id, .. } if !self.single_leg => {
                 let has_far_leg = grown.lock().is_ok_and(|grown| grown.contains(call_id));
-                (holds(local, call_id) && !has_far_leg)
+                (holds(local, call_id) && !has_far_leg && !holds(&self.ws_calls, call_id))
                     .then(|| "attach_x3: the call has no second leg to intercept".to_string())
             }
             Command::Echo {
                 call_id,
                 enabled: true,
                 ..
-            } if holds(&self.intercepted, call_id) => Some(NATIVE_ENGINE_ECHO_REFUSED.to_string()),
+            } if self.intercepts(scope, call_id) => Some(NATIVE_ENGINE_ECHO_REFUSED.to_string()),
             Command::ConferenceSeat { conference_id, .. }
                 if conference_id.starts_with(NATIVE_ENGINE_CLOSING_ROOM) =>
             {
@@ -470,12 +606,16 @@ impl X3Model {
     /// Keep what an accepted command changed.
     fn accepted(&self, command: &Command, scope: &Option<String>) {
         let key = |call_id: &String| (scope.clone(), call_id.clone());
-        let (Ok(mut seats), Ok(mut intercepted), Ok(mut echoing)) = (
+        let (Ok(mut seats), Ok(mut deliveries), Ok(mut echoing), Ok(mut ws_calls)) = (
             self.seats.lock(),
-            self.intercepted.lock(),
+            self.deliveries.lock(),
             self.echoing.lock(),
+            self.ws_calls.lock(),
         ) else {
             return;
+        };
+        let on_call = |held: &HeldDelivery, call_id: &String| {
+            &held.scope == scope && &held.call_id == call_id
         };
         match command {
             Command::ConferenceJoin {
@@ -490,16 +630,78 @@ impl X3Model {
                 from_tag,
             } => {
                 seats.remove(&(conference_id.clone(), from_tag.clone()));
+                // A seat's deliveries end with the seat.
+                self.end_where(&mut deliveries, "CallEnded", |held| {
+                    on_call(held, conference_id) && &held.from_tag == from_tag
+                });
             }
-            Command::AttachX3 { call_id, .. } => {
-                intercepted.insert(key(call_id));
+            Command::AttachX3 {
+                call_id,
+                from_tag,
+                delivery,
+                xid,
+                correlation_id,
+                ..
+            } => {
+                let asked = HeldDelivery {
+                    scope: scope.clone(),
+                    call_id: call_id.clone(),
+                    from_tag: from_tag.clone(),
+                    xid: *xid,
+                    delivery: delivery.clone(),
+                    correlation_id: *correlation_id,
+                };
+                // The same three values replace only that delivery. An
+                // engine that holds one delivery per call replaces whatever
+                // the call holds.
+                let several = self.multi_delivery;
+                self.end_where(&mut deliveries, "Detached", |held| match several {
+                    true => held == &asked,
+                    false => on_call(held, call_id) && &held.from_tag == from_tag,
+                });
+                deliveries.push(asked);
             }
-            Command::DetachX3 { call_id, .. } => {
-                intercepted.remove(&key(call_id));
+            Command::DetachX3 {
+                call_id,
+                from_tag,
+                xid,
+                delivery,
+                correlation_id,
+            } => {
+                // An engine from before the selectors reads none of them.
+                let several = self.multi_delivery;
+                self.end_where(&mut deliveries, "Detached", |held| {
+                    on_call(held, call_id)
+                        && &held.from_tag == from_tag
+                        && (!several
+                            || (xid.is_none_or(|xid| xid == held.xid)
+                                && delivery
+                                    .as_ref()
+                                    .is_none_or(|named| named == &held.delivery)
+                                && correlation_id.is_none_or(|named| named == held.correlation_id)))
+                });
             }
             Command::Delete { call_id, .. } => {
-                intercepted.remove(&key(call_id));
+                self.end_where(&mut deliveries, "CallEnded", |held| on_call(held, call_id));
                 echoing.remove(&key(call_id));
+                ws_calls.remove(&key(call_id));
+            }
+            // An `offer` on a call the engine holds replaces it, and ends
+            // what was attached to it.
+            Command::Offer { call_id, .. } => {
+                self.end_where(&mut deliveries, "CallEnded", |held| on_call(held, call_id));
+                ws_calls.remove(&key(call_id));
+            }
+            // A call whose audio goes to a WebSocket server, from here on.
+            Command::AnswerLocal {
+                call_id, profile, ..
+            }
+            | Command::Answer {
+                call_id, profile, ..
+            } => {
+                if profile.ws_uri.is_some() {
+                    ws_calls.insert(key(call_id));
+                }
             }
             Command::Echo {
                 call_id, enabled, ..
@@ -727,6 +929,20 @@ impl NativeTestEngine {
             NATIVE_ENGINE_X3_AT_OFFER,
             NATIVE_ENGINE_X3_CONFERENCE_SEAT,
             NATIVE_ENGINE_X3_SINGLE_LEG,
+        ]);
+        NativeTestEngine::start_with_features(&features).await
+    }
+
+    /// [`NativeTestEngine::start`] for a siphon-rtp 0.26.0 provisioned for
+    /// X3: what 0.25.2 lists, and `x3_multi_delivery` and `x3_ws_takeover`.
+    pub(crate) async fn start_with_x3_026() -> NativeTestEngine {
+        let mut features = NATIVE_ENGINE_FEATURES.to_vec();
+        features.extend([
+            NATIVE_ENGINE_X3_AT_OFFER,
+            NATIVE_ENGINE_X3_CONFERENCE_SEAT,
+            NATIVE_ENGINE_X3_SINGLE_LEG,
+            NATIVE_ENGINE_X3_MULTI_DELIVERY,
+            NATIVE_ENGINE_X3_WS_TAKEOVER,
         ]);
         NativeTestEngine::start_with_features(&features).await
     }
@@ -1037,6 +1253,29 @@ impl NativeTestEngine {
             answers,
             deletes,
         }
+    }
+
+    /// The `x3_ended` the engine would have sent since this was last asked,
+    /// oldest first: one for each delivery a detach, a replacing attach, a
+    /// `delete`, a replacing `offer` or a seat leaving ended.
+    pub(crate) fn take_x3_ends(&self) -> Vec<crate::rtpengine::events::RtpEngineEvent> {
+        self.x3
+            .ends
+            .lock()
+            .map(|mut ends| std::mem::take(&mut *ends))
+            .unwrap_or_default()
+            .into_iter()
+            .map(crate::rtpengine::events::RtpEngineEvent::X3Ended)
+            .collect()
+    }
+
+    /// How many content deliveries the engine holds.
+    pub(crate) fn x3_delivery_count(&self) -> usize {
+        self.x3
+            .deliveries
+            .lock()
+            .map(|deliveries| deliveries.len())
+            .unwrap_or(0)
     }
 
     /// Hold every `delete` answer until [`release_deletes`](Self::release_deletes).

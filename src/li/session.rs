@@ -810,7 +810,7 @@ impl LiManager {
         // own yet. The call's content is going out under one, and that is the
         // session's: the live delivery keeps it where the cache did not.
         *known.correlation_id.get_or_insert_with(|| {
-            self.x3_correlation_in_use(&engine_call_id, x_id)
+            self.x3_correlation_in_use(&engine_call_id, x_id, session_id)
                 .unwrap_or(fresh)
         })
     }
@@ -2410,6 +2410,7 @@ mod tests {
                     crate::li::ActiveIntercept {
                         x_id: view.matches[0].task.details.x_id,
                         d_id: view.matches[0].task.details.list_of_dids[0],
+                        delivery: "192.0.2.50:42069".to_string(),
                         from_tag: "a".to_string(),
                         correlation_id: 7,
                         session_id: Arc::clone(&view.session_id),

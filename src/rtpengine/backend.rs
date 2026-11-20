@@ -1151,6 +1151,28 @@ impl MediaBackend {
         }
     }
 
+    /// Stop one content delivery of a call and leave its others: the one
+    /// attached with this warrant, delivery address and Correlation ID. For
+    /// a `siphon-rtp` that lists `x3_multi_delivery`.
+    pub async fn detach_x3_delivery(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        delivery: &super::events::X3Delivery,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => client.detach_x3_delivery(call_id, from_tag, delivery).await,
+            Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
+                operation: "detach_x3",
+                backend: "rtpengine",
+            }),
+            Self::RtpProxy(_) => Err(RtpEngineError::Unsupported {
+                operation: "detach_x3",
+                backend: "rtpproxy",
+            }),
+        }
+    }
+
     /// Liveness check.
     pub async fn ping(&self) -> Result<(), RtpEngineError> {
         match self {

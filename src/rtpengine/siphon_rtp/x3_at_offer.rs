@@ -20,12 +20,13 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 
-use siphon_rtp_proto::{CmdResult, Command};
+use siphon_rtp_proto::{CmdResult, Command, Xid};
 
 use super::per_call::scoped_key;
 use super::scope::CallScope;
 use super::{expect_ok, result_kind, SiphonRtpClient, SiphonRtpClientSet};
 use crate::rtpengine::error::RtpEngineError;
+use crate::rtpengine::events::X3Delivery;
 
 /// What an engine may say it can intercept, by the name it lists in
 /// `node_info.features`.
@@ -38,6 +39,13 @@ pub enum X3Feature {
     ConferenceSeat,
     /// `attach_x3` on a call the engine answered itself.
     SingleLeg,
+    /// Several deliveries on one call, one per warrant, destination and
+    /// Correlation ID, each named on `detach_x3` and on the events of its
+    /// loss and end (0.26.0).
+    MultiDelivery,
+    /// `attach_x3` on a call whose audio goes to a WebSocket server
+    /// (`ws_uri`), and an interception following its leg onto one (0.26.0).
+    WsTakeover,
 }
 
 impl X3Feature {
@@ -47,6 +55,8 @@ impl X3Feature {
             Self::AttachAtOffer => "x3_attach_at_offer",
             Self::ConferenceSeat => "x3_conference_seat",
             Self::SingleLeg => "x3_single_leg",
+            Self::MultiDelivery => "x3_multi_delivery",
+            Self::WsTakeover => "x3_ws_takeover",
         }
     }
 
@@ -55,10 +65,18 @@ impl X3Feature {
             Self::AttachAtOffer => 1,
             Self::ConferenceSeat => 2,
             Self::SingleLeg => 4,
+            Self::MultiDelivery => 8,
+            Self::WsTakeover => 16,
         }
     }
 
-    const ALL: [X3Feature; 3] = [Self::AttachAtOffer, Self::ConferenceSeat, Self::SingleLeg];
+    const ALL: [X3Feature; 5] = [
+        Self::AttachAtOffer,
+        Self::ConferenceSeat,
+        Self::SingleLeg,
+        Self::MultiDelivery,
+        Self::WsTakeover,
+    ];
 }
 
 /// Set once the engine has been asked on this connection.
@@ -339,16 +357,40 @@ impl CallWatch {
 }
 
 impl SiphonRtpClient {
-    /// Stop X3 content delivery for a call. Idempotent — the engine does not
-    /// treat detaching a call with no interception as an error.
+    /// Stop X3 content delivery for a call: every delivery on it. Idempotent
+    /// — the engine does not treat detaching a call with no interception as
+    /// an error.
     pub async fn detach_x3(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
+        self.detach_x3_selected(call_id, from_tag, None).await
+    }
+
+    /// Stop one content delivery of a call and leave its others: the one
+    /// attached with this warrant, delivery address and Correlation ID. Only
+    /// on an engine that lists `x3_multi_delivery`; an older one reads no
+    /// selector and ends whatever the call carries.
+    pub async fn detach_x3_delivery(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        delivery: &X3Delivery,
+    ) -> Result<(), RtpEngineError> {
+        self.detach_x3_selected(call_id, from_tag, Some(delivery))
+            .await
+    }
+
+    async fn detach_x3_selected(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        delivery: Option<&X3Delivery>,
+    ) -> Result<(), RtpEngineError> {
         expect_ok(
             self.request(Command::DetachX3 {
                 call_id: call_id.to_string(),
                 from_tag: from_tag.to_string(),
-                xid: None,
-                delivery: None,
-                correlation_id: None,
+                xid: delivery.map(|delivery| Xid::from_bytes(delivery.xid)),
+                delivery: delivery.map(|delivery| delivery.address.clone()),
+                correlation_id: delivery.map(|delivery| delivery.correlation_id),
             })
             .await?,
         )
@@ -387,6 +429,19 @@ impl SiphonRtpClientSet {
     /// Stop X3 content delivery on the instance owning this call.
     pub async fn detach_x3(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         self.select(call_id).detach_x3(call_id, from_tag).await
+    }
+
+    /// Stop one content delivery of a call on the instance owning it
+    /// ([`SiphonRtpClient::detach_x3_delivery`]).
+    pub async fn detach_x3_delivery(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        delivery: &X3Delivery,
+    ) -> Result<(), RtpEngineError> {
+        self.select(call_id)
+            .detach_x3_delivery(call_id, from_tag, delivery)
+            .await
     }
 
     /// Register the observer of every engine call this set creates or ends.
@@ -454,6 +509,27 @@ mod tests {
         engine.record(&features(&["x3_conference_seat"]));
         assert_eq!(engine.listed(X3Feature::ConferenceSeat), Some(true));
         assert_eq!(engine.listed(X3Feature::SingleLeg), Some(false));
+    }
+
+    /// What 0.26.0 added is listed on its own too: an engine before it lists
+    /// the rest and neither of these.
+    #[test]
+    fn several_deliveries_and_a_takeover_are_listed_by_name() {
+        let engine = X3Features::default();
+        engine.record(&features(&[
+            "x3_attach_at_offer",
+            "x3_conference_seat",
+            "x3_single_leg",
+        ]));
+        assert_eq!(engine.listed(X3Feature::MultiDelivery), Some(false));
+        assert_eq!(engine.listed(X3Feature::WsTakeover), Some(false));
+        engine.record(&features(&["x3_multi_delivery"]));
+        assert_eq!(engine.listed(X3Feature::MultiDelivery), Some(true));
+        assert_eq!(engine.listed(X3Feature::WsTakeover), Some(false));
+        engine.record(&features(&["x3_ws_takeover", "x3_single_leg"]));
+        assert_eq!(engine.listed(X3Feature::WsTakeover), Some(true));
+        assert_eq!(engine.listed(X3Feature::SingleLeg), Some(true));
+        assert_eq!(engine.listed(X3Feature::MultiDelivery), Some(false));
     }
 
     #[test]
