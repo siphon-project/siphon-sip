@@ -297,6 +297,135 @@ async fn every_leg_of_a_warranted_b2bua_call_carries_one_correlation() {
     );
 }
 
+/// TS 103 221-2 clause 5.2.6 is asked of each message: the caller is the
+/// target here, so what the callee leg carries travels to the target, the far
+/// end's re-INVITE and BYE included, and only what the caller sends is from it.
+#[tokio::test]
+async fn each_record_of_a_b2bua_call_carries_its_own_direction() {
+    use crate::li::pdu::PayloadDirection::{SentFromTarget, SentToTarget};
+
+    let (state, _li, mut iri, _audit) = intercepting();
+    let internal_id = caller_calls(&state);
+    dial(&state, &internal_id, CALLEE_CALL_ID);
+    arrives(
+        &state,
+        CALLEE,
+        &callee_response(CALLEE_CALL_ID, "180 Ringing"),
+    );
+    arrives(&state, CALLEE, &callee_response(CALLEE_CALL_ID, "200 OK"));
+    arrives(&state, CALLER, CALLER_ACK);
+    arrives(
+        &state,
+        CALLEE,
+        &callee_request("INVITE", 1, "z9hG4bK-far-reinvite"),
+    );
+    arrives(&state, CALLEE, &callee_request("BYE", 2, "z9hG4bK-far-bye"));
+    arrives(&state, CALLER, CALLER_BYE_OK);
+
+    let events = drain_iri(&mut iri);
+    let directions: Vec<_> = events
+        .iter()
+        .map(|event| {
+            (
+                event.sip_method.as_str(),
+                event.status_code,
+                event.direction,
+            )
+        })
+        .collect();
+    assert_eq!(
+        directions,
+        [
+            ("INVITE", None, SentFromTarget),
+            ("INVITE", Some(180), SentToTarget),
+            ("INVITE", Some(200), SentToTarget),
+            ("ACK", None, SentFromTarget),
+            ("INVITE", None, SentToTarget),
+            ("BYE", None, SentToTarget),
+            ("BYE", Some(200), SentFromTarget),
+        ]
+    );
+    for event in &events {
+        assert_eq!(
+            event.matched_identifier,
+            TargetIdentifier::SipUri("sip:alice@example.com".to_string()),
+            "every record names the identifier the call was intercepted on, \
+             the callee leg's too though it carries none of the caller's"
+        );
+    }
+}
+
+/// One message of a proxied call to the target, from `carol` (tag `c`) to
+/// `alice` (tag `t`).
+fn proxied_to_target(start_line: &str, cseq: &str, to_tag: &str, branch: &str) -> String {
+    format!(
+        concat!(
+            "{start_line}\r\n",
+            "Via: SIP/2.0/UDP 198.51.100.77:5060;branch=z9hG4bK-{branch}\r\n",
+            "Max-Forwards: 70\r\n",
+            "From: <sip:carol@example.net>;tag=c\r\n",
+            "To: <sip:alice@example.com>{to_tag}\r\n",
+            "Call-ID: proxied-to-target@198.51.100.77\r\n",
+            "CSeq: {cseq}\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ),
+        start_line = start_line,
+        cseq = cseq,
+        to_tag = to_tag,
+        branch = branch,
+    )
+}
+
+/// The proxy path: a call to the target that it declines. The caller's INVITE
+/// and ACK travel to the target; the 180 and 486 are the target's own.
+#[tokio::test]
+async fn each_record_of_a_proxied_call_to_the_target_carries_its_own_direction() {
+    use crate::li::pdu::PayloadDirection::{SentFromTarget, SentToTarget};
+
+    let (state, _li, mut iri, _audit) = intercepting();
+    let invite = "INVITE sip:alice@example.com SIP/2.0";
+    arrives(
+        &state,
+        CALLEE,
+        &proxied_to_target(invite, "1 INVITE", "", "invite"),
+    );
+    arrives(
+        &state,
+        CALLER,
+        &proxied_to_target("SIP/2.0 180 Ringing", "1 INVITE", ";tag=t", "invite"),
+    );
+    arrives(
+        &state,
+        CALLER,
+        &proxied_to_target("SIP/2.0 486 Busy Here", "1 INVITE", ";tag=t", "invite"),
+    );
+    arrives(
+        &state,
+        CALLEE,
+        &proxied_to_target(
+            "ACK sip:alice@example.com SIP/2.0",
+            "1 ACK",
+            ";tag=t",
+            "invite",
+        ),
+    );
+
+    let directions: Vec<_> = drain_iri(&mut iri)
+        .iter()
+        .map(|event| (event.sip_method.clone(), event.status_code, event.direction))
+        .collect();
+    assert_eq!(
+        directions,
+        [
+            ("INVITE".to_string(), None, SentToTarget),
+            ("INVITE".to_string(), Some(180), SentFromTarget),
+            ("INVITE".to_string(), Some(486), SentFromTarget),
+            ("ACK".to_string(), None, SentToTarget),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn a_re_invite_from_the_far_end_does_not_attach_content_twice() {
     let (state, _li, _iri, mut audit) = intercepting();

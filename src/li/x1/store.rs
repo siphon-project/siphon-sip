@@ -24,9 +24,11 @@ use super::message::{
     TaskResponseDetails, TaskStatus,
 };
 use super::types::{
-    DId, DeliveryType, DestinationDeliveryStatus, ProvisioningStatus, Timestamp, XId,
+    DId, DeliveryType, DestinationDeliveryStatus, ProvisioningStatus, TargetIdentifier, Timestamp,
+    XId,
 };
-use crate::li::target::{MatchedParty, TargetStore};
+use crate::li::pdu::PayloadDirection;
+use crate::li::target::{identifier_for_key, MatchedField, MatchedParty, TargetStore};
 
 /// Whether this node can deliver X3 (content of communication).
 ///
@@ -103,6 +105,23 @@ pub struct TaskMatch {
     /// Which party the warrant names — the reference point every delivered
     /// packet's direction is defined against.
     pub party: MatchedParty,
+    /// Which of the task's target identifiers the traffic matched, as the ADMF
+    /// provisioned it. This is what TS 103 221-2 clause 5.3.18 puts on each
+    /// record, and it stays the same for the life of the session: a later
+    /// message that no longer carries the target was still intercepted because
+    /// of this identifier.
+    pub identifier: TargetIdentifier,
+    /// Where on the deciding message the identifier was found.
+    pub field: MatchedField,
+    /// Whether the message this match is for was sent by the target or towards
+    /// it (TS 103 221-2 clause 5.2.6).
+    ///
+    /// A property of the message, not of the call, so it is only known once
+    /// the session has placed the message: [`TaskStore::match_message`] cannot
+    /// tell a request from a response and leaves it
+    /// [`PayloadDirection::Unknown`], and `LiManager::resolve_session` fills it
+    /// in.
+    pub direction: PayloadDirection,
 }
 
 /// A provisioned task, with the bookkeeping `GetTaskDetails` reports.
@@ -372,9 +391,28 @@ impl TaskStore {
             .match_message(request_uri, from_uri, to_uri, source_ip)
             .into_iter()
             .filter_map(|matched| {
-                self.get(matched.x_id).map(|task| TaskMatch {
+                let task = self.get(matched.x_id)?;
+                let identifiers = &task.details.target_identifiers;
+                // The index and the store move together, so the key resolves.
+                // If it somehow does not, the warrant still matched and the
+                // record must still go out; it names the task's first
+                // identifier and the mismatch is logged rather than hidden.
+                let identifier = identifier_for_key(identifiers, &matched.key)
+                    .or_else(|| {
+                        tracing::error!(
+                            xid = %matched.x_id,
+                            "a warrant matched on a key none of its target identifiers \
+                             index under; the record names its first identifier"
+                        );
+                        identifiers.first()
+                    })?
+                    .clone();
+                Some(TaskMatch {
                     task,
                     party: matched.party,
+                    identifier,
+                    field: matched.field,
+                    direction: PayloadDirection::Unknown,
                 })
             })
             .collect()
