@@ -289,7 +289,14 @@ impl SiphonRtpClientSet {
         let result = self
             .select_key(&key)
             .offer_in(scope, call_id, from_tag, sdp, flags)
-            .await?;
+            .await;
+        // An offer the engine refused replaced nothing.
+        let outcome = match &result {
+            Ok(_) => EngineCallChange::Ended,
+            Err(_) => EngineCallChange::EndFailed,
+        };
+        self.calls.notify(outcome, scope, call_id, from_tag);
+        let result = result?;
         self.bind_affinity_key(&key);
         self.calls
             .notify(EngineCallChange::Offered, scope, call_id, from_tag);
@@ -369,6 +376,12 @@ impl SiphonRtpClientSet {
             .select_key(&key)
             .delete_in(scope, call_id, from_tag)
             .await;
+        self.calls.notify(
+            EngineCallChange::end_outcome(&result),
+            scope,
+            call_id,
+            from_tag,
+        );
         self.affinity.remove(key.as_ref());
         result
     }
@@ -393,14 +406,19 @@ impl SiphonRtpClientSet {
             match client.delete_in(scope, call_id, "").await {
                 Ok(()) => {
                     self.affinity.remove(key.as_ref());
+                    self.calls
+                        .notify(EngineCallChange::Ended, scope, call_id, "");
                     return Ok(());
                 }
                 Err(error) => last = Some(error),
             }
         }
-        Err(last.unwrap_or_else(|| {
+        let result: Result<(), RtpEngineError> = Err(last.unwrap_or_else(|| {
             RtpEngineError::Protocol("no media engine to delete on".to_string())
-        }))
+        }));
+        self.calls
+            .notify(EngineCallChange::end_outcome(&result), scope, call_id, "");
+        result
     }
 }
 

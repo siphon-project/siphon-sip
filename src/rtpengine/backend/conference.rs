@@ -274,6 +274,13 @@ impl MediaBackend {
             }
             other => other,
         };
+        // A seat the engine still holds keeps its content delivery, and an
+        // end the engine reports for it later is not siphon's doing.
+        let change = match outcome {
+            Ok(()) => EngineCallChange::SeatLeft,
+            Err(_) => EngineCallChange::SeatLeaveFailed,
+        };
+        set.seat_changed(change, call_id, &seat.conference_id, &seat.from_tag);
         // Kept on any other failure: the engine may still hold the seat, and a
         // later leave or delete must still find it.
         if outcome.is_ok() {

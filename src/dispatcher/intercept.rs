@@ -736,7 +736,12 @@ pub(super) fn watch_engine_calls(state: &Arc<DispatcherState>) {
         match call.change {
             // Before the frame is written: one map lookup, which misses for
             // every call no content warrant covers.
-            EngineCallChange::Ending => li.x3_media_ended_by_siphon(call.call_id, scope),
+            EngineCallChange::Ending => li.x3_media_ending(call.call_id, scope),
+            // The command's answer. Until it comes an end the engine reports
+            // is the command's; a command the engine refused ended nothing,
+            // and the delivery is watched again as any live one is.
+            EngineCallChange::Ended => li.x3_media_end_committed(call.call_id, scope),
+            EngineCallChange::EndFailed => li.x3_media_end_failed(call.call_id, scope),
             EngineCallChange::Offered => {
                 let feature = X3Feature::AttachAtOffer;
                 media_offered(&state, call.call_id, call.from_tag, scope.cloned(), feature);
@@ -754,11 +759,18 @@ pub(super) fn watch_engine_calls(state: &Arc<DispatcherState>) {
             // leg leaving its room has no record under the seat and ends
             // nothing.
             EngineCallChange::SeatLeaving => {
+                li.x3_media_ending(&seat().record(), None);
+            }
+            EngineCallChange::SeatLeft => {
                 let seat = seat();
-                li.x3_media_ended_by_siphon(&seat.record(), None);
+                li.x3_media_end_committed(&seat.record(), None);
                 if let Some(sip_call_id) = call.sip_call_id {
                     li.seat_left(sip_call_id, &seat);
                 }
+            }
+            // The seat is still in its room, and still the session's.
+            EngineCallChange::SeatLeaveFailed => {
+                li.x3_media_end_failed(&seat().record(), None);
             }
         }
     }));

@@ -232,6 +232,81 @@ async fn a_seats_delivery_ending_while_siphon_left_it_seated_is_a_fault() {
         .expect("the seat is freed");
 }
 
+/// A `delete` the engine refuses ended nothing: the call is still there and
+/// still delivering. siphon had counted it as its own end the moment it asked,
+/// so when the engine later ended the call on its own (it timed it out) the
+/// delivery's end read as clean. The refusal puts the delivery back on watch,
+/// and that end is a fault.
+#[tokio::test]
+async fn a_delete_the_engine_refused_does_not_make_a_later_end_clean() {
+    const CALL: &str = "delete-refused@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    let events = engine_events(&state);
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    backend_of(&state)
+        .offer(CALL, "caller-tag", b"v=0\r\n", &NgFlags::default())
+        .await
+        .expect("offered");
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+
+    engine.refuse_next("delete");
+    assert!(
+        backend_of(&state).delete(CALL, "caller-tag").await.is_err(),
+        "the engine refuses the delete"
+    );
+    assert_eq!(
+        li.x3_attachments_for(CALL).len(),
+        1,
+        "the delivery is live again"
+    );
+    engine_reports(&events, ended(CALL, "caller-tag", "CallEnded")).await;
+    assert_eq!(faults_reported(&log), 1, "{}", log.rendered());
+    assert_eq!(li.x3_attachment_count(), 0);
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("deleted");
+}
+
+/// The same for a seat: a `conference_leave` the engine refuses leaves the
+/// target seated and delivering, and still the session's. The engine reaping
+/// that seat later is a fault.
+#[tokio::test]
+async fn a_leave_the_engine_refused_does_not_make_a_later_reap_clean() {
+    const CALL: &str = "leave-refused@192.0.2.10";
+    const ROOM: &str = "room-leave-refused";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    let events = engine_events(&state);
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    script_joins(&state, CALL, ROOM).await;
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+
+    engine.refuse_next("conference_leave");
+    assert!(
+        backend_of(&state)
+            .conference_leave(CALL, &seat(ROOM, "caller-tag"))
+            .await
+            .is_err(),
+        "the engine refuses the leave"
+    );
+    assert_eq!(
+        li.session_of_leg(CALL).expect("the session").seats.len(),
+        1,
+        "the seat is still the session's"
+    );
+    engine_reports(&events, ended(ROOM, "caller-tag", "CallEnded")).await;
+    assert_eq!(faults_reported(&log), 1, "{}", log.rendered());
+    assert_eq!(li.x3_attachment_count(), 0);
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("the seat is freed");
+}
+
 /// On an engine that does not list `x3_conference_seat` nothing changes:
 /// nothing is asked when the caller is seated, the ACK asks for the call as
 /// it always did, the engine holds no such call, and that refusal is a loud

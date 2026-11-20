@@ -364,6 +364,8 @@ struct X3Model {
     /// Whether `node_info` lists `x3_conference_seat` and `x3_single_leg`.
     conference_seat: bool,
     single_leg: bool,
+    /// The verbs whose next command is refused, once each.
+    refuse_next: Mutex<Vec<&'static str>>,
     /// How many more `attach_x3` to refuse with a reason that says to retry.
     retry_refusals: Mutex<u32>,
     seats: Mutex<HashSet<(String, String)>>,
@@ -417,7 +419,19 @@ impl X3Model {
                 refuse
             })
         };
+        let refuse_next = |verb: &'static str| {
+            self.refuse_next.lock().is_ok_and(|mut verbs| {
+                let position = verbs.iter().position(|held| *held == verb);
+                position.map(|index| verbs.remove(index)).is_some()
+            })
+        };
         match command {
+            Command::Delete { .. } if refuse_next("delete") => {
+                Some("delete: refused for the test".to_string())
+            }
+            Command::ConferenceLeave { .. } if refuse_next("conference_leave") => {
+                Some("conference_leave: refused for the test".to_string())
+            }
             Command::AttachX3 { .. } if refused_for_now() => {
                 Some(NATIVE_ENGINE_ATTACH_RETRY.to_string())
             }
@@ -936,7 +950,7 @@ impl NativeTestEngine {
                                 refused = true;
                             } else if creates {
                                 live.insert(key);
-                            } else if record.name == "delete" {
+                            } else if record.name == "delete" && refusal.is_none() {
                                 live.remove(&key);
                             }
                         }
@@ -999,6 +1013,14 @@ impl NativeTestEngine {
             live,
             x3,
             answers,
+        }
+    }
+
+    /// Refuse the next `delete` or `conference_leave` (`verb`), leaving the
+    /// call or the seat as it is.
+    pub(crate) fn refuse_next(&self, verb: &'static str) {
+        if let Ok(mut verbs) = self.x3.refuse_next.lock() {
+            verbs.push(verb);
         }
     }
 

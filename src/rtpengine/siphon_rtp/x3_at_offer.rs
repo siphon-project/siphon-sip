@@ -104,6 +104,12 @@ pub enum EngineCallChange {
     /// before the frame is written, so before the engine can answer or report
     /// anything of the call ending.
     Ending,
+    /// The engine took the command [`Self::Ending`] was told ahead of, or no
+    /// longer holds the call: the engine call is gone, by siphon's doing.
+    Ended,
+    /// The engine refused that command, or it failed on the way: the engine
+    /// call is still there.
+    EndFailed,
     /// An `offer` has just created the engine call.
     Offered,
     /// An `answer_local` has just been answered: the engine holds the call
@@ -119,6 +125,24 @@ pub enum EngineCallChange {
     /// (`conference_leave`), which stops the room with its last seat. Told
     /// before the frame is written. Named as [`Self::SeatJoined`] names it.
     SeatLeaving,
+    /// The engine took the `conference_leave`, or no longer holds the seat.
+    SeatLeft,
+    /// The engine refused the `conference_leave`, or it failed on the way:
+    /// the seat is still in its room.
+    SeatLeaveFailed,
+}
+
+impl EngineCallChange {
+    /// How the command [`EngineCallChange::Ending`] was told ahead of turned
+    /// out. An engine that no longer holds the call has ended it as much as
+    /// one that just did.
+    pub(super) fn end_outcome<T>(result: &Result<T, RtpEngineError>) -> Self {
+        match result {
+            Ok(_) => Self::Ended,
+            Err(error) if error.is_call_not_found() => Self::Ended,
+            Err(_) => Self::EndFailed,
+        }
+    }
 }
 
 /// One engine call siphon is ending or has just created.
