@@ -306,7 +306,9 @@ fn x3_command(command: &Command, on_seat: bool) -> (Option<Recorded>, Option<Str
             false,
             !on_seat,
         ),
-        Command::DetachX3 { call_id, from_tag } => (
+        Command::DetachX3 {
+            call_id, from_tag, ..
+        } => (
             Some(Recorded::new("detach_x3", call_id, from_tag)),
             None,
             false,
@@ -389,7 +391,9 @@ impl X3Model {
         let (Command::AttachX3 {
             call_id, from_tag, ..
         }
-        | Command::DetachX3 { call_id, from_tag }) = command
+        | Command::DetachX3 {
+            call_id, from_tag, ..
+        }) = command
         else {
             return false;
         };

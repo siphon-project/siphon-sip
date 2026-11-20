@@ -1103,18 +1103,6 @@ impl SiphonRtpClient {
         )
     }
 
-    /// Stop X3 content delivery for a call. Idempotent — the engine does not
-    /// treat detaching a call with no interception as an error.
-    pub async fn detach_x3(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
-        expect_ok(
-            self.request(Command::DetachX3 {
-                call_id: call_id.to_string(),
-                from_tag: from_tag.to_string(),
-            })
-            .await?,
-        )
-    }
-
     /// Liveness check — `Ping` → `Pong`.
     pub async fn ping(&self) -> Result<(), RtpEngineError> {
         match self.request(Command::Ping).await? {
@@ -1639,11 +1627,6 @@ impl SiphonRtpClientSet {
         self.select(call_id)
             .attach_x3(call_id, from_tag, delivery, xid, correlation_id, target_leg)
             .await
-    }
-
-    /// Stop X3 content delivery on the instance owning this call.
-    pub async fn detach_x3(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
-        self.select(call_id).detach_x3(call_id, from_tag).await
     }
 
     /// Ping any one instance (the first). For quick health checks.
@@ -2608,6 +2591,9 @@ mod tests {
         let json = serde_json::to_value(Command::DetachX3 {
             call_id: "call-x3".into(),
             from_tag: "leg-a".into(),
+            xid: None,
+            delivery: None,
+            correlation_id: None,
         })
         .expect("serialize detach_x3");
         assert_eq!(json["call_id"], "call-x3");
@@ -2644,6 +2630,9 @@ mod tests {
         let converted = convert_event(Event::X3Loss {
             call_id: "call-x3".into(),
             from_tag: "leg-a".into(),
+            xid: None,
+            delivery: None,
+            correlation_id: None,
             dropped: 17,
             delivered: 900,
             dropped_since_ms: 5_000,
@@ -2666,6 +2655,9 @@ mod tests {
         let ended = |reason| match convert_event(Event::X3Ended {
             call_id: "call-x3".into(),
             from_tag: "leg-a".into(),
+            xid: None,
+            delivery: None,
+            correlation_id: None,
             reason,
             delivered: 1_000,
             dropped: 0,
@@ -2685,6 +2677,9 @@ mod tests {
         match convert_event(Event::X3Ended {
             call_id: "call-x3".into(),
             from_tag: "leg-a".into(),
+            xid: None,
+            delivery: None,
+            correlation_id: None,
             reason: X3EndReason::TransportError,
             delivered: 812,
             dropped: 44,

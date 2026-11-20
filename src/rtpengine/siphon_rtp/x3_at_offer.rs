@@ -24,7 +24,7 @@ use siphon_rtp_proto::{CmdResult, Command};
 
 use super::per_call::scoped_key;
 use super::scope::CallScope;
-use super::{result_kind, SiphonRtpClient, SiphonRtpClientSet};
+use super::{expect_ok, result_kind, SiphonRtpClient, SiphonRtpClientSet};
 use crate::rtpengine::error::RtpEngineError;
 
 /// What an engine may say it can intercept, by the name it lists in
@@ -339,6 +339,21 @@ impl CallWatch {
 }
 
 impl SiphonRtpClient {
+    /// Stop X3 content delivery for a call. Idempotent — the engine does not
+    /// treat detaching a call with no interception as an error.
+    pub async fn detach_x3(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
+        expect_ok(
+            self.request(Command::DetachX3 {
+                call_id: call_id.to_string(),
+                from_tag: from_tag.to_string(),
+                xid: None,
+                delivery: None,
+                correlation_id: None,
+            })
+            .await?,
+        )
+    }
+
     /// Whether this instance's engine listed `feature`; `None` while it has
     /// not been asked on this connection.
     pub fn x3_feature(&self, feature: X3Feature) -> Option<bool> {
@@ -369,6 +384,11 @@ impl SiphonRtpClient {
 }
 
 impl SiphonRtpClientSet {
+    /// Stop X3 content delivery on the instance owning this call.
+    pub async fn detach_x3(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
+        self.select(call_id).detach_x3(call_id, from_tag).await
+    }
+
     /// Register the observer of every engine call this set creates or ends.
     pub fn observe_calls(&self, observer: EngineCallObserver) {
         self.calls.set(observer);

@@ -251,6 +251,7 @@ pub(super) fn convert_event(event: Event) -> RtpEngineEvent {
             dropped,
             delivered,
             dropped_since_ms,
+            ..
         } => RtpEngineEvent::X3Loss(X3LossEvent {
             call_id,
             from_tag,
@@ -264,6 +265,7 @@ pub(super) fn convert_event(event: Event) -> RtpEngineEvent {
             reason,
             delivered,
             dropped,
+            ..
         } => RtpEngineEvent::X3Ended(X3EndedEvent {
             call_id,
             from_tag,
