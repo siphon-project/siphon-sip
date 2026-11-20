@@ -926,6 +926,53 @@ async fn a_late_refusal_does_not_erase_an_earlier_engine_calls_delivery() {
     assert_eq!(li.x3_attachment_count(), 0);
 }
 
+/// The caller re-INVITEs an established, intercepted call and then CANCELs
+/// that re-INVITE (RFC 3261 §9.1: the CANCEL carries the re-INVITE's branch).
+/// The call goes on as it was, and so does its interception: nothing is
+/// detached.
+#[tokio::test]
+async fn a_cancelled_re_invite_keeps_the_calls_interception() {
+    const CALL: &str = "re-invite-cancelled@192.0.2.10";
+    let (state, engine, li, mut iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    backend_of(&state)
+        .offer(CALL, "caller-tag", b"v=0\r\n", &NgFlags::default())
+        .await
+        .expect("offered");
+    arrives(&state, CALLEE, &on_call(&proxied_response("200 OK"), CALL));
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+    drain_iri(&mut iri);
+
+    let re_invite = on_call(CALLER_ACK, CALL)
+        .replace("ACK sip:", "INVITE sip:")
+        .replace("CSeq: 1 ACK", "CSeq: 2 INVITE")
+        .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-reinvite");
+    arrives(&state, CALLER, &re_invite);
+    let cancel = re_invite
+        .replace("INVITE sip:", "CANCEL sip:")
+        .replace("CSeq: 2 INVITE", "CSeq: 2 CANCEL");
+    arrives(&state, CALLER, &cancel);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    assert!(
+        engine.commands("detach_x3").is_empty(),
+        "the call's content is still being delivered"
+    );
+    assert_eq!(li.x3_attachments_for(CALL).len(), 1);
+    assert!(
+        drain_iri(&mut iri)
+            .iter()
+            .all(|event| event.event_type != crate::li::IriEventType::End),
+        "and the session has not ended"
+    );
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("deleted");
+}
+
 /// The local tag siphon holds on the caller's dialog of `internal_id`.
 fn siphon_tag(state: &Arc<DispatcherState>, internal_id: &str) -> String {
     state

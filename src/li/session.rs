@@ -114,6 +114,29 @@ impl Seat {
 }
 
 impl SessionDecision {
+    /// Whether a CANCEL, or a response to one, is of a re-INVITE.
+    ///
+    /// A CANCEL carries the branch of the request it cancels (RFC 3261 §9.1),
+    /// so it is the INVITE with that branch that says. For a branch that
+    /// identifies nothing (RFC 2543), or an INVITE no longer remembered, the
+    /// request's own `To` does: only a request inside a dialog carries a tag
+    /// there, and a CANCEL copies the `To` of the INVITE it cancels.
+    fn cancels_a_re_invite(&self, facts: &MessageFacts<'_>) -> bool {
+        let cancelled = facts
+            .branch
+            .filter(|branch| branch.starts_with(BRANCH_MAGIC_COOKIE))
+            .and_then(|branch| {
+                self.invite_branches
+                    .iter()
+                    .rev()
+                    .find(|(invite_branch, _)| &**invite_branch == branch)
+            });
+        match cancelled {
+            Some((_, re_invite)) => *re_invite,
+            None => facts.request && facts.to_tagged,
+        }
+    }
+
     /// The seats the session's legs hold now.
     fn held_seats(&self) -> Vec<Seat> {
         self.seats
@@ -722,9 +745,17 @@ impl LiManager {
                 (decision.invite_session, decision.established)
             });
 
+        // A CANCEL ends the session only when it cancels the INVITE that
+        // opened it. One that cancels a re-INVITE withdraws a change to a call
+        // that goes on (RFC 3261 §9.1, §14.1), and so does its 200.
+        let cancels_a_re_invite = facts.method == "CANCEL"
+            && decision
+                .as_deref()
+                .is_some_and(|decision| decision.cancels_a_re_invite(facts));
         let event_type = if facts.request {
             match facts.method {
                 "INVITE" if !facts.to_tagged => IriEventType::Begin,
+                "CANCEL" if cancels_a_re_invite => IriEventType::Continue,
                 "BYE" | "CANCEL" => IriEventType::End,
                 "REGISTER" | "MESSAGE" | "SUBSCRIBE" | "PUBLISH" | "OPTIONS" => {
                     IriEventType::Report
@@ -777,7 +808,7 @@ impl LiManager {
             decision.established = true;
         }
 
-        let ends = matches!(facts.method, "BYE" | "CANCEL")
+        let ends = (matches!(facts.method, "BYE" | "CANCEL") && !cancels_a_re_invite)
             || (!facts.request && event_type == IriEventType::End);
         if ends {
             decision.ended_at.get_or_insert_with(Instant::now);
@@ -2293,5 +2324,59 @@ mod tests {
             || None,
         );
         assert_eq!(later.matches[0].direction, SentFromTarget);
+    }
+
+    /// A CANCEL of a re-INVITE withdraws a change to a call that goes on. It
+    /// is not the end of the session, and neither is its 200; the CANCEL of
+    /// the INVITE that opened the session is.
+    #[test]
+    fn a_cancel_ends_the_session_only_when_it_cancels_the_opening_invite() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2Only, None);
+        let view = manager.resolve_session(CALLER_LEG, &invite(), &caller(), || None);
+        manager.note_message(&view, &invite());
+        manager.note_message(&view, &response("INVITE", 200));
+        let re_invite = MessageFacts {
+            branch: Some("z9hG4bK-re-invite"),
+            ..request("INVITE")
+        };
+        manager.note_message(&view, &re_invite);
+
+        let cancel = |branch| MessageFacts {
+            branch: Some(branch),
+            ..request("CANCEL")
+        };
+        assert_eq!(
+            manager.note_message(&view, &cancel("z9hG4bK-re-invite")),
+            IriEventType::Continue
+        );
+        let ok = MessageFacts {
+            branch: Some("z9hG4bK-re-invite"),
+            ..response("CANCEL", 200)
+        };
+        assert_eq!(manager.note_message(&view, &ok), IriEventType::Continue);
+        manager.sweep_sessions(Instant::now() + SESSION_GRACE * 2, |_| false);
+        assert_eq!(
+            manager.remembered_session_count(),
+            1,
+            "the session did not end"
+        );
+
+        // The CANCEL of the opening INVITE: its branch, and no To-tag.
+        let opening = MessageFacts {
+            to_tagged: false,
+            ..cancel("z9hG4bK-invite")
+        };
+        assert_eq!(manager.note_message(&view, &opening), IriEventType::End);
+        // And one whose INVITE is not remembered is read off its own To.
+        let unknown = MessageFacts {
+            to_tagged: false,
+            ..cancel("z9hG4bK-not-seen")
+        };
+        assert_eq!(manager.note_message(&view, &unknown), IriEventType::End);
+        assert_eq!(
+            manager.note_message(&view, &cancel("z9hG4bK-not-seen")),
+            IriEventType::Continue
+        );
     }
 }
