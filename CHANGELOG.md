@@ -23,6 +23,7 @@ entry, but a working config keeps working.
 ### Changed
 
 - **An `srs.backend` other than `file`, `http` or `none` is refused at startup** while `srs.enabled` is true. Any other value used to be taken as `file`, so a misspelt `http` wrote metadata files and sent nothing.
+- **siphon-rtp-proto is pinned at `=0.25.2`** (was 0.21.0). The video fields the protocol gained since (`video`, `video_relay`) are sent at their defaults, so every frame siphon writes is what it was.
 
 ### Fixed
 

@@ -144,6 +144,11 @@ pub(crate) fn profile_flags_from_ng(flags: &NgFlags) -> ProfileFlags {
         transmission_control_formats: Vec::new(),
         floor_channel_label: None,
         key_mgmt: None,
+        // Forwarding-room video is a conference verb's, and how a relayed call
+        // carries `m=video` has no profile key yet: both stay at the engine's
+        // defaults, which serialise away, so every frame is what it was.
+        video: None,
+        video_relay: siphon_rtp_proto::VideoRelay::Passthrough,
     }
 }
 
@@ -1807,6 +1812,8 @@ mod tests {
                                 duration_ms: None,
                                 to_tag: None,
                                 stats: None,
+                                streams: Vec::new(),
+                                video_declined: None,
                                 play_id: None,
                                 recording_id: None,
                             },
@@ -1815,6 +1822,8 @@ mod tests {
                                 duration_ms: None,
                                 to_tag: None,
                                 stats: None,
+                                streams: Vec::new(),
+                                video_declined: None,
                                 play_id: None,
                                 recording_id: None,
                             },
@@ -1892,6 +1901,8 @@ mod tests {
                                 duration_ms: None,
                                 to_tag: None,
                                 stats: None,
+                                streams: Vec::new(),
+                                video_declined: None,
                                 play_id: None,
                                 recording_id: None,
                             },
@@ -1900,6 +1911,8 @@ mod tests {
                                 duration_ms: None,
                                 to_tag: None,
                                 stats: None,
+                                streams: Vec::new(),
+                                video_declined: None,
                                 play_id: None,
                                 recording_id: None,
                             },
@@ -1968,6 +1981,8 @@ mod tests {
                                     duration_ms: None,
                                     to_tag: None,
                                     stats: None,
+                                    streams: Vec::new(),
+                                    video_declined: None,
                                     play_id: None,
                                     recording_id: None,
                                 }
@@ -1977,6 +1992,8 @@ mod tests {
                                 duration_ms: None,
                                 to_tag: None,
                                 stats: None,
+                                streams: Vec::new(),
+                                video_declined: None,
                                 play_id: None,
                                 recording_id: None,
                             },
@@ -2211,6 +2228,7 @@ mod tests {
             egress_ssrc: None,
             payload_type: None,
             media_started_at_unix_ms: None,
+            video: None,
         };
         let converted = convert_leg_summary(with_text.clone());
         let stats = converted.text.expect("text stats carried");
@@ -2305,6 +2323,8 @@ mod tests {
             transmission_control_formats: Vec::new(),
             floor_channel_label: None,
             key_mgmt: None,
+            video: None,
+            video_relay: siphon_rtp_proto::VideoRelay::Passthrough,
         };
 
         assert_eq!(profile_flags_from_ng(&ng), expected);
@@ -3189,6 +3209,7 @@ mod tests {
             egress_ssrc: None,
             payload_type: None,
             media_started_at_unix_ms: Some(1_790_000_000_123),
+            video: None,
         };
         let far = ProtoLegSummary {
             tag: "far-tag".into(),
@@ -3213,6 +3234,7 @@ mod tests {
             egress_ssrc: None,
             payload_type: None,
             media_started_at_unix_ms: None,
+            video: None,
         };
         match convert_event(Event::CallSummary {
             call_id: "call-9".into(),
@@ -3285,6 +3307,8 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: None,
+                        streams: Vec::new(),
+                        video_declined: None,
                         play_id: None,
                         recording_id: None,
                     },
@@ -3337,6 +3361,8 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: None,
+                        streams: Vec::new(),
+                        video_declined: None,
                         play_id: None,
                         recording_id: None,
                     },
@@ -3383,6 +3409,8 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: None,
+                        streams: Vec::new(),
+                        video_declined: None,
                         play_id: None,
                         recording_id: None,
                     },
@@ -3426,6 +3454,8 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: None,
+                        streams: Vec::new(),
+                        video_declined: None,
                         play_id: Some(play_id),
                         recording_id: None,
                     },
@@ -3639,6 +3669,8 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: None,
+                        streams: Vec::new(),
+                        video_declined: None,
                         play_id: None,
                         recording_id: None,
                     },
@@ -3684,6 +3716,8 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: None,
+                        streams: Vec::new(),
+                        video_declined: None,
                         play_id: None,
                         recording_id: None,
                     },
@@ -3699,6 +3733,8 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: None,
+                        streams: Vec::new(),
+                        video_declined: None,
                         play_id: None,
                         recording_id: None,
                     },
@@ -3831,6 +3867,8 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: None,
+                        streams: Vec::new(),
+                        video_declined: None,
                         play_id: None,
                         recording_id: None,
                     },
@@ -3855,6 +3893,8 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: None,
+                        streams: Vec::new(),
+                        video_declined: None,
                         play_id: None,
                         recording_id: None,
                     },
@@ -3901,6 +3941,8 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: None,
+                        streams: Vec::new(),
+                        video_declined: None,
                         play_id: None,
                         recording_id: None,
                     },
@@ -3983,6 +4025,8 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: Some(SessionStats::default()),
+                        streams: Vec::new(),
+                        video_declined: None,
                         play_id: None,
                         recording_id: None,
                     },
