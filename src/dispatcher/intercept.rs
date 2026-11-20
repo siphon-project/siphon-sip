@@ -924,6 +924,11 @@ fn leg_name(scope: Option<&crate::rtpengine::CallScope>) -> &str {
 /// call, each leg on the leg it was attached on, and on each conference seat
 /// a party of it joined.
 ///
+/// What is detached stays on record until the engine reports its delivery
+/// ended ([`LiManager::x3_detaching`]): that report says whether content was
+/// dropped on the way out, and a transport failure can beat the detach to it.
+/// Either is a fault, and a fault needs the warrant it is reported against.
+///
 /// Not on an engine call whose leg sits in a conference room: see below.
 pub(super) fn detach_x3(session: &crate::li::SessionView, state: &Arc<DispatcherState>) {
     let Some(li) = state.li_manager.as_ref() else {
@@ -941,12 +946,12 @@ pub(super) fn detach_x3(session: &crate::li::SessionView, state: &Arc<Dispatcher
     let seated = crate::rtpengine::MediaBackend::seated_call_room(call_id).is_some();
     let on_call = match seated {
         true => Vec::new(),
-        false => li.take_x3_attachments(call_id),
+        false => li.x3_detaching(call_id),
     };
     let on_seats: Vec<_> = session
         .seats
         .iter()
-        .map(|seat| (seat.clone(), li.take_x3_attachments(&seat.record())))
+        .map(|seat| (seat.clone(), li.x3_detaching(&seat.record())))
         .filter(|(_, attachments)| !attachments.is_empty())
         .collect();
     if on_call.is_empty() && on_seats.is_empty() {

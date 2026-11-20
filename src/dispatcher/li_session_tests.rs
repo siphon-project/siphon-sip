@@ -486,10 +486,14 @@ async fn the_far_end_hanging_up_stops_content_capture() {
     );
 
     arrives(&state, CALLEE, &callee_request("BYE", 2, "z9hG4bK-far-bye"));
+    assert!(
+        li.x3_attachments_for(CALLER_CALL_ID).is_empty(),
+        "a BYE on the callee leg ends the call, so its content capture"
+    );
     assert_eq!(
         li.x3_attachment_count(),
-        0,
-        "a BYE on the callee leg ends the call, so its content capture"
+        1,
+        "on record until the engine reports the delivery ended"
     );
 }
 
@@ -686,7 +690,10 @@ async fn every_scoped_leg_of_an_intercepted_proxy_call_is_tapped() {
         detached,
         vec![Some("orig".to_string()), Some("term".to_string())]
     );
-    assert_eq!(li.x3_attachment_count(), 0, "the call's records drain");
+    assert!(
+        li.x3_attachments_for(PROXY_CALL_ID).is_empty(),
+        "no leg is live; each stays on record until the engine reports it ended"
+    );
 }
 
 /// Without per-call scopes the call's own media is the one tapped, as before.

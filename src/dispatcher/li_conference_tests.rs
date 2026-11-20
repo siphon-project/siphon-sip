@@ -146,11 +146,66 @@ async fn a_bye_detaches_a_seats_delivery_on_the_seat() {
         (ROOM, "caller-tag")
     );
     assert!(!detached[0].refused);
-    assert_eq!(li.x3_attachment_count(), 0);
+    assert!(
+        li.x3_attachments_for(&crate::li::seat_record(ROOM, "caller-tag"))
+            .is_empty(),
+        "no longer live; on record until the engine reports it ended"
+    );
     backend_of(&state)
         .delete(CALL, "caller-tag")
         .await
         .expect("the seat is freed");
+}
+
+/// A detach that the engine reports as having dropped content, or that a
+/// transport failure beat, is content the agency did not get. The delivery is
+/// kept on record from the detach to that report, so the fault is raised, and
+/// against the warrant it was delivering for.
+#[tokio::test]
+async fn a_detach_that_dropped_content_is_a_fault_against_its_warrant() {
+    for (call, reason) in [
+        ("detach-dropped@192.0.2.10", "Detached"),
+        ("detach-lost-the-race@192.0.2.10", "TransportError"),
+    ] {
+        let (log, _guard) = capture_log();
+        let (state, engine, li, _iri, mut audit) =
+            intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+        let events = engine_events(&state);
+        arrives(&state, CALLER, &on_call(CALLER_INVITE, call));
+        backend_of(&state)
+            .offer(call, "caller-tag", b"v=0\r\n", &NgFlags::default())
+            .await
+            .expect("offered");
+        assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+        let warrant = li.tasks().list()[0].details.x_id.to_string();
+
+        let bye = on_call(CALLER_ACK, call)
+            .replace("ACK sip:", "BYE sip:")
+            .replace("CSeq: 1 ACK", "CSeq: 2 BYE")
+            .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-bye");
+        arrives(&state, CALLER, &bye);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(engine.commands("detach_x3").len(), 1, "{reason}");
+        assert!(li.x3_attachments_for(call).is_empty(), "no longer live");
+
+        let mut report = ended(call, "caller-tag", reason);
+        if let crate::rtpengine::events::RtpEngineEvent::X3Ended(ended) = &mut report {
+            ended.dropped = 3;
+        }
+        engine_reports(&events, report).await;
+        assert_eq!(faults_reported(&log), 1, "{reason}:\n{}", log.rendered());
+        assert!(
+            log.rendered()
+                .contains(&format!("X3 delivery ended for task {warrant}")),
+            "{reason}: reported against the warrant:\n{}",
+            log.rendered()
+        );
+        assert_eq!(li.x3_attachment_count(), 0, "{reason}: the record drains");
+        backend_of(&state)
+            .delete(call, "caller-tag")
+            .await
+            .expect("deleted");
+    }
 }
 
 /// The engine ending a seat's delivery while siphon took no seat out (the
