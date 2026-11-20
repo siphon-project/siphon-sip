@@ -320,6 +320,9 @@ pub(super) struct X3Site {
     record: String,
     /// The joined conference seat it is on; `None` for an engine call.
     seat: Option<crate::rtpengine::backend::ConferenceSeat>,
+    /// Whether the engine call's offerer, the engine's "caller", is the
+    /// session's caller.
+    offerer_is_caller: bool,
     /// The engine call-id, or the seat's room.
     call_id: String,
     /// The offerer's tag, or the seat's.
@@ -341,6 +344,7 @@ impl X3Site {
         Self {
             record: session.engine_call_id.to_string(),
             seat: None,
+            offerer_is_caller: session.offerer_is_caller,
             call_id: session.engine_call_id.to_string(),
             from_tag: from_tag.to_string(),
             legs: vec![(scope, attempt)],
@@ -381,6 +385,7 @@ impl X3Site {
                 conference_id: seat.conference_id.to_string(),
                 from_tag: seat.tag.to_string(),
             }),
+            offerer_is_caller: true,
             call_id: seat.conference_id.to_string(),
             from_tag: seat.tag.to_string(),
             legs: vec![(None, attempt)],
@@ -496,7 +501,7 @@ pub(super) fn attach_x3(
     matched: &crate::li::x1::store::TaskMatch,
     session: &crate::li::SessionView,
     site: &X3Site,
-    state: &Arc<DispatcherState>,
+    state: &DispatcherState,
 ) {
     let (call_id, from_tag): (&str, &str) = (&site.call_id, &site.from_tag);
     let record: &str = &site.record;
@@ -530,13 +535,13 @@ pub(super) fn attach_x3(
     // TS 103 221-2 §5.2.6 measures a delivered packet's direction against the
     // target, so which end the warrant names is load-bearing rather than
     // cosmetic: getting it wrong inverts the direction on every packet.
-    let target_leg = match matched.party {
-        crate::li::target::MatchedParty::Originating => {
-            crate::rtpengine::backend::X3TargetLeg::Caller
-        }
-        crate::li::target::MatchedParty::Terminating => {
-            crate::rtpengine::backend::X3TargetLeg::Callee
-        }
+    // The engine's caller is whoever offered the engine call. That is the
+    // session's caller, except on an engine call a transfer offered with the
+    // called party's media, where the two are the other way round.
+    let target_is_caller = matched.party == crate::li::target::MatchedParty::Originating;
+    let target_leg = match target_is_caller == site.offerer_is_caller {
+        true => crate::rtpengine::backend::X3TargetLeg::Caller,
+        false => crate::rtpengine::backend::X3TargetLeg::Callee,
     };
 
     let attachments = named
@@ -747,9 +752,13 @@ pub(super) fn watch_engine_calls(state: &Arc<DispatcherState>) {
             // The command's answer. Until it comes an end the engine reports
             // is the command's; a command the engine refused ended nothing,
             // and the delivery is watched again as any live one is.
-            EngineCallChange::Ended => li.x3_media_end_committed(call.call_id, scope),
+            EngineCallChange::Ended => {
+                li.x3_media_end_committed(call.call_id, scope);
+                li.engine_call_is_live(call.call_id, false);
+            }
             EngineCallChange::EndFailed => li.x3_media_end_failed(call.call_id, scope),
             EngineCallChange::Offered => {
+                li.engine_call_is_live(call.call_id, true);
                 let feature = X3Feature::AttachAtOffer;
                 media_offered(&state, call.call_id, call.from_tag, scope.cloned(), feature);
             }
@@ -849,14 +858,15 @@ fn media_offered(
         return;
     }
     // The session interception decided on the INVITE, which ran before the
-    // script that made this offer. An offer under an engine call-id that is
-    // not the session's anchoring Call-ID (a dial's own allocation, a transfer
-    // re-anchoring an answered call) names no session, and its content stays
-    // with the ACK's attachment.
+    // script that made this offer. The engine call is the session's when it
+    // is under the session's anchoring Call-ID, or under an id siphon minted
+    // and registered with the session before offering it (a transfer
+    // re-anchoring an answered call, [`LiManager::adopt_engine_call`]). An
+    // offer under any other id names no session.
     let Some(session) = li.session_of_leg(call_id) else {
         return;
     };
-    if !session.on_primary_leg
+    if &*session.engine_call_id != call_id
         || !session
             .matches
             .iter()
@@ -900,6 +910,36 @@ fn media_offered(
                 }
             });
         }
+    }
+}
+
+/// siphon has answered, at the engine, an engine call it minted for a session
+/// (a transfer's: the target's answer against the survivor's offer). Both
+/// parties are in the engine now, which is what the caller's ACK says of an
+/// ordinary call, and no ACK of the transfer is inbound: siphon sends them.
+/// So whatever content delivery the session has no record of on that engine
+/// call is asked for here.
+pub(super) fn minted_engine_call_answered(
+    state: &DispatcherState,
+    engine_call_id: &str,
+    offerer_tag: &str,
+) {
+    let Some(li) = state.li_manager.as_ref() else {
+        return;
+    };
+    if !li.is_intercepting() {
+        return;
+    }
+    let Some(session) = li.session_of_leg(engine_call_id) else {
+        return;
+    };
+    if &*session.engine_call_id != engine_call_id || session.on_primary_leg {
+        return;
+    }
+    let attempt = li.x3_attempt(engine_call_id, None);
+    let site = X3Site::call_leg(&session, offerer_tag, None, attempt);
+    for matched in &session.matches {
+        attach_x3(matched, &session, &site, state);
     }
 }
 

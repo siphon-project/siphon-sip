@@ -555,6 +555,119 @@ async fn a_bye_on_a_dialog_of_a_seated_call_does_not_detach_its_interception() {
     assert_eq!(li.x3_attachment_count(), 0);
 }
 
+/// A transfer re-anchors the call's media: siphon offers the survivor's SDP
+/// under an engine call-id of its own minting, answers it with the transfer
+/// target's, and deletes the engine call the caller's Call-ID named. Content
+/// delivery follows the media. The new engine call is attached, at its offer
+/// on an engine that takes it there and at its answer on one that does not
+/// (siphon sends the ACKs of a transfer itself, so none arrives to ask at),
+/// and the old delivery ends with the engine call siphon deleted: one live
+/// interception, on the engine call that holds the media.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transfer_re_anchoring_the_media_is_followed_by_its_interception() {
+    for at_offer in [true, false] {
+        let call = format!("transfer-re-anchor-{at_offer}@192.0.2.10");
+        let minted = format!("minted-engine-call-{at_offer}");
+        let engine = match at_offer {
+            true => NativeTestEngine::start_with_x3().await,
+            false => NativeTestEngine::start().await,
+        };
+        let (state, engine, li, _iri, mut audit) = intercepting_on_the_engine(engine).await;
+        let events = engine_events(&state);
+        let backend = backend_of(&state);
+        let flags = NgFlags::default();
+        arrives(&state, CALLER, &on_call(CALLER_INVITE, &call));
+        backend
+            .offer(&call, "caller-tag", b"v=0\r\n", &flags)
+            .await
+            .expect("offered");
+        arrives(&state, CALLEE, &on_call(&proxied_response("200 OK"), &call));
+        backend
+            .answer(&call, "caller-tag", "callee-tag", b"v=0\r\n", &flags)
+            .await
+            .expect("answered");
+        arrives(&state, CALLER, &on_call(CALLER_ACK, &call));
+        assert_eq!(attach_outcomes(&mut audit).await, (1, 0), "{at_offer}");
+
+        // The transfer: the caller survives, and its media is offered afresh.
+        tokio::task::block_in_place(|| {
+            assert!(super::b2bua::b2bua_transfer_rtpengine_offer(
+                &state,
+                &minted,
+                "caller-tag",
+                b"v=0\r\n",
+                &call,
+                "rtp_passthrough",
+                None,
+            )
+            .is_some());
+            assert!(super::b2bua::b2bua_transfer_rtpengine_answer(
+                &state,
+                &minted,
+                "caller-tag",
+                "target-tag",
+                b"v=0\r\n",
+                "transfer-target@192.0.2.1",
+                &crate::rtpengine::session::SideFlags {
+                    profile: "rtp_passthrough".to_string(),
+                    half: crate::rtpengine::session::ProfileHalf::Answer,
+                },
+                None,
+            )
+            .is_some());
+        });
+        backend
+            .delete(&call, "caller-tag")
+            .await
+            .expect("the old anchor is deleted");
+        engine_reports(&events, ended(&call, "caller-tag", "CallEnded")).await;
+
+        assert_eq!(
+            attach_outcomes(&mut audit).await,
+            (1, 0),
+            "{at_offer}: the new engine call is attached"
+        );
+        let attached: Vec<String> = engine
+            .commands("attach_x3")
+            .into_iter()
+            .map(|command| command.call_id)
+            .collect();
+        assert_eq!(attached, vec![call.clone(), minted.clone()], "{at_offer}");
+        assert!(engine.commands("detach_x3").is_empty(), "{at_offer}");
+        assert_eq!(
+            li.x3_attachments_for(&minted).len(),
+            1,
+            "{at_offer}: live on the engine call that holds the media"
+        );
+        assert!(li.x3_attachments_for(&call).is_empty(), "{at_offer}");
+        assert_eq!(li.x3_attachment_count(), 1, "{at_offer}: exactly one");
+
+        // A later ACK on the caller's dialog asks for nothing more, and not
+        // for the engine call that is gone.
+        let ack = on_call(CALLER_ACK, &call)
+            .replace("CSeq: 1 ACK", "CSeq: 2 ACK")
+            .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-reack");
+        arrives(&state, CALLER, &ack);
+        assert_eq!(attach_outcomes(&mut audit).await, (0, 0), "{at_offer}");
+        assert_eq!(engine.commands("attach_x3").len(), 2, "{at_offer}");
+
+        // The call ends: the BYE detaches the live engine call's delivery.
+        let bye = on_call(CALLER_ACK, &call)
+            .replace("ACK sip:", "BYE sip:")
+            .replace("CSeq: 1 ACK", "CSeq: 3 BYE")
+            .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-bye");
+        arrives(&state, CALLER, &bye);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let detached = engine.commands("detach_x3");
+        assert_eq!(detached.len(), 1, "{at_offer}");
+        assert_eq!(detached[0].call_id, minted, "{at_offer}");
+        backend
+            .delete(&minted, "caller-tag")
+            .await
+            .expect("the engine call is deleted");
+    }
+}
+
 /// A room that closes while the leg is being moved into it leaves the call's
 /// media stopped. The engine refuses the seat and ends the interception with
 /// `transport_error`, which is a fault toward the ADMF like any end siphon did

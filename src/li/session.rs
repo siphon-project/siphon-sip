@@ -95,6 +95,23 @@ pub(super) struct SessionDecision {
     caller_tag: Option<Box<str>>,
     /// The legs a B2BUA call dialled for its called party.
     called_party_legs: Vec<Arc<str>>,
+    /// The engine calls siphon allocated for the session under an id of its
+    /// own minting, oldest first: a transfer re-anchors the call's media onto
+    /// a fresh engine call and deletes the one the caller's Call-ID named.
+    engine_calls: Vec<MintedEngineCall>,
+}
+
+/// An engine call siphon made for a session under an id that is no dialog's
+/// Call-ID.
+#[derive(Debug, Clone)]
+struct MintedEngineCall {
+    id: Arc<str>,
+    /// Whether the engine holds it: offered, and not ended by siphon since.
+    live: bool,
+    /// Whether the party whose SDP it was offered with is the session's
+    /// caller. The engine's "caller" is the offerer, whoever that is in the
+    /// call.
+    offerer_is_caller: bool,
 }
 
 /// A seat a party joined a conference room with (`conference_join`, or the
@@ -116,6 +133,20 @@ impl Seat {
 }
 
 impl SessionDecision {
+    /// The engine call that holds the session's media now, and whether its
+    /// offerer is the session's caller: the newest one siphon minted that the
+    /// engine still holds, else the one the anchoring Call-ID names.
+    fn engine_call(&self) -> (Arc<str>, bool) {
+        self.engine_calls
+            .iter()
+            .rev()
+            .find(|minted| minted.live)
+            .map_or_else(
+                || (Arc::clone(&self.primary_call_id), true),
+                |minted| (Arc::clone(&minted.id), minted.offerer_is_caller),
+            )
+    }
+
     /// Whether a CANCEL, or a response to one, is of a re-INVITE.
     ///
     /// A CANCEL carries the branch of the request it cancels (RFC 3261 §9.1),
@@ -492,6 +523,11 @@ pub struct SessionView {
     /// Whether the message is on the session's anchoring dialog rather than on
     /// another leg of the call.
     pub on_primary_leg: bool,
+    /// Whether the offerer of that engine call, which the engine takes for
+    /// the caller, is the session's caller. It is on the engine call the
+    /// caller's own offer made; not on one a transfer offered with the
+    /// called party's media.
+    pub offerer_is_caller: bool,
     /// The warrants covering the session.
     pub matches: Vec<TaskMatch>,
     /// The conference seats the session's legs joined.
@@ -504,6 +540,7 @@ impl SessionView {
         Self {
             session_id: Arc::clone(&call_id),
             engine_call_id: call_id,
+            offerer_is_caller: true,
             on_primary_leg: true,
             matches: Vec::new(),
             seats: Vec::new(),
@@ -712,8 +749,59 @@ impl LiManager {
             on_primary_leg: primary_call_id == call_id,
             session_id,
             engine_call_id: primary_call_id,
+            offerer_is_caller: true,
             matches,
             seats: Vec::new(),
+        }
+    }
+
+    /// siphon is about to offer the media of the session `sip_call_id` is a
+    /// dialog of to the engine under `engine_call_id`, an id of its own
+    /// minting. From here on that engine call is the session's: an offer or
+    /// an end siphon reports under the id is the session's, and its content
+    /// delivery is asked for and judged there. `sip_call_id` is the dialog of
+    /// the party whose SDP is offered.
+    ///
+    /// Nothing for a dialog no message was intercepted on, and nothing when
+    /// the id is the session's anchoring Call-ID, which is its engine call
+    /// already.
+    pub fn adopt_engine_call(&self, sip_call_id: &str, engine_call_id: &str) {
+        let Some(session_id) = self.session_id_of(sip_call_id) else {
+            return;
+        };
+        {
+            let Some(mut decision) = self.decisions.get_mut(&*session_id) else {
+                return;
+            };
+            if &*decision.primary_call_id == engine_call_id {
+                return;
+            }
+            let offerer_is_caller = &*decision.primary_call_id == sip_call_id;
+            decision
+                .engine_calls
+                .retain(|minted| &*minted.id != engine_call_id);
+            decision.engine_calls.push(MintedEngineCall {
+                id: Arc::from(engine_call_id),
+                live: true,
+                offerer_is_caller,
+            });
+        }
+        self.alias(engine_call_id, &session_id);
+    }
+
+    /// The engine holds the minted engine call `engine_call_id` (`live`), or
+    /// siphon has ended it. Nothing for an id that is no session's minted
+    /// engine call, which is nearly every one.
+    pub fn engine_call_is_live(&self, engine_call_id: &str, live: bool) {
+        let Some(session_id) = self.aliases.get(engine_call_id).map(|alias| alias.clone()) else {
+            return;
+        };
+        if let Some(mut decision) = self.decisions.get_mut(&*session_id) {
+            for minted in &mut decision.engine_calls {
+                if &*minted.id == engine_call_id {
+                    minted.live = live;
+                }
+            }
         }
     }
 
@@ -989,7 +1077,8 @@ impl LiManager {
             .collect();
         Some(SessionView {
             on_primary_leg: &*decision.primary_call_id == call_id,
-            engine_call_id: Arc::clone(&decision.primary_call_id),
+            engine_call_id: decision.engine_call().0,
+            offerer_is_caller: decision.engine_call().1,
             session_id: Arc::clone(&session_id),
             matches,
             seats: decision.held_seats(),
@@ -1047,6 +1136,9 @@ impl LiManager {
             self.forget_x3_call(&decision.primary_call_id);
             for (seat, _) in &decision.seats {
                 self.forget_x3_call(&seat.record());
+            }
+            for minted in &decision.engine_calls {
+                self.forget_x3_call(&minted.id);
             }
         }
     }
@@ -1198,7 +1290,8 @@ impl LiManager {
         Some(SessionView {
             session_id: Arc::clone(session_id),
             on_primary_leg: &*decision.primary_call_id == call_id,
-            engine_call_id: Arc::clone(&decision.primary_call_id),
+            engine_call_id: decision.engine_call().0,
+            offerer_is_caller: decision.engine_call().1,
             matches,
             seats: decision.held_seats(),
         })
@@ -1263,6 +1356,7 @@ impl LiManager {
                 seats: Vec::new(),
                 caller_tag,
                 called_party_legs: Vec::new(),
+                engine_calls: Vec::new(),
             },
         );
         self.alias(primary_call_id, session_id);
@@ -2563,5 +2657,66 @@ mod tests {
             direction(CALLEE_LEG, request("BYE"), callee_leg_request(), false),
             SentFromTarget
         );
+    }
+
+    /// An engine call siphon mints for a session is the session's media from
+    /// its offer to its end, and its record is released with the session.
+    #[test]
+    fn a_session_follows_its_media_onto_an_engine_call_siphon_minted() {
+        const MINTED: &str = "minted-engine-call";
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2AndX3, None);
+        manager.adopt_engine_call(CALLER_LEG, MINTED);
+        assert!(
+            manager.session_of_leg(MINTED).is_none(),
+            "a dialog nothing was intercepted on has no session to give it to"
+        );
+        let internal_id = warranted_call(&manager);
+
+        // Offered with the called party's media: the engine's caller is not
+        // the session's.
+        let on_callee_leg =
+            manager.resolve_session(CALLEE_LEG, &response("INVITE", 200), &callee(), || {
+                Some(owned_by(&internal_id))
+            });
+        assert_eq!(&*on_callee_leg.engine_call_id, CALLER_LEG);
+        manager.adopt_engine_call(CALLEE_LEG, MINTED);
+        let view = manager.session_of_leg(MINTED).expect("the session");
+        assert_eq!(&*view.session_id, internal_id.as_str());
+        assert_eq!(&*view.engine_call_id, MINTED);
+        assert!(!view.offerer_is_caller);
+        assert!(!view.on_primary_leg, "it is no dialog");
+        let message = manager.resolve_session(CALLER_LEG, &request("ACK"), &caller(), || None);
+        assert_eq!(
+            &*message.engine_call_id, MINTED,
+            "every later message sees it"
+        );
+
+        // siphon ends it: the media is where the anchoring Call-ID says again.
+        manager.engine_call_is_live(MINTED, false);
+        let back = manager.session_of_leg(CALLER_LEG).expect("the session");
+        assert_eq!(&*back.engine_call_id, CALLER_LEG);
+        assert!(back.offerer_is_caller);
+
+        // Offered with the caller's own media, it is the caller's.
+        manager.adopt_engine_call(CALLER_LEG, MINTED);
+        assert!(
+            manager
+                .session_of_leg(MINTED)
+                .expect("the session")
+                .offerer_is_caller
+        );
+
+        let attempt = manager.x3_attempt(MINTED, None);
+        assert!(manager.x3_attempt_in_progress(MINTED, None, attempt));
+        manager.sweep_sessions(Instant::now(), |_| false);
+        manager.sweep_sessions(Instant::now() + SESSION_GRACE * 2, |_| false);
+        assert_eq!(manager.remembered_session_count(), 0);
+        assert_eq!(
+            manager.session_alias_count(),
+            0,
+            "the minted id is released"
+        );
+        assert_eq!(manager.x3_call_count(), 0, "and so is its content record");
     }
 }

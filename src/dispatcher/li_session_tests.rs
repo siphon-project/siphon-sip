@@ -972,6 +972,7 @@ pub(super) async fn intercepting_on_the_engine(
 ) {
     let mut dispatcher = test_dispatcher();
     dispatcher.state.rtpengine_set = Some(engine.backend());
+    dispatcher.state.rtpengine_profiles = Some(Arc::new(crate::rtpengine::ProfileRegistry::new()));
     let sessions = Arc::new(crate::rtpengine::MediaSessionStore::new());
     sessions.insert(leg_session(CALLER_CALL_ID));
     dispatcher.state.rtpengine_sessions = Some(sessions);
