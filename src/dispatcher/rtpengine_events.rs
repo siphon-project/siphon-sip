@@ -1057,7 +1057,9 @@ async fn on_x3_loss(
          content did not reach the agency"
     );
     if let Some(li) = state.li_manager.as_ref() {
-        for attachment in li.x3_attachments_for_leg(&loss.call_id, scope.as_ref()) {
+        // A joined conference seat's delivery is recorded under the seat.
+        let record = li.x3_record_of_event(&loss.call_id, &loss.from_tag);
+        for attachment in li.x3_attachments_for_leg(&record, scope.as_ref()) {
             let li = li.clone();
             let detail = format!(
                 "X3 delivery loss on task {}{}: {} packet(s) dropped, {} \
@@ -1119,10 +1121,12 @@ async fn on_x3_ended(
     // The delivery this end belongs to, dropped from the record either way so
     // the map does not grow across calls: that of an engine call siphon ended,
     // oldest first, else the one in progress.
-    let delivery = state
-        .li_manager
-        .as_ref()
-        .map(|li| li.x3_delivery_ended(&ended.call_id, scope.as_ref()));
+    // A joined conference seat's delivery is recorded under the seat, which
+    // its end names by the room and the seat's tag.
+    let delivery = state.li_manager.as_ref().map(|li| {
+        let record = li.x3_record_of_event(&ended.call_id, &ended.from_tag);
+        li.x3_delivery_ended(&record, scope.as_ref())
+    });
     let ended_by_siphon = delivery.as_ref().is_some_and(|delivery| delivery.by_siphon);
     if x3_end_is_clean(&ended, ended_by_siphon) {
         info!(

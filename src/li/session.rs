@@ -84,6 +84,39 @@ pub(super) struct SessionDecision {
     /// When the session ended, if it has. It is kept for [`SESSION_GRACE`]
     /// after that, so the stragglers of a teardown still correlate.
     ended_at: Option<Instant>,
+    /// The conference seats the session's legs joined, each with whether it
+    /// is still held. One that left stays listed so that its content record
+    /// is released with the session, as an engine call's is.
+    seats: Vec<(Seat, bool)>,
+}
+
+/// A seat a party joined a conference room with (`conference_join`, or the
+/// answer to a `conference_offer`). No engine call is behind it: the media
+/// engine knows it by the room and the tag, and so does its content delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seat {
+    /// The room.
+    pub conference_id: Arc<str>,
+    /// The tag the engine knows the participant by.
+    pub tag: Arc<str>,
+}
+
+impl Seat {
+    /// What the seat's content delivery is recorded under.
+    pub fn record(&self) -> String {
+        super::content::seat_record(&self.conference_id, &self.tag)
+    }
+}
+
+impl SessionDecision {
+    /// The seats the session's legs hold now.
+    fn held_seats(&self) -> Vec<Seat> {
+        self.seats
+            .iter()
+            .filter(|(_, held)| *held)
+            .map(|(seat, _)| seat.clone())
+            .collect()
+    }
 }
 
 /// One warrant covering a session, and what is needed to say on every later
@@ -337,6 +370,8 @@ pub struct SessionView {
     pub on_primary_leg: bool,
     /// The warrants covering the session.
     pub matches: Vec<TaskMatch>,
+    /// The conference seats the session's legs joined.
+    pub seats: Vec<Seat>,
 }
 
 impl SessionView {
@@ -347,6 +382,7 @@ impl SessionView {
             engine_call_id: call_id,
             on_primary_leg: true,
             matches: Vec::new(),
+            seats: Vec::new(),
         }
     }
 }
@@ -482,7 +518,49 @@ impl LiManager {
             session_id,
             engine_call_id: primary_call_id,
             matches,
+            seats: Vec::new(),
         }
+    }
+
+    /// Record that the leg `sip_call_id` joined a conference room as `seat`,
+    /// when a warrant covers its session. The session as it then is.
+    pub fn note_seat(&self, sip_call_id: &str, seat: Seat) -> Option<SessionView> {
+        let session_id = self.session_id_of(sip_call_id)?;
+        {
+            let mut decision = self.decisions.get_mut(&*session_id)?;
+            if decision.matched.is_empty() {
+                return None;
+            }
+            decision.seats.retain(|(held, _)| *held != seat);
+            decision.seats.push((seat, true));
+        }
+        self.session_of_leg(sip_call_id)
+    }
+
+    /// The leg `sip_call_id` is leaving the room it joined as `seat`.
+    pub fn seat_left(&self, sip_call_id: &str, seat: &Seat) {
+        let Some(session_id) = self.session_id_of(sip_call_id) else {
+            return;
+        };
+        if let Some(mut decision) = self.decisions.get_mut(&*session_id) {
+            for (held, seated) in &mut decision.seats {
+                if held == seat {
+                    *seated = false;
+                }
+            }
+        }
+    }
+
+    /// The session `call_id` resolves to, if any message resolved it.
+    fn session_id_of(&self, call_id: &str) -> Option<Arc<str>> {
+        self.aliases
+            .get(call_id)
+            .map(|alias| Arc::clone(alias.value()))
+            .or_else(|| {
+                self.decisions
+                    .get(call_id)
+                    .map(|decision| Arc::clone(decision.key()))
+            })
     }
 
     /// [`resolve_session`](Self::resolve_session) for a caller that only wants
@@ -657,15 +735,7 @@ impl LiManager {
     /// provisioned since the session's last message is picked up by its next
     /// message, as before.
     pub fn session_of_leg(&self, call_id: &str) -> Option<SessionView> {
-        let session_id = self
-            .aliases
-            .get(call_id)
-            .map(|alias| Arc::clone(alias.value()))
-            .or_else(|| {
-                self.decisions
-                    .get(call_id)
-                    .map(|decision| Arc::clone(decision.key()))
-            })?;
+        let session_id = self.session_id_of(call_id)?;
         let decision = self.decisions.get(&*session_id)?;
         let matches = decision
             .matched
@@ -677,6 +747,7 @@ impl LiManager {
             engine_call_id: Arc::clone(&decision.primary_call_id),
             session_id: Arc::clone(&session_id),
             matches,
+            seats: decision.held_seats(),
         })
     }
 
@@ -729,6 +800,9 @@ impl LiManager {
             // whatever the session matches now: a warrant deactivated since
             // may have left one.
             self.forget_x3_call(&decision.primary_call_id);
+            for (seat, _) in &decision.seats {
+                self.forget_x3_call(&seat.record());
+            }
         }
     }
 
@@ -747,11 +821,16 @@ impl LiManager {
         }
         let mut released = Vec::new();
         for mut decision in self.decisions.iter_mut() {
-            if decision.bound_to_call
-                && decision.ended_at.is_none()
-                && !call_is_live(decision.key())
-            {
-                decision.ended_at = Some(now);
+            if decision.bound_to_call {
+                let live = call_is_live(decision.key());
+                if live {
+                    // A dialog of the call ended and the call did not: a leg
+                    // that was replaced, or merged away into a conference. The
+                    // session is the call's, and goes on with it.
+                    decision.ended_at = None;
+                } else if decision.ended_at.is_none() {
+                    decision.ended_at = Some(now);
+                }
             }
             if decision
                 .ended_at
@@ -852,6 +931,7 @@ impl LiManager {
             on_primary_leg: &*decision.primary_call_id == call_id,
             engine_call_id: Arc::clone(&decision.primary_call_id),
             matches,
+            seats: decision.held_seats(),
         })
     }
 
@@ -910,6 +990,7 @@ impl LiManager {
                 established: false,
                 invite_branches: Vec::new(),
                 ended_at: None,
+                seats: Vec::new(),
             },
         );
         self.alias(primary_call_id, session_id);
@@ -1787,5 +1868,114 @@ mod tests {
         assert_eq!(remembered, Some(MAX_INVITE_BRANCHES_PER_SESSION));
         // The newest is the one kept.
         assert!(manager.acknowledges_unanswered_invite(&opening, &ack(Some("z9hG4bK-re-99"))));
+    }
+
+    // ── A dialog of a call ending while the call goes on ────────────────────
+
+    /// A leg merged into a conference is sent a BYE and answers it, and the
+    /// call lives on with the far party seated. The session is the call's.
+    #[test]
+    fn a_dialog_of_a_live_call_ending_does_not_end_the_calls_session() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2Only, None);
+        let internal_id = warranted_call(&manager);
+        let view = manager.resolve_session(CALLER_LEG, &response("BYE", 200), &caller(), || None);
+        manager.note_message(&view, &response("BYE", 200));
+
+        let later = Instant::now() + SESSION_GRACE * 4;
+        manager.sweep_sessions(later, |id| id == internal_id);
+        manager.sweep_sessions(later + SESSION_GRACE * 4, |id| id == internal_id);
+        assert_eq!(manager.remembered_session_count(), 1, "the call is live");
+
+        // The call ends: the session goes after its grace, as any does.
+        manager.sweep_sessions(later, |_| false);
+        manager.sweep_sessions(later + SESSION_GRACE, |_| false);
+        assert_eq!(manager.remembered_session_count(), 0);
+        assert_eq!(manager.session_alias_count(), 0);
+    }
+
+    // ── Conference seats ────────────────────────────────────────────────────
+
+    fn seat(room: &str) -> Seat {
+        Seat {
+            conference_id: Arc::from(room),
+            tag: Arc::from("a"),
+        }
+    }
+
+    #[test]
+    fn a_session_learns_the_seat_its_leg_joined_and_forgets_it_when_it_leaves() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2AndX3, None);
+        assert!(
+            manager.note_seat(CALLER_LEG, seat("room-1")).is_none(),
+            "a leg no message was intercepted on has no session"
+        );
+        manager.resolve_session(CALLER_LEG, &invite(), &caller(), || None);
+
+        let seated = manager
+            .note_seat(CALLER_LEG, seat("room-1"))
+            .expect("the session");
+        assert_eq!(seated.seats, vec![seat("room-1")]);
+        let again = manager.resolve_session(CALLER_LEG, &request("ACK"), &caller(), || None);
+        assert_eq!(
+            again.seats,
+            vec![seat("room-1")],
+            "every later message sees it"
+        );
+
+        manager.seat_left(CALLER_LEG, &seat("room-1"));
+        let left = manager.resolve_session(CALLER_LEG, &request("INFO"), &caller(), || None);
+        assert!(left.seats.is_empty());
+        // Seated again elsewhere.
+        manager.note_seat(CALLER_LEG, seat("room-2"));
+        let moved = manager.session_of_leg(CALLER_LEG).expect("the session");
+        assert_eq!(moved.seats, vec![seat("room-2")]);
+    }
+
+    #[test]
+    fn an_unwarranted_session_keeps_no_seat() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2AndX3, None);
+        manager.resolve_session(CALLEE_LEG, &invite(), &callee(), || None);
+        assert!(manager.note_seat(CALLEE_LEG, seat("room-1")).is_none());
+    }
+
+    /// The per-module leak gate for seats: every seat's content record is
+    /// released with its session, the ones that left included.
+    #[test]
+    fn seat_records_are_released_with_their_sessions() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2AndX3, None);
+        for index in 0..200 {
+            let leg = format!("seated-{index}@example.com");
+            let view = manager.resolve_session(&leg, &invite(), &caller(), || None);
+            for room in ["first", "second"] {
+                let seat = seat(&format!("{room}-{index}"));
+                manager.note_seat(&leg, seat.clone());
+                let record = seat.record();
+                let attempt = manager.x3_attempt(&record, None);
+                manager.register_x3_attachment(
+                    &record,
+                    crate::li::ActiveIntercept {
+                        x_id: view.matches[0].task.details.x_id,
+                        d_id: view.matches[0].task.details.list_of_dids[0],
+                        from_tag: "a".to_string(),
+                        correlation_id: 7,
+                        scope: None,
+                    },
+                    attempt,
+                );
+                manager.x3_media_ended_by_siphon(&record, None);
+                manager.seat_left(&leg, &seat);
+                assert!(manager.x3_delivery_ended(&record, None).by_siphon);
+            }
+            manager.note_message(&view, &request("BYE"));
+        }
+        assert_eq!(manager.x3_attachment_count(), 0);
+        assert_eq!(manager.x3_call_count(), 400, "kept while the sessions are");
+        manager.sweep_sessions(Instant::now() + SESSION_GRACE, |_| false);
+        assert_eq!(manager.remembered_session_count(), 0);
+        assert_eq!(manager.x3_call_count(), 0, "seat records drain");
     }
 }

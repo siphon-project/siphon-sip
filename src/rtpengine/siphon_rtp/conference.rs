@@ -13,12 +13,13 @@
 //! that starts with it never meets a call's.
 
 use siphon_rtp_proto::{
-    BridgeDirection, CmdResult, Command, ConferenceDtmf, ConferenceRole, PlayRepeat,
+    BridgeDirection, CmdResult, Command, ConferenceDtmf, ConferenceRole, PlayRepeat, X3TargetLeg,
+    Xid,
 };
 
 use super::{
     expect_ok, expect_sdp, profile_flags_from_ng, proto_play_source, unexpected_result,
-    PlayMediaOutcome, SiphonRtpClient, SiphonRtpClientSet,
+    EngineCallChange, PlayMediaOutcome, SiphonRtpClient, SiphonRtpClientSet, X3Feature,
 };
 use crate::rtpengine::client::PlayMediaSource;
 use crate::rtpengine::error::RtpEngineError;
@@ -271,6 +272,45 @@ impl SiphonRtpClient {
         )
     }
 
+    /// Begin X3 content delivery on a seat that joined a room. Such a seat has
+    /// no call: the engine takes the room as the frame's `call_id` and the
+    /// seat's tag as its `from_tag`, with no scope, as on every room verb, and
+    /// only from the connection that seated it. The seated party is the
+    /// target, whatever `target_leg` says.
+    pub async fn attach_x3_seat(
+        &self,
+        conference_id: &str,
+        from_tag: &str,
+        delivery: &str,
+        xid: [u8; 16],
+        correlation_id: u64,
+        target_leg: X3TargetLeg,
+    ) -> Result<(), RtpEngineError> {
+        let attach = Command::AttachX3 {
+            call_id: conference_id.to_string(),
+            from_tag: from_tag.to_string(),
+            delivery: delivery.to_string(),
+            xid: Xid::from_bytes(xid),
+            correlation_id,
+            target_leg,
+        };
+        expect_ok(self.request_framed(None, attach).await?)
+    }
+
+    /// Stop X3 content delivery on a joined seat. Idempotent on a seat the
+    /// room still holds.
+    pub async fn detach_x3_seat(
+        &self,
+        conference_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        let detach = Command::DetachX3 {
+            call_id: conference_id.to_string(),
+            from_tag: from_tag.to_string(),
+        };
+        expect_ok(self.request_framed(None, detach).await?)
+    }
+
     /// Record the room's listener mix (every seat, any bridged room and any
     /// room playback) to a WAV, returning the engine's `recording_id`.
     /// Accept-on-start: the end arrives as a `recording_finished` naming the
@@ -336,6 +376,72 @@ impl SiphonRtpClientSet {
             .await?;
         self.bind_affinity(&key);
         Ok(answer)
+    }
+
+    /// Tell the observer of this set's engine calls that the call
+    /// `sip_call_id` was seated in a room, or is about to leave it.
+    pub fn seat_changed(
+        &self,
+        change: EngineCallChange,
+        sip_call_id: &str,
+        conference_id: &str,
+        from_tag: &str,
+    ) {
+        self.calls
+            .notify_seat(change, conference_id, from_tag, sip_call_id);
+    }
+
+    /// Whether the instance that holds the room listed `feature`; `None`
+    /// while it has not been asked.
+    pub fn x3_room_feature(&self, feature: X3Feature, conference_id: &str) -> Option<bool> {
+        self.select(&room_affinity_key(conference_id))
+            .x3_feature(feature)
+    }
+
+    /// [`Self::x3_room_feature`], asking that instance when it has not been
+    /// asked.
+    pub async fn learn_x3_room_feature(
+        &self,
+        feature: X3Feature,
+        conference_id: &str,
+    ) -> Result<bool, RtpEngineError> {
+        self.select(&room_affinity_key(conference_id))
+            .learn_x3_feature(feature)
+            .await
+    }
+
+    /// Begin X3 content delivery on a joined seat, on the instance that holds
+    /// the room.
+    pub async fn attach_x3_seat(
+        &self,
+        conference_id: &str,
+        from_tag: &str,
+        delivery: &str,
+        xid: [u8; 16],
+        correlation_id: u64,
+        target_leg: X3TargetLeg,
+    ) -> Result<(), RtpEngineError> {
+        self.select(&room_affinity_key(conference_id))
+            .attach_x3_seat(
+                conference_id,
+                from_tag,
+                delivery,
+                xid,
+                correlation_id,
+                target_leg,
+            )
+            .await
+    }
+
+    /// Stop X3 content delivery on a joined seat.
+    pub async fn detach_x3_seat(
+        &self,
+        conference_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        self.select(&room_affinity_key(conference_id))
+            .detach_x3_seat(conference_id, from_tag)
+            .await
     }
 
     /// Free a seat on the instance that holds the room.

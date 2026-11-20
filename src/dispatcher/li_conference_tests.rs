@@ -1,0 +1,607 @@
+//! Content delivery for the shapes of a call that are not two parties and a
+//! relay: a party seated in a conference room, a call's leg moved into one,
+//! and a call the engine answered itself.
+//!
+//! Driven the way [`super::li_session_tests`] drives a plain call: the
+//! messages through [`intercept_message`], the media verbs through the backend
+//! a script's `rtpengine` namespace calls, against the in-process native
+//! engine modelling siphon-rtp 0.25.2. The engine reports no events of its
+//! own, so each test sends the `x3_ended` the real one would.
+//!
+//! The seats this process holds are kept per SIP Call-ID for the whole
+//! process, so every test here runs on a Call-ID of its own.
+
+use super::li_session_tests::{
+    arrives, attach_outcomes, backend_of, callee_request, callee_response, caller_calls,
+    capture_log, dial, drain_iri, engine_events, engine_reports, faults_reported,
+    intercepting_on_the_engine, CALLEE, CALLEE_CALL_ID, CALLER, CALLER_ACK, CALLER_BYE_OK,
+    CALLER_INVITE,
+};
+use super::*;
+use crate::li::correlation_from_call_id;
+use crate::rtpengine::backend::{AdoptedSeat, ConferenceDtmf, ConferenceRole, ConferenceSeat};
+use crate::rtpengine::test_native_engine::{
+    NativeTestEngine, NATIVE_ENGINE_CLOSING_ROOM, NATIVE_ENGINE_ECHO_REFUSED,
+};
+use crate::rtpengine::NgFlags;
+
+const BASE_CALL_ID: &str = "caller-call@192.0.2.10";
+
+/// `raw`, a message of the shared caller dialog, on the dialog `call_id`.
+fn on_call(raw: &str, call_id: &str) -> String {
+    raw.replace(BASE_CALL_ID, call_id)
+}
+
+fn seat(conference_id: &str, tag: &str) -> ConferenceSeat {
+    ConferenceSeat {
+        conference_id: conference_id.to_string(),
+        from_tag: tag.to_string(),
+    }
+}
+
+/// The engine's report that the delivery named `call_id` / `from_tag` ended.
+fn ended(call_id: &str, from_tag: &str, reason: &str) -> crate::rtpengine::events::RtpEngineEvent {
+    crate::rtpengine::events::RtpEngineEvent::X3Ended(crate::rtpengine::events::X3EndedEvent {
+        call_id: call_id.to_string(),
+        from_tag: from_tag.to_string(),
+        reason: reason.to_string(),
+        orderly: reason == "Detached",
+        delivered: 320,
+        dropped: 0,
+    })
+}
+
+/// What a script's `rtpengine.conference_join(call, ...)` does on the factory
+/// INVITE: the caller is seated in the room under its own tag.
+async fn script_joins(state: &Arc<DispatcherState>, call_id: &str, room: &str) {
+    backend_of(state)
+        .conference_join(
+            call_id,
+            seat(room, "caller-tag"),
+            "v=0\r\n",
+            ConferenceRole::Talker,
+            &NgFlags::default(),
+        )
+        .await
+        .expect("the engine seats the caller");
+}
+
+/// A caller under warrant that dials a conference factory URI is seated in a
+/// room and has no engine call. Its content is asked for on the seat, named
+/// by the room and the seat's tag, as soon as it is seated, and never under
+/// the SIP Call-ID, which the engine does not hold. siphon taking the seat
+/// out (the script's `rtpengine.delete()` at the end) is why its delivery
+/// ends, so the engine's `call_ended` for it is clean.
+#[tokio::test]
+async fn a_factory_invite_seat_is_attached_on_the_seat_and_its_leave_is_clean() {
+    const CALL: &str = "factory-seat@192.0.2.10";
+    const ROOM: &str = "room-factory-seat";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    let events = engine_events(&state);
+
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    script_joins(&state, CALL, ROOM).await;
+    assert_eq!(
+        attach_outcomes(&mut audit).await,
+        (1, 0),
+        "attached when the caller is seated"
+    );
+    let attached = engine.commands("attach_x3");
+    assert_eq!(attached.len(), 1);
+    assert_eq!(attached[0].call_id, ROOM, "the room stands for the call");
+    assert_eq!(attached[0].from_tag, "caller-tag", "and the seat's tag");
+    assert_eq!(attached[0].scope, None, "a room verb carries no scope");
+    assert!(!attached[0].refused);
+
+    // siphon's own 200 is not inbound; the caller's ACK of it is, and finds
+    // the seat attached.
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    assert_eq!(attach_outcomes(&mut audit).await, (0, 0));
+    assert_eq!(
+        engine.commands("attach_x3").len(),
+        1,
+        "the ACK asks neither for the seat again nor for a call the engine does not hold"
+    );
+
+    // The conference ends for this caller: siphon takes the seat out, which
+    // stops the room with its last seat, and the engine ends the delivery.
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("the seat is freed");
+    assert_eq!(engine.commands("conference_leave").len(), 1);
+    engine_reports(&events, ended(ROOM, "caller-tag", "CallEnded")).await;
+
+    assert_eq!(faults_reported(&log), 0, "{}", log.rendered());
+    assert_eq!(li.x3_attachment_count(), 0, "the seat's record drains");
+    assert!(engine.commands("detach_x3").is_empty());
+}
+
+/// The caller hanging up detaches the seat's delivery on the seat.
+#[tokio::test]
+async fn a_bye_detaches_a_seats_delivery_on_the_seat() {
+    const CALL: &str = "factory-seat-bye@192.0.2.10";
+    const ROOM: &str = "room-factory-seat-bye";
+    let (state, engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    script_joins(&state, CALL, ROOM).await;
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+
+    let bye = on_call(CALLER_ACK, CALL)
+        .replace("ACK sip:", "BYE sip:")
+        .replace("CSeq: 1 ACK", "CSeq: 2 BYE")
+        .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-bye");
+    arrives(&state, CALLER, &bye);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let detached = engine.commands("detach_x3");
+    assert_eq!(detached.len(), 1);
+    assert_eq!(
+        (detached[0].call_id.as_str(), detached[0].from_tag.as_str()),
+        (ROOM, "caller-tag")
+    );
+    assert!(!detached[0].refused);
+    assert_eq!(li.x3_attachment_count(), 0);
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("the seat is freed");
+}
+
+/// The engine ending a seat's delivery while siphon took no seat out (the
+/// engine reaped the seat, or its room stopped under it) is a fault: the
+/// target is in the conference as far as its signalling says.
+#[tokio::test]
+async fn a_seats_delivery_ending_while_siphon_left_it_seated_is_a_fault() {
+    const CALL: &str = "factory-seat-reaped@192.0.2.10";
+    const ROOM: &str = "room-factory-seat-reaped";
+    let (log, _guard) = capture_log();
+    let (state, _engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    let events = engine_events(&state);
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    script_joins(&state, CALL, ROOM).await;
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+
+    engine_reports(&events, ended(ROOM, "caller-tag", "CallEnded")).await;
+    assert_eq!(faults_reported(&log), 1, "{}", log.rendered());
+    assert_eq!(li.x3_attachment_count(), 0);
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("the seat is freed");
+}
+
+/// On an engine that does not list `x3_conference_seat` nothing changes:
+/// nothing is asked when the caller is seated, the ACK asks for the call as
+/// it always did, the engine holds no such call, and that refusal is a loud
+/// fault toward the ADMF. The seat form is never sent to an engine that would
+/// not understand it.
+#[tokio::test]
+async fn without_the_feature_a_seated_caller_is_still_a_refused_attach_and_a_fault() {
+    const CALL: &str = "factory-seat-old-engine@192.0.2.10";
+    const ROOM: &str = "room-factory-seat-old-engine";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3_at_offer().await).await;
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    script_joins(&state, CALL, ROOM).await;
+    assert_eq!(
+        attach_outcomes(&mut audit).await,
+        (0, 0),
+        "nothing asked at the seat"
+    );
+
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 1));
+    let attached = engine.commands("attach_x3");
+    assert_eq!(attached.len(), 1);
+    assert_eq!(attached[0].call_id, CALL, "asked as a call, as before");
+    assert!(attached[0].refused, "which the engine does not hold");
+    assert!(
+        log.rendered().contains("NOT being delivered"),
+        "{}",
+        log.rendered()
+    );
+    assert_eq!(faults_reported(&log), 1, "{}", log.rendered());
+    assert_eq!(li.x3_attachment_count(), 0);
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("the seat is freed");
+}
+
+/// An intercepted B2BUA call on `call_id`, offered, answered and attached at
+/// its offer, with the far party's tag known to the engine.
+async fn answered_b2bua_call(
+    state: &Arc<DispatcherState>,
+    call_id: &str,
+    callee_call_id: &str,
+) -> String {
+    arrives(state, CALLER, &on_call(CALLER_INVITE, call_id));
+    let a_leg = Leg::new_a_leg(
+        call_id.to_string(),
+        "caller-tag".to_string(),
+        "z9hG4bK-caller-invite".to_string(),
+        LegTransport {
+            remote_addr: CALLER.parse().expect("a literal address"),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+            local_addr: None,
+        },
+    );
+    let internal_id = create_b2bua_call(state, a_leg);
+    let flags = NgFlags::default();
+    backend_of(state)
+        .offer(call_id, "caller-tag", b"v=0\r\n", &flags)
+        .await
+        .expect("the engine takes the offer");
+    dial(state, &internal_id, callee_call_id);
+    arrives(state, CALLEE, &callee_response(callee_call_id, "200 OK"));
+    backend_of(state)
+        .answer(call_id, "caller-tag", "callee-tag", b"v=0\r\n", &flags)
+        .await
+        .expect("the engine takes the answer");
+    arrives(state, CALLER, &on_call(CALLER_ACK, call_id));
+    internal_id
+}
+
+fn adopted(call_id: &str, internal_id: &str) -> AdoptedSeat {
+    AdoptedSeat {
+        sip_call_id: call_id.to_string(),
+        party_uri: None,
+        internal_call_id: internal_id.to_string(),
+        owner_call_id: "conference-dialog@192.0.2.10".to_string(),
+        end_owner_on_last: false,
+        dtmf: ConferenceDtmf::Events,
+    }
+}
+
+/// `b2bua.adopt_replaced` moves the far party of an intercepted call into a
+/// room in place and ends the caller's dialog. The engine carries the call's
+/// interception into the room, out of it and into another on the one delivery
+/// connection, so siphon detaches nothing and asks for nothing again, and the
+/// call's X2 and X3 stay under its Correlation ID for as long as the call
+/// lives: the 200 to the BYE that ended the merged dialog does not end the
+/// session. The call's `delete` is what ends the delivery, cleanly.
+#[tokio::test]
+async fn a_seated_call_keeps_its_one_interception_across_seat_leave_and_reseat() {
+    const CALL: &str = "seated-call@192.0.2.10";
+    const FAR: &str = "seated-call-far@192.0.2.1";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, mut iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    let events = engine_events(&state);
+    let internal_id = answered_b2bua_call(&state, CALL, FAR).await;
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0), "at the offer");
+    let correlation = correlation_from_call_id(&internal_id);
+    let backend = backend_of(&state);
+
+    // The merge: the far party is seated, the caller's dialog is sent its
+    // BYE and answers it.
+    backend
+        .conference_seat_call(
+            CALL,
+            "callee-tag",
+            "room-seated-a",
+            ConferenceRole::Talker,
+            adopted(FAR, &internal_id),
+        )
+        .await
+        .expect("the engine seats an intercepted call's leg");
+    arrives(&state, CALLER, &on_call(CALLER_BYE_OK, CALL));
+
+    // The call lives on in the room well past the grace of a session that
+    // ended: its session, and the record of its delivery, stay.
+    li.sweep_sessions(
+        std::time::Instant::now() + crate::li::SESSION_GRACE * 4,
+        |session_id| state.call_actors.contains_call(session_id),
+    );
+    li.sweep_sessions(
+        std::time::Instant::now() + crate::li::SESSION_GRACE * 8,
+        |session_id| state.call_actors.contains_call(session_id),
+    );
+    assert_eq!(
+        li.x3_attachments_for(CALL).len(),
+        1,
+        "the seated call's delivery is still on record"
+    );
+
+    // Out of the room and into another.
+    backend
+        .conference_leave(FAR, &seat("room-seated-a", "callee-tag"))
+        .await
+        .expect("the leg leaves the room");
+    backend
+        .conference_seat_call(
+            CALL,
+            "callee-tag",
+            "room-seated-b",
+            ConferenceRole::Talker,
+            adopted(FAR, &internal_id),
+        )
+        .await
+        .expect("the leg is seated again");
+    assert_eq!(attach_outcomes(&mut audit).await, (0, 0));
+    assert_eq!(engine.commands("conference_seat").len(), 2);
+    assert_eq!(
+        engine.commands("attach_x3").len(),
+        1,
+        "one interception for the life of the call"
+    );
+    assert!(
+        engine.commands("detach_x3").is_empty(),
+        "nothing is detached"
+    );
+    assert_eq!(li.x3_attachments_for(CALL).len(), 1);
+
+    // The far party's signalling still belongs to the session.
+    drain_iri(&mut iri);
+    arrives(
+        &state,
+        CALLEE,
+        &callee_request("INFO", 2, "z9hG4bK-far-info").replace(CALLEE_CALL_ID, FAR),
+    );
+    let late = drain_iri(&mut iri);
+    assert_eq!(late.len(), 1, "X2 goes on");
+    assert_eq!(late[0].correlation_id, correlation, "under the one CID");
+
+    // The call ends: siphon deletes it, and the engine ends the delivery.
+    backend
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("the engine deletes the call");
+    engine_reports(&events, ended(CALL, "caller-tag", "CallEnded")).await;
+    assert_eq!(faults_reported(&log), 0, "{}", log.rendered());
+    assert_eq!(li.x3_attachment_count(), 0);
+}
+
+/// A room that closes while the leg is being moved into it leaves the call's
+/// media stopped. The engine refuses the seat and ends the interception with
+/// `transport_error`, which is a fault toward the ADMF like any end siphon did
+/// not ask for.
+#[tokio::test]
+async fn a_room_that_cannot_take_the_seat_ends_the_delivery_as_a_fault() {
+    const CALL: &str = "seated-call-broken-room@192.0.2.10";
+    const FAR: &str = "seated-call-broken-room-far@192.0.2.1";
+    let (log, _guard) = capture_log();
+    let (state, _engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    let events = engine_events(&state);
+    let internal_id = answered_b2bua_call(&state, CALL, FAR).await;
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+
+    let room = format!("{NATIVE_ENGINE_CLOSING_ROOM}room");
+    let refused = backend_of(&state)
+        .conference_seat_call(
+            CALL,
+            "callee-tag",
+            &room,
+            ConferenceRole::Talker,
+            adopted(FAR, &internal_id),
+        )
+        .await;
+    assert!(refused.is_err(), "the engine refuses the seat");
+    engine_reports(&events, ended(CALL, "caller-tag", "TransportError")).await;
+
+    assert_eq!(faults_reported(&log), 1, "{}", log.rendered());
+    assert_eq!(li.x3_attachment_count(), 0);
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("the engine deletes the call");
+}
+
+/// A call siphon answers itself (an announcement, an IVR) is attached when the
+/// engine has answered it, on an engine that lists `x3_single_leg`. A
+/// re-answer of the same dialog keeps the interception and asks for nothing,
+/// and so does the ACK. The call's `delete` ends it cleanly.
+#[tokio::test]
+async fn a_locally_answered_call_is_attached_at_its_answer() {
+    const CALL: &str = "local-answer@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    let events = engine_events(&state);
+    let backend = backend_of(&state);
+    let flags = NgFlags::default();
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+
+    backend
+        .answer_local(CALL, "caller-tag", "v=0\r\n", &flags)
+        .await
+        .expect("the engine answers the call itself");
+    assert_eq!(
+        attach_outcomes(&mut audit).await,
+        (1, 0),
+        "attached at the local answer"
+    );
+    let attached = engine.commands("attach_x3");
+    assert_eq!(attached.len(), 1);
+    assert_eq!(
+        (attached[0].call_id.as_str(), attached[0].from_tag.as_str()),
+        (CALL, "caller-tag")
+    );
+    assert!(!attached[0].refused);
+
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    backend
+        .answer_local(CALL, "caller-tag", "v=0\r\n", &flags)
+        .await
+        .expect("the same dialog is answered again");
+    backend
+        .offer_far(CALL, "caller-tag", &flags)
+        .await
+        .expect("a far leg is offered behind it");
+    assert_eq!(attach_outcomes(&mut audit).await, (0, 0));
+    assert_eq!(engine.commands("attach_x3").len(), 1, "one interception");
+    assert!(engine.commands("detach_x3").is_empty());
+    assert_eq!(li.x3_attachments_for(CALL).len(), 1);
+
+    backend
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("the engine deletes the call");
+    engine_reports(&events, ended(CALL, "caller-tag", "CallEnded")).await;
+    assert_eq!(faults_reported(&log), 0, "{}", log.rendered());
+    assert_eq!(li.x3_attachment_count(), 0);
+}
+
+/// Echo and an interception do not go together, either way round, and neither
+/// refusal is swallowed. `echo` on an intercepted call is refused by the
+/// engine: the script's verb fails with the engine's reason and the call
+/// stays intercepted. An attach on a call already echoing is refused, and
+/// that is warranted content not being delivered: a fault toward the ADMF.
+#[tokio::test]
+async fn echo_is_refused_on_an_intercepted_call_and_an_echoing_call_is_a_fault() {
+    const INTERCEPTED: &str = "echo-on-intercepted@192.0.2.10";
+    const ECHOING: &str = "attach-on-echoing@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    let backend = backend_of(&state);
+    let flags = NgFlags::default();
+
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, INTERCEPTED));
+    backend
+        .offer(INTERCEPTED, "caller-tag", b"v=0\r\n", &flags)
+        .await
+        .expect("offered");
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+    let refused = backend
+        .echo(INTERCEPTED, "caller-tag", true)
+        .await
+        .expect_err("the engine refuses echo on an intercepted call");
+    assert!(
+        refused.to_string().contains(NATIVE_ENGINE_ECHO_REFUSED),
+        "the script is told why: {refused}"
+    );
+    assert_eq!(
+        li.x3_attachments_for(INTERCEPTED).len(),
+        1,
+        "the call is intercepted as it was"
+    );
+    assert!(engine.commands("detach_x3").is_empty());
+    assert_eq!(faults_reported(&log), 0, "content is still delivered");
+
+    // The other way round: the call echoes before anything is attached.
+    backend
+        .answer_local(ECHOING, "caller-tag", "v=0\r\n", &flags)
+        .await
+        .expect("answered before the warrant's INVITE is seen");
+    backend
+        .echo(ECHOING, "caller-tag", true)
+        .await
+        .expect("an echo test on a call nothing intercepts");
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, ECHOING));
+    arrives(&state, CALLER, &on_call(CALLER_ACK, ECHOING));
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 1));
+    assert!(
+        log.rendered().contains("NOT being delivered") && log.rendered().contains("echo mode"),
+        "{}",
+        log.rendered()
+    );
+    assert_eq!(faults_reported(&log), 1, "{}", log.rendered());
+
+    for call in [INTERCEPTED, ECHOING] {
+        backend
+            .delete(call, "caller-tag")
+            .await
+            .expect("the engine deletes the call");
+    }
+}
+
+/// The local tag siphon holds on the caller's dialog of `internal_id`.
+fn siphon_tag(state: &Arc<DispatcherState>, internal_id: &str) -> String {
+    state
+        .call_actors
+        .get_call(internal_id)
+        .expect("the call")
+        .a_leg
+        .dialog
+        .local_tag
+        .clone()
+}
+
+/// An INVITE on a dialog of its own that asks to replace the caller's dialog
+/// of the call (RFC 3891), from `from`.
+fn replacing_invite(call_id: &str, from: &str, replaces: &str) -> String {
+    format!(
+        concat!(
+            "INVITE sip:15550100042@siphon.example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.30:5060;branch=z9hG4bK-{call_id}\r\n",
+            "Max-Forwards: 70\r\n",
+            "From: <{from}>;tag=replacing-tag\r\n",
+            "To: <sip:15550100042@siphon.example.com>\r\n",
+            "Call-ID: {call_id}\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Contact: <sip:192.0.2.30:5060>\r\n",
+            "Replaces: {replaces}\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ),
+        call_id = call_id,
+        from = from,
+        replaces = replaces,
+    )
+}
+
+/// An INVITE with `Replaces` arrives on a dialog of its own, before the
+/// take-over moves it onto the call it names. It is signalling of that call,
+/// so it is recorded in that call's session under its Correlation ID, whoever
+/// sent it. One whose `Replaces` names no dialog here is a call of its own.
+#[tokio::test]
+async fn an_invite_with_replaces_joins_the_session_of_the_call_it_replaces() {
+    let (state, _engine, _li, mut iri, _audit) =
+        intercepting_on_the_engine(NativeTestEngine::start().await).await;
+    let internal_id = caller_calls(&state);
+    dial(&state, &internal_id, CALLEE_CALL_ID);
+    arrives(&state, CALLEE, &callee_response(CALLEE_CALL_ID, "200 OK"));
+    arrives(&state, CALLER, CALLER_ACK);
+    let correlation = correlation_from_call_id(&internal_id);
+    drain_iri(&mut iri);
+    let replaces = format!(
+        "{BASE_CALL_ID};to-tag={};from-tag=caller-tag",
+        siphon_tag(&state, &internal_id)
+    );
+
+    // From the target's own second device, and from a party no warrant names.
+    for (call_id, from) in [
+        ("replacing-own@192.0.2.30", "sip:alice@example.com"),
+        ("replacing-other@192.0.2.30", "sip:carol@example.com"),
+    ] {
+        arrives(
+            &state,
+            "192.0.2.30:5060",
+            &replacing_invite(call_id, from, &replaces),
+        );
+        let events = drain_iri(&mut iri);
+        assert_eq!(events.len(), 1, "{from}: recorded");
+        assert_eq!(events[0].call_id, call_id, "under its own Call-ID");
+        assert_eq!(
+            events[0].correlation_id, correlation,
+            "{from}: and the Correlation ID of the call it replaces a dialog of"
+        );
+    }
+
+    // A Replaces that names no dialog here joins nothing.
+    arrives(
+        &state,
+        "192.0.2.30:5060",
+        &replacing_invite(
+            "replacing-nothing@192.0.2.30",
+            "sip:alice@example.com",
+            &format!("{BASE_CALL_ID};to-tag=not-siphons;from-tag=caller-tag"),
+        ),
+    );
+    let events = drain_iri(&mut iri);
+    assert_eq!(events.len(), 1, "the target's own call is still recorded");
+    assert_ne!(
+        events[0].correlation_id, correlation,
+        "as a call of its own"
+    );
+}

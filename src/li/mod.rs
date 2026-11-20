@@ -51,8 +51,8 @@ use crate::config::{LawfulInterceptConfig, MediaBackendKind};
 use x1::store::{ContentCapability, DestinationStore, StoredTask, TaskMatch, TaskStore};
 use x1::types::{DeliveryType, XId};
 
-pub use content::{EndedDelivery, FailedAttach};
-pub use session::{CallOwner, Identities, MessageFacts, SessionView, SESSION_GRACE};
+pub use content::{seat_record, EndedDelivery, FailedAttach};
+pub use session::{CallOwner, Identities, MessageFacts, Seat, SessionView, SESSION_GRACE};
 #[cfg(test)]
 use session::{MAX_REMEMBERED_SESSIONS, MAX_SEEN_PER_SESSION};
 

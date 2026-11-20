@@ -623,6 +623,9 @@ async fn a_scripts_offer_is_told_to_the_engine_call_observer_and_its_re_offer_is
             match call.change {
                 EngineCallChange::Ending => "ending",
                 EngineCallChange::Offered => "offered",
+                EngineCallChange::AnsweredLocally => "answered_locally",
+                EngineCallChange::SeatJoined => "seat_joined",
+                EngineCallChange::SeatLeaving => "seat_leaving",
             },
             call.call_id.to_string(),
             call.from_tag.to_string(),

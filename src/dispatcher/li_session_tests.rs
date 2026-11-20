@@ -24,13 +24,13 @@ use crate::rtpengine::test_engine::TestEngine;
 use std::net::{IpAddr, Ipv4Addr};
 use tokio::sync::mpsc;
 
-const CALLER: &str = "192.0.2.10:5060";
-const CALLEE: &str = "198.51.100.77:5060";
-const CALLEE_CALL_ID: &str = "b2b-callee@192.0.2.1";
-const SECOND_CALLEE_CALL_ID: &str = "b2b-callee-2@192.0.2.1";
+pub(super) const CALLER: &str = "192.0.2.10:5060";
+pub(super) const CALLEE: &str = "198.51.100.77:5060";
+pub(super) const CALLEE_CALL_ID: &str = "b2b-callee@192.0.2.1";
+pub(super) const SECOND_CALLEE_CALL_ID: &str = "b2b-callee-2@192.0.2.1";
 
 /// The caller's INVITE. The warrant names the caller, in From.
-const CALLER_INVITE: &str = concat!(
+pub(super) const CALLER_INVITE: &str = concat!(
     "INVITE sip:15550100042@siphon.example.com SIP/2.0\r\n",
     "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-caller-invite\r\n",
     "Max-Forwards: 70\r\n",
@@ -43,7 +43,7 @@ const CALLER_INVITE: &str = concat!(
     "\r\n",
 );
 
-const CALLER_ACK: &str = concat!(
+pub(super) const CALLER_ACK: &str = concat!(
     "ACK sip:192.0.2.1:5060 SIP/2.0\r\n",
     "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-caller-ack\r\n",
     "Max-Forwards: 70\r\n",
@@ -56,7 +56,7 @@ const CALLER_ACK: &str = concat!(
 );
 
 /// The caller's 200 to the BYE siphon sends it when the far end hangs up.
-const CALLER_BYE_OK: &str = concat!(
+pub(super) const CALLER_BYE_OK: &str = concat!(
     "SIP/2.0 200 OK\r\n",
     "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-siphon-bye\r\n",
     "From: <sip:15550100042@siphon.example.com>;tag=siphon-tag\r\n",
@@ -70,7 +70,7 @@ const CALLER_BYE_OK: &str = concat!(
 /// A response from the callee to the INVITE siphon sent it on `call_id`. The
 /// callee leg carries none of the caller's identities: the B2BUA rewrote From
 /// to a number and To to the carrier's host.
-fn callee_response(call_id: &str, status_line: &str) -> String {
+pub(super) fn callee_response(call_id: &str, status_line: &str) -> String {
     format!(
         concat!(
             "SIP/2.0 {status_line}\r\n",
@@ -89,7 +89,7 @@ fn callee_response(call_id: &str, status_line: &str) -> String {
 }
 
 /// A request from the callee on its dialog with siphon.
-fn callee_request(method: &str, cseq: u32, branch: &str) -> String {
+pub(super) fn callee_request(method: &str, cseq: u32, branch: &str) -> String {
     format!(
         concat!(
             "{method} sip:192.0.2.1:5060 SIP/2.0\r\n",
@@ -109,7 +109,7 @@ fn callee_request(method: &str, cseq: u32, branch: &str) -> String {
     )
 }
 
-fn arrives(state: &Arc<DispatcherState>, source: &str, raw: &str) {
+pub(super) fn arrives(state: &Arc<DispatcherState>, source: &str, raw: &str) {
     let message = parse_sip_message_bytes(raw.as_bytes()).expect("the message parses");
     let inbound = InboundMessage {
         client_transport: None,
@@ -133,7 +133,7 @@ fn intercepting() -> (
 }
 
 /// [`intercepting`] on a dispatcher the test prepared (a media engine, say).
-fn intercepting_on(
+pub(super) fn intercepting_on(
     mut dispatcher: super::test_dispatcher::TestDispatcher,
 ) -> (
     Arc<DispatcherState>,
@@ -188,13 +188,13 @@ fn intercepting_on(
 
 /// The caller's INVITE arrives, and the call is created the way
 /// `handle_b2bua_invite` creates it. Returns the call's internal id.
-fn caller_calls(state: &Arc<DispatcherState>) -> String {
+pub(super) fn caller_calls(state: &Arc<DispatcherState>) -> String {
     arrives(state, CALLER, CALLER_INVITE);
     create_b2bua_call(state, caller_leg())
 }
 
 /// A callee leg on `call_id`, as `b2bua_send_b_leg_invite` registers one.
-fn dial(state: &Arc<DispatcherState>, internal_id: &str, call_id: &str) {
+pub(super) fn dial(state: &Arc<DispatcherState>, internal_id: &str, call_id: &str) {
     let leg = Leg::new_b_leg(
         call_id.to_string(),
         "siphon-leg".to_string(),
@@ -210,7 +210,7 @@ fn dial(state: &Arc<DispatcherState>, internal_id: &str, call_id: &str) {
     assert!(state.call_actors.add_b_leg(internal_id, leg));
 }
 
-fn drain_iri(iri: &mut mpsc::Receiver<IriEvent>) -> Vec<IriEvent> {
+pub(super) fn drain_iri(iri: &mut mpsc::Receiver<IriEvent>) -> Vec<IriEvent> {
     let mut events = Vec::new();
     while let Ok(event) = iri.try_recv() {
         events.push(event);
@@ -591,7 +591,7 @@ fn leg_scope(name: &str) -> crate::rtpengine::CallScope {
     crate::rtpengine::CallScope::per_call(name).expect("a valid scope")
 }
 
-fn leg_session(call_id: &str) -> crate::rtpengine::MediaSession {
+pub(super) fn leg_session(call_id: &str) -> crate::rtpengine::MediaSession {
     crate::rtpengine::MediaSession {
         rtpengine_call_id: call_id.to_string(),
         call_id: call_id.to_string(),
@@ -775,7 +775,7 @@ const CALLER_FAILURE_ACK: &str = concat!(
 
 /// A response to the caller's INVITE as a proxy receives it from the callee:
 /// same dialog, same Call-ID, the Via siphon added on top.
-fn proxied_response(status_line: &str) -> String {
+pub(super) fn proxied_response(status_line: &str) -> String {
     format!(
         concat!(
             "SIP/2.0 {status_line}\r\n",
@@ -948,17 +948,32 @@ async fn intercepting_on_an_engine(
         true => NativeTestEngine::start_with_x3_at_offer().await,
         false => NativeTestEngine::start().await,
     };
+    let (state, engine, li, _iri, audit) = intercepting_on_the_engine(engine).await;
+    (state, engine, li, audit)
+}
+
+/// An intercepting dispatcher that follows the calls of `engine`, with the
+/// caller's media session in siphon's store, and the X2 records it emits.
+pub(super) async fn intercepting_on_the_engine(
+    engine: NativeTestEngine,
+) -> (
+    Arc<DispatcherState>,
+    NativeTestEngine,
+    LiManager,
+    mpsc::Receiver<IriEvent>,
+    mpsc::Receiver<AuditEntry>,
+) {
     let mut dispatcher = test_dispatcher();
     dispatcher.state.rtpengine_set = Some(engine.backend());
     let sessions = Arc::new(crate::rtpengine::MediaSessionStore::new());
     sessions.insert(leg_session(CALLER_CALL_ID));
     dispatcher.state.rtpengine_sessions = Some(sessions);
-    let (state, li, _iri, audit) = intercepting_on(dispatcher);
+    let (state, li, iri, audit) = intercepting_on(dispatcher);
     super::intercept::watch_engine_calls(&state);
-    (state, engine, li, audit)
+    (state, engine, li, iri, audit)
 }
 
-fn backend_of(state: &Arc<DispatcherState>) -> Arc<crate::rtpengine::MediaBackend> {
+pub(super) fn backend_of(state: &Arc<DispatcherState>) -> Arc<crate::rtpengine::MediaBackend> {
     Arc::clone(state.rtpengine_set.as_ref().expect("a media backend"))
 }
 
@@ -987,7 +1002,7 @@ async fn script_deletes(state: &Arc<DispatcherState>) {
 }
 
 /// The attach attempts audited so far, and how many of them failed.
-async fn attach_outcomes(audit: &mut mpsc::Receiver<AuditEntry>) -> (usize, usize) {
+pub(super) async fn attach_outcomes(audit: &mut mpsc::Receiver<AuditEntry>) -> (usize, usize) {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let (mut attempts, mut failed) = (0, 0);
     while let Ok(entry) = audit.try_recv() {
@@ -1003,7 +1018,7 @@ async fn attach_outcomes(audit: &mut mpsc::Receiver<AuditEntry>) -> (usize, usiz
 
 /// Capture what is logged on this thread, which on a current-thread test
 /// runtime is every task of the test.
-fn capture_log() -> (
+pub(super) fn capture_log() -> (
     crate::log_capture::LogBuffer,
     tracing::subscriber::DefaultGuard,
 ) {
@@ -1019,7 +1034,7 @@ fn capture_log() -> (
 
 /// How many delivery faults went down the path to the ADMF, which this node,
 /// with no `admf:` block, can only log.
-fn faults_reported(log: &crate::log_capture::LogBuffer) -> usize {
+pub(super) fn faults_reported(log: &crate::log_capture::LogBuffer) -> usize {
     log.rendered()
         .matches("could not be reported to the ADMF")
         .count()
@@ -1066,7 +1081,7 @@ fn delivery_ended(reason: &str, delivered: u64) -> crate::rtpengine::events::Rtp
 }
 
 /// The engine's event stream into the dispatcher.
-fn engine_events(
+pub(super) fn engine_events(
     state: &Arc<DispatcherState>,
 ) -> mpsc::Sender<crate::rtpengine::events::RtpEngineEvent> {
     let (events, receiver) = mpsc::channel(16);
@@ -1075,7 +1090,7 @@ fn engine_events(
 }
 
 /// The engine reports `event`, and the dispatcher has acted on it.
-async fn engine_reports(
+pub(super) async fn engine_reports(
     events: &mpsc::Sender<crate::rtpengine::events::RtpEngineEvent>,
     event: crate::rtpengine::events::RtpEngineEvent,
 ) {
@@ -1845,25 +1860,42 @@ fn only_a_detach_or_a_call_siphon_ended_ends_a_delivery_cleanly() {
 }
 
 /// The leak gate for content delivery: calls that complete, calls routed
-/// again after a failed attempt and calls that fail unanswered leave every
-/// lawful-intercept map and the media backend's at baseline.
+/// again after a failed attempt, calls that fail unanswered, callers seated in
+/// a conference room (hanging up, or taken out of a room siphon stops), calls
+/// whose leg is moved into a room and calls the engine answers itself leave
+/// every lawful-intercept map and the media backend's at baseline.
 #[tokio::test]
 async fn completed_rerouted_and_failed_calls_drain_every_map_to_baseline() {
+    use crate::rtpengine::backend::{AdoptedSeat, ConferenceDtmf, ConferenceRole, ConferenceSeat};
     const EACH: usize = 20;
-    let (state, engine, li, _audit) = intercepting_on_an_engine(true).await;
+    const KINDS: [&str; 7] = [
+        "completed",
+        "rerouted",
+        "failed",
+        "seat",
+        "room-stop",
+        "seated",
+        "local",
+    ];
+    let (state, engine, li, _iri, _audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
     let backend = backend_of(&state);
     let events = engine_events(&state);
     let flags = crate::rtpengine::NgFlags::default();
     let settle = || tokio::time::sleep(std::time::Duration::from_millis(5));
 
-    for kind in ["completed", "rerouted", "failed"] {
+    for kind in KINDS {
         for index in 0..EACH {
             let call_id = format!("leak-{kind}-{index}@192.0.2.10");
+            let room = format!("leak-room-{kind}-{index}");
+            let seated = ["seat", "room-stop"].contains(&kind);
             let named = |raw: &str| raw.replace(CALLER_CALL_ID, &call_id);
+            // A joined seat's delivery is named by its room.
+            let delivery = if seated { &room } else { &call_id };
             let ended = |reason: &str| {
                 crate::rtpengine::events::RtpEngineEvent::X3Ended(
                     crate::rtpengine::events::X3EndedEvent {
-                        call_id: call_id.clone(),
+                        call_id: delivery.clone(),
                         from_tag: "caller-tag".to_string(),
                         reason: reason.to_string(),
                         orderly: reason == "Detached",
@@ -1873,6 +1905,63 @@ async fn completed_rerouted_and_failed_calls_drain_every_map_to_baseline() {
                 )
             };
             arrives(&state, CALLER, &named(CALLER_INVITE));
+            if seated {
+                let seat = ConferenceSeat {
+                    conference_id: room.clone(),
+                    from_tag: "caller-tag".to_string(),
+                };
+                backend
+                    .conference_join(&call_id, seat, "v=0\r\n", ConferenceRole::Talker, &flags)
+                    .await
+                    .expect("seated");
+                settle().await;
+                arrives(&state, CALLER, &named(CALLER_ACK));
+                if kind == "seat" {
+                    // The caller hangs up: detached on the seat.
+                    let bye = named(CALLER_ACK)
+                        .replace("ACK sip:", "BYE sip:")
+                        .replace("CSeq: 1 ACK", "CSeq: 2 BYE")
+                        .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-bye");
+                    arrives(&state, CALLER, &bye);
+                }
+                settle().await;
+                // siphon takes the seat out, which stops the room.
+                backend
+                    .delete(&call_id, "caller-tag")
+                    .await
+                    .expect("the seat is freed");
+                let reason = if kind == "seat" {
+                    "Detached"
+                } else {
+                    "CallEnded"
+                };
+                events
+                    .send(ended(reason))
+                    .await
+                    .expect("the event loop runs");
+                // The caller's answer to the BYE siphon sent it.
+                arrives(&state, CALLER, &named(CALLER_BYE_OK));
+                assert!(crate::rtpengine::MediaBackend::conference_seat(&call_id).is_none());
+                continue;
+            }
+            if kind == "local" {
+                backend
+                    .answer_local(&call_id, "caller-tag", "v=0\r\n", &flags)
+                    .await
+                    .expect("answered by the engine");
+                settle().await;
+                arrives(&state, CALLER, &named(CALLER_ACK));
+                backend
+                    .delete(&call_id, "caller-tag")
+                    .await
+                    .expect("deleted");
+                events
+                    .send(ended("CallEnded"))
+                    .await
+                    .expect("the event loop runs");
+                arrives(&state, CALLER, &named(CALLER_BYE_OK));
+                continue;
+            }
             backend
                 .offer(&call_id, "caller-tag", b"v=0\r\n", &flags)
                 .await
@@ -1904,6 +1993,41 @@ async fn completed_rerouted_and_failed_calls_drain_every_map_to_baseline() {
             } else {
                 arrives(&state, CALLEE, &named(&proxied_response("200 OK")));
                 arrives(&state, CALLER, &named(CALLER_ACK));
+                if kind == "seated" {
+                    // The far party is moved into a room, out, and back in.
+                    backend
+                        .answer(&call_id, "caller-tag", "callee-tag", b"v=0\r\n", &flags)
+                        .await
+                        .expect("answered");
+                    for _ in 0..2 {
+                        let adopted = AdoptedSeat {
+                            sip_call_id: call_id.clone(),
+                            party_uri: None,
+                            internal_call_id: call_id.clone(),
+                            owner_call_id: format!("owner-{call_id}"),
+                            end_owner_on_last: false,
+                            dtmf: ConferenceDtmf::Events,
+                        };
+                        backend
+                            .conference_seat_call(
+                                &call_id,
+                                "callee-tag",
+                                &room,
+                                ConferenceRole::Talker,
+                                adopted,
+                            )
+                            .await
+                            .expect("seated in place");
+                        let seat = ConferenceSeat {
+                            conference_id: room.clone(),
+                            from_tag: "callee-tag".to_string(),
+                        };
+                        backend
+                            .conference_leave(&call_id, &seat)
+                            .await
+                            .expect("out of the room");
+                    }
+                }
                 let bye = named(CALLER_ACK)
                     .replace("ACK sip:", "BYE sip:")
                     .replace("CSeq: 1 ACK", "CSeq: 2 BYE")
@@ -1926,7 +2050,7 @@ async fn completed_rerouted_and_failed_calls_drain_every_map_to_baseline() {
     assert_eq!(li.x3_attachment_count(), 0, "no delivery left on record");
     assert_eq!(
         li.remembered_session_count(),
-        3 * EACH,
+        KINDS.len() * EACH,
         "kept for the grace"
     );
     li.sweep_sessions(
@@ -1935,7 +2059,7 @@ async fn completed_rerouted_and_failed_calls_drain_every_map_to_baseline() {
     );
     assert_eq!(li.remembered_session_count(), 0, "decisions drain");
     assert_eq!(li.session_alias_count(), 0, "aliases drain");
-    assert_eq!(li.x3_call_count(), 0, "engine-call records drain");
+    assert_eq!(li.x3_call_count(), 0, "engine-call and seat records drain");
     assert_eq!(backend.active_sessions(), 0, "the backend holds no call");
     assert_eq!(engine.held_count(), 0, "and neither does the engine");
 }

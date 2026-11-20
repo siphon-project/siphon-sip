@@ -88,6 +88,17 @@ impl CallContent {
     }
 }
 
+/// What the content delivery of a seat that joined a conference room is
+/// recorded under.
+///
+/// The engine holds no call behind such a seat and keys its interception on
+/// the room and the seat's tag, so the record is keyed on the pair. Joined by
+/// U+001F, which no SIP Call-ID holds (RFC 3261 §25.1) and the engine refuses
+/// in a call-id, so the key is never an engine call's.
+pub fn seat_record(conference_id: &str, tag: &str) -> String {
+    format!("{conference_id}\u{1f}{tag}")
+}
+
 /// What a failed attach was an attach of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailedAttach {
@@ -212,6 +223,21 @@ impl LiManager {
                 by_siphon: false,
                 attachments: content.take_leg(scope),
             },
+        }
+    }
+
+    /// The record an engine event naming `call_id` and `from_tag` belongs to:
+    /// that of the seat that joined the room `call_id` as `from_tag` when one
+    /// is on record, else the engine call's.
+    pub fn x3_record_of_event<'a>(
+        &self,
+        call_id: &'a str,
+        from_tag: &str,
+    ) -> std::borrow::Cow<'a, str> {
+        let seat = seat_record(call_id, from_tag);
+        match self.x3_attachments.contains_key(&seat) {
+            true => seat.into(),
+            false => call_id.into(),
         }
     }
 
@@ -429,5 +455,38 @@ mod tests {
         );
         manager.forget_x3_call(CALL);
         assert_eq!(manager.x3_call_count(), 0);
+    }
+
+    /// A seat that joined a room is recorded under the room and its tag, so
+    /// two seats of one room are two records, and an engine event naming the
+    /// pair finds the seat's while one naming a call finds the call's.
+    #[test]
+    fn a_joined_seat_has_a_record_of_its_own() {
+        let (manager, _iri, _audit) = manager();
+        let (first, second) = (seat_record("room", "tag-1"), seat_record("room", "tag-2"));
+        assert_ne!(first, second);
+        for record in [&first, &second] {
+            let attempt = manager.x3_attempt(record, None);
+            assert!(manager.register_x3_attachment(
+                record,
+                attachment(DId::generate(), None),
+                attempt
+            ));
+        }
+        assert_eq!(manager.x3_record_of_event("room", "tag-1"), first);
+        assert_eq!(manager.x3_record_of_event("room", "tag-2"), second);
+        assert_eq!(
+            manager.x3_record_of_event("room", "caller-tag"),
+            "room",
+            "no seat on record under that tag: an engine call's event"
+        );
+        assert_eq!(manager.x3_record_of_event(CALL, "caller-tag"), CALL);
+
+        // One seat leaving ends its own delivery and not the other's.
+        manager.x3_media_ended_by_siphon(&first, None);
+        assert!(manager.x3_delivery_ended(&first, None).by_siphon);
+        assert_eq!(manager.x3_attachments_for(&second).len(), 1);
+        assert!(!manager.x3_delivery_ended(&second, None).by_siphon);
+        assert_eq!(manager.x3_attachment_count(), 0);
     }
 }

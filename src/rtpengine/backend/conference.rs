@@ -21,7 +21,7 @@ use super::MediaBackend;
 use crate::rtpengine::client::PlayMediaSource;
 use crate::rtpengine::error::RtpEngineError;
 use crate::rtpengine::profile::NgFlags;
-use crate::rtpengine::siphon_rtp::PlayMediaOutcome;
+use crate::rtpengine::siphon_rtp::{EngineCallChange, PlayMediaOutcome, X3Feature};
 // The routing matrix and the bridge direction are the engine contract's own
 // types, for the reason `X3TargetLeg` is: a local twin would only add a
 // conversion that could be wrong, and a wrong role seats a participant with the
@@ -225,6 +225,12 @@ impl MediaBackend {
             role_name,
             dtmf_label(dtmf),
         );
+        set.seat_changed(
+            EngineCallChange::SeatJoined,
+            call_id,
+            &seat.conference_id,
+            &seat.from_tag,
+        );
         SEATS.insert(call_id.to_string(), seat);
         Ok(answer)
     }
@@ -241,6 +247,16 @@ impl MediaBackend {
             return Err(self.no_mixer("conference_leave"));
         };
         let recorded = SEATS.get(call_id).is_some_and(|held| *held == *seat);
+        // Before the frame is written: a joined seat's content delivery ends
+        // with it, and that end is siphon's own doing. A seated call's leg
+        // leaving its room is told too, and ends nothing: its interception is
+        // its call's.
+        set.seat_changed(
+            EngineCallChange::SeatLeaving,
+            call_id,
+            &seat.conference_id,
+            &seat.from_tag,
+        );
         let outcome = match set
             .conference_leave(&seat.conference_id, &seat.from_tag)
             .await
@@ -286,6 +302,67 @@ impl MediaBackend {
             Self::RtpEngine(_) | Self::RtpProxy(_) => false,
         };
         Some((left, holds_call))
+    }
+
+    /// Whether the engine holding `conference_id` accepts `attach_x3` on a
+    /// seat that joined it (`x3_conference_seat`); `None` while it has not
+    /// been asked. rtpengine and rtpproxy have no room.
+    pub fn x3_conference_seat(&self, conference_id: &str) -> Option<bool> {
+        match self {
+            Self::SiphonRtp(set) => set.x3_room_feature(X3Feature::ConferenceSeat, conference_id),
+            Self::RtpEngine(_) | Self::RtpProxy(_) => Some(false),
+        }
+    }
+
+    /// [`Self::x3_conference_seat`], asking the engine when it has not been
+    /// asked on this connection.
+    pub async fn learn_x3_conference_seat(
+        &self,
+        conference_id: &str,
+    ) -> Result<bool, RtpEngineError> {
+        match self {
+            Self::SiphonRtp(set) => {
+                set.learn_x3_room_feature(X3Feature::ConferenceSeat, conference_id)
+                    .await
+            }
+            Self::RtpEngine(_) | Self::RtpProxy(_) => Ok(false),
+        }
+    }
+
+    /// Begin X3 content delivery on the seat `seat` joined its room with.
+    pub async fn attach_x3_seat(
+        &self,
+        seat: &ConferenceSeat,
+        delivery: &str,
+        xid: [u8; 16],
+        correlation_id: u64,
+        target_leg: super::X3TargetLeg,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(set) => {
+                set.attach_x3_seat(
+                    &seat.conference_id,
+                    &seat.from_tag,
+                    delivery,
+                    xid,
+                    correlation_id,
+                    target_leg,
+                )
+                .await
+            }
+            Self::RtpEngine(_) | Self::RtpProxy(_) => Err(self.no_mixer("attach_x3")),
+        }
+    }
+
+    /// Stop X3 content delivery on a joined seat.
+    pub async fn detach_x3_seat(&self, seat: &ConferenceSeat) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(set) => {
+                set.detach_x3_seat(&seat.conference_id, &seat.from_tag)
+                    .await
+            }
+            Self::RtpEngine(_) | Self::RtpProxy(_) => Err(self.no_mixer("detach_x3")),
+        }
     }
 
     /// Change a seat's role live.
@@ -413,6 +490,12 @@ impl MediaBackend {
             party_uri,
             &role_name,
             &dtmf_name,
+        );
+        set.seat_changed(
+            EngineCallChange::SeatJoined,
+            call_id,
+            &seat.conference_id,
+            &seat.from_tag,
         );
         SEATS.insert(call_id.to_string(), seat);
         Ok(())
