@@ -32,6 +32,10 @@ use super::x1::store::TaskMatch;
 use super::x1::types::{TargetIdentifier, XId};
 use super::{IriEventType, LiManager};
 
+mod engine_calls;
+use engine_calls::MintedEngineCall;
+pub use engine_calls::{DialogMedia, EngineCallSide};
+
 /// What was decided about one session, and when.
 #[derive(Debug, Clone)]
 pub(super) struct SessionDecision {
@@ -101,19 +105,6 @@ pub(super) struct SessionDecision {
     engine_calls: Vec<MintedEngineCall>,
 }
 
-/// An engine call siphon made for a session under an id that is no dialog's
-/// Call-ID.
-#[derive(Debug, Clone)]
-struct MintedEngineCall {
-    id: Arc<str>,
-    /// Whether the engine holds it: offered, and not ended by siphon since.
-    live: bool,
-    /// Whether the party whose SDP it was offered with is the session's
-    /// caller. The engine's "caller" is the offerer, whoever that is in the
-    /// call.
-    offerer_is_caller: bool,
-}
-
 /// A seat a party joined a conference room with (`conference_join`, or the
 /// answer to a `conference_offer`). No engine call is behind it: the media
 /// engine knows it by the room and the tag, and so does its content delivery.
@@ -136,14 +127,19 @@ impl SessionDecision {
     /// The engine call that holds the session's media now, and whether its
     /// offerer is the session's caller: the newest one siphon minted that the
     /// engine still holds, else the one the anchoring Call-ID names.
-    fn engine_call(&self) -> (Arc<str>, bool) {
+    pub(super) fn engine_call(&self) -> (Arc<str>, bool) {
         self.engine_calls
             .iter()
             .rev()
             .find(|minted| minted.live)
             .map_or_else(
                 || (Arc::clone(&self.primary_call_id), true),
-                |minted| (Arc::clone(&minted.id), minted.offerer_is_caller),
+                |minted| {
+                    (
+                        Arc::clone(&minted.id),
+                        minted.offerer_is_caller(&self.primary_call_id),
+                    )
+                },
             )
     }
 
@@ -612,7 +608,7 @@ impl LiManager {
         facts: &MessageFacts<'_>,
         identities: &Identities<'_>,
         owner: impl FnOnce() -> Option<CallOwner>,
-        caller_tag: impl FnOnce() -> Option<String>,
+        media: impl FnOnce() -> Option<DialogMedia>,
     ) -> SessionView {
         if !self.is_intercepting() {
             return SessionView::unwarranted(call_id);
@@ -620,6 +616,10 @@ impl LiManager {
         let generation = self.tasks.generation();
         let sender = Sender::of(facts, identities);
         let mut caller_tag_known: Option<Box<str>> = None;
+        // The engine calls siphon minted for the dialog, as an earlier
+        // decision knew them: a decision replaced by one a warrant now covers
+        // hands them on.
+        let mut minted: Vec<MintedEngineCall> = Vec::new();
 
         let known = self
             .aliases
@@ -638,7 +638,7 @@ impl LiManager {
                 facts,
                 identities,
                 &sender,
-                &mut caller_tag_known,
+                &mut (&mut caller_tag_known, &mut minted),
             ) {
                 return view;
             }
@@ -663,7 +663,7 @@ impl LiManager {
                     facts,
                     identities,
                     &sender,
-                    &mut None,
+                    &mut (&mut None, &mut Vec::new()),
                 ) {
                     return view;
                 }
@@ -676,14 +676,40 @@ impl LiManager {
             identities.to_uri,
             identities.source_ip,
         );
+        // What an unwarranted decision of the dialog, or of the call's
+        // anchoring dialog, knew: both are replaced by the one made here.
+        let anchoring = owner.as_ref().map(|owner| owner.a_leg_call_id.as_str());
+        for leg in [Some(call_id), anchoring].into_iter().flatten() {
+            if let Some(decision) = self.decisions.get(leg) {
+                if decision.matched.is_empty() {
+                    minted.extend(decision.engine_calls.iter().cloned());
+                }
+            }
+        }
+        // A warrant that starts in the middle of a call nothing is remembered
+        // of: the media path says where the call's media is, and who offered.
+        let known_to_media = (!facts.opens_dialog() && !matches.is_empty())
+            .then(media)
+            .flatten()
+            .unwrap_or_default();
+        if minted.is_empty() {
+            if let Some((engine_call_id, offerer_dialog)) = known_to_media.minted {
+                minted.push(MintedEngineCall {
+                    id: Arc::from(engine_call_id),
+                    live: true,
+                    dialog: Arc::from(offerer_dialog),
+                    side: EngineCallSide::Offerer,
+                });
+            }
+        }
         let caller_is_in_from = if facts.opens_dialog() {
             caller_tag_known = sender.from_tag.map(Box::from);
             Some(true)
         } else if let Some(owner) = owner.as_ref() {
             Some(leg_from_is_caller(facts, call_id == owner.a_leg_call_id))
         } else {
-            if caller_tag_known.is_none() && !matches.is_empty() {
-                caller_tag_known = caller_tag().map(String::into_boxed_str);
+            if caller_tag_known.is_none() {
+                caller_tag_known = known_to_media.offerer_tag.map(String::into_boxed_str);
             }
             sender
                 .from_tag
@@ -745,63 +771,17 @@ impl LiManager {
         if called_party_leg {
             self.note_called_party_leg(&session_id, &call_id);
         }
+        let (engine_call_id, offerer_is_caller) = match matches.is_empty() {
+            true => (Arc::clone(&primary_call_id), true),
+            false => self.hand_on_engine_calls(&session_id, minted, &primary_call_id),
+        };
         SessionView {
             on_primary_leg: primary_call_id == call_id,
             session_id,
-            engine_call_id: primary_call_id,
-            offerer_is_caller: true,
+            engine_call_id,
+            offerer_is_caller,
             matches,
             seats: Vec::new(),
-        }
-    }
-
-    /// siphon is about to offer the media of the session `sip_call_id` is a
-    /// dialog of to the engine under `engine_call_id`, an id of its own
-    /// minting. From here on that engine call is the session's: an offer or
-    /// an end siphon reports under the id is the session's, and its content
-    /// delivery is asked for and judged there. `sip_call_id` is the dialog of
-    /// the party whose SDP is offered.
-    ///
-    /// Nothing for a dialog no message was intercepted on, and nothing when
-    /// the id is the session's anchoring Call-ID, which is its engine call
-    /// already.
-    pub fn adopt_engine_call(&self, sip_call_id: &str, engine_call_id: &str) {
-        let Some(session_id) = self.session_id_of(sip_call_id) else {
-            return;
-        };
-        {
-            let Some(mut decision) = self.decisions.get_mut(&*session_id) else {
-                return;
-            };
-            if &*decision.primary_call_id == engine_call_id {
-                return;
-            }
-            let offerer_is_caller = &*decision.primary_call_id == sip_call_id;
-            decision
-                .engine_calls
-                .retain(|minted| &*minted.id != engine_call_id);
-            decision.engine_calls.push(MintedEngineCall {
-                id: Arc::from(engine_call_id),
-                live: true,
-                offerer_is_caller,
-            });
-        }
-        self.alias(engine_call_id, &session_id);
-    }
-
-    /// The engine holds the minted engine call `engine_call_id` (`live`), or
-    /// siphon has ended it. Nothing for an id that is no session's minted
-    /// engine call, which is nearly every one.
-    pub fn engine_call_is_live(&self, engine_call_id: &str, live: bool) {
-        let Some(session_id) = self.aliases.get(engine_call_id).map(|alias| alias.clone()) else {
-            return;
-        };
-        if let Some(mut decision) = self.decisions.get_mut(&*session_id) {
-            for minted in &mut decision.engine_calls {
-                if &*minted.id == engine_call_id {
-                    minted.live = live;
-                }
-            }
         }
     }
 
@@ -1138,7 +1118,19 @@ impl LiManager {
                 self.forget_x3_call(&seat.record());
             }
             for minted in &decision.engine_calls {
-                self.forget_x3_call(&minted.id);
+                // Two calls bridged onto one engine call each have a session
+                // on it: its record goes with the last of them.
+                let last =
+                    self.minted_engine_calls
+                        .get_mut(&*minted.id)
+                        .is_none_or(|mut sessions| {
+                            sessions.retain(|held| **held != *session_id);
+                            sessions.is_empty()
+                        });
+                if last {
+                    self.minted_engine_calls.remove(&*minted.id);
+                    self.forget_x3_call(&minted.id);
+                }
             }
         }
     }
@@ -1153,6 +1145,7 @@ impl LiManager {
         if !self.is_intercepting() {
             self.decisions.clear();
             self.aliases.clear();
+            self.minted_engine_calls.clear();
             self.forget_idle_x3_calls();
             return;
         }
@@ -1222,7 +1215,7 @@ impl LiManager {
         facts: &MessageFacts<'_>,
         identities: &Identities<'_>,
         sender: &Sender<'_>,
-        remembered_caller_tag: &mut Option<Box<str>>,
+        carried: &mut (&mut Option<Box<str>>, &mut Vec<MintedEngineCall>),
     ) -> Option<SessionView> {
         let mut decision = self.decisions.get_mut(&**session_id)?;
         if decision.generation != generation {
@@ -1234,7 +1227,8 @@ impl LiManager {
             );
             if decision.matched.is_empty() && !fresh.is_empty() {
                 // What the old decision knew of the caller carries over.
-                *remembered_caller_tag = decision.caller_tag.take();
+                *carried.0 = decision.caller_tag.take();
+                carried.1.extend(decision.engine_calls.iter().cloned());
                 drop(decision);
                 self.forget_session(session_id);
                 return None;
@@ -1331,6 +1325,7 @@ impl LiManager {
             );
             self.decisions.clear();
             self.aliases.clear();
+            self.minted_engine_calls.clear();
             self.forget_idle_x3_calls();
         }
         // A leg that had a decision of its own (unwarranted, from before the
@@ -2414,7 +2409,12 @@ mod tests {
             &request("BYE"),
             &from_the_far_end(),
             || None,
-            || Some("a".to_string()),
+            || {
+                Some(DialogMedia {
+                    offerer_tag: Some("a".to_string()),
+                    minted: None,
+                })
+            },
         );
         assert_eq!(party(&view), MatchedParty::Originating);
     }
@@ -2451,7 +2451,12 @@ mod tests {
             &response("INVITE", 200),
             &from_the_far_end(),
             || None,
-            || Some("a".to_string()),
+            || {
+                Some(DialogMedia {
+                    offerer_tag: Some("a".to_string()),
+                    minted: None,
+                })
+            },
         );
         assert_eq!(party(&view), MatchedParty::Originating);
     }
@@ -2664,14 +2669,22 @@ mod tests {
     #[test]
     fn a_session_follows_its_media_onto_an_engine_call_siphon_minted() {
         const MINTED: &str = "minted-engine-call";
+        use EngineCallSide::{Answerer, Offerer};
         let (manager, _iri, _audit) = manager();
         provision(&manager, DeliveryType::X2AndX3, None);
-        manager.adopt_engine_call(CALLER_LEG, MINTED);
-        assert!(
-            manager.session_of_leg(MINTED).is_none(),
+        manager.adopt_engine_call(CALLER_LEG, MINTED, Offerer);
+        assert_eq!(
+            manager.minted_engine_call_count(),
+            0,
             "a dialog nothing was intercepted on has no session to give it to"
         );
         let internal_id = warranted_call(&manager);
+        manager.adopt_engine_call(CALLER_LEG, CALLER_LEG, Offerer);
+        assert_eq!(
+            manager.minted_engine_call_count(),
+            0,
+            "its own Call-ID is no minted id"
+        );
 
         // Offered with the called party's media: the engine's caller is not
         // the session's.
@@ -2680,16 +2693,26 @@ mod tests {
                 Some(owned_by(&internal_id))
             });
         assert_eq!(&*on_callee_leg.engine_call_id, CALLER_LEG);
-        manager.adopt_engine_call(CALLEE_LEG, MINTED);
-        let view = manager.session_of_leg(MINTED).expect("the session");
-        assert_eq!(&*view.session_id, internal_id.as_str());
+        manager.adopt_engine_call(CALLEE_LEG, MINTED, Offerer);
+        let view = manager.session_of_leg(CALLER_LEG).expect("the session");
         assert_eq!(&*view.engine_call_id, MINTED);
         assert!(!view.offerer_is_caller);
-        assert!(!view.on_primary_leg, "it is no dialog");
+        assert_eq!(
+            manager.sessions_on_engine_call(MINTED),
+            vec![Arc::<str>::from(internal_id.as_str())]
+        );
         let message = manager.resolve_session(CALLER_LEG, &request("ACK"), &caller(), || None);
         assert_eq!(
             &*message.engine_call_id, MINTED,
             "every later message sees it"
+        );
+        // The caller's answer on it changes nothing it knew.
+        manager.adopt_engine_call(CALLER_LEG, MINTED, Answerer);
+        assert!(
+            !manager
+                .session_of_leg(CALLER_LEG)
+                .expect("the session")
+                .offerer_is_caller
         );
 
         // siphon ends it: the media is where the anchoring Call-ID says again.
@@ -2698,14 +2721,11 @@ mod tests {
         assert_eq!(&*back.engine_call_id, CALLER_LEG);
         assert!(back.offerer_is_caller);
 
-        // Offered with the caller's own media, it is the caller's.
-        manager.adopt_engine_call(CALLER_LEG, MINTED);
-        assert!(
-            manager
-                .session_of_leg(MINTED)
-                .expect("the session")
-                .offerer_is_caller
-        );
+        // Answered by the called party, another one's offerer is the caller.
+        manager.adopt_engine_call(CALLEE_LEG, "minted-2", Answerer);
+        let second = manager.session_of_leg(CALLER_LEG).expect("the session");
+        assert_eq!(&*second.engine_call_id, "minted-2");
+        assert!(second.offerer_is_caller);
 
         let attempt = manager.x3_attempt(MINTED, None);
         assert!(manager.x3_attempt_in_progress(MINTED, None, attempt));
@@ -2713,10 +2733,59 @@ mod tests {
         manager.sweep_sessions(Instant::now() + SESSION_GRACE * 2, |_| false);
         assert_eq!(manager.remembered_session_count(), 0);
         assert_eq!(
-            manager.session_alias_count(),
+            manager.minted_engine_call_count(),
             0,
-            "the minted id is released"
+            "the minted ids are released"
         );
-        assert_eq!(manager.x3_call_count(), 0, "and so is its content record");
+        assert_eq!(manager.x3_call_count(), 0, "and so is their content record");
+    }
+
+    /// A warrant that arrives after the call's media was moved onto an engine
+    /// call siphon minted finds that engine call: from what the unwarranted
+    /// decision of the dialog knew, and with nothing remembered at all from
+    /// what the media path holds.
+    #[test]
+    fn a_mid_call_warrant_finds_the_engine_call_the_media_moved_to() {
+        const MINTED: &str = "minted-engine-call";
+        // Another warrant was provisioned, so the dialog's decision was kept.
+        let (manager, _iri, _audit) = manager();
+        provision_targets(
+            &manager,
+            DeliveryType::X2Only,
+            None,
+            vec![TargetIdentifier::SipUri(
+                "sip:carol@example.com".to_string(),
+            )],
+        );
+        let opening = manager.resolve_session(CALLER_LEG, &invite(), &caller(), || None);
+        assert!(opening.matches.is_empty());
+        manager.adopt_engine_call(CALLER_LEG, MINTED, EngineCallSide::Offerer);
+        provision(&manager, DeliveryType::X2AndX3, None);
+        let view = manager.resolve_session(CALLER_LEG, &request("ACK"), &caller(), || None);
+        assert_eq!(view.matches.len(), 1);
+        assert_eq!(&*view.engine_call_id, MINTED);
+        assert!(view.offerer_is_caller);
+        assert_eq!(manager.sessions_on_engine_call(MINTED).len(), 1);
+
+        // Nothing was provisioned at all while the call was set up and moved.
+        let (manager, _iri, _audit) = crate::li::tests::manager();
+        provision(&manager, DeliveryType::X2AndX3, None);
+        let view = manager.resolve_session_with(
+            CALLER_LEG,
+            &request("ACK"),
+            &caller(),
+            || None,
+            || {
+                Some(DialogMedia {
+                    offerer_tag: Some("a".to_string()),
+                    minted: Some((MINTED.to_string(), CALLEE_LEG.to_string())),
+                })
+            },
+        );
+        assert_eq!(&*view.engine_call_id, MINTED);
+        assert!(
+            !view.offerer_is_caller,
+            "offered with the other party's media"
+        );
     }
 }

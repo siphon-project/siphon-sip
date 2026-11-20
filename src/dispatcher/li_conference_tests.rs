@@ -668,6 +668,269 @@ async fn a_transfer_re_anchoring_the_media_is_followed_by_its_interception() {
     }
 }
 
+// ── Engine calls siphon mints ───────────────────────────────────────────────
+//
+// The control plane's verbs put a call's media on an engine call under an id
+// of siphon's own: `dial` (the caller's offer, on an allocation of its own),
+// `bridge`, `replace_peer` and `accept_refer` (the pair's fresh engine call,
+// one step of the bridge plan), an originate's early offer, and a transfer or
+// take-over (the survivor's media, offered afresh). None of those ids is a
+// Call-ID. Each allocation says which dialog's SDP it carries, and that is
+// what binds it to the dialog's lawful-intercept session, in the one place
+// every offer is sent from.
+
+/// The SDP a control verb offers for the caller.
+const CALLER_SDP: &str = concat!(
+    "v=0\r\n",
+    "o=- 1 1 IN IP4 192.0.2.10\r\n",
+    "s=-\r\n",
+    "c=IN IP4 192.0.2.10\r\n",
+    "t=0 0\r\n",
+    "m=audio 40000 RTP/AVP 0\r\n",
+);
+
+/// The caller's INVITE on `call_id`, with an offer in it.
+fn caller_invite_with_sdp(call_id: &str) -> String {
+    on_call(CALLER_INVITE, call_id).replace(
+        "Content-Length: 0\r\n\r\n",
+        &format!(
+            "Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{CALLER_SDP}",
+            CALLER_SDP.len()
+        ),
+    )
+}
+
+fn caller_side() -> crate::rtpengine::session::SideFlags {
+    crate::rtpengine::session::SideFlags {
+        profile: "rtp_passthrough".to_string(),
+        half: crate::rtpengine::session::ProfileHalf::Offer,
+    }
+}
+
+/// Run the media step `verb` takes for the caller on `call`, as the control
+/// verb of that name does.
+fn mint_engine_call(verb: &str, state: &Arc<DispatcherState>, call: &str) {
+    let source: std::net::IpAddr = "192.0.2.10".parse().expect("a literal address");
+    tokio::task::block_in_place(|| match verb {
+        "dial" => {
+            let invite = parse_sip_message_bytes(caller_invite_with_sdp(call).as_bytes())
+                .expect("the INVITE parses");
+            super::b2bua::control_dial_media_offer(&invite, source, "rtp_passthrough", state)
+                .expect("the dial's media is offered");
+        }
+        "bridge" => {
+            let step = crate::b2bua::bridge::MediaStep::Offer {
+                media_call_id: crate::b2bua::actor::generate_call_id(),
+                from_tag: "caller-tag".to_string(),
+                profile: "rtp_passthrough".to_string(),
+                sdp: CALLER_SDP.as_bytes().to_vec(),
+                received_from: Some(source),
+                ingress: caller_side(),
+                sip_call_id: call.to_string(),
+            };
+            let backend = backend_of(state);
+            let offered =
+                tokio::runtime::Handle::current().block_on(super::b2bua::bridge_run_media_step(
+                    &backend,
+                    state.rtpengine_profiles.as_ref(),
+                    &step,
+                ));
+            assert!(matches!(offered, Ok(Some(_))), "the pair's offer");
+        }
+        "originate" => {
+            let caller = super::b2bua::LegOfferCaller {
+                sip_call_id: call.to_string(),
+                from_tag: "caller-tag".to_string(),
+                sdp: CALLER_SDP.as_bytes().to_vec(),
+                source,
+                ingress: caller_side(),
+                relaying: false,
+            };
+            assert!(
+                super::b2bua::allocate_leg_offer(&caller, "rtp_passthrough", state).is_ok(),
+                "the leg's early offer"
+            );
+        }
+        "transfer" => {
+            assert!(super::b2bua::b2bua_transfer_rtpengine_offer(
+                state,
+                &crate::b2bua::actor::generate_call_id(),
+                "caller-tag",
+                CALLER_SDP.as_bytes(),
+                call,
+                "rtp_passthrough",
+                None,
+            )
+            .is_some());
+        }
+        other => panic!("no such verb: {other}"),
+    });
+}
+
+/// Each control verb that mints an engine call for an intercepted call has
+/// that engine call attached, at its offer on an engine that takes an
+/// interception there and at its answer on one that does not, and never under
+/// the SIP Call-ID, which the engine holds no call for. With the caller's old
+/// engine call released there is exactly one live interception, on the engine
+/// call that holds the media.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_engine_call_a_control_verb_mints_is_attached() {
+    for verb in ["dial", "bridge", "originate", "transfer"] {
+        for at_offer in [true, false] {
+            let case = format!("{verb} at_offer={at_offer}");
+            let call = format!("minted-by-{verb}-{at_offer}@192.0.2.10");
+            let engine = match at_offer {
+                true => NativeTestEngine::start_with_x3().await,
+                false => NativeTestEngine::start().await,
+            };
+            let (state, engine, li, _iri, mut audit) = intercepting_on_the_engine(engine).await;
+            let events = engine_events(&state);
+            let backend = backend_of(&state);
+            let flags = NgFlags::default();
+            arrives(&state, CALLER, &caller_invite_with_sdp(&call));
+            // A dial is the caller's first allocation. Every other verb moves
+            // media the caller's Call-ID already anchors.
+            let anchored = verb != "dial";
+            if anchored {
+                backend
+                    .offer(&call, "caller-tag", CALLER_SDP.as_bytes(), &flags)
+                    .await
+                    .expect("offered");
+                backend
+                    .answer(&call, "caller-tag", "callee-tag", b"v=0\r\n", &flags)
+                    .await
+                    .expect("answered");
+                arrives(&state, CALLER, &on_call(CALLER_ACK, &call));
+                assert_eq!(attach_outcomes(&mut audit).await, (1, 0), "{case}");
+            }
+
+            mint_engine_call(verb, &state, &call);
+            let minted = engine
+                .commands("offer")
+                .last()
+                .expect("the verb offered")
+                .call_id
+                .clone();
+            assert_ne!(minted, call, "{case}: an id of siphon's own");
+            // The other party answers on the minted engine call.
+            let mut answer_flags = NgFlags::default();
+            answer_flags.stamp_sip_call_id("other-party@192.0.2.1");
+            backend
+                .answer(
+                    &minted,
+                    "caller-tag",
+                    "other-tag",
+                    b"v=0\r\n",
+                    &answer_flags,
+                )
+                .await
+                .expect("answered");
+            if anchored {
+                backend
+                    .delete(&call, "caller-tag")
+                    .await
+                    .expect("the old anchor is released");
+                engine_reports(&events, ended(&call, "caller-tag", "CallEnded")).await;
+            }
+
+            assert_eq!(attach_outcomes(&mut audit).await, (1, 0), "{case}");
+            let attached: Vec<String> = engine
+                .commands("attach_x3")
+                .into_iter()
+                .map(|command| command.call_id)
+                .collect();
+            let expected = match anchored {
+                true => vec![call.clone(), minted.clone()],
+                false => vec![minted.clone()],
+            };
+            assert_eq!(attached, expected, "{case}");
+            assert!(
+                engine
+                    .commands("attach_x3")
+                    .iter()
+                    .all(|command| !command.refused),
+                "{case}: nothing asked of a call the engine does not hold"
+            );
+            assert_eq!(li.x3_attachments_for(&minted).len(), 1, "{case}");
+            assert_eq!(li.x3_attachment_count(), 1, "{case}: exactly one live");
+
+            // A later ACK asks for nothing more.
+            let ack = on_call(CALLER_ACK, &call)
+                .replace("CSeq: 1 ACK", "CSeq: 2 ACK")
+                .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-reack");
+            arrives(&state, CALLER, &ack);
+            assert_eq!(attach_outcomes(&mut audit).await, (0, 0), "{case}");
+            backend
+                .delete(&minted, "caller-tag")
+                .await
+                .expect("released");
+        }
+    }
+}
+
+/// A warrant activated after the call's media was moved onto an engine call
+/// siphon minted, on a node that had nothing provisioned until then and so
+/// remembers nothing of the call: what the media path holds says where the
+/// media is, and the next ACK attaches there, not under the Call-ID.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mid_call_warrant_attaches_on_the_engine_call_the_media_moved_to() {
+    const CALL: &str = "mid-call-on-minted@192.0.2.10";
+    let (state, engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    let warrant = li.tasks().list()[0].details.clone();
+    li.tasks().deactivate(warrant.x_id).expect("no warrant yet");
+    let backend = backend_of(&state);
+    let flags = NgFlags::default();
+    arrives(&state, CALLER, &caller_invite_with_sdp(CALL));
+    backend
+        .offer(CALL, "caller-tag", CALLER_SDP.as_bytes(), &flags)
+        .await
+        .expect("offered");
+    mint_engine_call("transfer", &state, CALL);
+    let minted = engine
+        .commands("offer")
+        .last()
+        .expect("offered")
+        .call_id
+        .clone();
+    backend
+        .answer(&minted, "caller-tag", "target-tag", b"v=0\r\n", &flags)
+        .await
+        .expect("answered");
+    backend
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("the old anchor is released");
+    // What the transfer leaves in siphon's media store for the caller.
+    let sessions = state.rtpengine_sessions.as_ref().expect("a store");
+    sessions.insert(crate::rtpengine::MediaSession {
+        rtpengine_call_id: minted.clone(),
+        ..super::li_session_tests::leg_session(CALL)
+    });
+    sessions.record_parties(CALL, &minted, &[(CALL, Some("caller-tag"))]);
+    assert_eq!(
+        attach_outcomes(&mut audit).await,
+        (0, 0),
+        "nobody is warranted"
+    );
+
+    li.tasks()
+        .activate(warrant)
+        .expect("the warrant arrives mid-call");
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+    let attached = engine.commands("attach_x3");
+    assert_eq!(attached.len(), 1);
+    assert_eq!(attached[0].call_id, minted, "on the live allocation");
+    assert!(!attached[0].refused);
+    assert_eq!(attached[0].detail.as_deref(), Some("caller"));
+    assert_eq!(li.x3_attachments_for(&minted).len(), 1);
+    backend
+        .delete(&minted, "caller-tag")
+        .await
+        .expect("released");
+}
+
 /// A room that closes while the leg is being moved into it leaves the call's
 /// media stopped. The engine refuses the seat and ends the interception with
 /// `transport_error`, which is a fault toward the ADMF like any end siphon did

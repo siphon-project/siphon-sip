@@ -52,7 +52,10 @@ use x1::store::{ContentCapability, DestinationStore, StoredTask, TaskMatch, Task
 use x1::types::{DeliveryType, XId};
 
 pub use content::{seat_record, EndedDelivery, FailedAttach};
-pub use session::{CallOwner, Identities, MessageFacts, Seat, SessionView, SESSION_GRACE};
+pub use session::{
+    CallOwner, DialogMedia, EngineCallSide, Identities, MessageFacts, Seat, SessionView,
+    SESSION_GRACE,
+};
 #[cfg(test)]
 use session::{MAX_REMEMBERED_SESSIONS, MAX_SEEN_PER_SESSION};
 
@@ -250,6 +253,11 @@ pub struct LiManager {
     /// Leg Call-ID to the session it belongs to, for every leg whose session
     /// is not keyed on its own Call-ID.
     aliases: Arc<DashMap<Arc<str>, Arc<str>>>,
+    /// The sessions with media on each engine call siphon made under an id of
+    /// its own minting, by that id.
+    ///
+    /// See [`LiManager::adopt_engine_call`].
+    minted_engine_calls: Arc<DashMap<String, Vec<Arc<str>>>>,
 }
 
 impl LiManager {
@@ -279,6 +287,7 @@ impl LiManager {
             x3_attachments: Arc::new(DashMap::new()),
             decisions: Arc::new(DashMap::new()),
             aliases: Arc::new(DashMap::new()),
+            minted_engine_calls: Arc::new(DashMap::new()),
         };
 
         let _ = manager.audit_sender.try_send(AuditEntry {

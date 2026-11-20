@@ -112,6 +112,9 @@ pub enum EngineCallChange {
     EndFailed,
     /// An `offer` has just created the engine call.
     Offered,
+    /// An `answer` has just completed the engine call: both parties' media is
+    /// in the engine.
+    Answered,
     /// An `answer_local` has just been answered: the engine holds the call
     /// with itself as the far side. A re-answer of the same dialog is told
     /// again, and keeps the call.
@@ -154,7 +157,11 @@ pub struct EngineCall<'a> {
     pub from_tag: &'a str,
     /// The per-call scope the leg is anchored under; `None` for the node's.
     pub scope: Option<&'a CallScope>,
-    /// The SIP Call-ID of the call a seat seats, on a seat's change.
+    /// The SIP Call-ID of the dialog the change is for, where the command
+    /// names one: the dialog whose SDP an `offer`, an `answer` or an
+    /// `answer_local` carried (every allocation siphon makes is stamped with
+    /// it, which is what ties an engine call under an id siphon minted to
+    /// its call), and the call a seat seats.
     pub sip_call_id: Option<&'a str>,
     pub change: EngineCallChange,
 }
@@ -182,12 +189,44 @@ impl CallWatch {
         call_id: &str,
         from_tag: &str,
     ) {
+        self.notify_for(change, scope, call_id, from_tag, None);
+    }
+
+    /// Tell the observer of an `answer_local` the engine has just answered,
+    /// under the per-call scope of the current task and for the dialog its
+    /// flags are stamped with.
+    pub(super) fn answered_locally(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        flags: &crate::rtpengine::profile::NgFlags,
+    ) {
+        let scope = super::per_call::frame_scope();
+        self.notify_for(
+            EngineCallChange::AnsweredLocally,
+            scope.as_ref(),
+            call_id,
+            from_tag,
+            flags.sip_call_id.as_deref(),
+        );
+    }
+
+    /// [`Self::notify`] of a command that carried the SDP of the dialog
+    /// `sip_call_id`.
+    pub(super) fn notify_for(
+        &self,
+        change: EngineCallChange,
+        scope: Option<&CallScope>,
+        call_id: &str,
+        from_tag: &str,
+        sip_call_id: Option<&str>,
+    ) {
         if let Some(observer) = self.0.get() {
             observer(&EngineCall {
                 call_id,
                 from_tag,
                 scope,
-                sip_call_id: None,
+                sip_call_id,
                 change,
             });
         }

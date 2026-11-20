@@ -205,13 +205,6 @@ pub fn b2bua_transfer_rtpengine_offer(
     let mut offer_flags = profile.offer.clone();
     stamp_party_ingress(&mut offer_flags, profiles, ingress);
     offer_flags.stamp_sip_call_id(offerer_sip_call_id);
-    // The fresh engine call is the media of the survivor's session from here
-    // on. Lawful intercept is told before the engine is, so that the offer
-    // finds the session it belongs to and content delivery follows the media
-    // onto the new engine call, which no Call-ID names.
-    if let Some(li) = state.li_manager.as_ref() {
-        li.adopt_engine_call(offerer_sip_call_id, cid_new);
-    }
     match crate::script::blocking::block_on_released(backend.offer(
         cid_new,
         survivor_tag,
@@ -220,10 +213,6 @@ pub fn b2bua_transfer_rtpengine_offer(
     )) {
         Ok(rewritten) => Some(rewritten),
         Err(error) => {
-            // Nothing was allocated: the session's media is where it was.
-            if let Some(li) = state.li_manager.as_ref() {
-                li.engine_call_is_live(cid_new, false);
-            }
             warn!(rtpengine_call_id = %cid_new, "REFER terminate: rtpengine offer failed: {error}");
             None
         }
@@ -269,13 +258,7 @@ pub fn b2bua_transfer_rtpengine_answer(
         target_sdp,
         &answer_flags,
     )) {
-        Ok(rewritten) => {
-            // Both parties are in the engine: an engine that takes no
-            // interception before that is asked now, since siphon sends the
-            // ACKs of a transfer itself and none arrives to ask at.
-            crate::dispatcher::intercept::minted_engine_call_answered(state, cid_new, survivor_tag);
-            Some(rewritten)
-        }
+        Ok(rewritten) => Some(rewritten),
         Err(error) => {
             warn!(rtpengine_call_id = %cid_new, "rtpengine answer failed: {error}");
             None

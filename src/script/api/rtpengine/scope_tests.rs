@@ -623,6 +623,7 @@ async fn a_scripts_offer_is_told_to_the_engine_call_observer_and_its_re_offer_is
         if matches!(
             call.change,
             EngineCallChange::Ended
+                | EngineCallChange::Answered
                 | EngineCallChange::EndFailed
                 | EngineCallChange::SeatLeft
                 | EngineCallChange::SeatLeaveFailed

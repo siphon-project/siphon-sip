@@ -298,8 +298,11 @@ impl SiphonRtpClientSet {
         self.calls.notify(outcome, scope, call_id, from_tag);
         let result = result?;
         self.bind_affinity_key(&key);
+        // The one place every offer leaves from. The dialog it is stamped
+        // with is what an engine call under an id siphon minted belongs to.
+        let dialog = flags.sip_call_id.as_deref();
         self.calls
-            .notify(EngineCallChange::Offered, scope, call_id, from_tag);
+            .notify_for(EngineCallChange::Offered, scope, call_id, from_tag, dialog);
         Ok(result)
     }
 
@@ -355,9 +358,14 @@ impl SiphonRtpClientSet {
     ) -> Result<Vec<u8>, RtpEngineError> {
         let framed = framed(scope);
         let scope = framed.as_ref();
-        self.select_key(&scoped_key(call_id, scope))
+        let answered = self
+            .select_key(&scoped_key(call_id, scope))
             .answer_in(scope, call_id, from_tag, to_tag, sdp, flags)
-            .await
+            .await?;
+        let dialog = flags.sip_call_id.as_deref();
+        self.calls
+            .notify_for(EngineCallChange::Answered, scope, call_id, from_tag, dialog);
+        Ok(answered)
     }
 
     /// Send a `delete` under `scope` and drop the engine call's affinity.

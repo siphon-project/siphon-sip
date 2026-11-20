@@ -81,7 +81,7 @@ pub(super) fn intercept_message(
         &facts,
         &identities,
         || b2bua_owner(state, message, call_id),
-        || offerer_tag(state, call_id),
+        || dialog_media(state, call_id),
     );
     if session.matches.is_empty() {
         // An unwarranted session is remembered as unwarranted, and that
@@ -448,14 +448,31 @@ fn replaced_call(state: &DispatcherState, message: &SipMessage) -> Option<String
         .map(|(party, _answered)| party.internal_call_id)
 }
 
-/// The tag the media path knows the offerer of `call_id` by: the party that
-/// opened the dialog, on a call whose INVITE carried the offer.
-fn offerer_tag(state: &DispatcherState, call_id: &str) -> Option<String> {
-    state
-        .rtpengine_sessions
-        .as_ref()?
-        .get(call_id)
-        .map(|session| session.from_tag)
+/// What the media path holds for the call `call_id` is a dialog of: who
+/// offered its media, and the engine call it is on when that is under an id
+/// siphon minted (a dial, a bridge, a transfer), with the dialog of the party
+/// that offered there.
+fn dialog_media(state: &DispatcherState, call_id: &str) -> Option<crate::li::DialogMedia> {
+    let sessions = state.rtpengine_sessions.as_ref()?;
+    // A B2BUA call's media session is kept under its caller leg's Call-ID.
+    let anchoring = state
+        .call_actors
+        .find_by_sip_call_id(call_id)
+        .and_then(|internal_id| state.call_actors.get_call(&internal_id))
+        .map(|call| call.a_leg.dialog.call_id.clone())
+        .unwrap_or_else(|| call_id.to_string());
+    let session = sessions.get(&anchoring).or_else(|| sessions.get(call_id))?;
+    let engine_call_id = session.rtpengine_id();
+    let minted = (engine_call_id != anchoring).then(|| {
+        let offerer = sessions
+            .event_party(engine_call_id, &session.from_tag)
+            .unwrap_or_else(|| session.call_id.clone());
+        (engine_call_id.to_string(), offerer)
+    });
+    Some(crate::li::DialogMedia {
+        offerer_tag: Some(session.from_tag.clone()),
+        minted,
+    })
 }
 
 /// Create a B2BUA call from its caller leg, under the session id interception
@@ -722,6 +739,7 @@ fn from_tag(message: &SipMessage) -> Option<String> {
 /// Only the native engine tells anyone; on rtpengine and rtpproxy, which
 /// cannot deliver X3, this registers nothing.
 pub(super) fn watch_engine_calls(state: &Arc<DispatcherState>) {
+    use crate::li::EngineCallSide;
     use crate::rtpengine::siphon_rtp::{EngineCallChange, X3Feature};
     if state.li_manager.is_none() {
         return;
@@ -757,14 +775,31 @@ pub(super) fn watch_engine_calls(state: &Arc<DispatcherState>) {
                 li.engine_call_is_live(call.call_id, false);
             }
             EngineCallChange::EndFailed => li.x3_media_end_failed(call.call_id, scope),
-            EngineCallChange::Offered => {
-                li.engine_call_is_live(call.call_id, true);
-                let feature = X3Feature::AttachAtOffer;
-                media_offered(&state, call.call_id, call.from_tag, scope.cloned(), feature);
+            // Every allocation siphon makes says which dialog's SDP it
+            // carries. That dialog's session owns the engine call, which is
+            // how one under an id siphon minted (a dial, a bridge, a transfer,
+            // a take-over) is tied to its call's interception, whichever path
+            // made it.
+            EngineCallChange::Offered | EngineCallChange::AnsweredLocally => {
+                let dialog = call.sip_call_id.unwrap_or(call.call_id);
+                if scope.is_none() {
+                    li.adopt_engine_call(dialog, call.call_id, EngineCallSide::Offerer);
+                    li.engine_call_is_live(call.call_id, true);
+                }
+                let feature = match call.change {
+                    EngineCallChange::Offered => X3Feature::AttachAtOffer,
+                    _ => X3Feature::SingleLeg,
+                };
+                let engine_call = (call.call_id, call.from_tag, scope.cloned());
+                media_offered(&state, dialog, engine_call, feature);
             }
-            EngineCallChange::AnsweredLocally => {
-                let feature = X3Feature::SingleLeg;
-                media_offered(&state, call.call_id, call.from_tag, scope.cloned(), feature);
+            EngineCallChange::Answered => {
+                if scope.is_none() {
+                    if let Some(dialog) = call.sip_call_id {
+                        li.adopt_engine_call(dialog, call.call_id, EngineCallSide::Answerer);
+                    }
+                    minted_engine_call_answered(&state, call.call_id, call.from_tag);
+                }
             }
             EngineCallChange::SeatJoined => {
                 if let Some(sip_call_id) = call.sip_call_id {
@@ -843,11 +878,13 @@ fn seat_joined(state: &Arc<DispatcherState>, sip_call_id: &str, seat: crate::li:
 /// is spawned ([`attach_x3`]), and so is the one `node_info` round trip that
 /// asks a freshly connected engine what it lists. The INVITE is neither held
 /// nor failed by any of it. No Python is attached here and none is taken.
+///
+/// `dialog` is the SIP dialog whose SDP the verb carried, and the engine call
+/// is its id, its offerer's tag and the per-call scope it is under.
 fn media_offered(
     state: &Arc<DispatcherState>,
-    call_id: &str,
-    from_tag: &str,
-    scope: Option<crate::rtpengine::CallScope>,
+    dialog: &str,
+    (call_id, from_tag, scope): (&str, &str, Option<crate::rtpengine::CallScope>),
     feature: crate::rtpengine::siphon_rtp::X3Feature,
 ) {
     let (Some(li), Some(backend)) = (state.li_manager.as_ref(), state.rtpengine_set.as_ref())
@@ -863,7 +900,7 @@ fn media_offered(
     // and registered with the session before offering it (a transfer
     // re-anchoring an answered call, [`LiManager::adopt_engine_call`]). An
     // offer under any other id names no session.
-    let Some(session) = li.session_of_leg(call_id) else {
+    let Some(session) = li.session_of_leg(dialog) else {
         return;
     };
     if &*session.engine_call_id != call_id
@@ -913,33 +950,31 @@ fn media_offered(
     }
 }
 
-/// siphon has answered, at the engine, an engine call it minted for a session
-/// (a transfer's: the target's answer against the survivor's offer). Both
-/// parties are in the engine now, which is what the caller's ACK says of an
-/// ordinary call, and no ACK of the transfer is inbound: siphon sends them.
-/// So whatever content delivery the session has no record of on that engine
-/// call is asked for here.
-pub(super) fn minted_engine_call_answered(
-    state: &DispatcherState,
-    engine_call_id: &str,
-    offerer_tag: &str,
-) {
+/// An engine call siphon minted has been answered at the engine: both
+/// parties are in it now, which is what the caller's ACK says of an ordinary
+/// call. No ACK says it here: siphon sends the ACKs of the legs it bridges,
+/// dials and transfers itself. So each session with media on that engine call
+/// is asked for whatever content delivery it has no record of there, which on
+/// an engine that takes an interception at the offer is nothing.
+fn minted_engine_call_answered(state: &DispatcherState, engine_call_id: &str, offerer_tag: &str) {
     let Some(li) = state.li_manager.as_ref() else {
         return;
     };
     if !li.is_intercepting() {
         return;
     }
-    let Some(session) = li.session_of_leg(engine_call_id) else {
-        return;
-    };
-    if &*session.engine_call_id != engine_call_id || session.on_primary_leg {
-        return;
-    }
-    let attempt = li.x3_attempt(engine_call_id, None);
-    let site = X3Site::call_leg(&session, offerer_tag, None, attempt);
-    for matched in &session.matches {
-        attach_x3(matched, &session, &site, state);
+    for session_id in li.sessions_on_engine_call(engine_call_id) {
+        let Some(session) = li.session_of_leg(&session_id) else {
+            continue;
+        };
+        if &*session.engine_call_id != engine_call_id {
+            continue;
+        }
+        let attempt = li.x3_attempt(engine_call_id, None);
+        let site = X3Site::call_leg(&session, offerer_tag, None, attempt);
+        for matched in &session.matches {
+            attach_x3(matched, &session, &site, state);
+        }
     }
 }
 

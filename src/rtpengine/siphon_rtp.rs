@@ -1339,9 +1339,7 @@ impl SiphonRtpClientSet {
             .answer_local(call_id, from_tag, offer_sdp, flags)
             .await?;
         self.bind_affinity(call_id);
-        let scope = per_call::frame_scope();
-        let change = EngineCallChange::AnsweredLocally;
-        self.calls.notify(change, scope.as_ref(), call_id, from_tag);
+        self.calls.answered_locally(call_id, from_tag, flags);
         Ok(result)
     }
 
