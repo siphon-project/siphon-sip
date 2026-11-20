@@ -676,6 +676,9 @@ pub(super) fn watch_engine_calls(state: &Arc<DispatcherState>) {
             // made it.
             EngineCallChange::Offered | EngineCallChange::AnsweredLocally => {
                 let dialog = call.sip_call_id.unwrap_or(call.call_id);
+                // The leg has an engine call again: what ended the last one
+                // left nothing to ask for until now.
+                li.x3_media_offered(call.call_id, scope);
                 if scope.is_none() {
                     li.adopt_engine_call(dialog, call.call_id, EngineCallSide::Offerer);
                     li.engine_call_is_live(call.call_id, true);
@@ -703,6 +706,7 @@ pub(super) fn watch_engine_calls(state: &Arc<DispatcherState>) {
                 }
             }
             EngineCallChange::SeatJoined => {
+                li.x3_media_offered(&seat().record(), None);
                 if let Some(sip_call_id) = call.sip_call_id {
                     seat_joined(&state, sip_call_id, seat());
                 }

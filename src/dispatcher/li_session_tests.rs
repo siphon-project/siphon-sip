@@ -1289,6 +1289,88 @@ async fn an_unanswered_call_attaches_at_the_offer_and_raises_no_fault() {
     }
 }
 
+/// The real sequence of a B2BUA call the callee refuses: the script offers
+/// the caller's media in its INVITE handler (attached there), releases it in
+/// its failure handler, and the caller acknowledges the 486 siphon relays.
+/// That ACK finds an engine call siphon has ended and nothing offered since,
+/// so there is nothing for it to ask: no attach, no refusal from an engine
+/// that no longer holds the call, no fault.
+///
+/// Whatever the ACK looks like. RFC 3261 §17.1.1.3 has the ACK of a failure
+/// carry the INVITE's branch, which is how it is told from the ACK of an
+/// answer; a caller that puts a branch of its own on it is taken for the
+/// latter, and still must not be attached on media that is gone.
+#[tokio::test]
+async fn the_ack_of_a_failure_after_the_media_is_released_asks_for_nothing() {
+    let foreign_branch = CALLER_FAILURE_ACK.replace("z9hG4bK-caller-invite", "z9hG4bK-caller-4");
+    assert_ne!(foreign_branch, CALLER_FAILURE_ACK);
+    for (proxied, ack) in [
+        (false, CALLER_FAILURE_ACK),
+        (false, foreign_branch.as_str()),
+        (true, foreign_branch.as_str()),
+    ] {
+        let case = format!("proxied={proxied} own_branch={}", ack != CALLER_FAILURE_ACK);
+        let (log, _guard) = capture_log();
+        let (state, engine, li, mut audit) = intercepting_on_an_engine(true).await;
+        let events = engine_events(&state);
+        let internal_id = invite_arrives(&state, proxied);
+        script_offers(&state).await;
+        assert_eq!(attach_outcomes(&mut audit).await, (1, 0), "{case}");
+        callee_answers(&state, internal_id.as_deref(), "486 Busy Here");
+        // The script's failure handler releases the media, and the engine
+        // ends the delivery with the call.
+        script_deletes(&state).await;
+        engine_reports(&events, delivery_ended("CallEnded", 0)).await;
+
+        arrives(&state, CALLER, ack);
+        assert_eq!(
+            attach_outcomes(&mut audit).await,
+            (0, 0),
+            "{case}: nothing is asked of an engine call siphon ended"
+        );
+        assert_eq!(engine.commands("attach_x3").len(), 1, "{case}");
+        assert_eq!(faults_reported(&log), 0, "{case}:\n{}", log.rendered());
+        assert_eq!(li.x3_attachment_count(), 0, "{case}");
+
+        // A B2BUA call routed again is a new engine call, and is attached.
+        // A proxied one ended with its 486, and is owed nothing more.
+        script_offers(&state).await;
+        let again = if proxied { (0, 0) } else { (1, 0) };
+        assert_eq!(attach_outcomes(&mut audit).await, again, "{case}");
+        script_deletes(&state).await;
+    }
+}
+
+/// The same for a call siphon answered itself: once its media is released an
+/// ACK asks for nothing.
+#[tokio::test]
+async fn an_ack_after_a_locally_answered_calls_media_is_released_asks_for_nothing() {
+    let (log, _guard) = capture_log();
+    let (state, engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    let events = engine_events(&state);
+    let backend = backend_of(&state);
+    invite_arrives(&state, true);
+    backend
+        .answer_local(
+            CALLER_CALL_ID,
+            "caller-tag",
+            "v=0\r\n",
+            &crate::rtpengine::NgFlags::default(),
+        )
+        .await
+        .expect("answered by the engine");
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+    script_deletes(&state).await;
+    engine_reports(&events, delivery_ended("CallEnded", 0)).await;
+
+    arrives(&state, CALLER, CALLER_ACK);
+    assert_eq!(attach_outcomes(&mut audit).await, (0, 0));
+    assert_eq!(engine.commands("attach_x3").len(), 1);
+    assert_eq!(faults_reported(&log), 0, "{}", log.rendered());
+    assert_eq!(li.x3_attachment_count(), 0);
+}
+
 /// The engine ending the delivery of a call siphon did not delete is a fault:
 /// the engine timed the call out or lost it, and the call is up as far as its
 /// signalling says.

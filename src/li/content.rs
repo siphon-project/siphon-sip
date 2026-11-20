@@ -70,6 +70,11 @@ struct Leg {
     /// The deliveries asked for on an engine call that holds one and cannot
     /// carry another beside it, each reported once.
     undeliverable: Vec<Asked>,
+    /// Whether siphon has put media on the engine for the attempt in
+    /// progress (an `offer`, a local answer, a seat joined) since it last
+    /// ended the leg's engine call. An attempt siphon ended leaves the next
+    /// one without any, and with nothing to intercept, until then.
+    offered: bool,
 }
 
 /// One delivery as it is asked of the engine: a warrant, a destination and
@@ -122,6 +127,8 @@ struct Ended {
     /// The deliveries the engine had refused for good on the attempt, put
     /// back when the end siphon asked for fails and the attempt goes on.
     refused: Vec<Asked>,
+    /// Whether the attempt had media on the engine, put back the same way.
+    offered: bool,
 }
 
 /// How many end reports whose record was released under them are kept for
@@ -454,6 +461,15 @@ impl LiManager {
         if leg.refused.contains(&wanted) || leg.attempt != attempt {
             return X3Registration::Known;
         }
+        // siphon ended this leg's engine call and has offered nothing since:
+        // the engine holds no call to intercept. Whatever asks now (the ACK
+        // of the failure the media was released for, an answer that was on
+        // its way) would be refused as an unknown call, and that refusal
+        // would read as warranted content going undelivered on a call that
+        // has none. The next offer starts an attempt that is asked for.
+        if leg.attempt > 0 && !leg.offered {
+            return X3Registration::Known;
+        }
         let on_leg = || {
             content
                 .attachments
@@ -516,6 +532,17 @@ impl LiManager {
         self.x3_media_end_committed(call_id, scope);
     }
 
+    /// siphon has put media on the engine for one leg of a call: an `offer`
+    /// or a local answer made its engine call, or a party joined its seat.
+    /// The leg's attempt in progress has something to intercept. Nothing for
+    /// a call with no record, which has had no engine call ended and is asked
+    /// for as it comes.
+    pub fn x3_media_offered(&self, call_id: &str, scope: Option<&CallScope>) {
+        if let Some(mut content) = self.x3_attachments.get_mut(call_id) {
+            content.leg(scope).offered = true;
+        }
+    }
+
     /// siphon is about to ask the engine to end the engine call of one leg.
     /// Told before the command is written, so that the record is there before
     /// the engine can report anything of the call ending: from here on an end
@@ -545,6 +572,7 @@ impl LiManager {
             attachments,
             held: Vec::new(),
             refused,
+            offered: std::mem::take(&mut leg.offered),
         });
         leg.attempt += 1;
     }
@@ -605,7 +633,8 @@ impl LiManager {
             // never went away.
             let put_aside = !ended.detached && ended.attempt + 1 == current;
             if put_aside {
-                reopened = Some((ended.attempt, std::mem::take(&mut ended.refused)));
+                let refused = std::mem::take(&mut ended.refused);
+                reopened = Some((ended.attempt, refused, ended.offered));
             }
             for (report, attachments) in ended.held.drain(..) {
                 released.push(HeldEnd {
@@ -622,9 +651,10 @@ impl LiManager {
             }
             !ended.attachments.is_empty()
         });
-        if let Some((attempt, refused)) = reopened {
+        if let Some((attempt, refused, offered)) = reopened {
             leg.attempt = attempt;
             leg.refused = refused;
+            leg.offered = offered;
         }
         content.attachments.append(&mut restored);
         released
@@ -677,6 +707,7 @@ impl LiManager {
                 attachments,
                 held: Vec::new(),
                 refused: Vec::new(),
+                offered: false,
             });
         }
         detached
@@ -1037,6 +1068,57 @@ mod tests {
         }
     }
 
+    /// The number of the attempt in progress on the call's own media, with
+    /// media on the engine for it: what an offer leaves.
+    fn attempt_offered(manager: &LiManager) -> u64 {
+        manager.x3_media_offered(CALL, None);
+        manager.x3_attempt(CALL, None)
+    }
+
+    /// siphon ending a leg's engine call leaves the leg with nothing to
+    /// intercept until it offers again: nothing is recorded for the attempt
+    /// that follows, whoever asks, and the offer is what opens it. A failed
+    /// end puts the attempt back as it was.
+    #[test]
+    fn nothing_is_recorded_on_an_ended_leg_until_it_is_offered_again() {
+        let (manager, _iri, _audit) = manager();
+        let d_id = DId::generate();
+        let first = manager.x3_attempt(CALL, None);
+        assert!(
+            manager.register_x3_attachment(CALL, attachment(d_id, None), first),
+            "a call no engine call was ended on is asked for as it comes"
+        );
+        manager.x3_media_ended_by_siphon(CALL, None);
+        let next = manager.x3_attempt(CALL, None);
+        assert!(
+            !manager.register_x3_attachment(CALL, attachment(d_id, None), next),
+            "the engine holds no call"
+        );
+        assert!(manager.x3_attachments_for(CALL).is_empty());
+        let scoped = attachment(d_id, Some("orig"));
+        let scoped_attempt = manager.x3_attempt(CALL, scoped.scope.as_ref());
+        assert!(
+            manager.register_x3_attachment(CALL, scoped, scoped_attempt),
+            "another leg's engine call is its own"
+        );
+
+        manager.x3_media_offered(CALL, None);
+        assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), next));
+
+        // An end the engine refuses leaves the offered attempt offered.
+        manager.x3_media_ending(CALL, None);
+        manager.x3_media_end_failed(CALL, None);
+        let other = DId::generate();
+        assert!(manager.register_x3_attachment(CALL, attachment(other, None), next));
+        // And one it takes ends it.
+        manager.x3_media_ended_by_siphon(CALL, None);
+        let last = manager.x3_attempt(CALL, None);
+        assert!(!manager.register_x3_attachment(CALL, attachment(other, None), last));
+
+        manager.x3_media_offered("another@example.com", None);
+        assert_eq!(manager.x3_call_count(), 1, "no record is made by an offer");
+    }
+
     /// The address a test destination is dialled at: one per destination.
     fn delivery_of(d_id: DId) -> String {
         format!("mdf-{d_id}.example.net:8090")
@@ -1058,7 +1140,7 @@ mod tests {
     fn an_attachment_is_recorded_once_per_leg_warrant_and_destination() {
         let (manager, _iri, _audit) = manager();
         let d_id = DId::generate();
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), attempt));
         assert!(
             !manager.register_x3_attachment(CALL, attachment(d_id, None), attempt),
@@ -1081,7 +1163,7 @@ mod tests {
     fn siphon_ending_the_engine_call_frees_the_leg_for_the_next_attempt_at_once() {
         let (manager, _iri, _audit) = manager();
         let d_id = DId::generate();
-        let first = manager.x3_attempt(CALL, None);
+        let first = attempt_offered(&manager);
         assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), first));
 
         manager.x3_media_ended_by_siphon(CALL, None);
@@ -1090,7 +1172,7 @@ mod tests {
             !manager.register_x3_attachment(CALL, attachment(d_id, None), first),
             "an attach decided before the delete is not made after it"
         );
-        let second = manager.x3_attempt(CALL, None);
+        let second = attempt_offered(&manager);
         assert!(
             manager.register_x3_attachment(CALL, attachment(d_id, None), second),
             "the new offer attaches without waiting for the engine's report"
@@ -1114,7 +1196,7 @@ mod tests {
         let (manager, _iri, _audit) = manager();
         let d_id = DId::generate();
         let x_id = x_id();
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), attempt));
         assert_eq!(
             manager.x3_attach_failed(CALL, None, (x_id, d_id, 9), attempt),
@@ -1152,7 +1234,7 @@ mod tests {
             "a call with no record has nothing in progress"
         );
         assert_eq!(manager.x3_call_count(), 0, "and asking recorded nothing");
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt);
         assert!(manager.x3_attempt_in_progress(CALL, None, attempt));
         manager.x3_media_ended_by_siphon(CALL, None);
@@ -1186,7 +1268,7 @@ mod tests {
         manager.forget_idle_x3_calls();
         assert_eq!(manager.x3_call_count(), 0);
 
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt);
         manager.forget_idle_x3_calls();
         assert_eq!(
@@ -1239,10 +1321,10 @@ mod tests {
     fn a_late_refusal_leaves_the_record_of_another_attempt() {
         let (manager, _iri, _audit) = manager();
         let (x_id, d_id) = (x_id(), DId::generate());
-        let first = manager.x3_attempt(CALL, None);
+        let first = attempt_offered(&manager);
         assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), first));
         manager.x3_media_ended_by_siphon(CALL, None);
-        let second = manager.x3_attempt(CALL, None);
+        let second = attempt_offered(&manager);
         assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), second));
         manager.x3_media_ended_by_siphon(CALL, None);
 
@@ -1270,7 +1352,7 @@ mod tests {
     fn a_refusal_for_good_holds_until_the_engine_call_changes() {
         let (manager, _iri, _audit) = manager();
         let (x_id, d_id) = (x_id(), DId::generate());
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), attempt));
         manager.x3_attach_failed(CALL, None, (x_id, d_id, 9), attempt);
         assert!(!manager.register_x3_attachment(CALL, attachment(d_id, None), attempt));
@@ -1286,7 +1368,7 @@ mod tests {
         );
 
         manager.x3_media_ended_by_siphon(CALL, None);
-        let next = manager.x3_attempt(CALL, None);
+        let next = attempt_offered(&manager);
         assert!(
             manager.register_x3_attachment(CALL, attachment(d_id, None), next),
             "a new engine call is asked afresh"
@@ -1298,7 +1380,7 @@ mod tests {
     #[test]
     fn a_detached_delivery_is_kept_until_the_engine_reports_it_ended() {
         let (manager, _iri, _audit) = manager();
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt);
         assert_eq!(manager.x3_detaching(CALL, "session-1").len(), 1);
         assert!(
@@ -1341,7 +1423,7 @@ mod tests {
     fn a_refused_end_puts_the_attempt_back_in_progress() {
         let (manager, _iri, _audit) = manager();
         let d_id = DId::generate();
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         manager.register_x3_attachment(CALL, attachment(d_id, None), attempt);
 
         manager.x3_media_ending(CALL, None);
@@ -1392,7 +1474,7 @@ mod tests {
         assert_eq!(released.len(), 1);
         assert!(released[0].delivery.by_siphon);
         assert_eq!(manager.x3_attachment_count(), 0);
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
 
         // A call with nothing attached keeps its attempt number too.
         manager.x3_media_ending(CALL, None);
@@ -1406,7 +1488,7 @@ mod tests {
     fn a_failed_end_keeps_what_the_engine_refused() {
         let (manager, _iri, _audit) = manager();
         let (x_id, d_id) = (x_id(), DId::generate());
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         manager.register_x3_attachment(CALL, attachment(d_id, None), attempt);
         manager.x3_attach_failed(CALL, None, (x_id, d_id, 9), attempt);
 
@@ -1418,7 +1500,7 @@ mod tests {
         );
         manager.x3_media_ending(CALL, None);
         manager.x3_media_end_committed(CALL, None);
-        let next = manager.x3_attempt(CALL, None);
+        let next = attempt_offered(&manager);
         assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), next));
     }
 
@@ -1428,7 +1510,7 @@ mod tests {
     fn the_same_warrant_under_another_correlation_is_told_apart() {
         let (manager, _iri, _audit) = manager();
         let d_id = DId::generate();
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         let other = ActiveIntercept {
             correlation_id: 10,
             session_id: std::sync::Arc::from("session-2"),
@@ -1473,7 +1555,7 @@ mod tests {
         );
         assert_eq!(manager.x3_attachments_for(CALL).len(), 1);
         manager.x3_media_ended_by_siphon(CALL, None);
-        let next = manager.x3_attempt(CALL, None);
+        let next = attempt_offered(&manager);
         assert_eq!(
             manager.x3_register(CALL, other, next, Some(false)),
             X3Registration::Recorded
@@ -1487,7 +1569,7 @@ mod tests {
     #[test]
     fn an_end_siphon_starts_asking_for_cannot_claim_a_report_being_taken_in() {
         let (manager, _iri, _audit) = manager();
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt);
 
         let (asked, asking) = std::sync::mpsc::channel();
@@ -1523,7 +1605,7 @@ mod tests {
     #[test]
     fn a_record_released_under_a_held_report_gives_it_up_as_unanswered() {
         let (manager, _iri, _audit) = manager();
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt);
         manager.x3_media_ending(CALL, None);
         let report = ended_report("CallEnded");
@@ -1618,7 +1700,7 @@ mod tests {
     fn what_a_call_can_carry_decides_a_second_delivery() {
         let (manager, _iri, _audit) = manager();
         let (first, second) = (DId::generate(), DId::generate());
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         let register = |attachment: ActiveIntercept, several| {
             manager.x3_register(CALL, attachment, attempt, several)
         };
@@ -1697,7 +1779,7 @@ mod tests {
             attachment(DId::generate(), None),
             of_second_session(DId::generate()),
         );
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         for one in [&first, &second] {
             assert!(manager.register_x3_attachment(CALL, one.clone(), attempt));
         }
@@ -1735,7 +1817,7 @@ mod tests {
         assert_eq!(manager.x3_attachment_count(), 0);
 
         // An end that names none takes the whole attempt, as it always did.
-        let next = manager.x3_attempt(CALL, None);
+        let next = attempt_offered(&manager);
         for one in [&first, &second] {
             assert!(manager.register_x3_attachment(CALL, one.clone(), next));
         }
@@ -1756,7 +1838,7 @@ mod tests {
             of_second_session(DId::generate()),
         );
         for taken in [true, false] {
-            let attempt = manager.x3_attempt(CALL, None);
+            let attempt = attempt_offered(&manager);
             for one in [&first, &second] {
                 assert!(manager.register_x3_attachment(CALL, one.clone(), attempt));
             }
@@ -1783,7 +1865,7 @@ mod tests {
 
         // One reported and one not when the end fails: the one that was not
         // is live again, and the one that was did end.
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         for one in [&first, &second] {
             assert!(manager.register_x3_attachment(CALL, one.clone(), attempt));
         }
@@ -1815,7 +1897,7 @@ mod tests {
     fn a_session_detaches_its_own_deliveries_only() {
         let (manager, _iri, _audit) = manager();
         let d_id = DId::generate();
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), attempt));
         assert!(manager.register_x3_attachment(CALL, of_second_session(d_id), attempt));
 
@@ -1847,7 +1929,7 @@ mod tests {
     fn the_correlation_in_use_is_the_sessions_own() {
         let (manager, _iri, _audit) = manager();
         let d_id = DId::generate();
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), attempt));
         assert_eq!(
             manager.x3_correlation_in_use(CALL, x_id(), "session-3"),
@@ -1877,7 +1959,7 @@ mod tests {
     fn a_detached_end_siphon_did_not_ask_for_leaves_the_registration() {
         let (manager, _iri, _audit) = manager();
         let one = attachment(DId::generate(), None);
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         assert!(manager.register_x3_attachment(CALL, one.clone(), attempt));
 
         let replaced = manager
@@ -1924,7 +2006,7 @@ mod tests {
             attachment(DId::generate(), None),
             of_second_session(DId::generate()),
         );
-        let attempt = manager.x3_attempt(CALL, None);
+        let attempt = attempt_offered(&manager);
         for one in [&first, &second] {
             assert!(manager.register_x3_attachment(CALL, one.clone(), attempt));
         }
