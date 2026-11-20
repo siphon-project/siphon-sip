@@ -714,6 +714,88 @@ async fn an_attach_being_retried_is_given_up_when_siphon_ends_the_call() {
     assert_eq!(faults_reported(&log), 0, "{}", log.rendered());
 }
 
+/// A refusal for good is the engine's answer for that engine call: asking
+/// again at every later ACK would get it again and report it again. One
+/// attach and one fault, until siphon ends the engine call.
+#[tokio::test]
+async fn an_attach_refused_for_good_is_asked_and_reported_once_per_engine_call() {
+    const CALL: &str = "attach-refused-once@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let (state, engine, _li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3_at_offer().await).await;
+    backend_of(&state)
+        .answer_local(CALL, "caller-tag", "v=0\r\n", &NgFlags::default())
+        .await
+        .expect("answered by the engine");
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 1));
+
+    // A re-INVITE on the same engine call, and its ACK.
+    let re_invite = on_call(CALLER_ACK, CALL)
+        .replace("ACK sip:", "INVITE sip:")
+        .replace("CSeq: 1 ACK", "CSeq: 2 INVITE")
+        .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-reinvite");
+    arrives(&state, CALLER, &re_invite);
+    let ack = on_call(CALLER_ACK, CALL)
+        .replace("CSeq: 1 ACK", "CSeq: 2 ACK")
+        .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-reack");
+    arrives(&state, CALLER, &ack);
+    assert_eq!(attach_outcomes(&mut audit).await, (0, 0), "not asked again");
+    assert_eq!(engine.commands("attach_x3").len(), 1);
+    assert_eq!(faults_reported(&log), 1, "{}", log.rendered());
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("deleted");
+}
+
+/// An attach that is refused after siphon has ended its engine call takes
+/// only its own record with it. The engine call before it, whose delivery
+/// siphon ended as well and the engine has not reported yet, keeps its own:
+/// when that delivery turns out to have failed, the fault names its warrant.
+#[tokio::test]
+async fn a_late_refusal_does_not_erase_an_earlier_engine_calls_delivery() {
+    const CALL: &str = "late-refusal@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, mut audit) = attach_refused_for_now(CALL, 0).await;
+    let events = engine_events(&state);
+    let backend = backend_of(&state);
+    let flags = NgFlags::default();
+    assert_eq!(
+        attach_outcomes(&mut audit).await,
+        (1, 0),
+        "the first is live"
+    );
+
+    // Offered again, which replaces the engine call; the new one's attach is
+    // refused for now, and the call is released while it is being retried.
+    engine.refuse_attaches_for_now(100);
+    backend
+        .offer(CALL, "caller-tag", b"v=0\r\n", &flags)
+        .await
+        .expect("offered again");
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    backend.delete(CALL, "caller-tag").await.expect("deleted");
+    retries_are_over().await;
+    assert_eq!(faults_reported(&log), 0, "the given-up retry is no fault");
+    assert_eq!(
+        li.x3_attachment_count(),
+        1,
+        "the first engine call's delivery is still owed its end"
+    );
+
+    // The first delivery's end: its connection had failed.
+    engine_reports(&events, ended(CALL, "caller-tag", "TransportError")).await;
+    assert_eq!(faults_reported(&log), 1, "{}", log.rendered());
+    assert!(
+        log.rendered().contains("X3 delivery ended for task"),
+        "reported against the warrant: {}",
+        log.rendered()
+    );
+    assert_eq!(li.x3_attachment_count(), 0);
+}
+
 /// The local tag siphon holds on the caller's dialog of `internal_id`.
 fn siphon_tag(state: &Arc<DispatcherState>, internal_id: &str) -> String {
     state

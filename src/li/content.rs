@@ -44,9 +44,40 @@ struct Leg {
     /// How many engine calls siphon has ended on this leg: the number of the
     /// attempt in progress.
     attempt: u64,
-    /// The attachments of the attempts siphon ended whose delivery the engine
-    /// has not reported ended yet, oldest first.
-    ended: VecDeque<Vec<ActiveIntercept>>,
+    /// The deliveries siphon ended, is ending or detached, whose end the
+    /// engine has not reported yet, oldest first.
+    ended: VecDeque<Ended>,
+    /// The `(warrant, destination)` pairs the engine refused for good on the
+    /// attempt in progress. They are not asked for again on this engine call:
+    /// the answer would be the same, and so would the report. A new attempt
+    /// is a new engine call, and starts with none.
+    refused: Vec<(XId, DId)>,
+}
+
+/// Whether siphon ended the engine call a delivery was on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineCallEnd {
+    /// It did not: the delivery was only detached.
+    No,
+    /// It has asked the engine to, and the engine has not answered. An end
+    /// the engine reports meanwhile is this one's.
+    Asked,
+    /// It did.
+    Yes,
+}
+
+/// The attachments of one attempt whose delivery is over as far as siphon is
+/// concerned, kept until the engine reports it ended: that report is what
+/// says whether anything was dropped, and it needs a warrant to be reported
+/// against.
+#[derive(Debug)]
+struct Ended {
+    /// The attempt the attachments were asked under.
+    attempt: u64,
+    /// siphon detached them (`detach_x3`), rather than ending their call.
+    detached: bool,
+    engine_call: EngineCallEnd,
+    attachments: Vec<ActiveIntercept>,
 }
 
 /// The content deliveries of one engine call-id.
@@ -84,7 +115,12 @@ impl CallContent {
     /// Whether a delivery is asked for, live, or ended by siphon and not yet
     /// reported ended.
     fn delivering(&self) -> bool {
-        !self.attachments.is_empty() || self.legs.iter().any(|leg| !leg.ended.is_empty())
+        !self.attachments.is_empty()
+            || self
+                .legs
+                .iter()
+                .flat_map(|leg| &leg.ended)
+                .any(|ended| !ended.attachments.is_empty())
     }
 }
 
@@ -158,6 +194,10 @@ impl LiManager {
         attempt: u64,
     ) -> bool {
         let mut content = self.x3_attachments.entry(call_id.to_string()).or_default();
+        let leg = content.leg(attachment.scope.as_ref());
+        if leg.refused.contains(&(attachment.x_id, attachment.d_id)) {
+            return false;
+        }
         if content.leg(attachment.scope.as_ref()).attempt != attempt
             || content.attachments.iter().any(|known| {
                 known.x_id == attachment.x_id
@@ -179,23 +219,142 @@ impl LiManager {
     }
 
     /// siphon is ending the engine call of one leg (a `delete`, or an `offer`
-    /// replacing it): its attempt is over, and its attachments wait for the
-    /// engine's report of their delivery ending. Nothing for a call with no
-    /// record, which is every call no content warrant covers.
+    /// replacing it) and the engine has taken the command: its attempt is
+    /// over, and its attachments wait for the engine's report of their
+    /// delivery ending. Nothing for a call with no record, which is every call
+    /// no content warrant covers.
+    ///
+    /// [`Self::x3_media_ending`] and [`Self::x3_media_end_committed`] in one,
+    /// for an end that cannot fail.
     pub fn x3_media_ended_by_siphon(&self, call_id: &str, scope: Option<&CallScope>) {
+        self.x3_media_ending(call_id, scope);
+        self.x3_media_end_committed(call_id, scope);
+    }
+
+    /// siphon is about to ask the engine to end the engine call of one leg.
+    /// Told before the command is written, so that the record is there before
+    /// the engine can report anything of the call ending: from here on an end
+    /// the engine reports on the leg is this one's, and the next offer of the
+    /// leg attaches afresh. The command's outcome follows
+    /// ([`Self::x3_media_end_committed`], [`Self::x3_media_end_failed`]).
+    pub fn x3_media_ending(&self, call_id: &str, scope: Option<&CallScope>) {
         let Some(mut content) = self.x3_attachments.get_mut(call_id) else {
             return;
         };
         let attachments = content.take_leg(scope);
         let leg = content.leg(scope);
-        leg.attempt += 1;
-        if !attachments.is_empty() {
-            leg.ended.push_back(attachments);
+        // A delivery siphon detached and the engine has not reported ended
+        // goes with the call as well, whichever of the two the engine saw
+        // first.
+        for ended in &mut leg.ended {
+            if ended.engine_call == EngineCallEnd::No {
+                ended.engine_call = EngineCallEnd::Asked;
+            }
         }
+        leg.ended.push_back(Ended {
+            attempt: leg.attempt,
+            detached: false,
+            engine_call: EngineCallEnd::Asked,
+            attachments,
+        });
+        leg.attempt += 1;
+        leg.refused.clear();
     }
 
-    /// The engine refused or failed an attach asked under `attempt`: drop its
-    /// record, and say whether that attempt is still the one in progress.
+    /// The engine took the end siphon asked for: the engine call is gone, by
+    /// siphon's doing.
+    pub fn x3_media_end_committed(&self, call_id: &str, scope: Option<&CallScope>) {
+        let Some(mut content) = self.x3_attachments.get_mut(call_id) else {
+            return;
+        };
+        let leg = content.leg(scope);
+        for ended in &mut leg.ended {
+            if ended.engine_call == EngineCallEnd::Asked {
+                ended.engine_call = EngineCallEnd::Yes;
+            }
+        }
+        leg.ended.retain(|ended| !ended.attachments.is_empty());
+    }
+
+    /// The engine refused the end siphon asked for, or the command failed: the
+    /// engine call is still there, and so is its delivery. The attempt that
+    /// was put aside is the one in progress again, with its attachments,
+    /// unless the engine reported their delivery ended meanwhile. An end the
+    /// engine reports from here on is one siphon did not bring about.
+    pub fn x3_media_end_failed(&self, call_id: &str, scope: Option<&CallScope>) {
+        let Some(mut content) = self.x3_attachments.get_mut(call_id) else {
+            return;
+        };
+        let mut restored = Vec::new();
+        let leg = content.leg(scope);
+        let current = leg.attempt;
+        let mut reopened = None;
+        leg.ended.retain_mut(|ended| {
+            if ended.engine_call != EngineCallEnd::Asked {
+                return true;
+            }
+            if ended.detached {
+                ended.engine_call = EngineCallEnd::No;
+                return true;
+            }
+            // The attempt the failed command put aside: nothing was started
+            // after it, since the engine call it would have made room for
+            // never went away.
+            if ended.attempt + 1 == current {
+                reopened = Some(ended.attempt);
+                restored.append(&mut ended.attachments);
+                return false;
+            }
+            ended.engine_call = EngineCallEnd::No;
+            !ended.attachments.is_empty()
+        });
+        if let Some(attempt) = reopened {
+            leg.attempt = attempt;
+        }
+        content.attachments.append(&mut restored);
+    }
+
+    /// siphon is detaching every delivery of a call's attempts in progress
+    /// (`detach_x3`): they stop being live, and stay on record until the
+    /// engine reports each ended. A detach that dropped content, or lost the
+    /// race to a transport failure, is then still reported against its
+    /// warrant. Returns what to detach.
+    pub fn x3_detaching(&self, call_id: &str) -> Vec<ActiveIntercept> {
+        let Some(mut content) = self.x3_attachments.get_mut(call_id) else {
+            return Vec::new();
+        };
+        let detached = std::mem::take(&mut content.attachments);
+        let mut scopes: Vec<Option<CallScope>> = Vec::new();
+        for attachment in &detached {
+            if !scopes.contains(&attachment.scope) {
+                scopes.push(attachment.scope.clone());
+            }
+        }
+        for scope in scopes {
+            let attachments = detached
+                .iter()
+                .filter(|attachment| attachment.scope == scope)
+                .cloned()
+                .collect();
+            let leg = content.leg(scope.as_ref());
+            leg.ended.push_back(Ended {
+                attempt: leg.attempt,
+                detached: true,
+                engine_call: EngineCallEnd::No,
+                attachments,
+            });
+        }
+        detached
+    }
+
+    /// The engine refused or failed an attach asked under `attempt`, for
+    /// good: drop its record, and say whether that attempt is still the one
+    /// in progress. If it is, the pair is not asked for again on this engine
+    /// call.
+    ///
+    /// Only the record of that attempt goes. The same warrant and destination
+    /// on another attempt of the leg, ended and waiting for the engine's
+    /// report, is a delivery of its own.
     pub fn x3_attach_failed(
         &self,
         call_id: &str,
@@ -208,24 +367,34 @@ impl LiManager {
             return FailedAttach::Live;
         };
         let same = |known: &ActiveIntercept| known.x_id == x_id && known.d_id == d_id;
-        if content.leg(scope).attempt == attempt {
+        let live = content.leg(scope).attempt == attempt;
+        if live {
             content
                 .attachments
                 .retain(|known| !(same(known) && known.scope.as_ref() == scope));
-            return FailedAttach::Live;
         }
-        // Never attached, so the engine will report no end for it.
         let leg = content.leg(scope);
-        for attachments in &mut leg.ended {
-            attachments.retain(|known| !same(known));
+        // Never attached, so the engine will report no end for it.
+        for ended in &mut leg.ended {
+            if ended.attempt == attempt {
+                ended.attachments.retain(|known| !same(known));
+            }
         }
-        leg.ended.retain(|attachments| !attachments.is_empty());
-        FailedAttach::EndedBySiphon
+        leg.ended.retain(|ended| {
+            !ended.attachments.is_empty() || ended.engine_call == EngineCallEnd::Asked
+        });
+        if !live {
+            return FailedAttach::EndedBySiphon;
+        }
+        if !leg.refused.contains(&(x_id, d_id)) {
+            leg.refused.push((x_id, d_id));
+        }
+        FailedAttach::Live
     }
 
     /// The delivery an end the engine reported on a leg belongs to, dropped
-    /// from the record: the oldest attempt siphon ended, else the attempt in
-    /// progress.
+    /// from the record: the oldest one siphon ended, is ending or detached,
+    /// else the attempt in progress.
     pub fn x3_delivery_ended(&self, call_id: &str, scope: Option<&CallScope>) -> EndedDelivery {
         let Some(mut content) = self.x3_attachments.get_mut(call_id) else {
             return EndedDelivery {
@@ -233,11 +402,25 @@ impl LiManager {
                 attachments: Vec::new(),
             };
         };
-        match content.leg(scope).ended.pop_front() {
-            Some(attachments) => EndedDelivery {
-                by_siphon: true,
-                attachments,
-            },
+        let leg = content.leg(scope);
+        let oldest = leg
+            .ended
+            .iter()
+            .position(|ended| !ended.attachments.is_empty());
+        match oldest {
+            Some(index) => {
+                let ended = &mut leg.ended[index];
+                let delivery = EndedDelivery {
+                    by_siphon: ended.engine_call != EngineCallEnd::No,
+                    attachments: std::mem::take(&mut ended.attachments),
+                };
+                // An end still being asked for keeps its place, for the
+                // command's outcome to find.
+                if ended.engine_call != EngineCallEnd::Asked {
+                    leg.ended.remove(index);
+                }
+                delivery
+            }
             None => EndedDelivery {
                 by_siphon: false,
                 attachments: content.take_leg(scope),
@@ -426,6 +609,11 @@ mod tests {
             "not left behind"
         );
 
+        assert!(
+            !manager.register_x3_attachment(CALL, attachment(d_id, None), attempt),
+            "refused for good on this engine call: not asked again"
+        );
+        let d_id = DId::generate();
         assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), attempt));
         manager.x3_media_ended_by_siphon(CALL, None);
         assert_eq!(
@@ -525,5 +713,142 @@ mod tests {
         assert_eq!(manager.x3_attachments_for(&second).len(), 1);
         assert!(!manager.x3_delivery_ended(&second, None).by_siphon);
         assert_eq!(manager.x3_attachment_count(), 0);
+    }
+
+    /// A leg's attempt A was attached and siphon ended its engine call; the
+    /// next attempt B of the same warrant and destination is refused, late.
+    /// The refusal is B's. A's delivery is still owed its end report, and an
+    /// unclean one is reported against A's warrant.
+    #[test]
+    fn a_late_refusal_leaves_the_record_of_another_attempt() {
+        let (manager, _iri, _audit) = manager();
+        let (x_id, d_id) = (x_id(), DId::generate());
+        let first = manager.x3_attempt(CALL, None);
+        assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), first));
+        manager.x3_media_ended_by_siphon(CALL, None);
+        let second = manager.x3_attempt(CALL, None);
+        assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), second));
+        manager.x3_media_ended_by_siphon(CALL, None);
+
+        assert_eq!(
+            manager.x3_attach_failed(CALL, None, x_id, d_id, second),
+            FailedAttach::EndedBySiphon
+        );
+        let ended = manager.x3_delivery_ended(CALL, None);
+        assert!(ended.by_siphon);
+        assert_eq!(
+            ended.attachments.len(),
+            1,
+            "the first attempt's is still there"
+        );
+        assert_eq!(
+            manager.x3_attachment_count(),
+            0,
+            "and the refused one is not"
+        );
+    }
+
+    /// A pair the engine refused for good is not asked for again until siphon
+    /// ends that engine call.
+    #[test]
+    fn a_refusal_for_good_holds_until_the_engine_call_changes() {
+        let (manager, _iri, _audit) = manager();
+        let (x_id, d_id) = (x_id(), DId::generate());
+        let attempt = manager.x3_attempt(CALL, None);
+        assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), attempt));
+        manager.x3_attach_failed(CALL, None, x_id, d_id, attempt);
+        assert!(!manager.register_x3_attachment(CALL, attachment(d_id, None), attempt));
+        assert!(
+            manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt),
+            "another destination is asked for"
+        );
+        let scoped = attachment(d_id, Some("orig"));
+        let scoped_attempt = manager.x3_attempt(CALL, scoped.scope.as_ref());
+        assert!(
+            manager.register_x3_attachment(CALL, scoped, scoped_attempt),
+            "and so is another leg"
+        );
+
+        manager.x3_media_ended_by_siphon(CALL, None);
+        let next = manager.x3_attempt(CALL, None);
+        assert!(
+            manager.register_x3_attachment(CALL, attachment(d_id, None), next),
+            "a new engine call is asked afresh"
+        );
+    }
+
+    /// A detached delivery stays on record until the engine reports it ended,
+    /// so the report finds its warrant.
+    #[test]
+    fn a_detached_delivery_is_kept_until_the_engine_reports_it_ended() {
+        let (manager, _iri, _audit) = manager();
+        let attempt = manager.x3_attempt(CALL, None);
+        manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt);
+        assert_eq!(manager.x3_detaching(CALL).len(), 1);
+        assert!(
+            manager.x3_attachments_for(CALL).is_empty(),
+            "no longer live"
+        );
+        assert_eq!(manager.x3_attachment_count(), 1, "and still on record");
+
+        let ended = manager.x3_delivery_ended(CALL, None);
+        assert!(
+            !ended.by_siphon,
+            "siphon detached it, the call was not ended"
+        );
+        assert_eq!(ended.attachments.len(), 1);
+        assert_eq!(manager.x3_attachment_count(), 0);
+
+        // Detached and then deleted: the engine may report either first.
+        manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt);
+        manager.x3_detaching(CALL);
+        manager.x3_media_ending(CALL, None);
+        let ended = manager.x3_delivery_ended(CALL, None);
+        assert!(ended.by_siphon, "the call's end is siphon's");
+        assert_eq!(ended.attachments.len(), 1);
+        manager.x3_media_end_committed(CALL, None);
+        assert_eq!(manager.x3_attachment_count(), 0);
+    }
+
+    /// An end siphon asked for counts while the engine has not answered, and
+    /// is undone when the engine refuses it: the attempt is in progress
+    /// again, and an end reported later is not siphon's.
+    #[test]
+    fn a_refused_end_puts_the_attempt_back_in_progress() {
+        let (manager, _iri, _audit) = manager();
+        let d_id = DId::generate();
+        let attempt = manager.x3_attempt(CALL, None);
+        manager.register_x3_attachment(CALL, attachment(d_id, None), attempt);
+
+        manager.x3_media_ending(CALL, None);
+        assert!(!manager.x3_attempt_in_progress(CALL, None, attempt));
+        manager.x3_media_end_failed(CALL, None);
+        assert!(manager.x3_attempt_in_progress(CALL, None, attempt));
+        assert_eq!(manager.x3_attachments_for(CALL).len(), 1, "live again");
+        assert!(
+            !manager.register_x3_attachment(CALL, attachment(d_id, None), attempt),
+            "and not asked for twice"
+        );
+        let ended = manager.x3_delivery_ended(CALL, None);
+        assert!(
+            !ended.by_siphon,
+            "the engine ended a call siphon still holds"
+        );
+        assert_eq!(ended.attachments.len(), 1);
+
+        // An end reported while the command is out is the command's, whatever
+        // the command's answer turns out to be.
+        manager.register_x3_attachment(CALL, attachment(d_id, None), attempt);
+        manager.x3_media_ending(CALL, None);
+        let ended = manager.x3_delivery_ended(CALL, None);
+        assert!(ended.by_siphon);
+        manager.x3_media_end_failed(CALL, None);
+        assert!(manager.x3_attachments_for(CALL).is_empty());
+        assert_eq!(manager.x3_attachment_count(), 0);
+
+        // A call with nothing attached keeps its attempt number too.
+        manager.x3_media_ending(CALL, None);
+        manager.x3_media_end_failed(CALL, None);
+        assert!(manager.x3_attempt_in_progress(CALL, None, attempt));
     }
 }
