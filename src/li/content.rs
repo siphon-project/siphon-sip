@@ -92,6 +92,19 @@ struct Ended {
     refused: Vec<(XId, DId)>,
 }
 
+/// How many end reports whose record was released under them are kept for
+/// the ADMF at once. They come from sessions released while a command was
+/// out, which is rare; a flood of them is counted per destination instead of
+/// kept ([`LiManager::take_overflowed_x3_ends`]).
+pub const MAX_UNANSWERED_X3_ENDS: usize = 1024;
+
+/// The end reports waiting to be reported, and what there was no room for.
+#[derive(Debug, Default)]
+pub(super) struct UnansweredEnds {
+    held: VecDeque<HeldEnd>,
+    overflowed: Vec<(DId, u64)>,
+}
+
 /// An engine's report of a delivery ending that waited for the answer to the
 /// end siphon had asked for, with the delivery it belongs to.
 #[derive(Debug)]
@@ -324,24 +337,21 @@ impl LiManager {
             .attachments
             .iter()
             .find(|known| (known.x_id, known.d_id) == pair && known.scope == scope)
-            .map(|known| {
-                (
-                    known.correlation_id,
-                    known.session_id == attachment.session_id,
-                )
-            });
+            .map(|known| known.correlation_id);
         match other {
             None => {
                 content.attachments.push(attachment);
                 X3Registration::Recorded
             }
-            // The session's own delivery, whatever the task's details say
-            // now, and another session's under one Correlation ID the ADMF
-            // gave the task: one delivery serves it.
-            Some((held, same_session)) if same_session || held == attachment.correlation_id => {
-                X3Registration::Known
-            }
-            Some((held, _)) => {
+            // The delivery that is there carries this Correlation ID: the
+            // session's own, or another session's under the one the ADMF
+            // gave the task. One delivery serves it.
+            Some(held) if held == attachment.correlation_id => X3Registration::Known,
+            // Any other Correlation ID is content that would go out under
+            // one its X2 records do not carry: another session's, or, were a
+            // session ever to lose its own, the same one's. Never taken for
+            // what is already there.
+            Some(held) => {
                 let told = (pair.0, pair.1, attachment.correlation_id);
                 let leg = content.leg(scope.as_ref());
                 if leg.undeliverable.contains(&told) {
@@ -695,19 +705,73 @@ impl LiManager {
         if orphaned.is_empty() {
             return;
         }
-        if let Ok(mut unanswered) = self.unanswered_x3_ends.lock() {
-            unanswered.extend(orphaned);
+        let Ok(mut unanswered) = self.unanswered_x3_ends.lock() else {
+            return;
+        };
+        for end in orphaned {
+            if unanswered.held.len() < MAX_UNANSWERED_X3_ENDS {
+                unanswered.held.push_back(end);
+                continue;
+            }
+            // No room to keep the report itself. What must not be lost is
+            // that a delivery ended unaccounted for, and for whom: that is
+            // kept, one count per destination, which the destinations
+            // provisioned bound.
+            crate::metrics::li::unanswered_x3_end_overflowed();
+            tracing::error!(
+                call_id = %end.ended.call_id,
+                reason = %end.ended.reason,
+                kept = MAX_UNANSWERED_X3_ENDS,
+                "an X3 end report that nothing answered could not be kept for the ADMF: \
+                 too many are waiting; its destinations are told a count instead"
+            );
+            for attachment in end.delivery.attachments {
+                match unanswered
+                    .overflowed
+                    .iter_mut()
+                    .find(|(d_id, _)| *d_id == attachment.d_id)
+                {
+                    Some((_, count)) => *count += 1,
+                    None => unanswered.overflowed.push((attachment.d_id, 1)),
+                }
+            }
         }
     }
 
-    /// The end reports whose record was released while they still waited for
-    /// the answer to an end siphon asked for. Each is to be reported as an
-    /// end siphon did not bring about. Taken, so each is reported once.
-    pub fn take_unanswered_x3_ends(&self) -> Vec<HeldEnd> {
+    /// Up to `most` of the end reports whose record was released while they
+    /// still waited for the answer to an end siphon asked for, oldest first.
+    /// Each is to be reported as an end siphon did not bring about. Taken, so
+    /// each is reported once; the rest wait for the next call.
+    pub fn take_unanswered_x3_ends(&self, most: usize) -> Vec<HeldEnd> {
         self.unanswered_x3_ends
             .lock()
-            .map(|mut unanswered| std::mem::take(&mut *unanswered))
+            .map(|mut unanswered| {
+                let taken = most.min(unanswered.held.len());
+                unanswered.held.drain(..taken).collect()
+            })
             .unwrap_or_default()
+    }
+
+    /// For each destination, how many such end reports there was no room to
+    /// keep since this was last asked. Taken.
+    pub fn take_overflowed_x3_ends(&self) -> Vec<(DId, u64)> {
+        self.unanswered_x3_ends
+            .lock()
+            .map(|mut unanswered| std::mem::take(&mut unanswered.overflowed))
+            .unwrap_or_default()
+    }
+
+    /// The Correlation ID the content of the warrant `x_id` is going out
+    /// under on the engine call `call_id`, if a delivery of it is on record
+    /// there.
+    pub(super) fn x3_correlation_in_use(&self, call_id: &str, x_id: XId) -> Option<u64> {
+        self.x3_attachments.get(call_id).and_then(|content| {
+            content
+                .attachments
+                .iter()
+                .find(|known| known.x_id == x_id)
+                .map(|known| known.correlation_id)
+        })
     }
 
     /// Release every record no delivery hangs on: when the sessions they
@@ -1151,9 +1215,10 @@ mod tests {
             session_id: std::sync::Arc::from("session-2"),
             ..attachment(d_id, None)
         };
-        // The same session asking again under another Correlation ID (the
-        // task's was modified) is its own delivery, which keeps the one it has.
-        let modified = ActiveIntercept {
+        // The same session asking under another Correlation ID is not taken
+        // for its own delivery either: a session keeps one, and content under
+        // another than its X2 records carry is to be heard of.
+        let drifted = ActiveIntercept {
             correlation_id: 11,
             ..attachment(d_id, None)
         };
@@ -1166,10 +1231,15 @@ mod tests {
             X3Registration::Known
         );
         assert_eq!(
-            manager.x3_register(CALL, modified, attempt),
-            X3Registration::Known
+            manager.x3_register(CALL, drifted, attempt),
+            X3Registration::OtherCorrelation { held: 9 }
         );
         assert_eq!(manager.x3_attachments_for(CALL)[0].correlation_id, 9);
+        assert_eq!(manager.x3_correlation_in_use(CALL, x_id()), Some(9));
+        assert_eq!(
+            manager.x3_correlation_in_use("another@example.com", x_id()),
+            None
+        );
         assert_eq!(
             manager.x3_register(CALL, other.clone(), attempt),
             X3Registration::OtherCorrelation { held: 9 }
@@ -1240,16 +1310,54 @@ mod tests {
             .is_none());
 
         manager.forget_x3_call(CALL);
-        let unanswered = manager.take_unanswered_x3_ends();
+        let unanswered = manager.take_unanswered_x3_ends(usize::MAX);
         assert_eq!(unanswered.len(), 1);
         assert_eq!(unanswered[0].ended, report);
         assert!(!unanswered[0].delivery.by_siphon);
         assert_eq!(unanswered[0].delivery.attachments.len(), 1);
-        assert!(manager.take_unanswered_x3_ends().is_empty(), "once");
+        assert!(
+            manager.take_unanswered_x3_ends(usize::MAX).is_empty(),
+            "once"
+        );
 
         // A record with nothing held leaves nothing.
         manager.register_x3_attachment(CALL, attachment(DId::generate(), None), 0);
         manager.forget_x3_call(CALL);
-        assert!(manager.take_unanswered_x3_ends().is_empty());
+        assert!(manager.take_unanswered_x3_ends(usize::MAX).is_empty());
+    }
+
+    /// The end reports kept for the ADMF are bounded. Past the bound a report
+    /// is not kept, and is not lost either: it is counted for each of its
+    /// destinations. What is kept is handed out a batch at a time.
+    #[test]
+    fn unanswered_end_reports_are_bounded_and_the_overflow_is_counted() {
+        let (manager, _iri, _audit) = manager();
+        let d_id = DId::generate();
+        let extra = 3;
+        for index in 0..MAX_UNANSWERED_X3_ENDS + extra {
+            let call = format!("unanswered-{index}@example.com");
+            let attempt = manager.x3_attempt(&call, None);
+            manager.register_x3_attachment(&call, attachment(d_id, None), attempt);
+            manager.x3_media_ending(&call, None);
+            let report = ended_report("CallEnded");
+            assert!(manager
+                .x3_delivery_end_reported(&call, None, &report)
+                .is_none());
+            manager.forget_x3_call(&call);
+        }
+        assert_eq!(
+            manager.take_overflowed_x3_ends(),
+            vec![(d_id, extra as u64)],
+            "what there was no room for, by destination"
+        );
+        assert!(manager.take_overflowed_x3_ends().is_empty(), "told once");
+
+        let first = manager.take_unanswered_x3_ends(64);
+        assert_eq!(first.len(), 64, "a batch");
+        assert_eq!(
+            manager.take_unanswered_x3_ends(usize::MAX).len(),
+            MAX_UNANSWERED_X3_ENDS - 64,
+            "and the rest, still there for the next"
+        );
     }
 }

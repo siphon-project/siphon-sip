@@ -227,7 +227,7 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
         // An end report that was still waiting for the answer to an end
         // siphon asked for when its record was released: nothing answered,
         // so nothing says siphon ended that delivery.
-        super::rtpengine_events::x3_end_answered(li, li.take_unanswered_x3_ends());
+        super::rtpengine_events::report_unanswered_x3_ends(li);
     }
 
     // Registrar-liveness Part B: UDP+IPsec idle detection (kernel SA use-time

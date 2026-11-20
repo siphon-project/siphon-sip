@@ -1149,6 +1149,33 @@ pub(super) fn x3_end_answered(li: &crate::li::LiManager, held: Vec<crate::li::He
     }
 }
 
+/// How many unanswered end reports one sweep hands to the ADMF. The rest stay
+/// queued for the next, so a burst is spread and not spawned at once.
+const UNANSWERED_X3_ENDS_PER_SWEEP: usize = 64;
+
+/// Report the X3 ends that were still waiting for the answer to an end siphon
+/// asked for when their record was released: nothing answered, so nothing
+/// says siphon ended those deliveries. And, for each destination, how many
+/// more there was no room to keep.
+pub(super) fn report_unanswered_x3_ends(li: &crate::li::LiManager) {
+    x3_end_answered(li, li.take_unanswered_x3_ends(UNANSWERED_X3_ENDS_PER_SWEEP));
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    for (d_id, count) in li.take_overflowed_x3_ends() {
+        let li = li.clone();
+        let detail = format!(
+            "{count} X3 delivery end report(s) for this destination were not accounted \
+             for and could not be reported one by one: too many were waiting"
+        );
+        error!(%d_id, count, "X3 delivery ends went unaccounted for and unreported singly");
+        runtime.spawn(async move {
+            let fault = crate::li::x1::types::TaskReportType::TerminatingFault;
+            report_destination_fault(&li, d_id, fault, detail).await;
+        });
+    }
+}
+
 /// Judge the end of `delivery` the engine reported as `ended`, and report it
 /// to the ADMF unless it is clean. Spawns the reports; waits on nothing.
 fn x3_delivery_ended(

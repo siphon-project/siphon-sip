@@ -252,7 +252,7 @@ pub struct LiManager {
     /// End reports whose record was released while they still waited for the
     /// answer to an end siphon asked for. See
     /// [`LiManager::take_unanswered_x3_ends`].
-    unanswered_x3_ends: Arc<std::sync::Mutex<Vec<content::HeldEnd>>>,
+    unanswered_x3_ends: Arc<std::sync::Mutex<content::UnansweredEnds>>,
     /// Per-session matching decisions, keyed by session id.
     ///
     /// See [`LiManager::resolve_session`].

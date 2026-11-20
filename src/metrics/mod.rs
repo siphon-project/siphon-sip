@@ -13,6 +13,7 @@ pub mod enum_servers;
 pub mod event_lag;
 pub mod glibc;
 pub mod ipsec;
+pub mod li;
 pub mod log_writer;
 pub mod pool_connect;
 mod python_stats;

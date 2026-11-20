@@ -1205,6 +1205,102 @@ async fn a_task_modified_mid_call_leaves_the_sessions_correlation_as_it_was() {
         .expect("deleted");
 }
 
+/// The session cache is cleared when it reaches its cap, and every decision
+/// with it, while the engine goes on delivering. The call's next message
+/// rebuilds its session, and the session's Correlation ID is the one its
+/// content is already going out under: the live delivery kept it. So the X2
+/// records after the clear carry what the X3 does, also when the task's own
+/// Correlation ID was changed meanwhile, and nothing is asked for again.
+#[tokio::test]
+async fn a_session_rebuilt_after_the_cache_is_cleared_keeps_its_correlation() {
+    const CALL: &str = "cache-cleared@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, mut iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    backend_of(&state)
+        .offer(CALL, "caller-tag", b"v=0\r\n", &NgFlags::default())
+        .await
+        .expect("offered");
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+    let before = drain_iri(&mut iri)[0].correlation_id;
+
+    let mut modified = li.tasks().list()[0].details.clone();
+    modified.correlation_id = Some(before.wrapping_add(4242));
+    li.tasks().modify(modified).expect("the task is modified");
+    li.clear_session_cache();
+    assert_eq!(li.remembered_session_count(), 0);
+
+    arrives(&state, CALLEE, &on_call(&proxied_response("200 OK"), CALL));
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    let after = drain_iri(&mut iri);
+    assert_eq!(after.len(), 2);
+    assert!(
+        after.iter().all(|event| event.correlation_id == before),
+        "X2 carries the Correlation ID the content is delivered under"
+    );
+    assert_eq!(
+        attach_outcomes(&mut audit).await,
+        (0, 0),
+        "nothing asked again"
+    );
+    assert_eq!(engine.commands("attach_x3").len(), 1);
+    assert_eq!(li.x3_attachments_for(CALL)[0].correlation_id, before);
+    assert_eq!(faults_reported(&log), 0, "{}", log.rendered());
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("deleted");
+}
+
+/// Nine re-INVITEs are cancelled, and the far end's late 481 to the first
+/// CANCEL arrives after all of them: it ends nothing and detaches nothing.
+#[tokio::test]
+async fn a_late_481_to_one_of_many_cancelled_re_invites_detaches_nothing() {
+    const CALL: &str = "many-cancels@192.0.2.10";
+    let (state, engine, li, mut iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    backend_of(&state)
+        .offer(CALL, "caller-tag", b"v=0\r\n", &NgFlags::default())
+        .await
+        .expect("offered");
+    arrives(&state, CALLEE, &on_call(&proxied_response("200 OK"), CALL));
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+    drain_iri(&mut iri);
+
+    for cseq in 2..11 {
+        let re_invite = on_call(CALLER_ACK, CALL)
+            .replace("ACK sip:", "INVITE sip:")
+            .replace("CSeq: 1 ACK", &format!("CSeq: {cseq} INVITE"))
+            .replace("z9hG4bK-caller-ack", &format!("z9hG4bK-reinvite-{cseq}"));
+        arrives(&state, CALLER, &re_invite);
+        let cancel = re_invite.replace("INVITE sip:", "CANCEL sip:").replace(
+            &format!("CSeq: {cseq} INVITE"),
+            &format!("CSeq: {cseq} CANCEL"),
+        );
+        arrives(&state, CALLER, &cancel);
+    }
+    let late = on_call(
+        &proxied_response("481 Call/Transaction Does Not Exist"),
+        CALL,
+    )
+    .replace("CSeq: 1 INVITE", "CSeq: 2 CANCEL");
+    arrives(&state, CALLEE, &late);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    assert!(engine.commands("detach_x3").is_empty());
+    assert_eq!(li.x3_attachments_for(CALL).len(), 1);
+    assert!(drain_iri(&mut iri)
+        .iter()
+        .all(|event| event.event_type != crate::li::IriEventType::End));
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("deleted");
+}
+
 /// What the engine refused for good on an engine call stays refused when a
 /// `delete` of that engine call fails: it is the same engine call, and a
 /// later ACK does not ask again or report again.
