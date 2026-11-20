@@ -44,6 +44,7 @@
 //! its attempt number against the leg's and not against a fresh zero.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use super::x1::types::{DId, XId};
 use super::{ActiveIntercept, LiManager};
@@ -180,6 +181,10 @@ pub(super) struct CallContent {
     /// The attachments of every leg's attempt in progress, asked for or live.
     attachments: Vec<ActiveIntercept>,
     legs: Vec<Leg>,
+    /// The sessions that have ended here: siphon detached their deliveries
+    /// with the message that ended them. Nothing is recorded for one, and so
+    /// nothing asked, until a message shows it live again.
+    ended_sessions: Vec<Arc<str>>,
 }
 
 impl CallContent {
@@ -436,6 +441,13 @@ impl LiManager {
         several: Option<bool>,
     ) -> X3Registration {
         let mut content = self.x3_attachments.entry(call_id.to_string()).or_default();
+        // A session that has ended is owed no delivery, whatever asks: an ACK
+        // that crossed its BYE, an offer or an answer still on its way. Looked
+        // at here, under the record the end was written to, so that an ask
+        // and the end of its session cannot pass each other.
+        if content.ended_sessions.contains(&attachment.session_id) {
+            return X3Registration::Known;
+        }
         let scope = attachment.scope.clone();
         let wanted = asked(&attachment);
         let leg = content.leg(scope.as_ref());
@@ -627,10 +639,20 @@ impl LiManager {
     /// Only that session's. Another session with media on the same engine
     /// call (two calls bridged onto it) keeps its deliveries, on record and at
     /// the engine.
+    ///
+    /// The session has ended here from this on: in the same step, nothing
+    /// more is recorded for it ([`Self::x3_register`]), so an attach that was
+    /// about to be asked for it is not, and none can follow the detach to the
+    /// engine. [`Self::x3_session_is_live`] takes that back.
     pub fn x3_detaching(&self, call_id: &str, session_id: &str) -> Vec<ActiveIntercept> {
-        let Some(mut content) = self.x3_attachments.get_mut(call_id) else {
-            return Vec::new();
-        };
+        let mut content = self.x3_attachments.entry(call_id.to_string()).or_default();
+        if !content
+            .ended_sessions
+            .iter()
+            .any(|ended| &**ended == session_id)
+        {
+            content.ended_sessions.push(Arc::from(session_id));
+        }
         let (detached, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut content.attachments)
             .into_iter()
             .partition(|attachment| &*attachment.session_id == session_id);
@@ -658,6 +680,28 @@ impl LiManager {
             });
         }
         detached
+    }
+
+    /// A message shows the session `session_id` live on a call it had ended
+    /// on: its Call-ID opens a new dialog, or the answer to its INVITE beat
+    /// the CANCEL that was taken for its end. It is owed its content again.
+    /// Nothing for a call with no record, or a session that never ended
+    /// there, which is nearly every message.
+    pub fn x3_session_is_live(&self, call_id: &str, session_id: &str) {
+        let ended_here = self.x3_attachments.get(call_id).is_some_and(|content| {
+            content
+                .ended_sessions
+                .iter()
+                .any(|ended| &**ended == session_id)
+        });
+        if !ended_here {
+            return;
+        }
+        if let Some(mut content) = self.x3_attachments.get_mut(call_id) {
+            content
+                .ended_sessions
+                .retain(|ended| &**ended != session_id);
+        }
     }
 
     /// The engine refused or failed an attach asked under `attempt`, for
@@ -1271,8 +1315,16 @@ mod tests {
         assert_eq!(ended.attachments.len(), 1);
         assert_eq!(manager.x3_attachment_count(), 0);
 
+        // A session that has ended is owed nothing more, until a message
+        // shows it live again.
+        assert!(!manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt));
+        assert_eq!(manager.x3_attachment_count(), 0);
+        manager.x3_session_is_live(CALL, "session-2");
+        assert!(!manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt));
+        manager.x3_session_is_live(CALL, "session-1");
+
         // Detached and then deleted: the engine may report either first.
-        manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt);
+        assert!(manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt));
         manager.x3_detaching(CALL, "session-1");
         manager.x3_media_ending(CALL, None);
         let ended = manager.x3_delivery_ended(CALL, None);
@@ -1840,9 +1892,11 @@ mod tests {
         assert_eq!(failed.attachments.len(), 1);
         assert!(manager.x3_attachments_for(CALL).is_empty());
 
-        // Detached by siphon, then asked for again.
+        // Detached by siphon, then asked for again by a session a message
+        // showed live again (the answer that beat its CANCEL).
         assert!(manager.register_x3_attachment(CALL, one.clone(), attempt));
         assert_eq!(manager.x3_detaching(CALL, "session-1").len(), 1);
+        manager.x3_session_is_live(CALL, "session-1");
         assert!(manager.register_x3_attachment(CALL, one.clone(), attempt));
         let detached = manager
             .x3_delivery_end_reported(CALL, None, &named_report("Detached", &one))

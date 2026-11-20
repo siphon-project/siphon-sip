@@ -407,13 +407,20 @@ async fn two_destinations_are_two_deliveries_on_an_engine_that_carries_several()
         .expect("released");
 }
 
-/// A session whose delivery siphon detached asks for the same delivery again
-/// (an ACK that crossed its BYE). The engine reports the detached one ended.
-/// That end is the detached one's: the delivery asked for since is neither
-/// taken off the record nor reported.
+/// The caller's ACK of the answer on `call_id`, arriving late.
+fn late_ack(call_id: &str) -> String {
+    on_call(CALLER_ACK, call_id)
+        .replace("CSeq: 1 ACK", "CSeq: 3 ACK")
+        .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-late-ack")
+}
+
+/// An ACK that crosses the BYE of its call arrives on a session that has
+/// ended, whose delivery siphon has detached. It asks for nothing: the call
+/// has had its one attach, the engine is left with no delivery, and the
+/// detached one's end is clean.
 #[tokio::test]
-async fn the_end_of_a_detached_delivery_leaves_the_same_delivery_asked_for_since() {
-    const CALL: &str = "multi-same-triple-detached@192.0.2.10";
+async fn an_ack_that_crosses_the_bye_asks_for_no_second_delivery() {
+    const CALL: &str = "ended-ack-crosses-bye@192.0.2.10";
     let (log, _guard) = capture_log();
     let (state, engine, li, _iri, mut audit) =
         intercepting_on_the_engine(NativeTestEngine::start_with_x3_026().await).await;
@@ -421,31 +428,127 @@ async fn the_end_of_a_detached_delivery_leaves_the_same_delivery_asked_for_since
     arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
     offers(&state, CALL).await;
     assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
-    answered(&state, CALL);
+    arrives(&state, CALLEE, &on_call(&proxied_response("200 OK"), CALL));
 
     arrives(&state, CALLER, &bye(CALL));
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(engine.commands("detach_x3").len(), 1);
-    // An ACK of a re-INVITE's answer that crossed the BYE.
-    let late_ack = on_call(CALLER_ACK, CALL)
-        .replace("CSeq: 1 ACK", "CSeq: 3 ACK")
-        .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-late-ack");
-    arrives(&state, CALLER, &late_ack);
-    assert_eq!(attach_outcomes(&mut audit).await, (1, 0), "asked for again");
-    let attached: Vec<X3Delivery> = engine.commands("attach_x3").iter().map(named).collect();
-    assert_eq!(attached[0], attached[1], "the same delivery");
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    arrives(&state, CALLER, &late_ack(CALL));
+    assert_eq!(
+        attach_outcomes(&mut audit).await,
+        (0, 0),
+        "a session that has ended is owed no delivery"
+    );
+    assert_eq!(engine.commands("attach_x3").len(), 1, "exactly one attach");
+    assert_eq!(engine.x3_delivery_count(), 0, "nothing stale at the engine");
+    assert!(li.x3_attachments_for(CALL).is_empty());
 
-    assert_eq!(
-        engine_reports_its_ends(&events, &engine).await,
-        1,
-        "the detached one's end"
+    assert_eq!(engine_reports_its_ends(&events, &engine).await, 1);
+    assert_eq!(li.x3_attachment_count(), 0);
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("released");
+    // And an ACK after the media is gone asks an engine that holds no call
+    // for nothing either.
+    arrives(
+        &state,
+        CALLER,
+        &late_ack(CALL).replace("CSeq: 3 ACK", "CSeq: 4 ACK"),
     );
-    assert_eq!(
-        li.x3_attachments_for(CALL).len(),
-        1,
-        "the one asked for since is still on record"
-    );
+    assert_eq!(attach_outcomes(&mut audit).await, (0, 0));
+    assert_eq!(engine_reports_its_ends(&events, &engine).await, 0);
     assert_eq!(faults_reported(&log), 0, "{}", log.rendered());
+    assert_eq!(li.x3_attachment_count(), 0);
+}
+
+/// On an engine that is asked at the ACK, a call hung up before its ACK
+/// arrives is never asked for: the first attach is not made on a session that
+/// has ended any more than a second is. A call whose ACK came first has its
+/// one attach and its one detach.
+#[tokio::test]
+async fn a_late_ack_after_the_bye_attaches_nothing_and_raises_no_fault() {
+    const HUNG_UP: &str = "ended-bye-then-ack@192.0.2.10";
+    const ANSWERED: &str = "ended-ack-then-bye@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let engine = NativeTestEngine::start_with_features(&[
+        "relay",
+        "scope",
+        crate::rtpengine::test_native_engine::NATIVE_ENGINE_X3_MULTI_DELIVERY,
+    ])
+    .await;
+    let (state, engine, li, _iri, mut audit) = intercepting_on_the_engine(engine).await;
+    let events = engine_events(&state);
+    for call in [HUNG_UP, ANSWERED] {
+        arrives(&state, CALLER, &on_call(CALLER_INVITE, call));
+        offers(&state, call).await;
+        arrives(&state, CALLEE, &on_call(&proxied_response("200 OK"), call));
+    }
+    assert_eq!(
+        attach_outcomes(&mut audit).await,
+        (0, 0),
+        "asked at the ACK"
+    );
+
+    arrives(&state, CALLER, &bye(HUNG_UP));
+    arrives(&state, CALLER, &on_call(CALLER_ACK, HUNG_UP));
+    assert_eq!(attach_outcomes(&mut audit).await, (0, 0), "no attach");
+    assert!(engine.commands("attach_x3").is_empty());
+    assert!(engine.commands("detach_x3").is_empty());
+
+    arrives(&state, CALLER, &on_call(CALLER_ACK, ANSWERED));
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+    arrives(&state, CALLER, &bye(ANSWERED));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(engine.commands("attach_x3").len(), 1, "exactly one attach");
+    assert_eq!(engine.commands("detach_x3").len(), 1);
+    assert_eq!(engine_reports_its_ends(&events, &engine).await, 1);
+
+    for call in [HUNG_UP, ANSWERED] {
+        backend_of(&state)
+            .delete(call, "caller-tag")
+            .await
+            .expect("released");
+    }
+    assert_eq!(engine_reports_its_ends(&events, &engine).await, 0);
+    assert_eq!(faults_reported(&log), 0, "{}", log.rendered());
+    assert_eq!(engine.x3_delivery_count(), 0);
+    assert_eq!(li.x3_attachment_count(), 0);
+}
+
+/// A CANCEL of the opening INVITE is taken for the end of its session, and
+/// its delivery is detached. The answer that beat the CANCEL shows the call
+/// up after all: the session is live again and owed its content, so its ACK
+/// asks for the delivery again, and the detached one's end leaves that one
+/// on record.
+#[tokio::test]
+async fn a_call_answered_despite_its_cancel_is_attached_again() {
+    const CALL: &str = "ended-cancel-lost@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3_026().await).await;
+    let events = engine_events(&state);
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    offers(&state, CALL).await;
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+
+    let cancel = on_call(CALLER_INVITE, CALL)
+        .replace("INVITE sip:", "CANCEL sip:")
+        .replace("CSeq: 1 INVITE", "CSeq: 1 CANCEL");
+    arrives(&state, CALLER, &cancel);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(engine.commands("detach_x3").len(), 1);
+
+    answered(&state, CALL);
+    assert_eq!(
+        attach_outcomes(&mut audit).await,
+        (1, 0),
+        "the call is up: asked for again"
+    );
+    assert_eq!(engine.x3_delivery_count(), 1);
+    assert_eq!(engine_reports_its_ends(&events, &engine).await, 1);
+    assert_eq!(li.x3_attachments_for(CALL).len(), 1, "and still on record");
 
     backend_of(&state)
         .delete(CALL, "caller-tag")
@@ -570,7 +673,7 @@ async fn a_report_that_names_no_delivery_is_still_the_legs() {
 #[tokio::test]
 async fn calls_with_several_deliveries_drain_every_map_to_baseline() {
     const EACH: usize = 20;
-    const KINDS: [&str; 3] = ["completed", "rerouted", "bridged"];
+    const KINDS: [&str; 4] = ["completed", "rerouted", "bridged", "late-ack"];
     let (state, engine, li, _iri, _audit) =
         intercepting_on_the_engine(NativeTestEngine::start_with_x3_026().await).await;
     second_warrant(&li);
@@ -636,11 +739,22 @@ async fn calls_with_several_deliveries_drain_every_map_to_baseline() {
             answered(&state, &call_id);
             arrives(&state, CALLER, &bye(&call_id));
             settle().await;
+            if kind == "late-ack" {
+                // An ACK that crossed the BYE, before the media is released.
+                arrives(&state, CALLER, &late_ack(&call_id));
+                settle().await;
+            }
             backend
                 .delete(&call_id, "caller-tag")
                 .await
                 .expect("released");
             pass_on().await;
+            if kind == "late-ack" {
+                // And one more after it.
+                let later = late_ack(&call_id).replace("CSeq: 3 ACK", "CSeq: 4 ACK");
+                arrives(&state, CALLER, &later);
+                settle().await;
+            }
         }
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -649,6 +763,13 @@ async fn calls_with_several_deliveries_drain_every_map_to_baseline() {
         engine.x3_delivery_count(),
         0,
         "the engine holds no delivery"
+    );
+    assert_eq!(
+        engine.commands("attach_x3").len(),
+        // Two warrants: two for a completed call and for one with a late
+        // ACK, four for one routed again, four for a bridged pair.
+        EACH * (2 + 4 + 4 + 2),
+        "one attach for each delivery of each engine call, and none after a call ended"
     );
     assert!(
         engine.take_x3_ends().is_empty(),

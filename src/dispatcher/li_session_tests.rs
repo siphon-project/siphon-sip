@@ -1254,6 +1254,14 @@ async fn an_unanswered_call_attaches_at_the_offer_and_raises_no_fault() {
         let events = engine_events(&state);
         let internal_id = invite_arrives(&state, proxied);
         script_offers(&state).await;
+        // The call rings for a while: the attach is made while it does. One
+        // still being decided when the call fails is not made at all, since
+        // a session that has ended is owed no delivery.
+        assert_eq!(
+            attach_outcomes(&mut audit).await,
+            (1, 0),
+            "{case}: one attach, at the offer, and it did not fail"
+        );
         if early_media {
             callee_answers(&state, internal_id.as_deref(), "183 Session Progress");
         }
@@ -1262,8 +1270,8 @@ async fn an_unanswered_call_attaches_at_the_offer_and_raises_no_fault() {
 
         assert_eq!(
             attach_outcomes(&mut audit).await,
-            (1, 0),
-            "{case}: one attach, at the offer, and it did not fail"
+            (0, 0),
+            "{case}: the ACK of the failure asks for nothing"
         );
         assert_eq!(engine.commands("attach_x3").len(), 1, "{case}");
 
