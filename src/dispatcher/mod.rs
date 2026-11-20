@@ -261,6 +261,8 @@ mod li_multi_delivery_tests;
 #[cfg(test)]
 mod li_session_tests;
 #[cfg(test)]
+mod li_ws_takeover_tests;
+#[cfg(test)]
 mod listener_identity_tests;
 #[cfg(test)]
 mod local_answer_contact_tests;

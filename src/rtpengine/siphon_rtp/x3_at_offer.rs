@@ -181,6 +181,9 @@ pub struct EngineCall<'a> {
     /// it, which is what ties an engine call under an id siphon minted to
     /// its call), and the call a seat seats.
     pub sip_call_id: Option<&'a str>,
+    /// Whether the `answer_local` this tells of named a `ws_uri`: the call's
+    /// audio goes to a WebSocket server, which stands in for the callee.
+    pub takeover: bool,
     pub change: EngineCallChange,
 }
 
@@ -262,13 +265,16 @@ impl CallWatch {
         flags: &crate::rtpengine::profile::NgFlags,
     ) {
         let scope = super::per_call::frame_scope();
-        self.notify_for(
-            EngineCallChange::AnsweredLocally,
-            scope.as_ref(),
-            call_id,
-            from_tag,
-            flags.sip_call_id.as_deref(),
-        );
+        if let Some(observer) = self.0.get() {
+            observer(&EngineCall {
+                call_id,
+                from_tag,
+                scope: scope.as_ref(),
+                sip_call_id: flags.sip_call_id.as_deref(),
+                takeover: flags.ws_uri.is_some(),
+                change: EngineCallChange::AnsweredLocally,
+            });
+        }
     }
 
     /// [`Self::notify`] of a command that carried the SDP of the dialog
@@ -287,6 +293,7 @@ impl CallWatch {
                 from_tag,
                 scope,
                 sip_call_id,
+                takeover: false,
                 change,
             });
         }
@@ -350,6 +357,7 @@ impl CallWatch {
                 from_tag,
                 scope: None,
                 sip_call_id: Some(sip_call_id),
+                takeover: false,
                 change,
             });
         }

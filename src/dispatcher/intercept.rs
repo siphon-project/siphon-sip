@@ -168,9 +168,10 @@ pub(super) fn intercept_message(
     // **When the media reaches the engine**, on a siphon-rtp that lists the
     // feature for the shape the media has, in `node_info`: at the offer of a
     // call (`x3_attach_at_offer`, 0.25.1 and later), at the local answer of a
-    // call siphon answers itself (`x3_single_leg`, 0.25.2), and when a party
-    // is seated in a conference room (`x3_conference_seat`, 0.25.2), which is
-    // attached on the seat and not on a call. That engine takes an
+    // call siphon answers itself (`x3_single_leg`, 0.25.2; into a WebSocket
+    // server, `x3_ws_takeover`, 0.26.0), and when a party is seated in a
+    // conference room (`x3_conference_seat`, 0.25.2), which is attached on
+    // the seat and not on a call. That engine takes an
     // interception on a call that is offered but not answered: it opens the
     // delivery connection at once, puts the taps on at the first answer (a 183
     // with SDP included) and keeps the one connection, Correlation ID and
@@ -679,12 +680,19 @@ pub(super) fn watch_engine_calls(state: &Arc<DispatcherState>) {
                     li.adopt_engine_call(dialog, call.call_id, EngineCallSide::Offerer);
                     li.engine_call_is_live(call.call_id, true);
                 }
-                let feature = match call.change {
-                    EngineCallChange::Offered => X3Feature::AttachAtOffer,
-                    _ => X3Feature::SingleLeg,
+                // What says the engine takes an interception on the call
+                // as it stands now. A call answered into a WebSocket server
+                // (`ws_uri`, a hand-over to a bot) is taken by an engine
+                // that lists `x3_ws_takeover`. One that lists only
+                // `x3_single_leg` refuses it, and is asked as it always was:
+                // its refusal is the fault it always was.
+                let features: &[X3Feature] = match (call.change, call.takeover) {
+                    (EngineCallChange::Offered, _) => &[X3Feature::AttachAtOffer],
+                    (_, true) => &[X3Feature::WsTakeover, X3Feature::SingleLeg],
+                    _ => &[X3Feature::SingleLeg],
                 };
                 let engine_call = (call.call_id, call.from_tag, scope.cloned());
-                media_offered(&state, dialog, engine_call, feature);
+                media_offered(&state, dialog, engine_call, features);
             }
             EngineCallChange::Answered => {
                 if scope.is_none() {
@@ -766,7 +774,16 @@ fn seat_joined(state: &Arc<DispatcherState>, sip_call_id: &str, seat: crate::li:
 
 /// A call's media has just reached the engine, by an `offer` or by a local
 /// answer: if a content warrant covers the call and the engine takes an
-/// interception on such a call this early (`feature`), ask for it now.
+/// interception on such a call this early (it lists one of `features`), ask
+/// for it now.
+///
+/// A call handed to a bot (`call.handover(answer=True, ws_uri=...)`) is one
+/// the engine answers itself into a WebSocket server. It is attached like any
+/// call the engine answered: under the caller's Call-ID and the caller's tag,
+/// which the `answer_local` was made under, with the server standing in for
+/// the callee. An interception the call already has (one attached at its
+/// offer, or at an earlier answer of the same dialog) is carried onto the
+/// bridge by the engine, and is on record here, so nothing is asked twice.
 ///
 /// Runs inside the verb, between the engine accepting it and the rewritten
 /// SDP going back to whoever asked, so it only decides: the attach itself
@@ -780,7 +797,7 @@ fn media_offered(
     state: &Arc<DispatcherState>,
     dialog: &str,
     (call_id, from_tag, scope): (&str, &str, Option<crate::rtpengine::CallScope>),
-    feature: crate::rtpengine::siphon_rtp::X3Feature,
+    features: &'static [crate::rtpengine::siphon_rtp::X3Feature],
 ) {
     let (Some(li), Some(backend)) = (state.li_manager.as_ref(), state.rtpengine_set.as_ref())
     else {
@@ -819,22 +836,39 @@ fn media_offered(
             }
         }
     };
-    match backend.x3_feature(feature, call_id, scope.as_ref()) {
+    // Whether the engine lists any of them; `None` while it has not been
+    // asked on this connection, which is so of all of them at once.
+    let listed = |backend: &crate::rtpengine::MediaBackend,
+                  call_id: &str,
+                  scope: Option<&crate::rtpengine::CallScope>| {
+        features
+            .iter()
+            .map(|feature| backend.x3_feature(*feature, call_id, scope))
+            .try_fold(false, |any, listed| listed.map(|listed| any || listed))
+    };
+    match listed(backend, call_id, scope.as_ref()) {
         Some(true) => attach(),
         // An engine that does not take it this early: the ACK attaches.
         Some(false) => {}
         // The first intercepted call on this connection: ask the engine what
-        // it lists, off the verb's path.
+        // it lists, off the verb's path. One answer says all of it.
         None => {
             let backend = Arc::clone(backend);
             let call_id = call_id.to_string();
             tokio::spawn(async move {
+                let Some(first) = features.first() else {
+                    return;
+                };
                 match backend
-                    .learn_x3_feature(feature, &call_id, scope.as_ref())
+                    .learn_x3_feature(*first, &call_id, scope.as_ref())
                     .await
                 {
                     Ok(true) => attach(),
-                    Ok(false) => {}
+                    Ok(false) => {
+                        if listed(&backend, &call_id, scope.as_ref()) == Some(true) {
+                            attach();
+                        }
+                    }
                     Err(error) => warn!(
                         %call_id, %error,
                         "LI: could not read the media engine's features, X3 attaches at the ACK"
