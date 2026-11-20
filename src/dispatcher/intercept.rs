@@ -890,12 +890,26 @@ fn leg_name(scope: Option<&crate::rtpengine::CallScope>) -> &str {
 /// Stop content delivery for a session, if any was attached: on its engine
 /// call, each leg on the leg it was attached on, and on each conference seat
 /// a party of it joined.
+///
+/// Not on an engine call whose leg sits in a conference room: see below.
 pub(super) fn detach_x3(session: &crate::li::SessionView, state: &Arc<DispatcherState>) {
     let Some(li) = state.li_manager.as_ref() else {
         return;
     };
     let call_id: &str = &session.engine_call_id;
-    let on_call = li.take_x3_attachments(call_id);
+    // A call whose leg was moved into a conference room
+    // (`b2bua.adopt_replaced`) goes on without the dialog that was merged
+    // away, and a BYE on that dialog, or on any other of the session, is not
+    // the end of the media the engine delivers from the room. Detached there,
+    // the delivery would stop cleanly and silently with the target still in
+    // the room. Its interception ends with the engine call and with nothing
+    // else: siphon's `delete`, whose `call_ended` is then clean, or the
+    // engine's own, which is a fault.
+    let seated = crate::rtpengine::MediaBackend::seated_call_room(call_id).is_some();
+    let on_call = match seated {
+        true => Vec::new(),
+        false => li.take_x3_attachments(call_id),
+    };
     let on_seats: Vec<_> = session
         .seats
         .iter()

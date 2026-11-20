@@ -361,6 +361,70 @@ async fn a_seated_call_keeps_its_one_interception_across_seat_leave_and_reseat()
     assert_eq!(li.x3_attachment_count(), 0);
 }
 
+/// After the merge the handset may hang up the merged-away dialog itself,
+/// crossing the BYE siphon sends it. That BYE ends a dialog, not the call: the
+/// far party is in the room and the engine is delivering from there. Nothing
+/// is detached (a detach ends the delivery cleanly, so content would stop
+/// with nobody told), and the same holds for the far party's own BYE: the
+/// interception ends with the engine call, at siphon's `delete`.
+#[tokio::test]
+async fn a_bye_on_a_dialog_of_a_seated_call_does_not_detach_its_interception() {
+    const CALL: &str = "seated-call-handset-bye@192.0.2.10";
+    const FAR: &str = "seated-call-handset-bye-far@192.0.2.1";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    let events = engine_events(&state);
+    let internal_id = answered_b2bua_call(&state, CALL, FAR).await;
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+    backend_of(&state)
+        .conference_seat_call(
+            CALL,
+            "callee-tag",
+            "room-handset-bye",
+            ConferenceRole::Talker,
+            adopted(FAR, &internal_id),
+        )
+        .await
+        .expect("the engine seats the far party");
+
+    // The handset's own BYE on the dialog that was merged away.
+    let bye = on_call(CALLER_ACK, CALL)
+        .replace("ACK sip:", "BYE sip:")
+        .replace("CSeq: 1 ACK", "CSeq: 2 BYE")
+        .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-bye");
+    arrives(&state, CALLER, &bye);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        engine.commands("detach_x3").is_empty(),
+        "the seated call's delivery is not detached"
+    );
+    assert_eq!(
+        li.x3_attachments_for(CALL).len(),
+        1,
+        "and is still on record, so its end is still judged"
+    );
+
+    // The engine losing the call now would be a fault, as on any live call...
+    // and the far party hanging up later detaches nothing either.
+    arrives(
+        &state,
+        CALLEE,
+        &callee_request("BYE", 2, "z9hG4bK-far-bye").replace(CALLEE_CALL_ID, FAR),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(engine.commands("detach_x3").is_empty());
+
+    // siphon's teardown deletes the call, and that is the clean end.
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("the engine deletes the call");
+    engine_reports(&events, ended(CALL, "caller-tag", "CallEnded")).await;
+    assert_eq!(faults_reported(&log), 0, "{}", log.rendered());
+    assert_eq!(li.x3_attachment_count(), 0);
+}
+
 /// A room that closes while the leg is being moved into it leaves the call's
 /// media stopped. The engine refuses the seat and ends the interception with
 /// `transport_error`, which is a fault toward the ADMF like any end siphon did
