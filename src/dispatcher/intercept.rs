@@ -403,10 +403,16 @@ fn b2bua_owner(
     message: &SipMessage,
     call_id: &str,
 ) -> Option<crate::li::CallOwner> {
-    let internal_id = state
-        .call_actors
-        .find_by_sip_call_id(call_id)
-        .or_else(|| replaced_call(state, message))?;
+    let held = state.call_actors.find_by_sip_call_id(call_id);
+    // A dialog that takes a leg over, or the leg a transfer dials its target
+    // on, brings somebody new into the call.
+    let replacement_target = match held.as_deref() {
+        Some(internal_id) => state
+            .call_actors
+            .is_replacement_target_leg(internal_id, call_id),
+        None => true,
+    };
+    let internal_id = held.or_else(|| replaced_call(state, message))?;
     let a_leg_call_id = state
         .call_actors
         .get_call(&internal_id)?
@@ -417,6 +423,7 @@ fn b2bua_owner(
     Some(crate::li::CallOwner {
         internal_id,
         a_leg_call_id,
+        replacement_target,
     })
 }
 

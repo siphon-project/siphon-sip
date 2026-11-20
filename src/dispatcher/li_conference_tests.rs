@@ -1173,6 +1173,97 @@ async fn x2_direction_turns_with_the_sender_on_a_proxied_dialog() {
     );
 }
 
+/// The called party is under warrant on a B2BUA call, and the caller transfers
+/// it: siphon dials the transfer target on a third leg. The called party's
+/// own leg is from the target. The third party is somebody else, and nothing
+/// it sends is delivered as sent by the target: to the target where that is
+/// known, and not known (1) otherwise.
+#[tokio::test]
+async fn a_transfers_third_leg_is_never_from_a_called_target() {
+    use crate::b2bua::actor::{ReferSubscription, ReplacementTarget};
+    use crate::b2bua::transfer::TransferState;
+    use PayloadDirection::{SentFromTarget, SentToTarget, Unknown};
+    let (state, _engine, li, mut iri, _audit) =
+        intercepting_on_the_engine(NativeTestEngine::start().await).await;
+    let mut callee = li.tasks().list()[0].details.clone();
+    li.tasks()
+        .deactivate(callee.x_id)
+        .expect("the caller's warrant is withdrawn");
+    callee.target_identifiers = vec![crate::li::x1::types::TargetIdentifier::SipUri(
+        "sip:15550100042@siphon.example.com".to_string(),
+    )];
+    li.tasks().activate(callee).expect("task must provision");
+
+    let internal_id = caller_calls(&state);
+    dial(&state, &internal_id, CALLEE_CALL_ID);
+    arrives(&state, CALLEE, &callee_response(CALLEE_CALL_ID, "200 OK"));
+    arrives(&state, CALLER, CALLER_ACK);
+    // The transfer: a replacement of the caller's leg dials its target.
+    state.call_actors.push_refer_subscription(
+        &internal_id,
+        ReferSubscription {
+            on_a_leg: true,
+            siphon_notifies: true,
+            origin: crate::b2bua::transfer::ReplacementOrigin::SiphonInitiated,
+            event_id: 0,
+            notify_cseq: 0,
+            state: TransferState::Trying,
+            targets: Vec::new(),
+            referrer_gone: false,
+            deadline: None,
+            media_profile: None,
+        },
+    );
+    dial(&state, &internal_id, SECOND_CALLEE_CALL_ID);
+    let target = ReplacementTarget::ringing(
+        format!("z9hG4bK-{SECOND_CALLEE_CALL_ID}"),
+        SECOND_CALLEE_CALL_ID.to_string(),
+        None,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert!(state
+        .call_actors
+        .add_replacement_target(&internal_id, true, target, deadline)
+        .is_none());
+    arrives(
+        &state,
+        CALLEE,
+        &callee_response(SECOND_CALLEE_CALL_ID, "180 Ringing"),
+    );
+    arrives(
+        &state,
+        CALLEE,
+        &callee_response(SECOND_CALLEE_CALL_ID, "200 OK"),
+    );
+    arrives(
+        &state,
+        CALLEE,
+        &callee_request("INFO", 2, "z9hG4bK-callee-info"),
+    );
+
+    let seen = directions(&drain_iri(&mut iri));
+    assert_eq!(
+        seen[..3],
+        [
+            ("INVITE".to_string(), None, SentToTarget),
+            ("INVITE".to_string(), Some(200), SentFromTarget),
+            ("ACK".to_string(), None, SentToTarget),
+        ],
+        "the caller's and the called party's own"
+    );
+    for third in &seen[3..5] {
+        assert!(
+            matches!(third.2, SentToTarget | Unknown),
+            "the third party's {third:?} is not the target's"
+        );
+    }
+    assert_eq!(
+        seen[5],
+        ("INFO".to_string(), None, SentFromTarget),
+        "and the called party is still told from it"
+    );
+}
+
 /// A request from the far end of the caller's proxied dialog: `From` is the
 /// callee, `To` the caller.
 fn far_end_request(method: &str, cseq: u32) -> String {

@@ -93,6 +93,8 @@ pub(super) struct SessionDecision {
     /// media path knows the offerer by. It tells which end of the call a later
     /// message's `From` is, on a dialog both ends send on.
     caller_tag: Option<Box<str>>,
+    /// The legs a B2BUA call dialled for its called party.
+    called_party_legs: Vec<Arc<str>>,
 }
 
 /// A seat a party joined a conference room with (`conference_join`, or the
@@ -214,6 +216,39 @@ fn header_tag(header: &str) -> Option<&str> {
     })
 }
 
+/// Where a message arrived, for what its tags do not say of its direction.
+struct MessageOn<'a> {
+    manager: &'a LiManager,
+    identities: &'a Identities<'a>,
+    /// Whether it is on a leg a B2BUA call dialled for its called party:
+    /// only that party sends on it.
+    called_party_leg: bool,
+}
+
+impl<'a> MessageOn<'a> {
+    /// The header that names who sent the message: `From` on a request, `To`
+    /// on a response.
+    fn sender_identity(&self, sender: &Sender<'_>) -> Option<&'a str> {
+        match sender.request {
+            true => self.identities.from_uri,
+            false => self.identities.to_uri,
+        }
+    }
+
+    /// The header that names who the message was sent to.
+    fn recipient_identity(&self, sender: &Sender<'_>) -> Option<&'a str> {
+        match sender.request {
+            true => self.identities.to_uri,
+            false => self.identities.from_uri,
+        }
+    }
+
+    /// Whether the warrant `x_id` names the party at `uri`.
+    fn names(&self, x_id: XId, uri: Option<&str>) -> bool {
+        uri.is_some_and(|uri| self.manager.tasks.index().match_uri(uri).contains(&x_id))
+    }
+}
+
 impl SessionMatch {
     /// Remember a warrant matching `sender`'s message.
     ///
@@ -261,7 +296,7 @@ impl SessionMatch {
     /// owns the anchor tag exactly when the message carries that tag as its
     /// sender's. That holds on every leg of a B2BUA call, whose other legs
     /// carry other tags, and whether or not the legs share a Call-ID.
-    fn direction(&self, sender: &Sender<'_>) -> PayloadDirection {
+    fn direction(&self, sender: &Sender<'_>, on: &MessageOn<'_>) -> PayloadDirection {
         // A tag the target is known by on another dialog of the session: its
         // own second dialog, which replaces the first (RFC 3891), carries a
         // tag the anchor never had.
@@ -274,12 +309,41 @@ impl SessionMatch {
         let Some(anchor_tag) = self.anchor_tag.as_deref() else {
             return PayloadDirection::Unknown;
         };
-        let sent_by_anchor_owner = sender.tag() == Some(anchor_tag);
-        if sent_by_anchor_owner == self.target_owns_anchor {
-            PayloadDirection::SentFromTarget
-        } else {
-            PayloadDirection::SentToTarget
+        // On the dialog the anchor is a tag of, the two ends are the anchor's
+        // owner and the other one, and the message is from whichever of them
+        // its sender tag says.
+        let on_the_anchors_dialog =
+            sender.from_tag == Some(anchor_tag) || sender.to_tag == Some(anchor_tag);
+        if on_the_anchors_dialog {
+            let sent_by_anchor_owner = sender.tag() == Some(anchor_tag);
+            return match sent_by_anchor_owner == self.target_owns_anchor {
+                true => PayloadDirection::SentFromTarget,
+                false => PayloadDirection::SentToTarget,
+            };
         }
+        // Another dialog of the session, with tags of its own. "Not the
+        // anchor's owner" says nothing there when the anchor is the other
+        // end's: a transfer's third party is not the anchor's owner either,
+        // and is not the target. So only what is positively known decides:
+        // who the message itself names as its sender, the target having sent
+        // under the anchor and not under this tag, the leg being the one
+        // dialled for the party the warrant names, who the message is
+        // addressed to. With none of them the direction is not known, and is
+        // reported so (1), never guessed.
+        let x_id = self.x_id;
+        if on.names(x_id, on.sender_identity(sender)) {
+            return PayloadDirection::SentFromTarget;
+        }
+        if self.target_owns_anchor {
+            return PayloadDirection::SentToTarget;
+        }
+        if on.called_party_leg && self.party == MatchedParty::Terminating {
+            return PayloadDirection::SentFromTarget;
+        }
+        if on.names(x_id, on.recipient_identity(sender)) {
+            return PayloadDirection::SentToTarget;
+        }
+        PayloadDirection::Unknown
     }
 
     /// The match as a caller that is not a message sees it (the media path):
@@ -296,13 +360,18 @@ impl SessionMatch {
 
     /// The match as delivery sees it for `sender`'s message, re-reading the
     /// task so a `ModifyTask` is honoured on the very next message.
-    fn task_match(&self, manager: &LiManager, sender: &Sender<'_>) -> Option<TaskMatch> {
+    fn task_match(
+        &self,
+        manager: &LiManager,
+        sender: &Sender<'_>,
+        on: &MessageOn<'_>,
+    ) -> Option<TaskMatch> {
         manager.tasks.get(self.x_id).map(|task| TaskMatch {
             task,
             party: self.party,
             identifier: self.identifier.clone(),
             field: self.field,
-            direction: self.direction(sender),
+            direction: self.direction(sender, on),
         })
     }
 }
@@ -399,6 +468,17 @@ pub struct CallOwner {
     pub internal_id: String,
     /// The Call-ID of the call's caller leg.
     pub a_leg_call_id: String,
+    /// Whether the leg was dialled to replace a party of the call (a transfer
+    /// target, a dialog taking a leg over with `Replaces`) rather than for
+    /// the call's called party. Who sends on such a leg is somebody new.
+    pub replacement_target: bool,
+}
+
+impl CallOwner {
+    /// Whether `call_id` is a leg this call dialled for its called party.
+    fn dialled_for_called_party(&self, call_id: &str) -> bool {
+        !self.replacement_target && self.a_leg_call_id != call_id
+    }
 }
 
 /// The session one message belongs to.
@@ -533,6 +613,9 @@ impl LiManager {
         if let Some(owner) = owner.as_ref() {
             if let Some(session_id) = self.warranted_session_of(owner) {
                 self.alias(call_id, &session_id);
+                if owner.dialled_for_called_party(call_id) {
+                    self.note_called_party_leg(&session_id, call_id);
+                }
                 if facts.opens_dialog() {
                     self.learn_target_tag(&session_id, identities, &sender);
                 }
@@ -575,11 +658,19 @@ impl LiManager {
             .iter()
             .map(|matched| SessionMatch::decided_on(matched, &sender, owner.is_some()))
             .collect();
+        let called_party_leg = owner
+            .as_ref()
+            .is_some_and(|owner| owner.dialled_for_called_party(call_id));
+        let on = MessageOn {
+            manager: self,
+            identities,
+            called_party_leg,
+        };
         let matches = decided
             .iter()
             .zip(matches)
             .map(|(decided, matched)| TaskMatch {
-                direction: decided.direction(&sender),
+                direction: decided.direction(&sender, &on),
                 ..matched
             })
             .collect::<Vec<_>>();
@@ -614,12 +705,28 @@ impl LiManager {
             bound_to_call,
             caller_tag_known,
         );
+        if called_party_leg {
+            self.note_called_party_leg(&session_id, &call_id);
+        }
         SessionView {
             on_primary_leg: primary_call_id == call_id,
             session_id,
             engine_call_id: primary_call_id,
             matches,
             seats: Vec::new(),
+        }
+    }
+
+    /// `call_id` is a leg the session's call dialled for its called party.
+    fn note_called_party_leg(&self, session_id: &Arc<str>, call_id: &str) {
+        if let Some(mut decision) = self.decisions.get_mut(&**session_id) {
+            if !decision
+                .called_party_legs
+                .iter()
+                .any(|leg| &**leg == call_id)
+            {
+                decision.called_party_legs.push(Arc::from(call_id));
+            }
         }
     }
 
@@ -1072,13 +1179,21 @@ impl LiManager {
             }
             decision.generation = generation;
         }
+        let on = MessageOn {
+            manager: self,
+            identities,
+            called_party_leg: decision
+                .called_party_legs
+                .iter()
+                .any(|leg| &**leg == call_id),
+        };
         // Re-read each task rather than trusting a cached copy, so a
         // ModifyTask that changed a delivery type or a destination is
         // honoured on the very next message.
         let matches = decision
             .matched
             .iter()
-            .filter_map(|known| known.task_match(self, sender))
+            .filter_map(|known| known.task_match(self, sender, &on))
             .collect();
         Some(SessionView {
             session_id: Arc::clone(session_id),
@@ -1147,6 +1262,7 @@ impl LiManager {
                 ended_at: None,
                 seats: Vec::new(),
                 caller_tag,
+                called_party_legs: Vec::new(),
             },
         );
         self.alias(primary_call_id, session_id);
@@ -1253,6 +1369,7 @@ mod tests {
         CallOwner {
             internal_id: internal_id.to_string(),
             a_leg_call_id: CALLER_LEG.to_string(),
+            replacement_target: false,
         }
     }
 
@@ -1504,6 +1621,7 @@ mod tests {
             let owner = CallOwner {
                 internal_id,
                 a_leg_call_id: caller_leg.clone(),
+                replacement_target: false,
             };
             let answered =
                 manager.resolve_session(&callee_leg, &response("INVITE", 200), &callee(), || {
@@ -2377,6 +2495,73 @@ mod tests {
         assert_eq!(
             manager.note_message(&view, &cancel("z9hG4bK-not-seen")),
             IriEventType::Continue
+        );
+    }
+
+    /// The warrant names the called party, and the caller's INVITE decided
+    /// it, so the anchor is the caller's tag. The called party's own leg is
+    /// from the target. A transfer then dials a third party on a leg of its
+    /// own: that party is not the caller either, and is not the target. What
+    /// it sends is never reported as from the target; with nothing to say
+    /// which way it went, the direction is not known.
+    #[test]
+    fn a_transfers_third_party_is_never_taken_for_a_called_target() {
+        let (manager, _iri, _audit) = manager();
+        provision_targets(
+            &manager,
+            DeliveryType::X2Only,
+            None,
+            vec![TargetIdentifier::SipUri("sip:bob@example.com".to_string())],
+        );
+        let internal_id = warranted_call(&manager);
+        let direction = |leg: &str, facts: MessageFacts<'static>, identities, replacement| {
+            let owner = CallOwner {
+                replacement_target: replacement,
+                ..owned_by(&internal_id)
+            };
+            manager
+                .resolve_session(leg, &facts, &identities, || Some(owner))
+                .matches[0]
+                .direction
+        };
+        assert_eq!(
+            direction(
+                CALLEE_LEG,
+                response("INVITE", 200),
+                callee_leg_response(),
+                false
+            ),
+            SentFromTarget,
+            "the called party's own leg"
+        );
+        const THIRD: &str = "transfer-target@example.com";
+        for (facts, identities) in [
+            (response("INVITE", 180), callee_leg_response()),
+            (response("INVITE", 200), callee_leg_response()),
+            (request("BYE"), callee_leg_request()),
+        ] {
+            assert_eq!(
+                direction(THIRD, facts, identities, true),
+                PayloadDirection::Unknown,
+                "the third party's leg"
+            );
+        }
+        // Where the message says who it is for, the direction is known: the
+        // third party's request to the target.
+        let to_the_target = Identities {
+            request_uri: None,
+            from_uri: Some("<sip:carol@example.com>;tag=t"),
+            to_uri: Some("<sip:bob@example.com>;tag=s2"),
+            source_ip: None,
+        };
+        assert_eq!(
+            direction(THIRD, request("INFO"), to_the_target, true),
+            SentToTarget
+        );
+        // And the called party is still told from it afterwards.
+        assert_eq!(
+            direction(CALLEE_LEG, request("BYE"), callee_leg_request(), false),
+            SentFromTarget
         );
     }
 }
