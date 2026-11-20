@@ -57,6 +57,7 @@ mod recording;
 mod scope;
 mod tee;
 mod waiters;
+mod x3_at_offer;
 use connection::connection_manager;
 #[cfg(test)]
 use events::{
@@ -68,6 +69,8 @@ pub use scope::CallScope;
 use scope::CallScopes;
 use waiters::Waiters;
 pub use waiters::{DigitRead, DigitReadEnd, DigitReadLimits};
+use x3_at_offer::{CallWatch, X3AtOffer};
+pub use x3_at_offer::{EngineCall, EngineCallChange, EngineCallObserver};
 
 /// Read buffer chunk size for the control connection.
 const READ_CHUNK: usize = 8192;
@@ -256,6 +259,9 @@ pub struct SiphonRtpClient {
     /// The scope every frame naming a call carries (`media.siphon_rtp.scope`),
     /// and the per-call scopes scripts named in its place.
     scopes: Arc<CallScopes>,
+    /// Whether the connected engine listed `x3_attach_at_offer` in
+    /// `node_info`, when it has been asked on this connection.
+    x3_at_offer: Arc<X3AtOffer>,
     /// Active call-ids (offer→insert, delete→remove) — mirrors `RtpEngineSet`'s
     /// affinity count for the `rtpengine.active_sessions` Python getter.
     sessions: DashMap<String, ()>,
@@ -306,11 +312,13 @@ impl SiphonRtpClient {
         let (connected_tx, connected_rx) = watch::channel(false);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
         let scopes = Arc::new(CallScopes::new(scope));
+        let x3_at_offer = Arc::new(X3AtOffer::default());
 
         tokio::spawn(connection_manager(
             address,
             control_secret,
             Arc::clone(&scopes),
+            Arc::clone(&x3_at_offer),
             timeout_ms,
             Arc::clone(&pending),
             Arc::clone(&play_pending),
@@ -332,6 +340,7 @@ impl SiphonRtpClient {
             writer,
             connected: connected_rx,
             scopes,
+            x3_at_offer,
             sessions: DashMap::new(),
             _shutdown_tx: shutdown_tx,
         })
@@ -372,7 +381,14 @@ impl SiphonRtpClient {
         .await;
 
         match outcome {
-            Ok(result) => result,
+            Ok(result) => {
+                // Whoever asked, and for whatever feature: the answer also
+                // says whether this engine takes an X3 attach at the offer.
+                if let Ok(CmdResult::NodeInfo { node }) = &result {
+                    self.x3_at_offer.record(&node.features);
+                }
+                result
+            }
             Err(_) => {
                 self.pending.remove(&id);
                 Err(RtpEngineError::Timeout {
@@ -1144,6 +1160,8 @@ pub struct SiphonRtpClientSet {
     counter: AtomicU64,
     /// Call-ID → client index affinity.
     affinity: DashMap<String, usize>,
+    /// Who is told of each engine call the set creates or ends.
+    calls: CallWatch,
 }
 
 impl SiphonRtpClientSet {
@@ -1196,6 +1214,7 @@ impl SiphonRtpClientSet {
             total_weight: running_total,
             counter: AtomicU64::new(0),
             affinity: DashMap::new(),
+            calls: CallWatch::default(),
         }))
     }
 

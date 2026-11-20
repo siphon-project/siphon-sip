@@ -30,6 +30,7 @@ use siphon_rtp_proto::Command;
 use tracing::warn;
 
 use super::scope::{require_scope_feature, CallScope};
+use super::x3_at_offer::EngineCallChange;
 use super::{
     expect_ok, expect_sdp, is_codec_change_refusal, profile_flags_from_ng, SiphonRtpClient,
     SiphonRtpClientSet,
@@ -282,11 +283,16 @@ impl SiphonRtpClientSet {
         let framed = framed(scope);
         let scope = framed.as_ref();
         let key = scoped_key(call_id, scope);
+        // An `offer` on an id the engine already holds replaces that call.
+        self.calls
+            .notify(EngineCallChange::Ending, scope, call_id, from_tag);
         let result = self
             .select_key(&key)
             .offer_in(scope, call_id, from_tag, sdp, flags)
             .await?;
         self.bind_affinity_key(&key);
+        self.calls
+            .notify(EngineCallChange::Offered, scope, call_id, from_tag);
         Ok(result)
     }
 
@@ -357,6 +363,8 @@ impl SiphonRtpClientSet {
         let framed = framed(scope);
         let scope = framed.as_ref();
         let key = scoped_key(call_id, scope);
+        self.calls
+            .notify(EngineCallChange::Ending, scope, call_id, from_tag);
         let result = self
             .select_key(&key)
             .delete_in(scope, call_id, from_tag)
@@ -378,6 +386,8 @@ impl SiphonRtpClientSet {
         let framed = framed(scope);
         let scope = framed.as_ref();
         let key = scoped_key(call_id, scope);
+        self.calls
+            .notify(EngineCallChange::Ending, scope, call_id, "");
         let mut last: Option<RtpEngineError> = None;
         for client in &self.clients {
             match client.delete_in(scope, call_id, "").await {
