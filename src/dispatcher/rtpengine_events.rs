@@ -1,6 +1,7 @@
 //! The media backend's asynchronous event stream.
 
 use super::*;
+use crate::li::EndedDelivery;
 use crate::rtpengine::CallScope;
 
 /// Drain the media backend's asynchronous event stream — DTMF, the
@@ -1118,17 +1119,44 @@ async fn on_x3_ended(
     ended: crate::rtpengine::events::X3EndedEvent,
     scope: Option<CallScope>,
 ) {
-    // The delivery this end belongs to, dropped from the record either way so
-    // the map does not grow across calls: that of an engine call siphon ended,
-    // oldest first, else the one in progress.
+    let Some(li) = state.li_manager.as_ref() else {
+        return x3_delivery_ended(None, &ended, EndedDelivery::unknown());
+    };
     // A joined conference seat's delivery is recorded under the seat, which
     // its end names by the room and the seat's tag.
-    let delivery = state.li_manager.as_ref().map(|li| {
-        let record = li.x3_record_of_event(&ended.call_id, &ended.from_tag);
-        li.x3_delivery_ended(&record, scope.as_ref())
-    });
-    let ended_by_siphon = delivery.as_ref().is_some_and(|delivery| delivery.by_siphon);
-    if x3_end_is_clean(&ended, ended_by_siphon) {
+    let record = li.x3_record_of_event(&ended.call_id, &ended.from_tag);
+    // The delivery this end belongs to, dropped from the record so the map
+    // does not grow across calls: that of an engine call siphon ended, oldest
+    // first, else the one in progress. `None` while siphon has asked the
+    // engine to end that engine call and the engine has not answered: whether
+    // this end is the one siphon asked for is what the answer says, so it is
+    // judged when the answer comes ([`x3_end_answered`]).
+    match li.x3_delivery_end_reported(&record, scope.as_ref(), &ended) {
+        Some(delivery) => x3_delivery_ended(Some(li), &ended, delivery),
+        None => debug!(
+            call_id = %ended.call_id,
+            reason = %ended.reason,
+            "X3 content delivery ended while siphon's end of its call is unanswered"
+        ),
+    }
+}
+
+/// The engine answered an end siphon asked for: judge the end reports that
+/// waited for it.
+pub(super) fn x3_end_answered(li: &crate::li::LiManager, held: Vec<crate::li::HeldEnd>) {
+    for crate::li::HeldEnd { ended, delivery } in held {
+        x3_delivery_ended(Some(li), &ended, delivery);
+    }
+}
+
+/// Judge the end of `delivery` the engine reported as `ended`, and report it
+/// to the ADMF unless it is clean. Spawns the reports; waits on nothing.
+fn x3_delivery_ended(
+    li: Option<&crate::li::LiManager>,
+    ended: &crate::rtpengine::events::X3EndedEvent,
+    delivery: EndedDelivery,
+) {
+    if x3_end_is_clean(ended, delivery.by_siphon) {
         info!(
             call_id = %ended.call_id,
             reason = %ended.reason,
@@ -1145,7 +1173,7 @@ async fn on_x3_ended(
         "X3 content delivery ended without a clean detach or with \
          dropped content"
     );
-    let (Some(li), Some(delivery)) = (state.li_manager.as_ref(), delivery) else {
+    let Some(li) = li else {
         return;
     };
     for attachment in delivery.attachments {

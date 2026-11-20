@@ -661,6 +661,21 @@ fn seat_refusal(command: &Command) -> Option<String> {
     }
 }
 
+/// Wait while a test holds the answers of the command's kind: an
+/// `answer_local`'s, or a `delete`'s.
+async fn held_answer(
+    command: &Command,
+    answers_open: &mut tokio::sync::watch::Receiver<bool>,
+    deletes_open: &mut tokio::sync::watch::Receiver<bool>,
+) {
+    let gate = match command {
+        Command::AnswerLocal { .. } => answers_open,
+        Command::Delete { .. } => deletes_open,
+        _ => return,
+    };
+    let _ = gate.wait_for(|open| *open).await;
+}
+
 /// The `play_id` the engine hands the first playback it accepts; each later one
 /// gets the next.
 pub(crate) const NATIVE_ENGINE_FIRST_PLAY_ID: u64 = 7001;
@@ -674,6 +689,9 @@ pub(crate) struct NativeTestEngine {
     /// Open (the default) lets `answer_local` answer; closed holds every answer
     /// until it opens, so a test can act while a set-up is provably pending.
     answers: tokio::sync::watch::Sender<bool>,
+    /// The same for `delete`: closed, a delete is acted on and its answer
+    /// held, so a test can report something while the command is out.
+    deletes: tokio::sync::watch::Sender<bool>,
 }
 
 /// The calls the engine holds, keyed the way the engine keys a call:
@@ -729,6 +747,7 @@ impl NativeTestEngine {
         let x3 = Arc::new(X3Model::listing(&features));
         let x3_model = Arc::clone(&x3);
         let (answers, answers_open) = tokio::sync::watch::channel(true);
+        let (deletes, deletes_open) = tokio::sync::watch::channel(true);
         let next_play_id = Arc::new(std::sync::atomic::AtomicU64::new(
             NATIVE_ENGINE_FIRST_PLAY_ID,
         ));
@@ -742,6 +761,7 @@ impl NativeTestEngine {
                 let x3 = Arc::clone(&x3_model);
                 let next_play_id = Arc::clone(&next_play_id);
                 let mut answers_open = answers_open.clone();
+                let mut deletes_open = deletes_open.clone();
                 tokio::spawn(async move {
                     let mut buffer = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -991,9 +1011,7 @@ impl NativeTestEngine {
                                 video_declined: None,
                             },
                         };
-                        if matches!(request.command, Command::AnswerLocal { .. }) {
-                            let _ = answers_open.wait_for(|open| *open).await;
-                        }
+                        held_answer(&request.command, &mut answers_open, &mut deletes_open).await;
                         let Ok(bytes) = frame::encode(&Response {
                             id: request.id,
                             result,
@@ -1013,7 +1031,18 @@ impl NativeTestEngine {
             live,
             x3,
             answers,
+            deletes,
         }
+    }
+
+    /// Hold every `delete` answer until [`release_deletes`](Self::release_deletes).
+    pub(crate) fn hold_deletes(&self) {
+        self.deletes.send_replace(false);
+    }
+
+    /// Answer the held `delete`s, and every one after.
+    pub(crate) fn release_deletes(&self) {
+        self.deletes.send_replace(true);
     }
 
     /// Refuse the next `delete` or `conference_leave` (`verb`), leaving the

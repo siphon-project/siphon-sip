@@ -931,6 +931,242 @@ async fn a_mid_call_warrant_attaches_on_the_engine_call_the_media_moved_to() {
         .expect("released");
 }
 
+/// A transfer forked to two targets offers the caller's media on two minted
+/// engine calls. The one whose target answers has the media, whichever was
+/// offered last and whether the loser's engine call is gone yet. On an engine
+/// that takes no interception before the answer it is attached at that
+/// answer, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_winner_of_a_forked_transfer_is_attached_before_the_loser_is_released() {
+    let call = "forked-transfer@192.0.2.10";
+    let (state, engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start().await).await;
+    let backend = backend_of(&state);
+    let flags = NgFlags::default();
+    arrives(&state, CALLER, &caller_invite_with_sdp(call));
+    backend
+        .offer(call, "caller-tag", CALLER_SDP.as_bytes(), &flags)
+        .await
+        .expect("offered");
+    backend
+        .answer(call, "caller-tag", "callee-tag", b"v=0\r\n", &flags)
+        .await
+        .expect("answered");
+    arrives(&state, CALLER, &on_call(CALLER_ACK, call));
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+
+    // Two targets, each on an engine call of its own. The first is the winner.
+    mint_engine_call("transfer", &state, call);
+    let winner = engine
+        .commands("offer")
+        .last()
+        .expect("offered")
+        .call_id
+        .clone();
+    mint_engine_call("transfer", &state, call);
+    let loser = engine
+        .commands("offer")
+        .last()
+        .expect("offered")
+        .call_id
+        .clone();
+    assert_ne!(winner, loser);
+    backend
+        .answer(&winner, "caller-tag", "winner-tag", b"v=0\r\n", &flags)
+        .await
+        .expect("the winner answers");
+    assert_eq!(
+        attach_outcomes(&mut audit).await,
+        (1, 0),
+        "attached at its answer, with the loser still offered"
+    );
+    // Only now is the loser released, and the caller's old engine call.
+    backend
+        .delete(&loser, "caller-tag")
+        .await
+        .expect("the loser is released");
+    backend
+        .delete(call, "caller-tag")
+        .await
+        .expect("the old anchor is released");
+    assert_eq!(attach_outcomes(&mut audit).await, (0, 0));
+    let attached: Vec<String> = engine
+        .commands("attach_x3")
+        .into_iter()
+        .map(|command| command.call_id)
+        .collect();
+    assert_eq!(attached, vec![call.to_string(), winner.clone()]);
+    assert_eq!(li.x3_attachments_for(&winner).len(), 1);
+    assert!(li.x3_attachments_for(&loser).is_empty());
+    assert_eq!(
+        &*li.session_of_leg(call).expect("the session").engine_call_id,
+        winner.as_str(),
+        "and it is where the session's media is"
+    );
+    backend
+        .delete(&winner, "caller-tag")
+        .await
+        .expect("released");
+}
+
+/// The engine ends a delivery while a `delete` siphon sent is still
+/// unanswered. Whether that end is the one siphon asked for is what the
+/// delete's answer says, so it is not judged until then: the engine refusing
+/// the delete means it ended the delivery on its own, which is a fault, and
+/// the engine taking it means the end was siphon's, which is clean.
+#[tokio::test]
+async fn an_end_reported_while_a_delete_is_out_is_judged_by_the_deletes_answer() {
+    for refused in [true, false] {
+        let call = format!("end-during-delete-{refused}@192.0.2.10");
+        let (log, _guard) = capture_log();
+        let (state, engine, li, _iri, mut audit) =
+            intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+        let events = engine_events(&state);
+        arrives(&state, CALLER, &on_call(CALLER_INVITE, &call));
+        backend_of(&state)
+            .offer(&call, "caller-tag", b"v=0\r\n", &NgFlags::default())
+            .await
+            .expect("offered");
+        assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+
+        if refused {
+            engine.refuse_next("delete");
+        }
+        engine.hold_deletes();
+        let deleting = {
+            let (backend, call) = (backend_of(&state), call.clone());
+            tokio::spawn(async move { backend.delete(&call, "caller-tag").await })
+        };
+        while engine.commands("delete").is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        engine_reports(&events, ended(&call, "caller-tag", "CallEnded")).await;
+        assert_eq!(
+            faults_reported(&log),
+            0,
+            "refused={refused}: not judged while the delete is out"
+        );
+        assert_eq!(li.x3_attachment_count(), 1, "refused={refused}: on record");
+
+        engine.release_deletes();
+        let deleted = deleting.await.expect("the delete ran");
+        assert_eq!(deleted.is_err(), refused);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            faults_reported(&log),
+            usize::from(refused),
+            "refused={refused}:\n{}",
+            log.rendered()
+        );
+        assert_eq!(li.x3_attachment_count(), 0, "refused={refused}: drained");
+        if refused {
+            backend_of(&state)
+                .delete(&call, "caller-tag")
+                .await
+                .expect("deleted");
+        }
+    }
+}
+
+/// What the engine refused for good on an engine call stays refused when a
+/// `delete` of that engine call fails: it is the same engine call, and a
+/// later ACK does not ask again or report again.
+#[tokio::test]
+async fn a_failed_delete_does_not_ask_again_for_what_the_engine_refused() {
+    const CALL: &str = "refused-then-delete-failed@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let (state, engine, _li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3_at_offer().await).await;
+    backend_of(&state)
+        .answer_local(CALL, "caller-tag", "v=0\r\n", &NgFlags::default())
+        .await
+        .expect("answered by the engine");
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 1));
+
+    engine.refuse_next("delete");
+    assert!(backend_of(&state).delete(CALL, "caller-tag").await.is_err());
+    let ack = on_call(CALLER_ACK, CALL)
+        .replace("CSeq: 1 ACK", "CSeq: 2 ACK")
+        .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-reack");
+    arrives(&state, CALLER, &ack);
+    assert_eq!(attach_outcomes(&mut audit).await, (0, 0), "not asked again");
+    assert_eq!(engine.commands("attach_x3").len(), 1);
+    assert_eq!(faults_reported(&log), 1, "{}", log.rendered());
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("deleted");
+}
+
+/// Two calls of one target are bridged onto one engine call. Each is a
+/// session with a Correlation ID of its own, and the warrant owes each its
+/// content under it. The engine holds one delivery of a warrant per engine
+/// call, so the second cannot be delivered under its own: that is reported to
+/// the ADMF, once, naming both Correlation IDs, and never dropped in silence.
+#[tokio::test]
+async fn a_second_session_on_one_engine_call_is_a_fault_naming_both_correlations() {
+    const FIRST: &str = "bridged-first@192.0.2.10";
+    const SECOND: &str = "bridged-second@192.0.2.10";
+    const MINTED: &str = "bridged-pair-engine-call";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    let backend = backend_of(&state);
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, FIRST));
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, SECOND));
+    let correlation = |call: &str| {
+        let session = li.session_of_leg(call).expect("the session");
+        li.correlation_for(&session.matches[0].task, &session.session_id)
+    };
+    let (first, second) = (correlation(FIRST), correlation(SECOND));
+    assert_ne!(first, second, "two sessions");
+
+    // The pair's engine call: the first call's media offered, the second's
+    // answering.
+    let mut offer = NgFlags::default();
+    offer.stamp_sip_call_id(FIRST);
+    backend
+        .offer(MINTED, "caller-tag", b"v=0\r\n", &offer)
+        .await
+        .expect("offered");
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+    let mut answer = NgFlags::default();
+    answer.stamp_sip_call_id(SECOND);
+    backend
+        .answer(MINTED, "caller-tag", "peer-tag", b"v=0\r\n", &answer)
+        .await
+        .expect("answered");
+
+    assert_eq!(
+        attach_outcomes(&mut audit).await,
+        (1, 1),
+        "the second session's is audited as not delivered"
+    );
+    assert_eq!(
+        engine.commands("attach_x3").len(),
+        1,
+        "a second attach would replace the first session's delivery"
+    );
+    let rendered = log.rendered();
+    assert_eq!(faults_reported(&log), 1, "{rendered}");
+    assert!(
+        rendered.contains(&format!("cannot be delivered under correlation {second}"))
+            && rendered.contains(&format!("the session of correlation {first}")),
+        "both Correlation IDs are named:\n{rendered}"
+    );
+
+    // Reported once: a later ACK of either call says nothing more.
+    arrives(&state, CALLER, &on_call(CALLER_ACK, SECOND));
+    assert_eq!(attach_outcomes(&mut audit).await, (0, 0));
+    assert_eq!(faults_reported(&log), 1);
+    backend
+        .delete(MINTED, "caller-tag")
+        .await
+        .expect("released");
+}
+
 /// A room that closes while the leg is being moved into it leaves the call's
 /// media stopped. The engine refuses the seat and ends the interception with
 /// `transport_error`, which is a fault toward the ADMF like any end siphon did
@@ -1330,6 +1566,13 @@ async fn a_cancelled_re_invite_keeps_the_calls_interception() {
         .replace("INVITE sip:", "CANCEL sip:")
         .replace("CSeq: 2 INVITE", "CSeq: 2 CANCEL");
     arrives(&state, CALLER, &cancel);
+    // The far end had answered the re-INVITE already: nothing to cancel.
+    let no_transaction = on_call(
+        &proxied_response("481 Call/Transaction Does Not Exist"),
+        CALL,
+    )
+    .replace("CSeq: 1 INVITE", "CSeq: 2 CANCEL");
+    arrives(&state, CALLEE, &no_transaction);
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     assert!(

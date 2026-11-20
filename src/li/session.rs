@@ -99,6 +99,8 @@ pub(super) struct SessionDecision {
     caller_tag: Option<Box<str>>,
     /// The legs a B2BUA call dialled for its called party.
     called_party_legs: Vec<Arc<str>>,
+    /// The CANCELs of a re-INVITE whose final response has not come.
+    re_invite_cancels: u8,
     /// The engine calls siphon allocated for the session under an id of its
     /// own minting, oldest first: a transfer re-anchors the call's media onto
     /// a fresh engine call and deletes the one the caller's Call-ID named.
@@ -164,6 +166,30 @@ impl SessionDecision {
             Some((_, re_invite)) => *re_invite,
             None => facts.request && facts.to_tagged,
         }
+    }
+
+    /// [`Self::cancels_a_re_invite`], following a CANCEL to its responses.
+    ///
+    /// A response to a CANCEL cannot be matched to an INVITE by its branch:
+    /// through a proxy its top `Via` is the proxy's own, and on a B2BUA leg it
+    /// answers a CANCEL siphon sent. What it answers is the CANCEL that is
+    /// outstanding, so a CANCEL of a re-INVITE is counted until its final
+    /// response has come, and a response to a CANCEL meanwhile is that one's.
+    fn cancel_is_of_a_re_invite(&mut self, facts: &MessageFacts<'_>) -> bool {
+        if facts.request {
+            let of_a_re_invite = self.cancels_a_re_invite(facts);
+            if of_a_re_invite {
+                self.re_invite_cancels = self.re_invite_cancels.saturating_add(1);
+            }
+            return of_a_re_invite;
+        }
+        if self.re_invite_cancels == 0 {
+            return self.cancels_a_re_invite(facts);
+        }
+        if facts.status_code.is_some_and(|code| code >= 200) {
+            self.re_invite_cancels -= 1;
+        }
+        true
     }
 
     /// The seats the session's legs hold now.
@@ -922,11 +948,13 @@ impl LiManager {
 
         // A CANCEL ends the session only when it cancels the INVITE that
         // opened it. One that cancels a re-INVITE withdraws a change to a call
-        // that goes on (RFC 3261 §9.1, §14.1), and so does its 200.
+        // that goes on (RFC 3261 §9.1, §14.1), and so does every response to
+        // it: its 200, and a 481 from a far end that had already answered the
+        // re-INVITE.
         let cancels_a_re_invite = facts.method == "CANCEL"
             && decision
-                .as_deref()
-                .is_some_and(|decision| decision.cancels_a_re_invite(facts));
+                .as_deref_mut()
+                .is_some_and(|decision| decision.cancel_is_of_a_re_invite(facts));
         let event_type = if facts.request {
             match facts.method {
                 "INVITE" if !facts.to_tagged => IriEventType::Begin,
@@ -939,6 +967,7 @@ impl LiManager {
             }
         } else {
             match facts.status_code {
+                Some(code) if code >= 300 && cancels_a_re_invite => IriEventType::Continue,
                 // Another leg failing does not end the call. An LCR carrier
                 // that refused, a forked branch that lost, a far end that sent
                 // 491 to a re-INVITE: the call carries on, and so must content
@@ -1117,21 +1146,7 @@ impl LiManager {
             for (seat, _) in &decision.seats {
                 self.forget_x3_call(&seat.record());
             }
-            for minted in &decision.engine_calls {
-                // Two calls bridged onto one engine call each have a session
-                // on it: its record goes with the last of them.
-                let last =
-                    self.minted_engine_calls
-                        .get_mut(&*minted.id)
-                        .is_none_or(|mut sessions| {
-                            sessions.retain(|held| **held != *session_id);
-                            sessions.is_empty()
-                        });
-                if last {
-                    self.minted_engine_calls.remove(&*minted.id);
-                    self.forget_x3_call(&minted.id);
-                }
-            }
+            self.release_engine_calls(session_id, &decision.engine_calls);
         }
     }
 
@@ -1332,7 +1347,11 @@ impl LiManager {
         // warrant) is now part of this session.
         for leg in [call_id, primary_call_id] {
             if leg != session_id {
-                self.decisions.remove(&**leg);
+                // What it knew of minted engine calls was handed on already;
+                // the bindings under its own id go with it.
+                if let Some((_, replaced)) = self.decisions.remove(&**leg) {
+                    self.release_engine_calls(leg, &replaced.engine_calls);
+                }
             }
         }
         self.decisions.insert(
@@ -1351,6 +1370,7 @@ impl LiManager {
                 seats: Vec::new(),
                 caller_tag,
                 called_party_legs: Vec::new(),
+                re_invite_cancels: 0,
                 engine_calls: Vec::new(),
             },
         );
@@ -2579,6 +2599,20 @@ mod tests {
             "the session did not end"
         );
 
+        // A 481 to another CANCEL of the re-INVITE, through a proxy: the
+        // response's top Via is the proxy's own, not the re-INVITE's.
+        manager.note_message(&view, &cancel("z9hG4bK-re-invite"));
+        let no_transaction = MessageFacts {
+            branch: Some("z9hG4bK-the-proxys-own"),
+            ..response("CANCEL", 481)
+        };
+        assert_eq!(
+            manager.note_message(&view, &no_transaction),
+            IriEventType::Continue
+        );
+        manager.sweep_sessions(Instant::now() + SESSION_GRACE * 2, |_| false);
+        assert_eq!(manager.remembered_session_count(), 1);
+
         // The CANCEL of the opening INVITE: its branch, and no To-tag.
         let opening = MessageFacts {
             to_tagged: false,
@@ -2787,5 +2821,58 @@ mod tests {
             !view.offerer_is_caller,
             "offered with the other party's media"
         );
+    }
+
+    /// The leak gate for minted engine calls across a promotion: the caller's
+    /// dialog is decided unwarranted and its media moves onto an engine call
+    /// siphon minted; then a message on another leg of the call matches a
+    /// warrant, and the call's session replaces the caller dialog's decision.
+    /// What that decision bound goes with it, and every map is back at
+    /// baseline when the calls are over.
+    #[test]
+    fn a_decision_replaced_through_another_leg_leaves_no_engine_binding() {
+        let (manager, _iri, _audit) = manager();
+        // The warrant names the called number, which only the callee leg
+        // carries.
+        provision_targets(
+            &manager,
+            DeliveryType::X2AndX3,
+            None,
+            vec![TargetIdentifier::E164Number("15550100042".to_string())],
+        );
+        const CALLS: usize = 200;
+        for index in 0..CALLS {
+            let caller_leg = format!("promoted-caller-{index}@example.com");
+            let callee_leg = format!("promoted-callee-{index}@example.com");
+            let minted = format!("promoted-minted-{index}");
+            let opening = manager.resolve_session(&caller_leg, &invite(), &caller(), || None);
+            assert!(opening.matches.is_empty());
+            manager.adopt_engine_call(&caller_leg, &minted, EngineCallSide::Offerer);
+            assert_eq!(manager.sessions_on_engine_call(&minted).len(), 1);
+
+            let owner = CallOwner {
+                internal_id: format!("call-{index}"),
+                a_leg_call_id: caller_leg.clone(),
+                replacement_target: false,
+            };
+            let promoted =
+                manager.resolve_session(&callee_leg, &response("INVITE", 200), &callee(), || {
+                    Some(owner)
+                });
+            assert_eq!(promoted.matches.len(), 1);
+            assert_eq!(&*promoted.engine_call_id, minted.as_str(), "handed on");
+            assert_eq!(
+                manager.sessions_on_engine_call(&minted),
+                vec![Arc::<str>::from(format!("call-{index}"))],
+                "bound to the call's session, and to nothing that is gone"
+            );
+            manager.note_message(&promoted, &request("BYE"));
+        }
+        manager.sweep_sessions(Instant::now(), |_| false);
+        manager.sweep_sessions(Instant::now() + SESSION_GRACE * 2, |_| false);
+        assert_eq!(manager.remembered_session_count(), 0);
+        assert_eq!(manager.session_alias_count(), 0);
+        assert_eq!(manager.minted_engine_call_count(), 0, "bindings drain");
+        assert_eq!(manager.x3_call_count(), 0);
     }
 }

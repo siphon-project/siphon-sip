@@ -58,6 +58,52 @@ pub struct DialogMedia {
 }
 
 impl LiManager {
+    /// Take `session_id` off the minted engine calls a decision of it was
+    /// on: the decision is released, or replaced by another session's. An
+    /// engine call no session is left on has its content record released with
+    /// it. Two calls bridged onto one engine call each have a session there,
+    /// and its record goes with the last of them.
+    pub(super) fn release_engine_calls(&self, session_id: &str, engine_calls: &[MintedEngineCall]) {
+        for minted in engine_calls {
+            let last = self
+                .minted_engine_calls
+                .get_mut(&*minted.id)
+                .is_none_or(|mut sessions| {
+                    sessions.retain(|held| **held != *session_id);
+                    sessions.is_empty()
+                });
+            if last {
+                self.minted_engine_calls.remove(&*minted.id);
+                self.forget_x3_call(&minted.id);
+            }
+        }
+    }
+
+    /// The session `session_id` as it stands on the minted engine call
+    /// `engine_call_id`: with that engine call for its media and that engine
+    /// call's own offerer. `None` when the session is not on it, or siphon
+    /// has ended it.
+    ///
+    /// For what is asked of one engine call in particular. Which of a
+    /// session's engine calls holds its media in the end is not known while
+    /// several are offered (a transfer forked to two targets): the one that
+    /// is answered is asked for as itself, whatever was offered after it.
+    pub fn session_on_engine_call(
+        &self,
+        session_id: &str,
+        engine_call_id: &str,
+    ) -> Option<super::SessionView> {
+        let mut view = self.session_of_leg(session_id)?;
+        let decision = self.decisions.get(session_id)?;
+        let minted = decision
+            .engine_calls
+            .iter()
+            .find(|minted| &*minted.id == engine_call_id && minted.live)?;
+        view.offerer_is_caller = minted.offerer_is_caller(&decision.primary_call_id);
+        view.engine_call_id = Arc::clone(&minted.id);
+        Some(view)
+    }
+
     /// Give a decision just made the engine calls siphon minted for its
     /// dialogs before it. The engine call that holds the session's media now.
     pub(super) fn hand_on_engine_calls(

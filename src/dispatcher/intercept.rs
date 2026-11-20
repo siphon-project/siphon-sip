@@ -570,7 +570,7 @@ pub(super) fn attach_x3(
         };
         let d_id = destination.details.d_id;
         let attempt = *attempt;
-        let recorded = li.register_x3_attachment(
+        let registered = li.x3_register(
             record,
             crate::li::ActiveIntercept {
                 x_id,
@@ -581,8 +581,15 @@ pub(super) fn attach_x3(
             },
             attempt,
         );
-        if !recorded {
-            continue;
+        match registered {
+            crate::li::X3Registration::Recorded => {}
+            crate::li::X3Registration::Known => continue,
+            crate::li::X3Registration::OtherCorrelation { held } => {
+                // An engine that keys its deliveries by Correlation ID as well
+                // takes this attach beside the first: send it from here.
+                second_correlation_undeliverable(li, (x_id, d_id), call_id, held, correlation_id);
+                continue;
+            }
         }
         let leg = backend.leg(call_id, scope.as_ref());
         let backend = Arc::clone(backend);
@@ -695,6 +702,43 @@ pub(super) fn attach_x3(
     }
 }
 
+/// Two sessions share one engine call (two calls bridged onto it) and the same
+/// warrant covers both: each is owed the content under its own Correlation
+/// ID, to the same destination. The engine holds one delivery of a warrant
+/// per engine call, and a second attach would replace the first, so the
+/// second session's content cannot be delivered under its Correlation ID.
+/// That is warranted content not being delivered as the warrant's records
+/// say, and the ADMF is told, naming both: the mediation function can then
+/// tie the X2 records of `wanted` to the X3 delivered under `held`.
+fn second_correlation_undeliverable(
+    li: &crate::li::LiManager,
+    (x_id, d_id): (crate::li::x1::types::XId, crate::li::x1::types::DId),
+    call_id: &str,
+    held: u64,
+    wanted: u64,
+) {
+    error!(
+        %x_id, %d_id, %call_id, held, wanted,
+        "X3 content of a second session on one engine call is NOT being delivered under \
+         its own Correlation ID: the engine holds one delivery of a warrant per engine call"
+    );
+    let detail = format!(
+        "X3 for task {x_id} cannot be delivered under correlation {wanted}: its content is on \
+         an engine call shared with the session of correlation {held}, and is delivered \
+         under {held} only"
+    );
+    li.audit(
+        crate::li::AuditOperation::MediaCaptureStarted,
+        Some(&x_id.to_string()),
+        format!("X3 attach FAILED call_id={call_id}: {detail}"),
+    );
+    let li = li.clone();
+    tokio::spawn(async move {
+        let fault = crate::li::x1::types::TaskReportType::TerminatingFault;
+        report_destination_fault(&li, d_id, fault, detail).await;
+    });
+}
+
 /// How long to wait before each further try of an attach the engine refused
 /// for a reason that passes: three more within a second.
 const X3_ATTACH_RETRY_DELAYS: [std::time::Duration; 3] = [
@@ -771,10 +815,14 @@ pub(super) fn watch_engine_calls(state: &Arc<DispatcherState>) {
             // is the command's; a command the engine refused ended nothing,
             // and the delivery is watched again as any live one is.
             EngineCallChange::Ended => {
-                li.x3_media_end_committed(call.call_id, scope);
+                let held = li.x3_media_end_committed(call.call_id, scope);
+                super::rtpengine_events::x3_end_answered(li, held);
                 li.engine_call_is_live(call.call_id, false);
             }
-            EngineCallChange::EndFailed => li.x3_media_end_failed(call.call_id, scope),
+            EngineCallChange::EndFailed => {
+                let held = li.x3_media_end_failed(call.call_id, scope);
+                super::rtpengine_events::x3_end_answered(li, held);
+            }
             // Every allocation siphon makes says which dialog's SDP it
             // carries. That dialog's session owns the engine call, which is
             // how one under an id siphon minted (a dial, a bridge, a transfer,
@@ -814,14 +862,16 @@ pub(super) fn watch_engine_calls(state: &Arc<DispatcherState>) {
             }
             EngineCallChange::SeatLeft => {
                 let seat = seat();
-                li.x3_media_end_committed(&seat.record(), None);
+                let held = li.x3_media_end_committed(&seat.record(), None);
+                super::rtpengine_events::x3_end_answered(li, held);
                 if let Some(sip_call_id) = call.sip_call_id {
                     li.seat_left(sip_call_id, &seat);
                 }
             }
             // The seat is still in its room, and still the session's.
             EngineCallChange::SeatLeaveFailed => {
-                li.x3_media_end_failed(&seat().record(), None);
+                let held = li.x3_media_end_failed(&seat().record(), None);
+                super::rtpengine_events::x3_end_answered(li, held);
             }
         }
     }));
@@ -964,12 +1014,13 @@ fn minted_engine_call_answered(state: &DispatcherState, engine_call_id: &str, of
         return;
     }
     for session_id in li.sessions_on_engine_call(engine_call_id) {
-        let Some(session) = li.session_of_leg(&session_id) else {
+        // As the session stands on this engine call, and not on whichever it
+        // was offered last: of a transfer forked to two targets the one that
+        // answers is the one with media, whatever the order they were
+        // offered in and whether the loser's engine call is gone yet.
+        let Some(session) = li.session_on_engine_call(&session_id, engine_call_id) else {
             continue;
         };
-        if &*session.engine_call_id != engine_call_id {
-            continue;
-        }
         let attempt = li.x3_attempt(engine_call_id, None);
         let site = X3Site::call_leg(&session, offerer_tag, None, attempt);
         for matched in &session.matches {

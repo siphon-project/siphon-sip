@@ -51,7 +51,7 @@ use crate::config::{LawfulInterceptConfig, MediaBackendKind};
 use x1::store::{ContentCapability, DestinationStore, StoredTask, TaskMatch, TaskStore};
 use x1::types::{DeliveryType, XId};
 
-pub use content::{seat_record, EndedDelivery, FailedAttach};
+pub use content::{seat_record, EndedDelivery, FailedAttach, HeldEnd, X3Registration};
 pub use session::{
     CallOwner, DialogMedia, EngineCallSide, Identities, MessageFacts, Seat, SessionView,
     SESSION_GRACE,
