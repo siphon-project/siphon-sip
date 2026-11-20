@@ -76,9 +76,13 @@ pub(super) fn intercept_message(
     // one. See `LiManager::resolve_session`. This is what stops a warrant
     // delivering the INVITE and then missing the BYE, or the other leg, and
     // what gives the whole call one Correlation ID.
-    let session = li.resolve_session(call_id, &facts, &identities, || {
-        b2bua_owner(state, message, call_id)
-    });
+    let session = li.resolve_session_with(
+        call_id,
+        &facts,
+        &identities,
+        || b2bua_owner(state, message, call_id),
+        || offerer_tag(state, call_id),
+    );
     if session.matches.is_empty() {
         // An unwarranted session is remembered as unwarranted, and that
         // memory has to be released when the dialog ends or the map would
@@ -430,6 +434,16 @@ fn replaced_call(state: &DispatcherState, message: &SipMessage) -> Option<String
         .call_actors
         .replaced_dialog_party(&replaces.call_id, &replaces.from_tag, &replaces.to_tag)
         .map(|(party, _answered)| party.internal_call_id)
+}
+
+/// The tag the media path knows the offerer of `call_id` by: the party that
+/// opened the dialog, on a call whose INVITE carried the offer.
+fn offerer_tag(state: &DispatcherState, call_id: &str) -> Option<String> {
+    state
+        .rtpengine_sessions
+        .as_ref()?
+        .get(call_id)
+        .map(|session| session.from_tag)
 }
 
 /// Create a B2BUA call from its caller leg, under the session id interception

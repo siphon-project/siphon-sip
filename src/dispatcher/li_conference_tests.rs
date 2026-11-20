@@ -14,11 +14,12 @@
 use super::li_session_tests::{
     arrives, attach_outcomes, backend_of, callee_request, callee_response, caller_calls,
     capture_log, dial, drain_iri, engine_events, engine_reports, faults_reported,
-    intercepting_on_the_engine, CALLEE, CALLEE_CALL_ID, CALLER, CALLER_ACK, CALLER_BYE_OK,
-    CALLER_INVITE,
+    intercepting_on_the_engine, proxied_response, CALLEE, CALLEE_CALL_ID, CALLER, CALLER_ACK,
+    CALLER_BYE_OK, CALLER_INVITE, SECOND_CALLEE_CALL_ID,
 };
 use super::*;
-use crate::li::correlation_from_call_id;
+use crate::li::pdu::PayloadDirection;
+use crate::li::{correlation_from_call_id, IriEvent};
 use crate::rtpengine::backend::{AdoptedSeat, ConferenceDtmf, ConferenceRole, ConferenceSeat};
 use crate::rtpengine::test_native_engine::{
     NativeTestEngine, NATIVE_ENGINE_CLOSING_ROOM, NATIVE_ENGINE_ECHO_REFUSED,
@@ -604,4 +605,182 @@ async fn an_invite_with_replaces_joins_the_session_of_the_call_it_replaces() {
         events[0].correlation_id, correlation,
         "as a call of its own"
     );
+}
+
+fn directions(events: &[IriEvent]) -> Vec<(String, Option<u16>, PayloadDirection)> {
+    events
+        .iter()
+        .map(|event| (event.sip_method.clone(), event.status_code, event.direction))
+        .collect()
+}
+
+/// TS 103 221-2 §5.2.6: each X2 record's direction is its message's, relative
+/// to the target. With the caller under warrant, what the caller sends is
+/// from the target on whichever dialog it sends it, and what the callee and a
+/// transfer's third leg send is to the target.
+#[tokio::test]
+async fn x2_direction_follows_who_sent_each_message_on_every_leg() {
+    use PayloadDirection::{SentFromTarget, SentToTarget};
+    let (state, _engine, _li, mut iri, _audit) =
+        intercepting_on_the_engine(NativeTestEngine::start().await).await;
+    let internal_id = caller_calls(&state);
+    dial(&state, &internal_id, CALLEE_CALL_ID);
+    arrives(&state, CALLEE, &callee_response(CALLEE_CALL_ID, "200 OK"));
+    arrives(&state, CALLER, CALLER_ACK);
+    // The caller transfers: a REFER on its dialog, and the transfer target
+    // answers on a third leg.
+    let refer = CALLER_ACK
+        .replace("ACK sip:", "REFER sip:")
+        .replace("CSeq: 1 ACK", "CSeq: 2 REFER")
+        .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-refer");
+    arrives(&state, CALLER, &refer);
+    dial(&state, &internal_id, SECOND_CALLEE_CALL_ID);
+    arrives(
+        &state,
+        CALLEE,
+        &callee_response(SECOND_CALLEE_CALL_ID, "180 Ringing"),
+    );
+    arrives(
+        &state,
+        CALLEE,
+        &callee_response(SECOND_CALLEE_CALL_ID, "200 OK"),
+    );
+    arrives(
+        &state,
+        CALLEE,
+        &callee_request("BYE", 2, "z9hG4bK-third-bye")
+            .replace(CALLEE_CALL_ID, SECOND_CALLEE_CALL_ID),
+    );
+    // The caller's answer to the BYE siphon relays to it.
+    arrives(&state, CALLER, CALLER_BYE_OK);
+    // And its own second dialog, replacing the first.
+    let replaces = format!(
+        "{BASE_CALL_ID};to-tag={};from-tag=caller-tag",
+        siphon_tag(&state, &internal_id)
+    );
+    arrives(
+        &state,
+        "192.0.2.30:5060",
+        &replacing_invite(
+            "direction-own@192.0.2.30",
+            "sip:alice@example.com",
+            &replaces,
+        ),
+    );
+
+    assert_eq!(
+        directions(&drain_iri(&mut iri)),
+        vec![
+            ("INVITE".to_string(), None, SentFromTarget),
+            ("INVITE".to_string(), Some(200), SentToTarget),
+            ("ACK".to_string(), None, SentFromTarget),
+            ("REFER".to_string(), None, SentFromTarget),
+            ("INVITE".to_string(), Some(180), SentToTarget),
+            ("INVITE".to_string(), Some(200), SentToTarget),
+            ("BYE".to_string(), None, SentToTarget),
+            ("BYE".to_string(), Some(200), SentFromTarget),
+            ("INVITE".to_string(), None, SentFromTarget),
+        ]
+    );
+}
+
+/// The same with the callee under warrant, on a proxy, where both ends send
+/// on the one dialog: the direction turns with the sender.
+#[tokio::test]
+async fn x2_direction_turns_with_the_sender_on_a_proxied_dialog() {
+    use PayloadDirection::{SentFromTarget, SentToTarget};
+    let (state, _engine, li, mut iri, _audit) =
+        intercepting_on_the_engine(NativeTestEngine::start().await).await;
+    // The warrant names the callee.
+    let mut callee = li.tasks().list()[0].details.clone();
+    li.tasks()
+        .deactivate(callee.x_id)
+        .expect("the caller's warrant is withdrawn");
+    callee.target_identifiers = vec![crate::li::x1::types::TargetIdentifier::SipUri(
+        "sip:15550100042@siphon.example.com".to_string(),
+    )];
+    li.tasks().activate(callee).expect("task must provision");
+
+    arrives(&state, CALLER, CALLER_INVITE);
+    arrives(&state, CALLEE, &proxied_response("200 OK"));
+    arrives(&state, CALLER, CALLER_ACK);
+    arrives(&state, CALLEE, &far_end_request("BYE", 1));
+    assert_eq!(
+        directions(&drain_iri(&mut iri)),
+        vec![
+            ("INVITE".to_string(), None, SentToTarget),
+            ("INVITE".to_string(), Some(200), SentFromTarget),
+            ("ACK".to_string(), None, SentToTarget),
+            ("BYE".to_string(), None, SentFromTarget),
+        ]
+    );
+}
+
+/// A request from the far end of the caller's proxied dialog: `From` is the
+/// callee, `To` the caller.
+fn far_end_request(method: &str, cseq: u32) -> String {
+    format!(
+        concat!(
+            "{method} sip:alice@192.0.2.10:5060 SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 198.51.100.77:5060;branch=z9hG4bK-far-{method}-{cseq}\r\n",
+            "Max-Forwards: 70\r\n",
+            "From: <sip:15550100042@siphon.example.com>;tag=callee-tag\r\n",
+            "To: <sip:alice@example.com>;tag=caller-tag\r\n",
+            "Call-ID: caller-call@192.0.2.10\r\n",
+            "CSeq: {cseq} {method}\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ),
+        method = method,
+        cseq = cseq,
+    )
+}
+
+/// A warrant activated while the target's call is up is decided on whatever
+/// message comes next. When that is a request from the far end, the caller is
+/// in `To`: the warrant still names the caller, and the engine is told the
+/// caller is the target, or every delivered packet's direction is inverted.
+/// The same call seen from its start gives the same answer.
+#[tokio::test]
+async fn a_warrant_activated_mid_call_names_the_end_the_target_is_on() {
+    for mid_call in [true, false] {
+        let (state, engine, li, _iri, mut audit) =
+            intercepting_on_the_engine(NativeTestEngine::start().await).await;
+        let warrant = li.tasks().list()[0].details.clone();
+        if mid_call {
+            li.tasks().deactivate(warrant.x_id).expect("no warrant yet");
+        }
+        // The call is set up: alice calls, the script anchors the media.
+        arrives(&state, CALLER, CALLER_INVITE);
+        backend_of(&state)
+            .offer(BASE_CALL_ID, "caller-tag", b"v=0\r\n", &NgFlags::default())
+            .await
+            .expect("offered");
+        arrives(&state, CALLEE, &proxied_response("200 OK"));
+        if mid_call {
+            li.tasks()
+                .activate(warrant)
+                .expect("the warrant arrives mid-call");
+        }
+
+        // The far end re-INVITEs and ACKs the answer.
+        arrives(&state, CALLEE, &far_end_request("INVITE", 1));
+        arrives(&state, CALLEE, &far_end_request("ACK", 1));
+        assert_eq!(
+            attach_outcomes(&mut audit).await,
+            (1, 0),
+            "mid_call={mid_call}"
+        );
+        let attached = engine.commands("attach_x3");
+        assert_eq!(attached.len(), 1, "mid_call={mid_call}");
+        assert_eq!(
+            attached[0].detail.as_deref(),
+            Some("caller"),
+            "mid_call={mid_call}: alice opened the dialog, so the target is the caller's leg"
+        );
+        backend_of(&state)
+            .delete(BASE_CALL_ID, "caller-tag")
+            .await
+            .expect("deleted");
+    }
 }

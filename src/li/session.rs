@@ -88,6 +88,11 @@ pub(super) struct SessionDecision {
     /// is still held. One that left stays listed so that its content record
     /// is released with the session, as an engine call's is.
     seats: Vec<(Seat, bool)>,
+    /// The tag of the party that opened the session's anchoring dialog, when
+    /// it is known: the `From` tag of the dialog-forming INVITE, or what the
+    /// media path knows the offerer by. It tells which end of the call a later
+    /// message's `From` is, on a dialog both ends send on.
+    caller_tag: Option<Box<str>>,
 }
 
 /// A seat a party joined a conference room with (`conference_join`, or the
@@ -134,7 +139,13 @@ struct SessionMatch {
     anchor_tag: Option<Box<str>>,
     /// Whether the end that owns `anchor_tag` is the target.
     target_owns_anchor: bool,
+    /// Further tags the target is known by: the `From` tag of each dialog it
+    /// opened into the session after the deciding one.
+    target_tags: Vec<Box<str>>,
 }
+
+/// How many further tags of a target one match remembers.
+const MAX_TARGET_TAGS: usize = 8;
 
 /// The dialog tags of one message, and whether it is a request.
 ///
@@ -213,6 +224,7 @@ impl SessionMatch {
             field: matched.field,
             anchor_tag: anchor_tag.map(Box::from),
             target_owns_anchor,
+            target_tags: Vec::new(),
         }
     }
 
@@ -227,6 +239,15 @@ impl SessionMatch {
     /// sender's. That holds on every leg of a B2BUA call, whose other legs
     /// carry other tags, and whether or not the legs share a Call-ID.
     fn direction(&self, sender: &Sender<'_>) -> PayloadDirection {
+        // A tag the target is known by on another dialog of the session: its
+        // own second dialog, which replaces the first (RFC 3891), carries a
+        // tag the anchor never had.
+        if sender
+            .tag()
+            .is_some_and(|tag| self.target_tags.iter().any(|known| &**known == tag))
+        {
+            return PayloadDirection::SentFromTarget;
+        }
         let Some(anchor_tag) = self.anchor_tag.as_deref() else {
             return PayloadDirection::Unknown;
         };
@@ -238,8 +259,6 @@ impl SessionMatch {
         }
     }
 
-    /// The match as delivery sees it for `sender`'s message, re-reading the
-    /// task so a `ModifyTask` is honoured on the very next message.
     /// The match as a caller that is not a message sees it (the media path):
     /// no message, so no direction.
     fn task_match_of_no_message(&self, manager: &LiManager) -> Option<TaskMatch> {
@@ -252,6 +271,8 @@ impl SessionMatch {
         })
     }
 
+    /// The match as delivery sees it for `sender`'s message, re-reading the
+    /// task so a `ModifyTask` is honoured on the very next message.
     fn task_match(&self, manager: &LiManager, sender: &Sender<'_>) -> Option<TaskMatch> {
         manager.tasks.get(self.x_id).map(|task| TaskMatch {
             task,
@@ -429,11 +450,36 @@ impl LiManager {
         identities: &Identities<'_>,
         owner: impl FnOnce() -> Option<CallOwner>,
     ) -> SessionView {
+        self.resolve_session_with(call_id, facts, identities, owner, || None)
+    }
+
+    /// [`resolve_session`](Self::resolve_session), with somewhere to ask the
+    /// tag of the party that opened the dialog.
+    ///
+    /// Which end of a call a warrant names is which end the matched identity
+    /// is on, and a message says that only relative to whoever sent it: a
+    /// re-INVITE or a BYE from the far end carries the caller in `To`, and a
+    /// response carries the headers of the request it answers. So the party is
+    /// turned by which end the message's `From` is. On a B2BUA call the leg
+    /// says it. On a dialog both ends send on it is the tag: the one the
+    /// dialog-forming INVITE carried when this node saw it, else `caller_tag`,
+    /// which is asked only for a match on a message that opens nothing, in a
+    /// session nothing is remembered of. With none of them the `From` is
+    /// taken for the caller, as it is on the INVITE.
+    pub fn resolve_session_with(
+        &self,
+        call_id: &str,
+        facts: &MessageFacts<'_>,
+        identities: &Identities<'_>,
+        owner: impl FnOnce() -> Option<CallOwner>,
+        caller_tag: impl FnOnce() -> Option<String>,
+    ) -> SessionView {
         if !self.is_intercepting() {
             return SessionView::unwarranted(call_id);
         }
         let generation = self.tasks.generation();
         let sender = Sender::of(facts, identities);
+        let mut caller_tag_known: Option<Box<str>> = None;
 
         let known = self
             .aliases
@@ -445,8 +491,15 @@ impl LiManager {
                     .map(|decision| Arc::clone(decision.key()))
             });
         if let Some(session_id) = known {
-            if let Some(view) = self.refresh(&session_id, call_id, generation, identities, &sender)
-            {
+            if let Some(view) = self.refresh(
+                &session_id,
+                call_id,
+                generation,
+                facts,
+                identities,
+                &sender,
+                &mut caller_tag_known,
+            ) {
                 return view;
             }
         }
@@ -457,20 +510,44 @@ impl LiManager {
         if let Some(owner) = owner.as_ref() {
             if let Some(session_id) = self.warranted_session_of(owner) {
                 self.alias(call_id, &session_id);
-                if let Some(view) =
-                    self.refresh(&session_id, call_id, generation, identities, &sender)
-                {
+                if facts.opens_dialog() {
+                    self.learn_target_tag(&session_id, identities, &sender);
+                }
+                if let Some(view) = self.refresh(
+                    &session_id,
+                    call_id,
+                    generation,
+                    facts,
+                    identities,
+                    &sender,
+                    &mut None,
+                ) {
                     return view;
                 }
             }
         }
 
-        let matches = self.tasks.match_message(
+        let mut matches = self.tasks.match_message(
             identities.request_uri,
             identities.from_uri,
             identities.to_uri,
             identities.source_ip,
         );
+        let caller_is_in_from = if facts.opens_dialog() {
+            caller_tag_known = sender.from_tag.map(Box::from);
+            Some(true)
+        } else if let Some(owner) = owner.as_ref() {
+            Some(leg_from_is_caller(facts, call_id == owner.a_leg_call_id))
+        } else {
+            if caller_tag_known.is_none() && !matches.is_empty() {
+                caller_tag_known = caller_tag().map(String::into_boxed_str);
+            }
+            sender
+                .from_tag
+                .zip(caller_tag_known.as_deref())
+                .map(|(from, caller)| from == caller)
+        };
+        orient(&mut matches, facts, caller_is_in_from);
         let decided: Vec<SessionMatch> = matches
             .iter()
             .map(|matched| SessionMatch::decided_on(matched, &sender, owner.is_some()))
@@ -512,6 +589,7 @@ impl LiManager {
             generation,
             decided,
             bound_to_call,
+            caller_tag_known,
         );
         SessionView {
             on_primary_leg: primary_call_id == call_id,
@@ -519,6 +597,35 @@ impl LiManager {
             engine_call_id: primary_call_id,
             matches,
             seats: Vec::new(),
+        }
+    }
+
+    /// A dialog-forming request joined the session on a Call-ID of its own:
+    /// where its `From` is the target of a warrant covering the session, its
+    /// tag is one more the target sends under.
+    fn learn_target_tag(
+        &self,
+        session_id: &Arc<str>,
+        identities: &Identities<'_>,
+        sender: &Sender<'_>,
+    ) {
+        let (Some(from), Some(tag)) = (identities.from_uri, sender.from_tag) else {
+            return;
+        };
+        let named = self.tasks.index().match_uri(from);
+        if named.is_empty() {
+            return;
+        }
+        let Some(mut decision) = self.decisions.get_mut(&**session_id) else {
+            return;
+        };
+        for known in &mut decision.matched {
+            if named.contains(&known.x_id)
+                && known.target_tags.len() < MAX_TARGET_TAGS
+                && !known.target_tags.iter().any(|held| &**held == tag)
+            {
+                known.target_tags.push(Box::from(tag));
+            }
         }
     }
 
@@ -882,22 +989,38 @@ impl LiManager {
         session_id: &Arc<str>,
         call_id: &str,
         generation: u64,
+        facts: &MessageFacts<'_>,
         identities: &Identities<'_>,
         sender: &Sender<'_>,
+        remembered_caller_tag: &mut Option<Box<str>>,
     ) -> Option<SessionView> {
         let mut decision = self.decisions.get_mut(&**session_id)?;
         if decision.generation != generation {
-            let fresh = self.tasks.match_message(
+            let mut fresh = self.tasks.match_message(
                 identities.request_uri,
                 identities.from_uri,
                 identities.to_uri,
                 identities.source_ip,
             );
             if decision.matched.is_empty() && !fresh.is_empty() {
+                // What the old decision knew of the caller carries over.
+                *remembered_caller_tag = decision.caller_tag.take();
                 drop(decision);
                 self.forget_session(session_id);
                 return None;
             }
+            let caller_is_in_from = if decision.bound_to_call {
+                Some(leg_from_is_caller(
+                    facts,
+                    &*decision.primary_call_id == call_id,
+                ))
+            } else {
+                sender
+                    .from_tag
+                    .zip(decision.caller_tag.as_deref())
+                    .map(|(from, caller)| from == caller)
+            };
+            orient(&mut fresh, facts, caller_is_in_from);
             // Warrants still provisioned keep covering the session, and any
             // new one this message matches is added. Re-deriving from this
             // message alone would drop a warrant whose target this particular
@@ -957,6 +1080,7 @@ impl LiManager {
         generation: u64,
         matched: Vec<SessionMatch>,
         bound_to_call: bool,
+        caller_tag: Option<Box<str>>,
     ) {
         // Bounded, because the key is attacker-supplied. Clearing on overflow
         // costs a re-derivation, never a missed interception.
@@ -991,10 +1115,47 @@ impl LiManager {
                 invite_branches: Vec::new(),
                 ended_at: None,
                 seats: Vec::new(),
+                caller_tag,
             },
         );
         self.alias(primary_call_id, session_id);
         self.alias(call_id, session_id);
+    }
+}
+
+/// Whether the `From` of a message that arrived on a leg of a B2BUA call is
+/// the calling end. Only the party of a leg sends on it, so what arrives on
+/// the caller's leg is the caller's: its requests carry it in `From`, and its
+/// responses carry the headers of a request sent toward it.
+fn leg_from_is_caller(facts: &MessageFacts<'_>, on_caller_leg: bool) -> bool {
+    let response = !facts.request && facts.status_code.is_some();
+    on_caller_leg != response
+}
+
+/// Turn each match from the end of the *message* it was found on into the end
+/// of the *call* that end is.
+///
+/// A match reads `From` as the originating end, which holds for the request
+/// that opens the dialog and for nothing sent the other way. A source address
+/// names whoever sent the message: the `From` of a request, the `To` of a
+/// response. `caller_is_in_from` unknown is taken as it is on the INVITE.
+fn orient(matches: &mut [TaskMatch], facts: &MessageFacts<'_>, caller_is_in_from: Option<bool>) {
+    let caller_is_in_from = caller_is_in_from.unwrap_or(true);
+    let response = !facts.request && facts.status_code.is_some();
+    if caller_is_in_from && !response {
+        return;
+    }
+    for matched in matches {
+        let on_from_side = match matched.field {
+            MatchedField::From => true,
+            MatchedField::RequestUri | MatchedField::To => false,
+            MatchedField::SourceAddress => !response,
+        };
+        matched.party = if on_from_side == caller_is_in_from {
+            MatchedParty::Originating
+        } else {
+            MatchedParty::Terminating
+        };
     }
 }
 
@@ -1977,5 +2138,160 @@ mod tests {
         manager.sweep_sessions(Instant::now() + SESSION_GRACE, |_| false);
         assert_eq!(manager.remembered_session_count(), 0);
         assert_eq!(manager.x3_call_count(), 0, "seat records drain");
+    }
+
+    // ── Which end of the call a warrant names ───────────────────────────────
+
+    /// A request from the far end of alice's call: alice is in `To`.
+    fn from_the_far_end() -> Identities<'static> {
+        Identities {
+            request_uri: Some("sip:alice@192.0.2.10"),
+            from_uri: Some("<sip:bob@example.com>;tag=b"),
+            to_uri: Some("<sip:alice@example.com>;tag=a"),
+            source_ip: None,
+        }
+    }
+
+    fn party(view: &SessionView) -> MatchedParty {
+        assert_eq!(view.matches.len(), 1, "the warrant covers the session");
+        view.matches[0].party
+    }
+
+    /// Nothing was provisioned when the call was set up, so nothing is
+    /// remembered of it. The warrant arrives, and the first message after it
+    /// is the far end's: the target is in `To`, and is still the caller.
+    #[test]
+    fn a_mid_call_warrant_decided_on_a_far_end_request_names_the_caller() {
+        let (manager, _iri, _audit) = manager();
+        manager.resolve_session(CALLER_LEG, &invite(), &caller(), || None);
+        provision(&manager, DeliveryType::X2AndX3, None);
+
+        let view = manager.resolve_session_with(
+            CALLER_LEG,
+            &request("BYE"),
+            &from_the_far_end(),
+            || None,
+            || Some("a".to_string()),
+        );
+        assert_eq!(party(&view), MatchedParty::Originating);
+    }
+
+    /// With another warrant already provisioned the call's opening was seen,
+    /// and the caller's tag is remembered from it: nothing has to be asked.
+    #[test]
+    fn the_callers_tag_is_remembered_from_the_invite() {
+        let (manager, _iri, _audit) = manager();
+        let other = provision(&manager, DeliveryType::X2Only, None);
+        let mut carol = manager.tasks().get(other).expect("a task").details.clone();
+        manager.tasks().deactivate(other).expect("must deactivate");
+        carol.target_identifiers = vec![crate::li::x1::types::TargetIdentifier::SipUri(
+            "sip:carol@example.com".to_string(),
+        )];
+        manager.tasks().activate(carol).expect("must provision");
+        let opening = manager.resolve_session(CALLER_LEG, &invite(), &caller(), || None);
+        assert!(opening.matches.is_empty(), "nobody names alice yet");
+
+        provision(&manager, DeliveryType::X2AndX3, None);
+        let view =
+            manager.resolve_session(CALLER_LEG, &request("BYE"), &from_the_far_end(), || None);
+        assert_eq!(party(&view), MatchedParty::Originating);
+    }
+
+    /// A response carries the headers of the request it answers: the caller's
+    /// 200 to the far end's re-INVITE has the caller in `To` as well.
+    #[test]
+    fn a_mid_call_warrant_decided_on_a_response_names_the_caller() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2AndX3, None);
+        let view = manager.resolve_session_with(
+            CALLER_LEG,
+            &response("INVITE", 200),
+            &from_the_far_end(),
+            || None,
+            || Some("a".to_string()),
+        );
+        assert_eq!(party(&view), MatchedParty::Originating);
+    }
+
+    /// With nothing to tell the ends apart the `From` is taken for the caller,
+    /// as it is on the INVITE.
+    #[test]
+    fn a_dialog_nothing_is_known_of_is_read_as_its_headers_say() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2AndX3, None);
+        let view =
+            manager.resolve_session(CALLER_LEG, &request("BYE"), &from_the_far_end(), || None);
+        assert_eq!(party(&view), MatchedParty::Terminating);
+    }
+
+    /// On a B2BUA call the leg says which end sent a message. A warrant on the
+    /// caller that is decided on the callee's leg, where a transparent B2BUA
+    /// left the caller's identity in place, names the caller whether the
+    /// deciding message is the callee's request or its response.
+    #[test]
+    fn a_mid_call_warrant_decided_on_the_callee_leg_names_the_caller() {
+        for facts in [request("INFO"), response("INVITE", 200)] {
+            let (manager, _iri, _audit) = manager();
+            provision(&manager, DeliveryType::X2AndX3, None);
+            // The callee's request carries the caller in `To`; its response
+            // carries the request siphon sent it, with the caller in `From`.
+            let identities = match facts.request {
+                true => from_the_far_end(),
+                false => caller(),
+            };
+            let view = manager
+                .resolve_session(CALLEE_LEG, &facts, &identities, || Some(owned_by("call-1")));
+            assert_eq!(
+                party(&view),
+                MatchedParty::Originating,
+                "request={}",
+                facts.request
+            );
+        }
+    }
+
+    /// The target's own second dialog into the call (an INVITE that replaces
+    /// its first, RFC 3891) carries a tag the session never saw. What it
+    /// sends there is from the target, and a third party doing the same is
+    /// not.
+    #[test]
+    fn a_dialog_the_target_opens_into_its_call_is_sent_from_the_target() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2Only, None);
+        let internal_id = warranted_call(&manager);
+        let joining = |leg: &str, from: &'static str| {
+            let identities = Identities {
+                request_uri: Some("sip:bob@example.com"),
+                from_uri: Some(from),
+                to_uri: Some("<sip:bob@example.com>"),
+                source_ip: None,
+            };
+            let view = manager
+                .resolve_session(leg, &invite(), &identities, || Some(owned_by(&internal_id)));
+            assert_eq!(&*view.session_id, internal_id.as_str());
+            view.matches[0].direction
+        };
+        assert_eq!(
+            joining(
+                "second-device@example.com",
+                "<sip:alice@example.com>;tag=a2"
+            ),
+            SentFromTarget
+        );
+        assert_eq!(
+            joining("third-party@example.com", "<sip:carol@example.com>;tag=c"),
+            SentToTarget
+        );
+        // And its later requests on that dialog.
+        let later = manager.resolve_session(
+            "second-device@example.com",
+            &request("BYE"),
+            &proxied(
+                "<sip:alice@example.com>;tag=a2",
+                "<sip:bob@example.com>;tag=s",
+            ),
+            || None,
+        );
+        assert_eq!(later.matches[0].direction, SentFromTarget);
     }
 }
