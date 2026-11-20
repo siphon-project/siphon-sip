@@ -1068,6 +1068,143 @@ async fn an_end_reported_while_a_delete_is_out_is_judged_by_the_deletes_answer()
     }
 }
 
+/// An intercepted, offered proxy call whose `delete` is out, unanswered, with
+/// the engine's `CallEnded` for its delivery already in: held, not judged.
+async fn end_reported_while_a_delete_is_unanswered(
+    call: &str,
+) -> (
+    Arc<DispatcherState>,
+    NativeTestEngine,
+    crate::li::LiManager,
+    tokio::task::JoinHandle<Result<(), crate::rtpengine::RtpEngineError>>,
+) {
+    let (state, engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    let events = engine_events(&state);
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, call));
+    backend_of(&state)
+        .offer(call, "caller-tag", b"v=0\r\n", &NgFlags::default())
+        .await
+        .expect("offered");
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+    engine.hold_deletes();
+    let deleting = {
+        let (backend, call) = (backend_of(&state), call.to_string());
+        tokio::spawn(async move { backend.delete(&call, "caller-tag").await })
+    };
+    while engine.commands("delete").is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    engine_reports(&events, ended(call, "caller-tag", "CallEnded")).await;
+    assert_eq!(li.x3_attachment_count(), 1, "held with its delivery");
+    (state, engine, li, deleting)
+}
+
+/// The handler that asked for the delete is cancelled, and its future is
+/// dropped with the command still out: no answer will ever be read. Nothing
+/// then shows the engine took the delete, so the end that was waiting for
+/// its answer is not siphon's: a fault, raised when the future goes.
+#[tokio::test]
+async fn an_end_held_for_a_delete_that_is_dropped_is_a_fault() {
+    const CALL: &str = "delete-dropped@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, deleting) = end_reported_while_a_delete_is_unanswered(CALL).await;
+    assert_eq!(faults_reported(&log), 0);
+
+    deleting.abort();
+    assert!(deleting.await.is_err(), "the delete was cancelled");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(faults_reported(&log), 1, "{}", log.rendered());
+    assert_eq!(li.x3_attachment_count(), 0, "judged, and off the record");
+    engine.release_deletes();
+    drop(state);
+}
+
+/// The session is released with an end report still waiting on it. The
+/// report is not dropped with the record: it is reported as an end nothing
+/// shows siphon brought about.
+#[tokio::test]
+async fn an_end_still_held_when_its_session_is_released_is_a_fault() {
+    const CALL: &str = "released-under-a-held-end@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, deleting) = end_reported_while_a_delete_is_unanswered(CALL).await;
+    let session_id = li.session_of_leg(CALL).expect("the session").session_id;
+
+    li.forget_session(&session_id);
+    assert_eq!(faults_reported(&log), 0, "not yet reported");
+    sweep_stale_entries(&state).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(faults_reported(&log), 1, "{}", log.rendered());
+    assert_eq!(li.x3_call_count(), 0);
+
+    // The delete's answer, when it comes, finds nothing left to judge.
+    engine.release_deletes();
+    deleting.await.expect("ran").expect("deleted");
+    sweep_stale_entries(&state).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(faults_reported(&log), 1, "once");
+}
+
+/// The ADMF changes the task's Correlation ID while a call of the target is
+/// up. The session's records keep the one they started with, X2 and X3
+/// alike, and the session asking for its own delivery again is not a second
+/// session: no attach, no fault.
+#[tokio::test]
+async fn a_task_modified_mid_call_leaves_the_sessions_correlation_as_it_was() {
+    const CALL: &str = "task-modified@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, mut iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    backend_of(&state)
+        .offer(CALL, "caller-tag", b"v=0\r\n", &NgFlags::default())
+        .await
+        .expect("offered");
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+    let before = drain_iri(&mut iri)[0].correlation_id;
+    assert_eq!(li.x3_attachments_for(CALL)[0].correlation_id, before);
+
+    let mut modified = li.tasks().list()[0].details.clone();
+    modified.correlation_id = Some(before.wrapping_add(4242));
+    li.tasks().modify(modified).expect("the task is modified");
+
+    arrives(&state, CALLEE, &on_call(&proxied_response("200 OK"), CALL));
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    assert_eq!(
+        attach_outcomes(&mut audit).await,
+        (0, 0),
+        "nothing asked again"
+    );
+    assert_eq!(engine.commands("attach_x3").len(), 1);
+    assert_eq!(faults_reported(&log), 0, "{}", log.rendered());
+    assert_eq!(
+        li.x3_attachments_for(CALL)[0].correlation_id,
+        before,
+        "the delivery keeps its Correlation ID"
+    );
+    let after = drain_iri(&mut iri);
+    assert_eq!(after.len(), 2);
+    assert!(
+        after.iter().all(|event| event.correlation_id == before),
+        "and so do the session's X2 records"
+    );
+
+    // A call that starts after the change carries the new one.
+    arrives(
+        &state,
+        CALLER,
+        &on_call(CALLER_INVITE, "after-the-change@192.0.2.10"),
+    );
+    assert_eq!(
+        drain_iri(&mut iri)[0].correlation_id,
+        before.wrapping_add(4242)
+    );
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("deleted");
+}
+
 /// What the engine refused for good on an engine call stays refused when a
 /// `delete` of that engine call fails: it is the same engine call, and a
 /// later ACK does not ask again or report again.

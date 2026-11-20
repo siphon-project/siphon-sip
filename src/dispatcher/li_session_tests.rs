@@ -481,6 +481,7 @@ async fn the_far_end_hanging_up_stops_content_capture() {
             d_id: li.tasks().list()[0].details.list_of_dids[0],
             from_tag: "caller-tag".to_string(),
             correlation_id: correlation_from_call_id(&internal_id),
+            session_id: Arc::from(internal_id.as_str()),
             scope: None,
         },
     );
@@ -733,6 +734,7 @@ async fn one_legs_x3_end_leaves_the_other_legs_record() {
                 d_id: task.list_of_dids[0],
                 from_tag: "caller-tag".to_string(),
                 correlation_id: 7,
+                session_id: Arc::from(PROXY_CALL_ID),
                 scope: Some(leg_scope(name)),
             },
         );

@@ -391,6 +391,19 @@ impl SiphonRtpClientSet {
             .notify_seat(change, conference_id, from_tag, sip_call_id);
     }
 
+    /// Tell the observer siphon is about to take the seat of the call
+    /// `sip_call_id` out of its room; how that turns out is told through what
+    /// is returned, also when the leave is dropped half-way.
+    pub(crate) fn seat_leaving<'a>(
+        &'a self,
+        sip_call_id: &'a str,
+        conference_id: &'a str,
+        from_tag: &'a str,
+    ) -> super::PendingEnd<'a> {
+        self.calls
+            .seat_leaving(conference_id, from_tag, sip_call_id)
+    }
+
     /// Whether the instance that holds the room listed `feature`; `None`
     /// while it has not been asked.
     pub fn x3_room_feature(&self, feature: X3Feature, conference_id: &str) -> Option<bool> {

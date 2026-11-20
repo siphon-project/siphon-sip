@@ -170,6 +170,48 @@ pub struct EngineCall<'a> {
 /// the verb, so it must not wait on anything: it spawns what takes time.
 pub type EngineCallObserver = Box<dyn Fn(&EngineCall<'_>) + Send + Sync>;
 
+/// An end the observer was told siphon is about to ask the engine for, until
+/// it is told how that turned out.
+///
+/// The outcome has to be told whatever becomes of the future that asked: a
+/// script's awaitable is dropped when its handler is cancelled, in the middle
+/// of the command. So an end that is dropped unsettled is told as failed.
+/// Nothing then says the engine took the command, and an end nobody can show
+/// siphon brought about is not one to call siphon's.
+#[must_use = "an end that is not settled is told as failed when dropped"]
+pub(crate) struct PendingEnd<'a> {
+    watch: &'a CallWatch,
+    /// What to tell when no outcome is known.
+    failed: EngineCallChange,
+    scope: Option<&'a CallScope>,
+    call_id: &'a str,
+    from_tag: &'a str,
+    sip_call_id: Option<&'a str>,
+    settled: bool,
+}
+
+impl PendingEnd<'_> {
+    /// Tell the observer how the end turned out.
+    pub(crate) fn settle(mut self, outcome: EngineCallChange) {
+        self.tell(outcome);
+    }
+
+    fn tell(&mut self, outcome: EngineCallChange) {
+        self.settled = true;
+        let (scope, dialog) = (self.scope, self.sip_call_id);
+        self.watch
+            .notify_for(outcome, scope, self.call_id, self.from_tag, dialog);
+    }
+}
+
+impl Drop for PendingEnd<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.tell(self.failed);
+        }
+    }
+}
+
 /// The one observer of a set's engine calls.
 #[derive(Default)]
 pub(super) struct CallWatch(OnceLock<EngineCallObserver>);
@@ -229,6 +271,49 @@ impl CallWatch {
                 sip_call_id,
                 change,
             });
+        }
+    }
+
+    /// Tell the observer siphon is about to end the engine call of `call_id`
+    /// under `scope` ([`EngineCallChange::Ending`]). The outcome is told
+    /// through what is returned.
+    pub(super) fn ending<'a>(
+        &'a self,
+        scope: Option<&'a CallScope>,
+        call_id: &'a str,
+        from_tag: &'a str,
+    ) -> PendingEnd<'a> {
+        self.notify(EngineCallChange::Ending, scope, call_id, from_tag);
+        PendingEnd {
+            watch: self,
+            failed: EngineCallChange::EndFailed,
+            scope,
+            call_id,
+            from_tag,
+            sip_call_id: None,
+            settled: false,
+        }
+    }
+
+    /// Tell the observer siphon is about to take the seat `from_tag` of the
+    /// room `conference_id`, which seats the call `sip_call_id`, out of the
+    /// room ([`EngineCallChange::SeatLeaving`]).
+    pub(super) fn seat_leaving<'a>(
+        &'a self,
+        conference_id: &'a str,
+        from_tag: &'a str,
+        sip_call_id: &'a str,
+    ) -> PendingEnd<'a> {
+        let leaving = EngineCallChange::SeatLeaving;
+        self.notify_seat(leaving, conference_id, from_tag, sip_call_id);
+        PendingEnd {
+            watch: self,
+            failed: EngineCallChange::SeatLeaveFailed,
+            scope: None,
+            call_id: conference_id,
+            from_tag,
+            sip_call_id: Some(sip_call_id),
+            settled: false,
         }
     }
 

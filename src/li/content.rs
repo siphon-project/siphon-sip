@@ -149,6 +149,64 @@ impl CallContent {
         leg
     }
 
+    /// The delivery an end the engine reported on a leg belongs to, dropped
+    /// from the record; `None` when `report` is kept instead, because that
+    /// delivery's engine call is one siphon has asked the engine to end and
+    /// the engine has not answered. With no `report` to keep it is judged as
+    /// it stands.
+    fn end_reported(
+        &mut self,
+        scope: Option<&CallScope>,
+        report: Option<&X3EndedEvent>,
+    ) -> Option<EndedDelivery> {
+        let leg = self.leg(scope);
+        let oldest = leg
+            .ended
+            .iter()
+            .position(|ended| !ended.attachments.is_empty() && ended.held.is_none());
+        let Some(index) = oldest else {
+            return Some(EndedDelivery {
+                by_siphon: false,
+                attachments: self.take_leg(scope),
+            });
+        };
+        let ended = &mut leg.ended[index];
+        let asked = ended.engine_call == EngineCallEnd::Asked;
+        if let (true, Some(report)) = (asked, report) {
+            ended.held = Some(report.clone());
+            return None;
+        }
+        let delivery = EndedDelivery {
+            by_siphon: ended.engine_call != EngineCallEnd::No,
+            attachments: std::mem::take(&mut ended.attachments),
+        };
+        // An end still being asked for keeps its place, for the command's
+        // outcome to find.
+        if !asked {
+            leg.ended.remove(index);
+        }
+        Some(delivery)
+    }
+
+    /// The end reports still waiting on this call's record, each with its
+    /// delivery, when the record is released under them. Nothing answered the
+    /// end they waited for, so nothing says siphon ended those deliveries.
+    fn orphaned(self) -> Vec<HeldEnd> {
+        self.legs
+            .into_iter()
+            .flat_map(|leg| leg.ended)
+            .filter_map(|ended| {
+                Some(HeldEnd {
+                    ended: ended.held?,
+                    delivery: EndedDelivery {
+                        by_siphon: false,
+                        attachments: ended.attachments,
+                    },
+                })
+            })
+            .collect()
+    }
+
     /// Whether a delivery is asked for, live, or ended by siphon and not yet
     /// reported ended.
     fn delivering(&self) -> bool {
@@ -266,14 +324,24 @@ impl LiManager {
             .attachments
             .iter()
             .find(|known| (known.x_id, known.d_id) == pair && known.scope == scope)
-            .map(|known| known.correlation_id);
+            .map(|known| {
+                (
+                    known.correlation_id,
+                    known.session_id == attachment.session_id,
+                )
+            });
         match other {
             None => {
                 content.attachments.push(attachment);
                 X3Registration::Recorded
             }
-            Some(held) if held == attachment.correlation_id => X3Registration::Known,
-            Some(held) => {
+            // The session's own delivery, whatever the task's details say
+            // now, and another session's under one Correlation ID the ADMF
+            // gave the task: one delivery serves it.
+            Some((held, same_session)) if same_session || held == attachment.correlation_id => {
+                X3Registration::Known
+            }
+            Some((held, _)) => {
                 let told = (pair.0, pair.1, attachment.correlation_id);
                 let leg = content.leg(scope.as_ref());
                 if leg.undeliverable.contains(&told) {
@@ -514,57 +582,29 @@ impl LiManager {
         scope: Option<&CallScope>,
         ended: &X3EndedEvent,
     ) -> Option<EndedDelivery> {
-        {
-            let mut content = self.x3_attachments.get_mut(call_id)?;
-            let oldest = content
-                .leg(scope)
-                .ended
-                .iter_mut()
-                .find(|delivery| !delivery.attachments.is_empty() && delivery.held.is_none());
-            if let Some(delivery) = oldest {
-                if delivery.engine_call == EngineCallEnd::Asked {
-                    delivery.held = Some(ended.clone());
-                    return None;
-                }
-            }
-        }
-        Some(self.x3_delivery_ended(call_id, scope))
+        // One guard for the whole of it. Whether the report waits and which
+        // delivery it is the end of are one decision: taken apart, an end
+        // siphon starts asking for in between would claim a report that came
+        // before it, and an end siphon had no part in would read as its own.
+        let Some(mut content) = self.x3_attachments.get_mut(call_id) else {
+            return Some(EndedDelivery::unknown());
+        };
+        #[cfg(test)]
+        pause::reporting(call_id);
+        content.end_reported(scope, Some(ended))
     }
 
     /// The delivery an end the engine reported on a leg belongs to, dropped
     /// from the record: the oldest one siphon ended, is ending or detached,
     /// else the attempt in progress.
+    ///
+    /// Judges at once, for a caller with no report to keep. The message path
+    /// uses [`Self::x3_delivery_end_reported`].
     pub fn x3_delivery_ended(&self, call_id: &str, scope: Option<&CallScope>) -> EndedDelivery {
-        let Some(mut content) = self.x3_attachments.get_mut(call_id) else {
-            return EndedDelivery {
-                by_siphon: false,
-                attachments: Vec::new(),
-            };
-        };
-        let leg = content.leg(scope);
-        let oldest = leg
-            .ended
-            .iter()
-            .position(|ended| !ended.attachments.is_empty() && ended.held.is_none());
-        match oldest {
-            Some(index) => {
-                let ended = &mut leg.ended[index];
-                let delivery = EndedDelivery {
-                    by_siphon: ended.engine_call != EngineCallEnd::No,
-                    attachments: std::mem::take(&mut ended.attachments),
-                };
-                // An end still being asked for keeps its place, for the
-                // command's outcome to find.
-                if ended.engine_call != EngineCallEnd::Asked {
-                    leg.ended.remove(index);
-                }
-                delivery
-            }
-            None => EndedDelivery {
-                by_siphon: false,
-                attachments: content.take_leg(scope),
-            },
-        }
+        self.x3_attachments
+            .get_mut(call_id)
+            .and_then(|mut content| content.end_reported(scope, None))
+            .unwrap_or_else(EndedDelivery::unknown)
     }
 
     /// The record an engine event naming `call_id` and `from_tag` belongs to:
@@ -642,8 +682,32 @@ impl LiManager {
     }
 
     /// Release the record of an engine call, with its session.
+    ///
+    /// An end report still held on it is not dropped: nothing ever said
+    /// whether siphon ended that delivery, and warranted content going
+    /// unaccounted for is not something to lose with a map entry. It is kept
+    /// for [`Self::take_unanswered_x3_ends`].
     pub(super) fn forget_x3_call(&self, call_id: &str) {
-        self.x3_attachments.remove(call_id);
+        let Some((_, content)) = self.x3_attachments.remove(call_id) else {
+            return;
+        };
+        let orphaned = content.orphaned();
+        if orphaned.is_empty() {
+            return;
+        }
+        if let Ok(mut unanswered) = self.unanswered_x3_ends.lock() {
+            unanswered.extend(orphaned);
+        }
+    }
+
+    /// The end reports whose record was released while they still waited for
+    /// the answer to an end siphon asked for. Each is to be reported as an
+    /// end siphon did not bring about. Taken, so each is reported once.
+    pub fn take_unanswered_x3_ends(&self) -> Vec<HeldEnd> {
+        self.unanswered_x3_ends
+            .lock()
+            .map(|mut unanswered| std::mem::take(&mut *unanswered))
+            .unwrap_or_default()
     }
 
     /// Release every record no delivery hangs on: when the sessions they
@@ -651,6 +715,32 @@ impl LiManager {
     pub(super) fn forget_idle_x3_calls(&self) {
         self.x3_attachments
             .retain(|_, content| content.delivering());
+    }
+}
+
+/// A place for a test to act while an end report is being taken in.
+#[cfg(test)]
+pub(crate) mod pause {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn Fn(&str)>;
+
+    thread_local! {
+        static REPORTING: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` with the call-id each time this thread takes an end report
+    /// in, after the record is found and before the report is placed.
+    pub(crate) fn on_reporting(hook: impl Fn(&str) + 'static) {
+        REPORTING.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn reporting(call_id: &str) {
+        REPORTING.with(|slot| {
+            if let Some(hook) = slot.borrow().as_ref() {
+                hook(call_id);
+            }
+        });
     }
 }
 
@@ -684,6 +774,7 @@ mod tests {
             d_id,
             from_tag: "caller-tag".to_string(),
             correlation_id: 9,
+            session_id: std::sync::Arc::from("session-1"),
             scope: scope.map(|scope| CallScope::per_call(scope).expect("a scope")),
         }
     }
@@ -1057,6 +1148,13 @@ mod tests {
         let attempt = manager.x3_attempt(CALL, None);
         let other = ActiveIntercept {
             correlation_id: 10,
+            session_id: std::sync::Arc::from("session-2"),
+            ..attachment(d_id, None)
+        };
+        // The same session asking again under another Correlation ID (the
+        // task's was modified) is its own delivery, which keeps the one it has.
+        let modified = ActiveIntercept {
+            correlation_id: 11,
             ..attachment(d_id, None)
         };
         assert_eq!(
@@ -1067,6 +1165,11 @@ mod tests {
             manager.x3_register(CALL, attachment(d_id, None), attempt),
             X3Registration::Known
         );
+        assert_eq!(
+            manager.x3_register(CALL, modified, attempt),
+            X3Registration::Known
+        );
+        assert_eq!(manager.x3_attachments_for(CALL)[0].correlation_id, 9);
         assert_eq!(
             manager.x3_register(CALL, other.clone(), attempt),
             X3Registration::OtherCorrelation { held: 9 }
@@ -1083,5 +1186,70 @@ mod tests {
             manager.x3_register(CALL, other, next),
             X3Registration::Recorded
         );
+    }
+
+    /// An end the engine reports when siphon has asked for none is the
+    /// engine's own. siphon starting to end the call while that report is
+    /// being taken in does not make it siphon's: the two cannot interleave,
+    /// so the end siphon asks for comes after, and finds the delivery gone.
+    #[test]
+    fn an_end_siphon_starts_asking_for_cannot_claim_a_report_being_taken_in() {
+        let (manager, _iri, _audit) = manager();
+        let attempt = manager.x3_attempt(CALL, None);
+        manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt);
+
+        let (asked, asking) = std::sync::mpsc::channel();
+        let other = manager.clone();
+        pause::on_reporting(move |call_id| {
+            // siphon starts ending the call, on another thread, right now.
+            let (manager, call_id, asked) = (other.clone(), call_id.to_string(), asked.clone());
+            std::thread::spawn(move || {
+                manager.x3_media_ending(&call_id, None);
+                let _ = asked.send(());
+            });
+            // Long enough for it to get in, were anything to let it.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+        let delivery = manager
+            .x3_delivery_end_reported(CALL, None, &ended_report("CallEnded"))
+            .expect("nothing was asked for when it came: judged, not held");
+        pause::on_reporting(|_| {});
+        assert!(
+            !delivery.by_siphon,
+            "the engine ended it before siphon asked for anything"
+        );
+        assert_eq!(delivery.attachments.len(), 1);
+        asking
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the end siphon asked for goes ahead afterwards");
+        assert!(manager.x3_media_end_committed(CALL, None).is_empty());
+        assert_eq!(manager.x3_attachment_count(), 0);
+    }
+
+    /// A record released while an end report still waits on it gives the
+    /// report up to be reported: nothing answered the end it waited for.
+    #[test]
+    fn a_record_released_under_a_held_report_gives_it_up_as_unanswered() {
+        let (manager, _iri, _audit) = manager();
+        let attempt = manager.x3_attempt(CALL, None);
+        manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt);
+        manager.x3_media_ending(CALL, None);
+        let report = ended_report("CallEnded");
+        assert!(manager
+            .x3_delivery_end_reported(CALL, None, &report)
+            .is_none());
+
+        manager.forget_x3_call(CALL);
+        let unanswered = manager.take_unanswered_x3_ends();
+        assert_eq!(unanswered.len(), 1);
+        assert_eq!(unanswered[0].ended, report);
+        assert!(!unanswered[0].delivery.by_siphon);
+        assert_eq!(unanswered[0].delivery.attachments.len(), 1);
+        assert!(manager.take_unanswered_x3_ends().is_empty(), "once");
+
+        // A record with nothing held leaves nothing.
+        manager.register_x3_attachment(CALL, attachment(DId::generate(), None), 0);
+        manager.forget_x3_call(CALL);
+        assert!(manager.take_unanswered_x3_ends().is_empty());
     }
 }

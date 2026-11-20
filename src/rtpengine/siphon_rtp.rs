@@ -69,6 +69,7 @@ pub use scope::CallScope;
 use scope::CallScopes;
 use waiters::Waiters;
 pub use waiters::{DigitRead, DigitReadEnd, DigitReadLimits};
+pub(crate) use x3_at_offer::PendingEnd;
 use x3_at_offer::{CallWatch, X3Features};
 pub use x3_at_offer::{EngineCall, EngineCallChange, EngineCallObserver, X3Feature};
 

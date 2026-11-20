@@ -251,12 +251,7 @@ impl MediaBackend {
         // with it, and that end is siphon's own doing. A seated call's leg
         // leaving its room is told too, and ends nothing: its interception is
         // its call's.
-        set.seat_changed(
-            EngineCallChange::SeatLeaving,
-            call_id,
-            &seat.conference_id,
-            &seat.from_tag,
-        );
+        let leaving = set.seat_leaving(call_id, &seat.conference_id, &seat.from_tag);
         let outcome = match set
             .conference_leave(&seat.conference_id, &seat.from_tag)
             .await
@@ -280,7 +275,7 @@ impl MediaBackend {
             Ok(()) => EngineCallChange::SeatLeft,
             Err(_) => EngineCallChange::SeatLeaveFailed,
         };
-        set.seat_changed(change, call_id, &seat.conference_id, &seat.from_tag);
+        leaving.settle(change);
         // Kept on any other failure: the engine may still hold the seat, and a
         // later leave or delete must still find it.
         if outcome.is_ok() {

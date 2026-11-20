@@ -284,18 +284,16 @@ impl SiphonRtpClientSet {
         let scope = framed.as_ref();
         let key = scoped_key(call_id, scope);
         // An `offer` on an id the engine already holds replaces that call.
-        self.calls
-            .notify(EngineCallChange::Ending, scope, call_id, from_tag);
+        let ending = self.calls.ending(scope, call_id, from_tag);
         let result = self
             .select_key(&key)
             .offer_in(scope, call_id, from_tag, sdp, flags)
             .await;
         // An offer the engine refused replaced nothing.
-        let outcome = match &result {
+        ending.settle(match &result {
             Ok(_) => EngineCallChange::Ended,
             Err(_) => EngineCallChange::EndFailed,
-        };
-        self.calls.notify(outcome, scope, call_id, from_tag);
+        });
         let result = result?;
         self.bind_affinity_key(&key);
         // The one place every offer leaves from. The dialog it is stamped
@@ -378,18 +376,12 @@ impl SiphonRtpClientSet {
         let framed = framed(scope);
         let scope = framed.as_ref();
         let key = scoped_key(call_id, scope);
-        self.calls
-            .notify(EngineCallChange::Ending, scope, call_id, from_tag);
+        let ending = self.calls.ending(scope, call_id, from_tag);
         let result = self
             .select_key(&key)
             .delete_in(scope, call_id, from_tag)
             .await;
-        self.calls.notify(
-            EngineCallChange::end_outcome(&result),
-            scope,
-            call_id,
-            from_tag,
-        );
+        ending.settle(EngineCallChange::end_outcome(&result));
         self.affinity.remove(key.as_ref());
         result
     }
@@ -407,15 +399,13 @@ impl SiphonRtpClientSet {
         let framed = framed(scope);
         let scope = framed.as_ref();
         let key = scoped_key(call_id, scope);
-        self.calls
-            .notify(EngineCallChange::Ending, scope, call_id, "");
+        let ending = self.calls.ending(scope, call_id, "");
         let mut last: Option<RtpEngineError> = None;
         for client in &self.clients {
             match client.delete_in(scope, call_id, "").await {
                 Ok(()) => {
                     self.affinity.remove(key.as_ref());
-                    self.calls
-                        .notify(EngineCallChange::Ended, scope, call_id, "");
+                    ending.settle(EngineCallChange::Ended);
                     return Ok(());
                 }
                 Err(error) => last = Some(error),
@@ -424,8 +414,7 @@ impl SiphonRtpClientSet {
         let result: Result<(), RtpEngineError> = Err(last.unwrap_or_else(|| {
             RtpEngineError::Protocol("no media engine to delete on".to_string())
         }));
-        self.calls
-            .notify(EngineCallChange::end_outcome(&result), scope, call_id, "");
+        ending.settle(EngineCallChange::end_outcome(&result));
         result
     }
 }

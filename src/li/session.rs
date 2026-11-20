@@ -99,8 +99,12 @@ pub(super) struct SessionDecision {
     caller_tag: Option<Box<str>>,
     /// The legs a B2BUA call dialled for its called party.
     called_party_legs: Vec<Arc<str>>,
-    /// The CANCELs of a re-INVITE whose final response has not come.
-    re_invite_cancels: u8,
+    /// The CANCELs of a re-INVITE whose final response has not come, each by
+    /// the Call-ID and CSeq number of its transaction.
+    re_invite_cancels: Vec<(Arc<str>, u32)>,
+    /// A BYE has ended the session. No response that arrives later (the
+    /// answer to a CANCEL that crossed the BYE) makes it live again.
+    ended_by_bye: bool,
     /// The engine calls siphon allocated for the session under an id of its
     /// own minting, oldest first: a transfer re-anchors the call's media onto
     /// a fresh engine call and deletes the one the caller's Call-ID named.
@@ -172,22 +176,31 @@ impl SessionDecision {
     ///
     /// A response to a CANCEL cannot be matched to an INVITE by its branch:
     /// through a proxy its top `Via` is the proxy's own, and on a B2BUA leg it
-    /// answers a CANCEL siphon sent. What it answers is the CANCEL that is
-    /// outstanding, so a CANCEL of a re-INVITE is counted until its final
-    /// response has come, and a response to a CANCEL meanwhile is that one's.
+    /// answers a CANCEL siphon sent. It does carry the Call-ID and the CSeq
+    /// number of the CANCEL it answers, as every response does (RFC 3261
+    /// §8.2.6.2). So each CANCEL of a re-INVITE is remembered by those two
+    /// until its final response has come, and a response to a CANCEL is of a
+    /// re-INVITE when it answers one of them.
     fn cancel_is_of_a_re_invite(&mut self, facts: &MessageFacts<'_>) -> bool {
+        let transaction = facts.cseq.map(|cseq| (facts.call_id, cseq));
+        let known = |held: &(Arc<str>, u32)| Some((&*held.0, held.1)) == transaction;
         if facts.request {
             let of_a_re_invite = self.cancels_a_re_invite(facts);
-            if of_a_re_invite {
-                self.re_invite_cancels = self.re_invite_cancels.saturating_add(1);
+            if let (true, Some((call_id, cseq))) = (of_a_re_invite, transaction) {
+                if !self.re_invite_cancels.iter().any(known) {
+                    if self.re_invite_cancels.len() >= MAX_INVITE_BRANCHES_PER_SESSION {
+                        self.re_invite_cancels.remove(0);
+                    }
+                    self.re_invite_cancels.push((Arc::from(call_id), cseq));
+                }
             }
             return of_a_re_invite;
         }
-        if self.re_invite_cancels == 0 {
+        let Some(index) = self.re_invite_cancels.iter().position(known) else {
             return self.cancels_a_re_invite(facts);
-        }
+        };
         if facts.status_code.is_some_and(|code| code >= 200) {
-            self.re_invite_cancels -= 1;
+            self.re_invite_cancels.remove(index);
         }
         true
     }
@@ -220,6 +233,9 @@ struct SessionMatch {
     /// Further tags the target is known by: the `From` tag of each dialog it
     /// opened into the session after the deciding one.
     target_tags: Vec<Box<str>>,
+    /// The Correlation ID the session's records for this warrant carry, from
+    /// the first one delivered.
+    correlation_id: Option<u64>,
 }
 
 /// How many further tags of a target one match remembers.
@@ -336,6 +352,7 @@ impl SessionMatch {
             anchor_tag: anchor_tag.map(Box::from),
             target_owns_anchor,
             target_tags: Vec::new(),
+            correlation_id: None,
         }
     }
 
@@ -496,6 +513,12 @@ pub struct MessageFacts<'a> {
     pub to_tagged: bool,
     /// The branch of the top `Via`.
     pub branch: Option<&'a str>,
+    /// The message's Call-ID and the number of its CSeq, which with the
+    /// method name a transaction end to end: a response carries both as its
+    /// request did, through any number of proxies, where its top `Via` is
+    /// only the last hop's.
+    pub call_id: &'a str,
+    pub cseq: Option<u32>,
 }
 
 impl MessageFacts<'_> {
@@ -506,6 +529,8 @@ impl MessageFacts<'_> {
         status_code: None,
         to_tagged: true,
         branch: None,
+        call_id: "",
+        cseq: None,
     };
 
     /// An INVITE outside any dialog: the message that opens a session.
@@ -811,6 +836,19 @@ impl LiManager {
         }
     }
 
+    /// The Correlation ID the session `session_id` uses for the warrant
+    /// `x_id`: the one it already uses, else `fresh`, which it uses from now
+    /// on. `fresh` for a session with no decision to keep it in.
+    pub(super) fn session_correlation(&self, session_id: &str, x_id: XId, fresh: u64) -> u64 {
+        let Some(mut decision) = self.decisions.get_mut(session_id) else {
+            return fresh;
+        };
+        match decision.matched.iter_mut().find(|known| known.x_id == x_id) {
+            Some(known) => *known.correlation_id.get_or_insert(fresh),
+            None => fresh,
+        }
+    }
+
     /// `call_id` is a leg the session's call dialled for its called party.
     fn note_called_party_leg(&self, session_id: &Arc<str>, call_id: &str) {
         if let Some(mut decision) = self.decisions.get_mut(&**session_id) {
@@ -1014,11 +1052,20 @@ impl LiManager {
 
         let ends = (matches!(facts.method, "BYE" | "CANCEL") && !cancels_a_re_invite)
             || (!facts.request && event_type == IriEventType::End);
+        if facts.method == "BYE" {
+            decision.ended_by_bye = true;
+        }
         if ends {
             decision.ended_at.get_or_insert_with(Instant::now);
-        } else if !(facts.request && facts.method == "ACK") {
+            // What was outstanding went with the session.
+            decision.re_invite_cancels.clear();
+        } else if !(facts.request && facts.method == "ACK")
+            && !(decision.ended_by_bye && !facts.request)
+        {
             // Something that is not part of a teardown: the session is live.
             // An ACK is neither, since the ACK of a failure follows the end.
+            // Nor is a response once a BYE has ended the session: the answer
+            // to a request that crossed the BYE says nothing of the call.
             decision.ended_at = None;
         }
         event_type
@@ -1370,7 +1417,8 @@ impl LiManager {
                 seats: Vec::new(),
                 caller_tag,
                 called_party_legs: Vec::new(),
-                re_invite_cancels: 0,
+                re_invite_cancels: Vec::new(),
+                ended_by_bye: false,
                 engine_calls: Vec::new(),
             },
         );
@@ -1431,6 +1479,8 @@ mod tests {
             status_code: None,
             to_tagged: false,
             branch: Some("z9hG4bK-invite"),
+            call_id: "",
+            cseq: None,
         }
     }
 
@@ -1441,6 +1491,8 @@ mod tests {
             status_code: Some(code),
             to_tagged: true,
             branch: None,
+            call_id: "",
+            cseq: None,
         }
     }
 
@@ -1451,6 +1503,8 @@ mod tests {
             status_code: None,
             to_tagged: true,
             branch: None,
+            call_id: "",
+            cseq: None,
         }
     }
 
@@ -2381,6 +2435,7 @@ mod tests {
                         d_id: view.matches[0].task.details.list_of_dids[0],
                         from_tag: "a".to_string(),
                         correlation_id: 7,
+                        session_id: Arc::clone(&view.session_id),
                         scope: None,
                     },
                     attempt,
@@ -2563,35 +2618,64 @@ mod tests {
         assert_eq!(later.matches[0].direction, SentFromTarget);
     }
 
-    /// A CANCEL of a re-INVITE withdraws a change to a call that goes on. It
-    /// is not the end of the session, and neither is its 200; the CANCEL of
-    /// the INVITE that opened the session is.
-    #[test]
-    fn a_cancel_ends_the_session_only_when_it_cancels_the_opening_invite() {
-        let (manager, _iri, _audit) = manager();
-        provision(&manager, DeliveryType::X2Only, None);
+    /// The facts of a message of the transaction `cseq` on the caller's
+    /// dialog.
+    fn transaction(facts: MessageFacts<'static>, cseq: u32) -> MessageFacts<'static> {
+        MessageFacts {
+            call_id: CALLER_LEG,
+            cseq: Some(cseq),
+            ..facts
+        }
+    }
+
+    /// An established session with a re-INVITE in progress, CSeq 2.
+    fn established_with_a_re_invite(manager: &LiManager) -> SessionView {
         let view = manager.resolve_session(CALLER_LEG, &invite(), &caller(), || None);
         manager.note_message(&view, &invite());
         manager.note_message(&view, &response("INVITE", 200));
         let re_invite = MessageFacts {
             branch: Some("z9hG4bK-re-invite"),
-            ..request("INVITE")
+            ..transaction(request("INVITE"), 2)
         };
         manager.note_message(&view, &re_invite);
+        view
+    }
 
-        let cancel = |branch| MessageFacts {
-            branch: Some(branch),
-            ..request("CANCEL")
-        };
+    /// The CANCEL of the re-INVITE with CSeq `cseq`.
+    fn cancel_of_re_invite(cseq: u32) -> MessageFacts<'static> {
+        MessageFacts {
+            branch: Some("z9hG4bK-re-invite"),
+            ..transaction(request("CANCEL"), cseq)
+        }
+    }
+
+    /// A response to a CANCEL as a proxy receives it: the transaction's
+    /// Call-ID and CSeq, and a top Via that is the proxy's own.
+    fn cancel_response(code: u16, cseq: u32) -> MessageFacts<'static> {
+        MessageFacts {
+            branch: Some("z9hG4bK-the-proxys-own"),
+            ..transaction(response("CANCEL", code), cseq)
+        }
+    }
+
+    /// A CANCEL of a re-INVITE withdraws a change to a call that goes on. It
+    /// is not the end of the session, and neither is any response to it; the
+    /// CANCEL of the INVITE that opened the session is.
+    #[test]
+    fn a_cancel_ends_the_session_only_when_it_cancels_the_opening_invite() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2Only, None);
+        let view = established_with_a_re_invite(&manager);
+
         assert_eq!(
-            manager.note_message(&view, &cancel("z9hG4bK-re-invite")),
+            manager.note_message(&view, &cancel_of_re_invite(2)),
             IriEventType::Continue
         );
-        let ok = MessageFacts {
-            branch: Some("z9hG4bK-re-invite"),
-            ..response("CANCEL", 200)
-        };
-        assert_eq!(manager.note_message(&view, &ok), IriEventType::Continue);
+        assert_eq!(
+            manager.note_message(&view, &cancel_response(481, 2)),
+            IriEventType::Continue,
+            "a 481 to it, from a far end that had answered the re-INVITE"
+        );
         manager.sweep_sessions(Instant::now() + SESSION_GRACE * 2, |_| false);
         assert_eq!(
             manager.remembered_session_count(),
@@ -2599,35 +2683,107 @@ mod tests {
             "the session did not end"
         );
 
-        // A 481 to another CANCEL of the re-INVITE, through a proxy: the
-        // response's top Via is the proxy's own, not the re-INVITE's.
-        manager.note_message(&view, &cancel("z9hG4bK-re-invite"));
-        let no_transaction = MessageFacts {
-            branch: Some("z9hG4bK-the-proxys-own"),
-            ..response("CANCEL", 481)
-        };
-        assert_eq!(
-            manager.note_message(&view, &no_transaction),
-            IriEventType::Continue
-        );
-        manager.sweep_sessions(Instant::now() + SESSION_GRACE * 2, |_| false);
-        assert_eq!(manager.remembered_session_count(), 1);
-
         // The CANCEL of the opening INVITE: its branch, and no To-tag.
         let opening = MessageFacts {
             to_tagged: false,
-            ..cancel("z9hG4bK-invite")
+            branch: Some("z9hG4bK-invite"),
+            ..transaction(request("CANCEL"), 1)
         };
         assert_eq!(manager.note_message(&view, &opening), IriEventType::End);
-        // And one whose INVITE is not remembered is read off its own To.
+    }
+
+    /// A CANCEL whose INVITE is not on record is read off its own `To`.
+    #[test]
+    fn a_cancel_of_an_invite_not_on_record_is_read_off_its_own_to() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2Only, None);
+        let view = established_with_a_re_invite(&manager);
         let unknown = MessageFacts {
-            to_tagged: false,
-            ..cancel("z9hG4bK-not-seen")
+            branch: Some("z9hG4bK-not-seen"),
+            ..transaction(request("CANCEL"), 7)
         };
-        assert_eq!(manager.note_message(&view, &unknown), IriEventType::End);
         assert_eq!(
-            manager.note_message(&view, &cancel("z9hG4bK-not-seen")),
+            manager.note_message(&view, &unknown),
             IriEventType::Continue
+        );
+        let untagged = MessageFacts {
+            to_tagged: false,
+            ..unknown
+        };
+        assert_eq!(manager.note_message(&view, &untagged), IriEventType::End);
+    }
+
+    /// Each response to a CANCEL is matched to the CANCEL it answers by the
+    /// transaction it carries. Two re-INVITE CANCELs outstanding are told
+    /// apart, each is done with at its final response, and a response to a
+    /// CANCEL that is none of them is not excused by them.
+    #[test]
+    fn responses_are_matched_to_the_cancel_they_answer() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2Only, None);
+        let view = established_with_a_re_invite(&manager);
+        manager.note_message(&view, &cancel_of_re_invite(2));
+        let second = MessageFacts {
+            branch: Some("z9hG4bK-re-invite-3"),
+            ..transaction(request("INVITE"), 3)
+        };
+        manager.note_message(&view, &second);
+        let second_cancel = MessageFacts {
+            branch: Some("z9hG4bK-re-invite-3"),
+            ..transaction(request("CANCEL"), 3)
+        };
+        manager.note_message(&view, &second_cancel);
+
+        // The second is answered first.
+        assert_eq!(
+            manager.note_message(&view, &cancel_response(481, 3)),
+            IriEventType::Continue
+        );
+        assert_eq!(
+            manager.note_message(&view, &cancel_response(481, 2)),
+            IriEventType::Continue,
+            "the first, by its own transaction"
+        );
+        assert_eq!(
+            manager.note_message(&view, &cancel_response(481, 2)),
+            IriEventType::End,
+            "and done with at its final response"
+        );
+
+        // A response to a CANCEL that is none of those outstanding is not
+        // excused by one that is.
+        let (manager, _iri, _audit) = crate::li::tests::manager();
+        provision(&manager, DeliveryType::X2Only, None);
+        let view = established_with_a_re_invite(&manager);
+        manager.note_message(&view, &cancel_of_re_invite(2));
+        assert_eq!(
+            manager.note_message(&view, &cancel_response(481, 9)),
+            IriEventType::End
+        );
+    }
+
+    /// A BYE ends the session. The answer to a CANCEL that crossed it arrives
+    /// afterwards and says nothing of the call: the session stays ended, and
+    /// is released after its grace.
+    #[test]
+    fn a_late_response_does_not_bring_back_a_session_a_bye_ended() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2Only, None);
+        let view = established_with_a_re_invite(&manager);
+        manager.note_message(&view, &cancel_of_re_invite(2));
+        assert_eq!(
+            manager.note_message(&view, &transaction(request("BYE"), 3)),
+            IriEventType::End
+        );
+        let ended = Instant::now();
+
+        manager.note_message(&view, &cancel_response(200, 2));
+        manager.note_message(&view, &transaction(response("INVITE", 487), 2));
+        manager.sweep_sessions(ended + SESSION_GRACE + Duration::from_secs(1), |_| false);
+        assert_eq!(
+            manager.remembered_session_count(),
+            0,
+            "ended at the BYE, and released a grace after it"
         );
     }
 

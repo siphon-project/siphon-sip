@@ -63,6 +63,12 @@ pub(super) fn intercept_message(
         status_code,
         to_tagged: to_has_tag(message),
         branch: top_via_branch(message),
+        call_id,
+        cseq: message
+            .headers
+            .get("CSeq")
+            .and_then(|cseq| cseq.split_whitespace().next())
+            .and_then(|number| number.parse().ok()),
     };
     let identities = crate::li::Identities {
         request_uri: request_uri.as_deref(),
@@ -577,6 +583,7 @@ pub(super) fn attach_x3(
                 d_id,
                 from_tag: from_tag.to_string(),
                 correlation_id,
+                session_id: Arc::clone(&session.session_id),
                 scope: scope.clone(),
             },
             attempt,

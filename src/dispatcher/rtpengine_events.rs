@@ -1176,6 +1176,11 @@ fn x3_delivery_ended(
     let Some(li) = li else {
         return;
     };
+    // An end can be judged as a command future is dropped, which a shutdown
+    // does outside the runtime: the error above is then all there is.
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
     for attachment in delivery.attachments {
         let li = li.clone();
         let detail = format!(
@@ -1187,7 +1192,7 @@ fn x3_delivery_ended(
             ended.dropped
         );
         let d_id = attachment.d_id;
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             report_destination_fault(
                 &li,
                 d_id,

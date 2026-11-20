@@ -218,6 +218,9 @@ pub struct ActiveIntercept {
     pub from_tag: String,
     /// The session correlation, shared with this session's X2 records.
     pub correlation_id: u64,
+    /// The session the delivery is for. Two calls bridged onto one engine
+    /// call are two sessions there; one session asking again is not.
+    pub session_id: Arc<str>,
     /// The per-call media scope of the leg the content is taken from
     /// (`rtpengine.offer(..., scope=)`), `None` for the call's own media.
     ///
@@ -246,6 +249,10 @@ pub struct LiManager {
     /// X3 interceptions, keyed by the call-id the media engine knows the call
     /// by: the caller leg's SIP Call-ID, whichever leg asked. See [`content`].
     x3_attachments: Arc<DashMap<String, content::CallContent>>,
+    /// End reports whose record was released while they still waited for the
+    /// answer to an end siphon asked for. See
+    /// [`LiManager::take_unanswered_x3_ends`].
+    unanswered_x3_ends: Arc<std::sync::Mutex<Vec<content::HeldEnd>>>,
     /// Per-session matching decisions, keyed by session id.
     ///
     /// See [`LiManager::resolve_session`].
@@ -285,6 +292,7 @@ impl LiManager {
             config: Arc::new(config),
             x1_client: Arc::new(std::sync::OnceLock::new()),
             x3_attachments: Arc::new(DashMap::new()),
+            unanswered_x3_ends: Arc::default(),
             decisions: Arc::new(DashMap::new()),
             aliases: Arc::new(DashMap::new()),
             minted_engine_calls: Arc::new(DashMap::new()),
@@ -353,13 +361,20 @@ impl LiManager {
     ///
     /// Honours a value the ADMF provisioned; otherwise derives a stable
     /// non-zero one from the session id.
+    ///
+    /// One value for the life of the session (TS 103 221-2 clause 6 ties a
+    /// session's X2 and X3 records together by it). The first one used for a
+    /// warrant on a session is the session's: a `ModifyTask` that changes the
+    /// task's Correlation ID applies to the sessions that start after it, and
+    /// does not split one in progress between two.
     pub fn correlation_for(&self, task: &StoredTask, session_id: &str) -> u64 {
-        match task.details.correlation_id {
+        let fresh = match task.details.correlation_id {
             // Zero is reserved on the wire, so a provisioned zero is treated as
             // "not provisioned" rather than emitted.
             Some(provisioned) if provisioned != 0 => provisioned,
             _ => correlation_from_call_id(session_id),
-        }
+        };
+        self.session_correlation(session_id, task.details.x_id, fresh)
     }
 
     /// The LIID a task's records carry.
