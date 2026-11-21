@@ -729,6 +729,8 @@ impl NativeTestEngine {
                                 recording_id,
                                 to_tag: None,
                                 stats: None,
+                                streams: Vec::new(),
+                                video_declined: None,
                             },
                         };
                         if matches!(request.command, Command::AnswerLocal { .. }) {

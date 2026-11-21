@@ -758,3 +758,161 @@ async fn one_legs_x3_end_leaves_the_other_legs_record() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(li.x3_attachment_count(), 0, "drains to baseline");
 }
+
+/// The caller's ACK of a failure response. RFC 3261 §17.1.1.3: it belongs to
+/// the INVITE's transaction, so it carries the INVITE's branch.
+const CALLER_FAILURE_ACK: &str = concat!(
+    "ACK sip:15550100042@siphon.example.com SIP/2.0\r\n",
+    "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-caller-invite\r\n",
+    "Max-Forwards: 70\r\n",
+    "From: <sip:alice@example.com>;tag=caller-tag\r\n",
+    "To: <sip:15550100042@siphon.example.com>;tag=siphon-tag\r\n",
+    "Call-ID: caller-call@192.0.2.10\r\n",
+    "CSeq: 1 ACK\r\n",
+    "Content-Length: 0\r\n",
+    "\r\n",
+);
+
+/// A response to the caller's INVITE as a proxy receives it from the callee:
+/// same dialog, same Call-ID, the Via siphon added on top.
+fn proxied_response(status_line: &str) -> String {
+    format!(
+        concat!(
+            "SIP/2.0 {status_line}\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-siphon-relay\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-caller-invite\r\n",
+            "From: <sip:alice@example.com>;tag=caller-tag\r\n",
+            "To: <sip:15550100042@siphon.example.com>;tag=callee-tag\r\n",
+            "Call-ID: caller-call@192.0.2.10\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ),
+        status_line = status_line,
+    )
+}
+
+/// An intercepting dispatcher on a media engine that delivers X3 and counts
+/// the commands it is sent. `anchored` says whether the call has media there:
+/// a refused call's media session is gone by the time its ACK arrives.
+async fn intercepting_on_a_counting_engine(
+    anchored: bool,
+) -> (
+    Arc<DispatcherState>,
+    crate::rtpengine::test_native_engine::NativeTestEngine,
+    mpsc::Receiver<IriEvent>,
+    mpsc::Receiver<AuditEntry>,
+) {
+    let engine = crate::rtpengine::test_native_engine::NativeTestEngine::start().await;
+    let backend = engine.backend();
+    if anchored {
+        backend
+            .offer_in(
+                None,
+                CALLER_CALL_ID,
+                "caller-tag",
+                b"v=0\r\n",
+                &crate::rtpengine::NgFlags::default(),
+            )
+            .await
+            .expect("the call is anchored");
+    }
+    let mut dispatcher = test_dispatcher();
+    dispatcher.state.rtpengine_set = Some(backend);
+    let (state, _li, iri, audit) = intercepting_on(dispatcher);
+    (state, engine, iri, audit)
+}
+
+/// The ACK was still delivered on X2, as a `Continue` of the session.
+fn assert_ack_reported(iri: &mut mpsc::Receiver<IriEvent>) {
+    let events = drain_iri(iri);
+    assert!(
+        events.iter().any(|event| event.sip_method == "ACK"
+            && event.event_type == crate::li::IriEventType::Continue),
+        "the ACK is signalling of a warranted session and stays on X2: {:?}",
+        events
+            .iter()
+            .map(|event| (event.sip_method.clone(), event.status_code))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A B2BUA call the callee refuses has no media to deliver. The caller's ACK
+/// of the 486 siphon relayed must not ask the engine for content: the engine
+/// no longer knows the call, and its refusal would be reported to the ADMF as
+/// warranted content going undelivered.
+#[tokio::test]
+async fn the_ack_of_a_refused_b2bua_call_attaches_no_content() {
+    let (state, engine, mut iri, mut audit) = intercepting_on_a_counting_engine(false).await;
+    let internal_id = caller_calls(&state);
+    dial(&state, &internal_id, CALLEE_CALL_ID);
+    arrives(
+        &state,
+        CALLEE,
+        &callee_response(CALLEE_CALL_ID, "486 Busy Here"),
+    );
+    arrives(&state, CALLER, CALLER_FAILURE_ACK);
+
+    assert_eq!(
+        attach_attempts(&mut audit).await,
+        0,
+        "no attempt, so no failed attempt audited and no fault reported to the ADMF"
+    );
+    assert!(
+        engine.commands("attach_x3").is_empty(),
+        "the engine is not asked to deliver a call that was never answered"
+    );
+    assert_ack_reported(&mut iri);
+}
+
+/// The same on a proxy, where the 486 arrives on the caller's own dialog.
+#[tokio::test]
+async fn the_ack_of_a_refused_proxied_call_attaches_no_content() {
+    let (state, engine, mut iri, mut audit) = intercepting_on_a_counting_engine(false).await;
+    arrives(&state, CALLER, CALLER_INVITE);
+    arrives(&state, CALLEE, &proxied_response("180 Ringing"));
+    arrives(&state, CALLEE, &proxied_response("486 Busy Here"));
+    arrives(&state, CALLER, CALLER_FAILURE_ACK);
+
+    assert_eq!(attach_attempts(&mut audit).await, 0);
+    assert!(engine.commands("attach_x3").is_empty());
+    assert_ack_reported(&mut iri);
+}
+
+/// An answered call still attaches once, on the ACK of the 2xx, which is a
+/// transaction of its own with its own branch (RFC 3261 §13.2.2.4).
+#[tokio::test]
+async fn the_ack_of_an_answered_call_attaches_content_once() {
+    for proxied in [false, true] {
+        let (state, engine, mut iri, mut audit) = intercepting_on_a_counting_engine(true).await;
+        if proxied {
+            arrives(&state, CALLER, CALLER_INVITE);
+            arrives(&state, CALLEE, &proxied_response("200 OK"));
+        } else {
+            let internal_id = caller_calls(&state);
+            dial(&state, &internal_id, CALLEE_CALL_ID);
+            arrives(&state, CALLEE, &callee_response(CALLEE_CALL_ID, "200 OK"));
+        }
+        arrives(&state, CALLER, CALLER_ACK);
+
+        assert_eq!(attach_attempts(&mut audit).await, 1, "proxied={proxied}");
+        let attached = engine.commands("attach_x3");
+        assert_eq!(attached.len(), 1, "proxied={proxied}");
+        assert!(!attached[0].refused, "the engine knows an answered call");
+        assert_ack_reported(&mut iri);
+    }
+}
+
+/// An ACK of a 2xx that reuses the INVITE's branch is wrong (RFC 3261
+/// §13.2.2.4) but it still acknowledges an answered call, whose content is
+/// owed. A missed attachment is the failure that cannot be recovered.
+#[tokio::test]
+async fn an_answered_call_attaches_even_when_its_ack_reuses_the_invite_branch() {
+    let (state, engine, _iri, mut audit) = intercepting_on_a_counting_engine(true).await;
+    arrives(&state, CALLER, CALLER_INVITE);
+    arrives(&state, CALLEE, &proxied_response("200 OK"));
+    arrives(&state, CALLER, CALLER_FAILURE_ACK);
+
+    assert_eq!(attach_attempts(&mut audit).await, 1);
+    assert_eq!(engine.commands("attach_x3").len(), 1);
+}

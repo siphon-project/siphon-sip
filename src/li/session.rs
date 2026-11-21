@@ -77,6 +77,10 @@ pub(super) struct SessionDecision {
     /// Whether that INVITE was answered. After the answer a failure response
     /// belongs to a re-INVITE or another in-dialog request and ends nothing.
     established: bool,
+    /// The top `Via` branches of the INVITEs seen on the session, newest last:
+    /// what the ACK of a failure response carries. See
+    /// [`LiManager::acknowledges_unanswered_invite`].
+    invite_branches: Vec<Box<str>>,
     /// When the session ended, if it has. It is kept for [`SESSION_GRACE`]
     /// after that, so the stragglers of a teardown still correlate.
     ended_at: Option<Instant>,
@@ -242,6 +246,19 @@ pub(super) const MAX_REMEMBERED_SESSIONS: usize = 100_000;
 /// session it ends.
 pub const SESSION_GRACE: Duration = Duration::from_secs(32);
 
+/// How many INVITE branches one session remembers.
+///
+/// One for the INVITE that opened it and room for re-INVITEs in flight on
+/// either leg. Past it the oldest is dropped, and an ACK that no longer finds
+/// its INVITE is treated as the ACK of an answer, which is what every ACK was
+/// taken for before this was kept.
+pub(super) const MAX_INVITE_BRANCHES_PER_SESSION: usize = 8;
+
+/// The prefix RFC 3261 §8.1.1.7 puts on a branch that identifies its
+/// transaction. A branch without it (RFC 2543) promises nothing, so nothing is
+/// concluded from two of them being equal.
+const BRANCH_MAGIC_COOKIE: &str = "z9hG4bK";
+
 /// The identities a message is matched against a warrant on.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Identities<'a> {
@@ -266,6 +283,8 @@ pub struct MessageFacts<'a> {
     pub status_code: Option<u16>,
     /// Whether the To header carries a tag.
     pub to_tagged: bool,
+    /// The branch of the top `Via`.
+    pub branch: Option<&'a str>,
 }
 
 impl MessageFacts<'_> {
@@ -275,6 +294,7 @@ impl MessageFacts<'_> {
         method: "",
         status_code: None,
         to_tagged: true,
+        branch: None,
     };
 
     /// An INVITE outside any dialog: the message that opens a session.
@@ -541,6 +561,14 @@ impl LiManager {
         if event_type == IriEventType::Begin {
             decision.invite_session = true;
         }
+        if facts.request && facts.method == "INVITE" {
+            if let Some(branch) = facts.branch {
+                if decision.invite_branches.len() >= MAX_INVITE_BRANCHES_PER_SESSION {
+                    decision.invite_branches.remove(0);
+                }
+                decision.invite_branches.push(Box::from(branch));
+            }
+        }
         let answered = !facts.request
             && facts.method == "INVITE"
             && facts
@@ -560,6 +588,46 @@ impl LiManager {
             decision.ended_at = None;
         }
         event_type
+    }
+
+    /// Whether an ACK acknowledges a failure response to an INVITE on a
+    /// session that was never answered, so there is no media to deliver.
+    ///
+    /// Interception sees every ACK, because it runs ahead of the transaction
+    /// layer that would absorb this one. RFC 3261 tells the two kinds apart by
+    /// transaction: the ACK of a non-2xx final belongs to the INVITE's and
+    /// carries its branch (§17.1.1.3), the ACK of a 2xx is a transaction of its
+    /// own with a new one (§13.2.2.4). That holds whoever sent the failure, a
+    /// far end through a proxy or siphon itself as a B2BUA, where no failure
+    /// response ever arrives on the caller's leg to be noticed.
+    ///
+    /// Both conditions are required, and every doubt resolves to `false`,
+    /// which attaches: a sender that reuses the INVITE's branch on the ACK of
+    /// a 2xx is wrong but its call was answered and its content is owed, and a
+    /// branch without the magic cookie identifies nothing.
+    pub fn acknowledges_unanswered_invite(
+        &self,
+        view: &SessionView,
+        facts: &MessageFacts<'_>,
+    ) -> bool {
+        if !(facts.request && facts.method == "ACK") {
+            return false;
+        }
+        let Some(branch) = facts
+            .branch
+            .filter(|branch| branch.starts_with(BRANCH_MAGIC_COOKIE))
+        else {
+            return false;
+        };
+        self.decisions
+            .get(&*view.session_id)
+            .is_some_and(|decision| {
+                !decision.established
+                    && decision
+                        .invite_branches
+                        .iter()
+                        .any(|invite_branch| &**invite_branch == branch)
+            })
     }
 
     /// Record that a message instance has been intercepted, once.
@@ -784,6 +852,7 @@ impl LiManager {
                 bound_to_call,
                 invite_session: false,
                 established: false,
+                invite_branches: Vec::new(),
                 ended_at: None,
             },
         );
@@ -807,6 +876,7 @@ mod tests {
             method: "INVITE",
             status_code: None,
             to_tagged: false,
+            branch: Some("z9hG4bK-invite"),
         }
     }
 
@@ -816,6 +886,7 @@ mod tests {
             method,
             status_code: Some(code),
             to_tagged: true,
+            branch: None,
         }
     }
 
@@ -825,6 +896,7 @@ mod tests {
             method,
             status_code: None,
             to_tagged: true,
+            branch: None,
         }
     }
 
@@ -1547,5 +1619,74 @@ mod tests {
             "a parameter of the URI is not the header's"
         );
         assert_eq!(header_tag("<sip:alice@example.com>;tag="), None);
+    }
+
+    fn ack(branch: Option<&'static str>) -> MessageFacts<'static> {
+        MessageFacts {
+            branch,
+            ..request("ACK")
+        }
+    }
+
+    #[test]
+    fn the_ack_of_a_failure_is_told_from_the_ack_of_an_answer() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2Only, None);
+        let opening = manager.resolve_session(CALLER_LEG, &invite(), &caller(), || None);
+        manager.note_message(&opening, &invite());
+
+        // RFC 3261 §17.1.1.3: the ACK of a non-2xx carries the INVITE's branch.
+        assert!(manager.acknowledges_unanswered_invite(&opening, &ack(Some("z9hG4bK-invite"))));
+        // §13.2.2.4: the ACK of a 2xx is its own transaction.
+        assert!(!manager.acknowledges_unanswered_invite(&opening, &ack(Some("z9hG4bK-ack"))));
+        assert!(!manager.acknowledges_unanswered_invite(&opening, &ack(None)));
+        assert!(
+            !manager.acknowledges_unanswered_invite(&opening, &invite()),
+            "only an ACK acknowledges anything"
+        );
+
+        // Once answered, an ACK is never taken for the ACK of a failure,
+        // whatever branch a careless sender put on it.
+        manager.note_message(&opening, &response("INVITE", 200));
+        assert!(!manager.acknowledges_unanswered_invite(&opening, &ack(Some("z9hG4bK-invite"))));
+    }
+
+    #[test]
+    fn a_branch_without_the_magic_cookie_decides_nothing() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2Only, None);
+        let legacy = MessageFacts {
+            branch: Some("1"),
+            ..invite()
+        };
+        let opening = manager.resolve_session(CALLER_LEG, &legacy, &caller(), || None);
+        manager.note_message(&opening, &legacy);
+        assert!(
+            !manager.acknowledges_unanswered_invite(&opening, &ack(Some("1"))),
+            "an RFC 2543 branch is not unique, so equality proves nothing"
+        );
+    }
+
+    #[test]
+    fn remembered_invite_branches_are_bounded() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2Only, None);
+        let opening = manager.resolve_session(CALLER_LEG, &invite(), &caller(), || None);
+        manager.note_message(&opening, &invite());
+        for index in 0..100 {
+            let branch = format!("z9hG4bK-re-{index}");
+            let re_invite = MessageFacts {
+                branch: Some(&branch),
+                ..request("INVITE")
+            };
+            manager.note_message(&opening, &re_invite);
+        }
+        let remembered = manager
+            .decisions
+            .get(&*opening.session_id)
+            .map(|decision| decision.invite_branches.len());
+        assert_eq!(remembered, Some(MAX_INVITE_BRANCHES_PER_SESSION));
+        // The newest is the one kept.
+        assert!(manager.acknowledges_unanswered_invite(&opening, &ack(Some("z9hG4bK-re-99"))));
     }
 }

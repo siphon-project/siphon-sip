@@ -62,6 +62,7 @@ pub(super) fn intercept_message(
         method,
         status_code,
         to_tagged: to_has_tag(message),
+        branch: top_via_branch(message),
     };
     let identities = crate::li::Identities {
         request_uri: request_uri.as_deref(),
@@ -102,6 +103,9 @@ pub(super) fn intercept_message(
     // The event type follows the message, not the warrant: a mediation
     // function reconstructs the session from the sequence.
     let event_type = li.note_message(&session, &facts);
+    // The ACK of a failure response is recorded like any other message, but
+    // the call it closes was never answered and has no content.
+    let unanswered = li.acknowledges_unanswered_invite(&session, &facts);
     let method = method.to_string();
     let from_uri = from_uri.unwrap_or_default().to_string();
     let to_uri = to_uri.unwrap_or_default().to_string();
@@ -169,8 +173,19 @@ pub(super) fn intercept_message(
         // call by that dialog's Call-ID and keys the interception on its
         // offerer's tag; an ACK on the callee leg, which a re-INVITE from the
         // far end produces, names neither, and the call is already attached.
+        //
+        // And only the ACK of an answer. The ACK of a 486 looks the same here,
+        // but by then the media session is gone: the engine would refuse an
+        // unknown call, and that refusal would reach the ADMF as warranted
+        // content going undelivered on a call that never had any.
         if is_ack(message, &method) {
-            if session.on_primary_leg {
+            if unanswered {
+                debug!(
+                    call_id = %call_id,
+                    session = %session.session_id,
+                    "LI: ACK of a failure response, the call was not answered and has no content"
+                );
+            } else if session.on_primary_leg {
                 attach_x3(matched, &session, message, state);
             } else {
                 debug!(

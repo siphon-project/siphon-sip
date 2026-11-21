@@ -53,6 +53,8 @@ fn offer_response() -> Response {
             duration_ms: None,
             to_tag: None,
             stats: None,
+            streams: Vec::new(),
+            video_declined: None,
             play_id: None,
             recording_id: None,
         },
