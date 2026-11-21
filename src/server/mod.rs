@@ -11,6 +11,7 @@ mod python_thread;
 pub(crate) mod shutdown_sequence;
 use shutdown_sequence::run_shutdown_sequence;
 mod event_clock;
+mod restored_stream_eviction;
 mod sbi_callbacks;
 mod sbi_notif_tls;
 
@@ -31,6 +32,7 @@ use bootstrap::*;
 pub use python_thread::build_runtime;
 #[cfg(test)]
 use python_thread::*;
+use restored_stream_eviction::evict_restored_stream_bindings;
 
 use std::sync::Arc;
 
