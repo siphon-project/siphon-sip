@@ -489,6 +489,11 @@ registrar:
   #   read_through_ttl_ms: 1000   # how long a node serves an AoR from memory before
   #   # reading Redis again: the bound on how stale another node's registration,
   #   # refresh or removal can look. 0 = memory only (no read-through).
+  #   required_for_readiness: false   # default. A Redis that is down at start is
+  #   # retried every second in the background (the node runs on memory alone
+  #   # until it answers; then it restores, drops the restored stream bindings
+  #   # and writes what it accepted meanwhile through). true holds /admin/ready
+  #   # at 503 until it has answered. siphon_registrar_backend_up shows which.
   #   presence_key_prefix: "siphon:presence:"
   #   # presence subscriptions (presence.subscribe_dialog) are written through
   #   # to this Redis under their own prefix and restored at boot, so a
@@ -503,6 +508,8 @@ registrar:
   # postgres:
   #   url: "postgres://user:pass@localhost/siphon"
   #   table: "registrar"
+  #   required_for_readiness: false   # as for redis: retried in the background,
+  #   # true holds /admin/ready at 503 until the first connection
 
   # Registration liveness — network-initiated deregistration when a UE
   # vanishes without a SIP de-REGISTER (default off until proven in the field).

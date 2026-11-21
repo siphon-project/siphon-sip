@@ -875,6 +875,29 @@ pub async fn restore_from_backend<B: RegistrarBackend>(
     backend: &B,
     registrar: &super::Registrar,
 ) -> Result<(usize, usize), BackendError> {
+    restore_into(backend, registrar, false).await
+}
+
+/// [`restore_from_backend`] into a registrar that is already taking
+/// registrations: what a backend that answered after start-up restores.
+///
+/// A binding this process holds for the same contact wins over the stored one,
+/// bindings of an AoR that exist only in the backend are added beside the live
+/// ones, and auxiliary state this process already set is kept. Run
+/// [`Registrar::evict_connection_oriented`](super::Registrar::evict_connection_oriented)
+/// over the result: the stored stream bindings name connections that are gone.
+pub async fn restore_from_backend_keeping_live<B: RegistrarBackend>(
+    backend: &B,
+    registrar: &super::Registrar,
+) -> Result<(usize, usize), BackendError> {
+    restore_into(backend, registrar, true).await
+}
+
+async fn restore_into<B: RegistrarBackend>(
+    backend: &B,
+    registrar: &super::Registrar,
+    keep_live: bool,
+) -> Result<(usize, usize), BackendError> {
     let aors = backend.all_aors().await?;
     let mut aor_count = 0usize;
     let mut contact_count = 0usize;
@@ -914,7 +937,11 @@ pub async fn restore_from_backend<B: RegistrarBackend>(
                 .sort_by(|a, b| b.q.partial_cmp(&a.q).unwrap_or(std::cmp::Ordering::Equal));
             contact_count += contacts_for_aor.len();
             aor_count += 1;
-            registrar.install_bindings(aor, contacts_for_aor);
+            if keep_live {
+                registrar.merge_restored_bindings(aor, contacts_for_aor);
+            } else {
+                registrar.install_bindings(aor, contacts_for_aor);
+            }
         }
     }
 
@@ -924,7 +951,11 @@ pub async fn restore_from_backend<B: RegistrarBackend>(
     // `aors` and just enumerate everything the backend has.
     for aor in backend.all_aor_state_aors().await? {
         if let Some(state) = backend.load_aor_state(&aor).await? {
-            registrar.apply_aor_state(&aor, state);
+            if keep_live {
+                registrar.apply_aor_state_unless_held(&aor, state);
+            } else {
+                registrar.apply_aor_state(&aor, state);
+            }
         }
     }
 

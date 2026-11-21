@@ -996,6 +996,11 @@ pub async fn restore_ifc_profiles(
 
         if let Some(xml) = xml {
             let aor = key.strip_prefix(key_prefix).unwrap_or(key);
+            // A profile stored since this process started (a backend that
+            // answered late) is newer than the one read back.
+            if store.profiles.contains_key(aor) {
+                continue;
+            }
             match parse_user_profile(&xml) {
                 Ok(profile) => {
                     ifc_count +=

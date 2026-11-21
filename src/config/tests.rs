@@ -6558,6 +6558,49 @@ fn registrar_redis_presence_key_prefix_defaults_and_overrides() {
     );
 }
 
+/// The registrar backend keeps a node out of rotation until it has been
+/// connected only when asked to.
+#[test]
+fn registrar_backend_required_for_readiness_defaults_off_and_parses() {
+    let config = Config::from_str(&backend_yaml(
+        "registrar:\n  backend: redis\n  redis:\n    url: \"redis://127.0.0.1:6379\"\n",
+    ))
+    .expect("config");
+    assert!(
+        !config
+            .registrar
+            .redis
+            .expect("redis")
+            .required_for_readiness
+    );
+
+    let config = Config::from_str(&backend_yaml(
+        "registrar:\n  backend: redis\n  redis:\n    url: \"redis://127.0.0.1:6379\"\n    \
+         required_for_readiness: true\n",
+    ))
+    .expect("config");
+    assert!(
+        config
+            .registrar
+            .redis
+            .expect("redis")
+            .required_for_readiness
+    );
+
+    let config = Config::from_str(&backend_yaml(
+        "registrar:\n  backend: postgres\n  postgres:\n    url: \"postgres://localhost/siphon\"\n    \
+         required_for_readiness: true\n",
+    ))
+    .expect("config");
+    assert!(
+        config
+            .registrar
+            .postgres
+            .expect("postgres")
+            .required_for_readiness
+    );
+}
+
 #[test]
 fn direct_dispatch_defaults_to_off() {
     assert_eq!(
