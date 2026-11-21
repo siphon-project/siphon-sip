@@ -976,3 +976,173 @@ async fn a_withdrawal_is_on_record_at_once_while_another_delivery_stays() {
     assert_eq!(live[0].x_id, rig.warrant.x_id, "the other goes on");
     assert_eq!(rig.engine.x3_delivery_count(), 1);
 }
+
+const HOLD_SDP: &str = concat!(
+    "v=0\r\n",
+    "o=- 2 2 IN IP4 192.0.2.10\r\n",
+    "s=-\r\n",
+    "c=IN IP4 192.0.2.10\r\n",
+    "t=0 0\r\n",
+    "m=audio 40000 RTP/AVP 0\r\n",
+    "a=rtpmap:0 PCMU/8000\r\n",
+    "a=sendonly\r\n",
+);
+
+/// The caller's hold re-INVITE on the dialog `call_id`, with its SDP.
+fn hold_reinvite(call_id: &str) -> String {
+    on_call(CALLER_INVITE, call_id)
+        .replace(
+            "To: <sip:15550100042@siphon.example.com>",
+            "To: <sip:15550100042@siphon.example.com>;tag=siphon-tag",
+        )
+        .replace("CSeq: 1 INVITE", "CSeq: 2 INVITE")
+        .replace("z9hG4bK-caller-invite", "z9hG4bK-caller-hold")
+        .replace(
+            "Content-Length: 0\r\n\r\n",
+            &format!(
+                "Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{HOLD_SDP}",
+                HOLD_SDP.len()
+            ),
+        )
+}
+
+/// The ACK of the hold re-INVITE.
+fn hold_ack(call_id: &str) -> String {
+    on_call(CALLER_ACK, call_id)
+        .replace("CSeq: 1 ACK", "CSeq: 2 ACK")
+        .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-hold-ack")
+}
+
+/// A hold re-INVITE the script relays through the engine (offer and answer),
+/// then its ACK, on a call a warrant was activated on in the middle of.
+async fn hold_relayed(rig: &Rig, call: &str, callee_leg: Option<&str>, replacing_offer: bool) {
+    arrives(&rig.state, CALLER, &hold_reinvite(call));
+    let backend = backend_of(&rig.state);
+    let mut flags = NgFlags::default();
+    flags.stamp_sip_call_id(call);
+    match replacing_offer {
+        true => {
+            backend
+                .offer(call, "caller-tag", HOLD_SDP.as_bytes(), &flags)
+                .await
+        }
+        false => {
+            backend
+                .reoffer(call, "caller-tag", HOLD_SDP.as_bytes(), &flags)
+                .await
+        }
+    }
+    .expect("the engine takes the hold offer");
+    // The callee's 200 reaches interception first, and the answer it carries
+    // goes through the engine stamped with the callee's own dialog.
+    let mut answer_flags = NgFlags::default();
+    answer_flags.stamp_sip_call_id(callee_leg.unwrap_or(call));
+    if let Some(callee_leg) = callee_leg {
+        arrives(
+            &rig.state,
+            super::li_session_tests::CALLEE,
+            &super::li_session_tests::callee_response(callee_leg, "200 OK")
+                .replace("CSeq: 1 INVITE", "CSeq: 2 INVITE"),
+        );
+    }
+    backend
+        .answer(
+            call,
+            "caller-tag",
+            "callee-tag",
+            HOLD_SDP.as_bytes(),
+            &answer_flags,
+        )
+        .await
+        .expect("and its answer");
+    arrives(&rig.state, CALLER, &hold_ack(call));
+}
+
+/// A call a warrant was activated on in the middle of is attached once, and
+/// stays attached once through a hold re-INVITE relayed through the engine and
+/// through a second scan: no further `attach_x3`, no detach, the delivery live.
+#[tokio::test]
+async fn a_mid_call_attach_is_not_asked_again_by_the_next_reinvite_or_scan() {
+    for (case, b2bua, replacing_offer) in [
+        ("proxied, re-offer", false, false),
+        ("b2bua, re-offer", true, false),
+    ] {
+        let call = format!("mid-reinvite-{}@192.0.2.10", case.replace([' ', ','], "-"));
+        let mut rig = Rig::on(NativeTestEngine::start_with_x3_026().await).await;
+        let mut callee_leg = None;
+        match b2bua {
+            true => {
+                let internal_id = rig.b2bua_call(&call, true).await;
+                let leg = format!("callee-of-{call}");
+                super::li_session_tests::dial(&rig.state, &internal_id, &leg);
+                callee_leg = Some(leg);
+            }
+            false => {
+                arrives(&rig.state, CALLER, &on_call(CALLER_INVITE, &call));
+                rig.proxied_media(&call, true).await;
+            }
+        }
+        rig.activate();
+        assert_eq!(attach_outcomes(&mut rig.audit).await, (1, 0), "{case}");
+        assert_eq!(rig.attached().len(), 1, "{case}");
+
+        // The warrants change before the call's next message, as they do on a
+        // node provisioning others: its next message finds the generation
+        // moved.
+        keep_intercepting(&rig);
+        assert_eq!(attach_outcomes(&mut rig.audit).await, (0, 0), "{case}");
+        hold_relayed(&rig, &call, callee_leg.as_deref(), replacing_offer).await;
+        assert_eq!(attach_outcomes(&mut rig.audit).await, (0, 0), "{case}");
+        assert_eq!(rig.attached().len(), 1, "{case}: not attached again");
+        assert!(rig.engine.commands("detach_x3").is_empty(), "{case}");
+        assert_eq!(rig.li.x3_attachments_for(&call).len(), 1, "{case}: live");
+        assert_eq!(rig.engine.x3_delivery_count(), 1, "{case}");
+
+        // An unrelated warrant changes the generation: a second scan.
+        keep_intercepting(&rig);
+        assert_eq!(attach_outcomes(&mut rig.audit).await, (0, 0), "{case}");
+        assert_eq!(
+            rig.attached().len(),
+            1,
+            "{case}: a second scan asks nothing"
+        );
+        assert!(rig.engine.commands("detach_x3").is_empty(), "{case}");
+        let _ = drain_iri(&mut rig.iri);
+        backend_of(&rig.state)
+            .delete(&call, "caller-tag")
+            .await
+            .expect("released");
+    }
+}
+
+/// A hold relayed as a replacing `offer` ends the engine call (the engine tears
+/// the old one down, ending its delivery) and starts a new one, which is
+/// attached once: two `attach_x3` in all, one for each engine call, the end of
+/// the first one siphon asked for and so clean, no detach and one delivery live
+/// at the end. This is true of a call decided at its INVITE and of one decided
+/// mid-call alike.
+#[tokio::test]
+async fn a_replacing_offer_ends_the_engine_call_and_attaches_the_new_one_once() {
+    for (case, mid_call) in [("decided at the invite", false), ("decided mid-call", true)] {
+        let call = format!("mid-replace-{}@192.0.2.10", mid_call);
+        let (log, _guard) = capture_log();
+        let mut rig = Rig::on(NativeTestEngine::start_with_x3_026().await).await;
+        if !mid_call {
+            rig.activate();
+        }
+        rig.b2bua_call(&call, true).await;
+        if mid_call {
+            rig.activate();
+        }
+        assert_eq!(attach_outcomes(&mut rig.audit).await, (1, 0), "{case}");
+
+        hold_relayed(&rig, &call, None, true).await;
+        assert_eq!(attach_outcomes(&mut rig.audit).await, (1, 0), "{case}");
+        assert_eq!(rig.attached().len(), 2, "{case}");
+        assert!(rig.engine.commands("detach_x3").is_empty(), "{case}");
+        assert_eq!(engine_reports_its_ends(&rig).await, 1, "{case}");
+        assert_eq!(faults_reported(&log), 0, "{case}: {}", log.rendered());
+        assert_eq!(rig.engine.x3_delivery_count(), 1, "{case}");
+        assert_eq!(rig.li.x3_attachments_for(&call).len(), 1, "{case}");
+    }
+}

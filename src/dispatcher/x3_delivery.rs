@@ -248,7 +248,8 @@ async fn attach(li: LiManager, backend: Arc<MediaBackend>, ask: X3Ask) {
         }
         Ok(()) => {
             info!(
-                %x_id, %d_id, %call_id, %delivery, correlation_id,
+                %x_id, %d_id, %call_id, %delivery, correlation_id, attempt,
+                record = %ask.record,
                 scope = leg.scope().map(CallScope::as_str),
                 "X3 content delivery attached"
             );

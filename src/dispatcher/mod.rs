@@ -257,6 +257,8 @@ mod lcr_route_bookkeeping_tests;
 #[cfg(test)]
 mod li_conference_tests;
 #[cfg(test)]
+mod li_mid_call_relay_tests;
+#[cfg(test)]
 mod li_mid_call_tests;
 #[cfg(test)]
 mod li_multi_delivery_tests;
