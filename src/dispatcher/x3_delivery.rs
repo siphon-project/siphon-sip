@@ -102,6 +102,12 @@ pub(super) fn ask_for(
     let (x_id, d_id) = (ask.attachment.x_id, ask.attachment.d_id);
     let wanted = ask.attachment.correlation_id;
     let registered = li.x3_register(&ask.record, ask.attachment.clone(), ask.attempt, several);
+    debug!(
+        record = %ask.record, call_id = %ask.call_id, attempt = ask.attempt,
+        scope = ask.scope().map(CallScope::as_str),
+        %x_id, %d_id, correlation_id = wanted, ?registered,
+        "LI: an X3 delivery was asked for"
+    );
     match registered {
         X3Registration::Recorded => {
             tokio::spawn(attach(li.clone(), Arc::clone(backend), ask));
