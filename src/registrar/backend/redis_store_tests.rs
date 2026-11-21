@@ -80,6 +80,7 @@ async fn real_aors(url: &str, prefix: &str) -> BTreeSet<String> {
     let index = format!("{prefix}index");
     let alias = format!("{prefix}alias:");
     let claim = format!("{prefix}expired:");
+    let removed = format!("{prefix}removed:");
     keys_under(url, prefix)
         .await
         .into_iter()
@@ -87,6 +88,7 @@ async fn real_aors(url: &str, prefix: &str) -> BTreeSet<String> {
             !key.starts_with(&state)
                 && !key.starts_with(&alias)
                 && !key.starts_with(&claim)
+                && !key.starts_with(&removed)
                 && *key != index
         })
         .map(|key| key[prefix.len()..].to_string())
@@ -427,7 +429,22 @@ async fn everything_drains_when_every_aor_expires_or_deregisters() {
     tokio::time::sleep(Duration::from_millis(4_000)).await;
     assert_eq!(first.count_aors().await.expect("count"), 0);
     assert_eq!(second.count_aors().await.expect("count"), 0);
-    let left = keys_under(&url, &prefix).await;
+    // A removal stays recorded for as long as the removed bindings would have
+    // lived (bounded, so the expiry claim of an older copy elsewhere loses);
+    // nothing else is left, and nothing without a TTL.
+    let removed = format!("{prefix}removed:");
+    let mut left = Vec::new();
+    for key in keys_under(&url, &prefix).await {
+        if key.starts_with(&removed) {
+            let ttl = ttl_ms(&url, &key).await;
+            assert!(
+                ttl > 0 && ttl <= (600 + 30 + 600) * 1000,
+                "{key} is recorded without a bounded TTL: {ttl} ms"
+            );
+        } else {
+            left.push(key);
+        }
+    }
     assert!(left.is_empty(), "keys left behind: {left:?}");
 }
 
@@ -503,4 +520,56 @@ async fn connect_builds_the_index_for_an_existing_keyspace() {
         .query_async(&mut connection)
         .await
         .expect("clean up");
+}
+
+/// A removal is recorded for as long as the removed bindings would have
+/// lived, plus the claim lifetime; a save forgets it; a save of bindings
+/// that already ran out is no removal.
+#[tokio::test]
+async fn a_removal_is_recorded_until_the_removed_bindings_would_have_run_out() {
+    let Some(url) = test_url() else { return };
+    let prefix = unique_prefix("removed-ttl");
+    let backend = backend(&url, &prefix, 30, 7200).await;
+    let aor = "sip:alice@example.com";
+    let removed = format!("{prefix}removed:{aor}");
+
+    backend
+        .save(aor, &[contact("sip:alice@198.51.100.10", 3600)])
+        .await
+        .expect("save");
+    backend.remove(aor).await.expect("remove");
+    let ttl = ttl_ms(&url, &removed).await;
+    assert!(
+        ttl > (3600 + 600) * 1000 && ttl <= (3600 + 30 + 600) * 1000,
+        "recorded for the hash's life plus the claim lifetime, got {ttl} ms"
+    );
+    assert!(!backend
+        .claim_expiry(aor, "generation-1")
+        .await
+        .expect("claim"));
+
+    backend
+        .save(aor, &[contact("sip:alice@198.51.100.10", 3600)])
+        .await
+        .expect("save");
+    assert_eq!(
+        ttl_ms(&url, &removed).await,
+        -2,
+        "a save forgets the removal"
+    );
+    assert!(backend
+        .claim_expiry(aor, "generation-2")
+        .await
+        .expect("claim"));
+
+    let expired = StoredContact {
+        expires_at: Some(epoch_now() - 1),
+        ..contact("sip:alice@198.51.100.10", 3600)
+    };
+    backend.save(aor, &[expired]).await.expect("save");
+    assert_eq!(ttl_ms(&url, &removed).await, -2, "run out, not removed");
+    assert!(backend
+        .claim_expiry(aor, "generation-3")
+        .await
+        .expect("claim"));
 }
