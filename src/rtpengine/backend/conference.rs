@@ -310,10 +310,7 @@ impl MediaBackend {
     /// seat that joined it (`x3_conference_seat`); `None` while it has not
     /// been asked. rtpengine and rtpproxy have no room.
     pub fn x3_conference_seat(&self, conference_id: &str) -> Option<bool> {
-        match self {
-            Self::SiphonRtp(set) => set.x3_room_feature(X3Feature::ConferenceSeat, conference_id),
-            Self::RtpEngine(_) | Self::RtpProxy(_) => Some(false),
-        }
+        self.x3_room_feature(X3Feature::ConferenceSeat, conference_id)
     }
 
     /// [`Self::x3_conference_seat`], asking the engine when it has not been
@@ -322,11 +319,29 @@ impl MediaBackend {
         &self,
         conference_id: &str,
     ) -> Result<bool, RtpEngineError> {
+        self.learn_x3_room_feature(X3Feature::ConferenceSeat, conference_id)
+            .await
+    }
+
+    /// Whether the engine holding the room `conference_id` listed `feature`
+    /// in `node_info`; `None` while it has not been asked. rtpengine and
+    /// rtpproxy have no room.
+    pub fn x3_room_feature(&self, feature: X3Feature, conference_id: &str) -> Option<bool> {
         match self {
-            Self::SiphonRtp(set) => {
-                set.learn_x3_room_feature(X3Feature::ConferenceSeat, conference_id)
-                    .await
-            }
+            Self::SiphonRtp(set) => set.x3_room_feature(feature, conference_id),
+            Self::RtpEngine(_) | Self::RtpProxy(_) => Some(false),
+        }
+    }
+
+    /// [`Self::x3_room_feature`], asking the engine when it has not been
+    /// asked on this connection.
+    pub async fn learn_x3_room_feature(
+        &self,
+        feature: X3Feature,
+        conference_id: &str,
+    ) -> Result<bool, RtpEngineError> {
+        match self {
+            Self::SiphonRtp(set) => set.learn_x3_room_feature(feature, conference_id).await,
             Self::RtpEngine(_) | Self::RtpProxy(_) => Ok(false),
         }
     }

@@ -810,7 +810,7 @@ impl LiManager {
         // own yet. The call's content is going out under one, and that is the
         // session's: the live delivery keeps it where the cache did not.
         *known.correlation_id.get_or_insert_with(|| {
-            self.x3_correlation_in_use(&engine_call_id, x_id)
+            self.x3_correlation_in_use(&engine_call_id, x_id, session_id)
                 .unwrap_or(fresh)
         })
     }
@@ -953,7 +953,8 @@ impl LiManager {
     /// A message that ends the session leaves it resolvable for
     /// [`SESSION_GRACE`]; [`sweep_sessions`](Self::sweep_sessions) releases it.
     pub fn note_message(&self, view: &SessionView, facts: &MessageFacts<'_>) -> IriEventType {
-        let mut decision = self.decisions.get_mut(&*view.session_id);
+        let mut decision_guard = self.decisions.get_mut(&*view.session_id);
+        let decision = &mut decision_guard;
         let (invite_session, established) =
             decision.as_deref().map_or((false, false), |decision| {
                 (decision.invite_session, decision.established)
@@ -1045,15 +1046,32 @@ impl LiManager {
         }
         if ends {
             decision.ended_at.get_or_insert_with(Instant::now);
-        } else if !(facts.request && facts.method == "ACK")
-            && !cancel_response
-            && !decision.ended_by_bye
-        {
-            // Something that is not part of a teardown: the session is live.
-            // An ACK is neither, since the ACK of a failure follows the end;
-            // nor is a response to a CANCEL, which follows the CANCEL that
-            // may have ended it. And a session a BYE ended stays ended.
-            decision.ended_at = None;
+            return event_type;
+        }
+        if (facts.request && facts.method == "ACK") || cancel_response || decision.ended_by_bye {
+            return event_type;
+        }
+        // Something that is not part of a teardown: the session is live.
+        // An ACK is neither, since the ACK of a failure follows the end;
+        // nor is a response to a CANCEL, which follows the CANCEL that
+        // may have ended it. And a session a BYE ended stays ended.
+        decision.ended_at = None;
+        // Live, it is owed its content again wherever its end was written
+        // (`x3_detaching`): the answer that beat the CANCEL of its INVITE, a
+        // Call-ID that opens a new dialog. An ACK or anything else that
+        // follows an end does not get here, and asks for nothing.
+        let records: Vec<String> = std::iter::once(decision.primary_call_id.to_string())
+            .chain(
+                decision
+                    .engine_calls
+                    .iter()
+                    .map(|minted| minted.id.to_string()),
+            )
+            .chain(decision.seats.iter().map(|(seat, _)| seat.record()))
+            .collect();
+        drop(decision_guard);
+        for record in records {
+            self.x3_session_is_live(&record, &view.session_id);
         }
         event_type
     }
@@ -2410,6 +2428,7 @@ mod tests {
                     crate::li::ActiveIntercept {
                         x_id: view.matches[0].task.details.x_id,
                         d_id: view.matches[0].task.details.list_of_dids[0],
+                        delivery: "192.0.2.50:42069".to_string(),
                         from_tag: "a".to_string(),
                         correlation_id: 7,
                         session_id: Arc::clone(&view.session_id),

@@ -214,6 +214,9 @@ pub struct ActiveIntercept {
     pub x_id: XId,
     /// The destination the content is being delivered to.
     pub d_id: x1::types::DId,
+    /// Where that destination is dialled, as the engine was given it on the
+    /// attach and names it on the events of this delivery.
+    pub delivery: String,
     /// The leg the engine keys the interception on.
     pub from_tag: String,
     /// The session correlation, shared with this session's X2 records.

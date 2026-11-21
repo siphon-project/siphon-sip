@@ -49,6 +49,7 @@ fn ended(call_id: &str, from_tag: &str, reason: &str) -> crate::rtpengine::event
         orderly: reason == "Detached",
         delivered: 320,
         dropped: 0,
+        delivery: None,
     })
 }
 
@@ -1394,6 +1395,20 @@ async fn a_second_session_on_one_engine_call_is_a_fault_naming_both_correlations
     arrives(&state, CALLER, &on_call(CALLER_ACK, SECOND));
     assert_eq!(attach_outcomes(&mut audit).await, (0, 0));
     assert_eq!(faults_reported(&log), 1);
+
+    // The second call ending detaches nothing: the delivery on the engine
+    // call is the first session's, and the first call is still up.
+    let bye = on_call(CALLER_ACK, SECOND)
+        .replace("ACK sip:", "BYE sip:")
+        .replace("CSeq: 1 ACK", "CSeq: 2 BYE")
+        .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-bye");
+    arrives(&state, CALLER, &bye);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        engine.commands("detach_x3").is_empty(),
+        "the first session's delivery is not the second's to end"
+    );
+    assert_eq!(li.x3_attachments_for(MINTED).len(), 1);
     backend
         .delete(MINTED, "caller-tag")
         .await
