@@ -983,6 +983,7 @@ pub(super) async fn intercepting_on_the_engine(
     dispatcher.state.rtpengine_sessions = Some(sessions);
     let (state, li, iri, audit) = intercepting_on(dispatcher);
     super::intercept::watch_engine_calls(&state);
+    super::intercept::watch_warrants(&state);
     (state, engine, li, iri, audit)
 }
 

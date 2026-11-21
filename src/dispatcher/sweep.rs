@@ -224,6 +224,15 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
         li.sweep_sessions(now, |session_id| {
             state.call_actors.contains_call(session_id)
         });
+        // The dialogs seen opening whose call is gone: a B2BUA call that is
+        // over, a proxied one with no media left, a refused INVITE.
+        li.sweep_live_dialogs(now, |call_id| {
+            state.call_actors.find_by_sip_call_id(call_id).is_some()
+                || state
+                    .rtpengine_sessions
+                    .as_ref()
+                    .is_some_and(|sessions| sessions.get(call_id).is_some())
+        });
         // An end report that was still waiting for the answer to an end
         // siphon asked for when its record was released: nothing answered,
         // so nothing says siphon ended that delivery.

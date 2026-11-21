@@ -242,7 +242,7 @@ impl<'a> Sender<'a> {
 ///
 /// Looked for after the closing `>` of a name-addr, so a `tag` inside the URI
 /// itself is not mistaken for the header's.
-fn header_tag(header: &str) -> Option<&str> {
+pub(super) fn header_tag(header: &str) -> Option<&str> {
     let parameters = header.rfind('>').map_or(header, |end| &header[end + 1..]);
     parameters.split(';').skip(1).find_map(|parameter| {
         let (name, value) = parameter.split_once('=')?;
@@ -619,6 +619,22 @@ impl LiManager {
         owner: impl FnOnce() -> Option<CallOwner>,
         media: impl FnOnce() -> Option<DialogMedia>,
     ) -> SessionView {
+        self.resolve_session_inner(call_id, facts, identities, owner, media, false)
+    }
+
+    /// [`resolve_session_with`](Self::resolve_session_with). `media_on_open`
+    /// asks the media path what it holds for a dialog-forming INVITE too,
+    /// which only a decision made after the fact needs: the INVITE that is
+    /// being decided as it arrives has no media yet.
+    fn resolve_session_inner(
+        &self,
+        call_id: &str,
+        facts: &MessageFacts<'_>,
+        identities: &Identities<'_>,
+        owner: impl FnOnce() -> Option<CallOwner>,
+        media: impl FnOnce() -> Option<DialogMedia>,
+        media_on_open: bool,
+    ) -> SessionView {
         if !self.is_intercepting() {
             return SessionView::unwarranted(call_id);
         }
@@ -697,7 +713,7 @@ impl LiManager {
         }
         // A warrant that starts in the middle of a call nothing is remembered
         // of: the media path says where the call's media is, and who offered.
-        let known_to_media = (!facts.opens_dialog() && !matches.is_empty())
+        let known_to_media = ((media_on_open || !facts.opens_dialog()) && !matches.is_empty())
             .then(media)
             .flatten()
             .unwrap_or_default();
@@ -792,6 +808,62 @@ impl LiManager {
             matches,
             seats: Vec::new(),
         }
+    }
+
+    /// Decide, now, the session of a dialog that opened before a warrant that
+    /// covers it was activated, as its dialog-forming INVITE would have been
+    /// decided had the warrant been there.
+    ///
+    /// The identities are the INVITE's own, so the `From` is the caller and
+    /// the parties are oriented as on that INVITE. `owner` is the B2BUA call
+    /// the dialog is the caller leg of, and `media` what the media path holds
+    /// for it (a call whose media moved to an engine call siphon minted is on
+    /// that one). `answered` marks the session established, so a failure that
+    /// follows is a re-INVITE's and ends nothing.
+    ///
+    /// Records no message, and so emits no X2: that resumes at the call's next
+    /// message, which finds the decision made and carries on from it.
+    pub fn decide_live_dialog(
+        &self,
+        dialog: &super::live_dialogs::LiveDialog,
+        owner: Option<CallOwner>,
+        media: Option<DialogMedia>,
+        answered: bool,
+    ) -> SessionView {
+        let facts = MessageFacts {
+            request: true,
+            method: "INVITE",
+            status_code: None,
+            to_tagged: false,
+            branch: None,
+        };
+        let identities = Identities {
+            request_uri: Some(&dialog.request_uri),
+            from_uri: Some(&dialog.from),
+            to_uri: Some(&dialog.to),
+            source_ip: dialog.source_ip,
+        };
+        let view = self.resolve_session_inner(
+            &dialog.call_id,
+            &facts,
+            &identities,
+            || owner,
+            || media,
+            true,
+        );
+        if view.matches.is_empty() {
+            // Nothing covers it. Not remembered as unwarranted either: no
+            // message follows to release that, as one does for a dialog that
+            // ends in front of this node.
+            self.forget_session(&view.session_id);
+            return view;
+        }
+        if let Some(mut decision) = self.decisions.get_mut(&*view.session_id) {
+            // A dialog-forming INVITE opened it, as it would have.
+            decision.invite_session = true;
+            decision.established |= answered;
+        }
+        view
     }
 
     /// The Correlation ID the session `session_id` uses for the warrant
@@ -3036,5 +3108,163 @@ mod tests {
         assert_eq!(manager.session_alias_count(), 0);
         assert_eq!(manager.minted_engine_call_count(), 0, "bindings drain");
         assert_eq!(manager.x3_call_count(), 0);
+    }
+
+    // --- a warrant activated in the middle of a call --------------------
+
+    fn live(call_id: &str, from: &str, to: &str) -> crate::li::live_dialogs::LiveDialog {
+        crate::li::live_dialogs::LiveDialog {
+            call_id: Box::from(call_id),
+            request_uri: Box::from("sip:bob@example.com"),
+            from: Box::from(from),
+            to: Box::from(to),
+            source_ip: None,
+            answered: false,
+            opened: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn a_live_dialog_is_decided_with_the_caller_in_from() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2AndX3, None);
+        let dialog = live(
+            "live-1@example.com",
+            "<sip:alice@example.com>;tag=caller",
+            "<sip:bob@example.com>",
+        );
+        let view = manager.decide_live_dialog(&dialog, None, None, true);
+        assert_eq!(view.matches.len(), 1);
+        assert_eq!(view.matches[0].party, MatchedParty::Originating);
+        assert!(view.on_primary_leg);
+        assert!(view.offerer_is_caller);
+        assert_eq!(&*view.engine_call_id, "live-1@example.com");
+        assert_eq!(manager.remembered_session_count(), 1);
+    }
+
+    #[test]
+    fn a_live_dialog_whose_target_is_called_is_the_terminating_party() {
+        let (manager, _iri, _audit) = manager();
+        provision_targets(
+            &manager,
+            DeliveryType::X2AndX3,
+            None,
+            vec![TargetIdentifier::SipUri("sip:bob@example.com".to_string())],
+        );
+        let dialog = live(
+            "live-2@example.com",
+            "<sip:alice@example.com>;tag=caller",
+            "<sip:bob@example.com>",
+        );
+        let view = manager.decide_live_dialog(&dialog, None, None, true);
+        assert_eq!(view.matches.len(), 1);
+        assert_eq!(view.matches[0].party, MatchedParty::Terminating);
+    }
+
+    #[test]
+    fn a_live_dialog_no_warrant_covers_is_not_remembered() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2AndX3, None);
+        let dialog = live(
+            "live-3@example.com",
+            "<sip:carol@example.com>;tag=caller",
+            "<sip:dave@example.com>",
+        );
+        let view = manager.decide_live_dialog(&dialog, None, None, true);
+        assert!(view.matches.is_empty());
+        assert_eq!(manager.remembered_session_count(), 0);
+    }
+
+    #[test]
+    fn a_live_dialog_is_decided_once_and_the_next_message_finds_it() {
+        let (manager, mut iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2AndX3, None);
+        let dialog = live(
+            "live-4@example.com",
+            "<sip:alice@example.com>;tag=caller",
+            "<sip:bob@example.com>",
+        );
+        let first = manager.decide_live_dialog(&dialog, None, None, true);
+        let again = manager.decide_live_dialog(&dialog, None, None, true);
+        assert_eq!(first.session_id, again.session_id);
+        assert_eq!(manager.remembered_session_count(), 1);
+        assert!(iri.try_recv().is_err(), "deciding emits no X2");
+
+        // The far end's re-INVITE: the target is in To now. The decision
+        // made at activation holds, and the party stays the caller.
+        let message = manager.resolve_session(
+            "live-4@example.com",
+            &request("INVITE"),
+            &Identities {
+                request_uri: Some("sip:alice@192.0.2.9"),
+                from_uri: Some("<sip:bob@example.com>;tag=callee"),
+                to_uri: Some("<sip:alice@example.com>;tag=caller"),
+                source_ip: None,
+            },
+            || None,
+        );
+        assert_eq!(message.session_id, first.session_id);
+        assert_eq!(message.matches.len(), 1);
+    }
+
+    #[test]
+    fn an_answered_live_dialog_is_established_so_a_failed_re_invite_ends_nothing() {
+        for (answered, expected) in [(true, IriEventType::Continue), (false, IriEventType::End)] {
+            let (manager, _iri, _audit) = manager();
+            provision(&manager, DeliveryType::X2AndX3, None);
+            let dialog = live(
+                "live-5@example.com",
+                "<sip:alice@example.com>;tag=caller",
+                "<sip:bob@example.com>",
+            );
+            let view = manager.decide_live_dialog(&dialog, None, None, answered);
+            assert_eq!(
+                manager.note_message(&view, &response("INVITE", 491)),
+                expected,
+                "answered: {answered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_dialog_of_a_b2bua_call_is_the_calls_session() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2AndX3, None);
+        let dialog = live(
+            "live-6@example.com",
+            "<sip:alice@example.com>;tag=caller",
+            "<sip:bob@example.com>",
+        );
+        let owner = CallOwner {
+            internal_id: "internal-6".to_string(),
+            a_leg_call_id: "live-6@example.com".to_string(),
+            replacement_target: false,
+        };
+        let view = manager.decide_live_dialog(&dialog, Some(owner), None, true);
+        assert_eq!(&*view.session_id, "internal-6");
+        assert!(view.on_primary_leg);
+        manager.sweep_sessions(Instant::now(), |session_id| session_id == "internal-6");
+        assert_eq!(manager.remembered_session_count(), 1, "bound to the call");
+        manager.sweep_sessions(Instant::now(), |_| false);
+        manager.sweep_sessions(Instant::now() + SESSION_GRACE * 2, |_| false);
+        assert_eq!(manager.remembered_session_count(), 0);
+    }
+
+    #[test]
+    fn a_live_dialog_decided_on_minted_media_is_on_the_engine_call_it_moved_to() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2AndX3, None);
+        let dialog = live(
+            "live-7@example.com",
+            "<sip:alice@example.com>;tag=caller",
+            "<sip:bob@example.com>",
+        );
+        let media = DialogMedia {
+            offerer_tag: Some("caller".to_string()),
+            minted: Some(("minted-7".to_string(), "live-7@example.com".to_string())),
+        };
+        let view = manager.decide_live_dialog(&dialog, None, Some(media), true);
+        assert_eq!(&*view.engine_call_id, "minted-7");
+        assert!(view.offerer_is_caller);
     }
 }

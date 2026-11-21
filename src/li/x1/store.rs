@@ -336,6 +336,9 @@ pub struct TaskStore {
     /// progress, so a session decided as "no warrant" a moment earlier must be
     /// decided again rather than trusted.
     generation: Arc<AtomicU64>,
+    /// Carries the generation to whoever acts on a change as it happens
+    /// ([`TaskStore::subscribe`]), rather than at the next message of a call.
+    changed: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 impl TaskStore {
@@ -347,7 +350,17 @@ impl TaskStore {
             destinations,
             content_capability,
             generation: Arc::new(AtomicU64::new(0)),
+            changed: Arc::new(tokio::sync::watch::channel(0).0),
         }
+    }
+
+    /// A receiver that is woken whenever the provisioning generation moves:
+    /// a task activated, modified or deactivated, or the set replaced.
+    ///
+    /// The value is the generation. A receiver that is slow sees the newest
+    /// one only, which is all a re-scan needs.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
     }
 
     /// The current provisioning generation.
@@ -364,7 +377,17 @@ impl TaskStore {
     /// missed interception is not survivable, so every session is re-decided
     /// rather than reasoning about which ones could have been affected.
     fn bump_generation(&self) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        // `send_replace` stores the value with no receiver listening too, so
+        // a subscriber that arrives later still reads the current one.
+        self.changed.send_replace(generation);
+    }
+
+    /// How many receivers are listening for a change. For tests of the
+    /// tasks that stop when what they serve is gone.
+    #[cfg(test)]
+    pub(crate) fn subscriber_count(&self) -> usize {
+        self.changed.receiver_count()
     }
 
     /// The matching index this store maintains.
@@ -728,6 +751,9 @@ impl TaskStore {
                 },
             );
         }
+        // A replaced set changes what matches as much as an activation does,
+        // and a decision cached before it must not be trusted.
+        self.bump_generation();
     }
 }
 
@@ -785,6 +811,61 @@ mod tests {
 
     fn stores_with_content() -> (DestinationStore, TaskStore) {
         stores(ContentCapability::Available)
+    }
+
+    // -- generation changes ---------------------------------------------
+
+    #[test]
+    fn replacing_the_task_set_moves_the_generation() {
+        let (destinations, tasks) = stores_with_content();
+        let details = destination(DeliveryType::X2AndX3);
+        let d_id = details.d_id;
+        destinations.create(details).unwrap();
+        let before = tasks.generation();
+        tasks.replace_all(vec![task(DeliveryType::X2AndX3, vec![d_id])]);
+        assert!(tasks.generation() > before);
+        assert_eq!(tasks.len(), 1);
+    }
+
+    #[test]
+    fn every_mutation_wakes_a_subscriber_with_the_new_generation() {
+        let (destinations, tasks) = stores_with_content();
+        let details = destination(DeliveryType::X2AndX3);
+        let d_id = details.d_id;
+        destinations.create(details).unwrap();
+        let mut receiver = tasks.subscribe();
+        assert!(!receiver.has_changed().unwrap());
+
+        let activated = task(DeliveryType::X2AndX3, vec![d_id]);
+        let x_id = activated.x_id;
+        tasks.activate(activated.clone()).unwrap();
+        assert!(receiver.has_changed().unwrap());
+        assert_eq!(*receiver.borrow_and_update(), tasks.generation());
+
+        tasks.modify(activated).unwrap();
+        assert!(receiver.has_changed().unwrap());
+        assert_eq!(*receiver.borrow_and_update(), tasks.generation());
+
+        tasks.deactivate(x_id).unwrap();
+        assert!(receiver.has_changed().unwrap());
+        assert_eq!(*receiver.borrow_and_update(), tasks.generation());
+
+        tasks.replace_all(Vec::new());
+        assert!(receiver.has_changed().unwrap());
+        assert_eq!(*receiver.borrow_and_update(), tasks.generation());
+    }
+
+    #[test]
+    fn a_subscriber_that_arrives_late_reads_the_current_generation() {
+        let (destinations, tasks) = stores_with_content();
+        let details = destination(DeliveryType::X2AndX3);
+        let d_id = details.d_id;
+        destinations.create(details).unwrap();
+        tasks
+            .activate(task(DeliveryType::X2AndX3, vec![d_id]))
+            .unwrap();
+        let receiver = tasks.subscribe();
+        assert_eq!(*receiver.borrow(), tasks.generation());
     }
 
     // -- destination lifecycle ------------------------------------------

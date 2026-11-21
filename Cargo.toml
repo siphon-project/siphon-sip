@@ -276,6 +276,10 @@ name = "inflight_invite"    # dispatch loop: classify every message, register an
 harness = false
 
 [[bench]]
+name = "li_live_dialogs"    # lawful intercept: remembering an initial INVITE so a warrant activated mid-call finds the call
+harness = false
+
+[[bench]]
 name = "dispatch_await"     # an async handler call through the script handle: 0/1/4 awaits, direct dispatch off vs on
 harness = false
 

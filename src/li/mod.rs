@@ -32,6 +32,7 @@
 
 pub mod asn1;
 mod content;
+pub mod live_dialogs;
 pub mod pdu;
 pub mod session;
 pub mod siprec;
@@ -268,6 +269,9 @@ pub struct LiManager {
     ///
     /// See [`LiManager::adopt_engine_call`].
     minted_engine_calls: Arc<DashMap<String, Vec<Arc<str>>>>,
+    /// The dialogs seen opening, so a warrant activated while one is up can
+    /// find it. See [`live_dialogs`].
+    live_dialogs: Arc<live_dialogs::LiveDialogs>,
 }
 
 impl LiManager {
@@ -299,6 +303,7 @@ impl LiManager {
             decisions: Arc::new(DashMap::new()),
             aliases: Arc::new(DashMap::new()),
             minted_engine_calls: Arc::new(DashMap::new()),
+            live_dialogs: Arc::default(),
         };
 
         let _ = manager.audit_sender.try_send(AuditEntry {
@@ -541,6 +546,22 @@ mod tests {
         mpsc::Receiver<AuditEntry>,
     ) {
         LiManager::new(test_config(), 100, ContentCapability::Available)
+    }
+
+    /// A manager with lawful intercept switched off.
+    pub(super) fn manager_disabled() -> (
+        LiManager,
+        mpsc::Receiver<IriEvent>,
+        mpsc::Receiver<AuditEntry>,
+    ) {
+        LiManager::new(
+            LawfulInterceptConfig {
+                enabled: false,
+                ..test_config()
+            },
+            100,
+            ContentCapability::Available,
+        )
     }
 
     pub(super) fn provision(
