@@ -253,6 +253,11 @@ admin:
   while the Redis of a `cache:` entry marked `required_for_readiness: true`
   does not answer (see [Cache backend health](#cache-backend-health)). No cache
   is marked by default, so a node is not affected unless its config says so.
+  The same `503` (`"registrar backend not connected"`) holds while the registrar's
+  Redis or Postgres has not answered since start-up, when
+  `registrar.redis.required_for_readiness` (or `registrar.postgres.`) is `true`.
+  Off by default: the backend is retried every second in the background either
+  way, and `siphon_registrar_backend_up` shows whether the node is durable yet.
 
 #### TLS and `protect_reads`
 

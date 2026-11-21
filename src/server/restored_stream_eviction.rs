@@ -12,6 +12,13 @@ use tracing::warn;
 /// there first, with the egress bars for its endpoints that this eviction
 /// would not set), and before any listener accepts, so a REGISTER cannot land
 /// in the gap and have its fresh binding evicted with the stale ones.
+pub(super) fn evict_restored_stream_bindings_at_startup() {
+    if let Some(registrar) = crate::script::api::registrar_arc() {
+        evict_restored_stream_bindings(registrar);
+    }
+}
+
+/// [`evict_restored_stream_bindings_at_startup`] on a registrar at hand.
 pub(super) fn evict_restored_stream_bindings(registrar: &crate::registrar::Registrar) -> usize {
     let evicted = registrar.evict_connection_oriented();
     if evicted > 0 {
@@ -101,7 +108,7 @@ mod tests {
     fn startup_evicts_before_any_listener_starts() {
         let startup = include_str!("mod.rs");
         let eviction = startup
-            .find("evict_restored_stream_bindings(registrar)")
+            .find("evict_restored_stream_bindings_at_startup();")
             .expect("startup evicts the restored stream bindings");
         for listener in [
             "starting UDP transport",

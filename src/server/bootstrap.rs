@@ -189,7 +189,7 @@ pub(crate) fn instance_id(config: &Config) -> String {
 /// the restored bindings that were IPsec-protected and whose security
 /// associations did not survive are dropped ([`crate::ipsec::restore`]). This
 /// runs once the manager exists and before any traffic: the restore ran
-/// earlier, in [`init_registrar_backend`], when there was no manager to ask.
+/// earlier, in [`super::registrar_backend::init_registrar_backend`], when there was no manager to ask.
 /// The manager of a new process holds no pair, so every protected binding goes;
 /// each UE re-registers when its next protected request goes unanswered
 /// (TS 24.229 clause 5.1.1.4.1).
@@ -229,119 +229,6 @@ pub(super) fn init_registrar_identity(config: &Config) {
 
     info!(instance_id = %id, instance_epoch = %epoch, "registrar instance identity");
     registrar.set_instance_identity(InstanceIdentity { id, epoch });
-}
-
-pub(super) async fn init_registrar_backend(config: &Config) {
-    use crate::config::RegistrarBackendType;
-    use crate::registrar::backend;
-    use crate::script::api::registrar_arc;
-
-    let registrar = match registrar_arc() {
-        Some(r) => r,
-        None => return,
-    };
-
-    match config.registrar.backend {
-        RegistrarBackendType::Redis => {
-            let redis_cfg = match &config.registrar.redis {
-                Some(redis_cfg) => redis_cfg,
-                None => {
-                    error!("registrar backend is redis but no redis config provided");
-                    return;
-                }
-            };
-            let redis_config = backend::RedisBackendConfig {
-                target: redis_cfg.target.clone(),
-                urls: redis_cfg.urls.clone(),
-                key_prefix: redis_cfg.key_prefix.clone(),
-                shard_count: redis_cfg.shard_count,
-                ttl_slack_secs: redis_cfg.ttl_slack_secs as u64,
-            };
-            match backend::RedisBackend::connect(redis_config).await {
-                Ok(redis_backend) => {
-                    let redis_backend = redis_backend
-                        .with_max_binding_lifetime(u64::from(config.registrar.max_expires));
-                    match backend::restore_from_backend(&redis_backend, registrar).await {
-                        Ok((aors, contacts)) => {
-                            if let Some(metrics) = crate::metrics::try_metrics() {
-                                metrics.registrations_active.set(aors as i64);
-                            }
-                            info!(aors, contacts, "restored contacts from Redis backend");
-                        }
-                        Err(err) => {
-                            error!(%err, "failed to restore contacts from Redis backend");
-                        }
-                    }
-                    let redis_backend = std::sync::Arc::new(redis_backend);
-                    registrar.set_backend_writer(backend::spawn_backend_writer(
-                        std::sync::Arc::clone(&redis_backend),
-                    ));
-                    if redis_cfg.read_through_ttl_ms > 0 {
-                        registrar.set_shared_reader(crate::registrar::SharedReader::new(
-                            redis_backend,
-                            std::time::Duration::from_millis(redis_cfg.read_through_ttl_ms),
-                        ));
-                    }
-
-                    // --- iFC profile persistence (shares the same Redis instance) ---
-                    init_ifc_redis_backend(
-                        &redis_cfg.target,
-                        u64::from(redis_cfg.ttl_slack_secs),
-                        config,
-                    )
-                    .await;
-
-                    // --- presence subscriptions (the same Redis, its own prefix) ---
-                    init_presence_redis_backend(redis_cfg).await;
-                }
-                Err(err) => {
-                    error!(%err, "failed to connect to Redis registrar backend");
-                }
-            }
-        }
-        RegistrarBackendType::Postgres => {
-            let pg_config = match &config.registrar.postgres {
-                Some(cfg) => backend::PostgresBackendConfig {
-                    url: cfg.url.clone(),
-                    urls: Vec::new(),
-                    table: cfg.table.clone(),
-                    shard_count: 0,
-                },
-                None => {
-                    error!("registrar backend is postgres but no postgres config provided");
-                    return;
-                }
-            };
-            match backend::PostgresBackend::connect(pg_config).await {
-                Ok(pg_backend) => {
-                    let pg_backend = pg_backend
-                        .with_max_binding_lifetime(u64::from(config.registrar.max_expires));
-                    match backend::restore_from_backend(&pg_backend, registrar).await {
-                        Ok((aors, contacts)) => {
-                            if let Some(metrics) = crate::metrics::try_metrics() {
-                                metrics.registrations_active.set(aors as i64);
-                            }
-                            info!(aors, contacts, "restored contacts from Postgres backend");
-                        }
-                        Err(err) => {
-                            error!(%err, "failed to restore contacts from Postgres backend");
-                        }
-                    }
-                    registrar.set_backend_writer(backend::spawn_backend_writer(pg_backend));
-                }
-                Err(err) => {
-                    error!(%err, "failed to connect to Postgres registrar backend");
-                }
-            }
-        }
-        RegistrarBackendType::Memory | RegistrarBackendType::Python => {}
-    }
-    if matches!(config.registrar.backend, RegistrarBackendType::Postgres) {
-        info!(
-            "presence subscriptions are written through with the redis registrar backend \
-             only; with postgres they stay in memory and a restart drops them"
-        );
-    }
 }
 
 /// Stand-in when the `redis-backend` feature is off: subscriptions stay in

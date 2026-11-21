@@ -7,8 +7,10 @@
 //! are feature-gated for later phases.
 
 pub mod backend;
+pub mod backend_status;
 pub(crate) mod contact_index;
 pub mod event_hold;
+mod late_attach;
 pub(crate) mod proxy_grant;
 pub mod reginfo;
 pub mod restore_eviction;

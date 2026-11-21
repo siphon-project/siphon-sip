@@ -112,9 +112,9 @@ All four, plus the reliable-provisional scenario that had been driven only by
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| Redis backend | **Production** | `registrar.backend: redis` | Persistent across restarts |
+| Redis backend | **Production** | `registrar.backend: redis` | Persistent across restarts. A Redis that is down at start-up is retried every second in the background (the node runs on memory alone meanwhile, `siphon_registrar_backend_up 0`); once it answers, its bindings are merged beside the live ones, the restored stream-transport bindings are evicted, the writer is installed and everything accepted meanwhile is written through. `registrar.redis.required_for_readiness` (default false) holds `/admin/ready` at 503 until then. iFC profiles and presence subscriptions attach at the same moment, restoring only what the store does not hold; ones created before it are not written through until their next change. Unit tests (`server::registrar_backend`, `registrar::late_attach`); not run against a real Redis outage |
 | Memory backend | Implemented | `registrar.backend: memory` | Ephemeral |
-| PostgreSQL backend | Implemented | `registrar.backend: postgres` | |
+| PostgreSQL backend | Implemented | `registrar.backend: postgres` | Retried in the background and attached late like the Redis backend; `registrar.postgres.required_for_readiness` |
 | Python custom backend | Implemented | `registrar.backend: python` | |
 | Expires control (default/min/max) | **Production** | `registrar.{default,min,max}_expires` | An `Expires` below `min_expires` is answered `423 Interval Too Brief` with `Min-Expires` by `registrar.save()`, which returns `False` and stores nothing |
 | Max contacts per AoR | **Production** | `registrar.max_contacts` | A new binding past it is answered `503 Service Unavailable` with `Retry-After` (seconds until the soonest held binding expires) by `registrar.save()`, which returns `False`. The REGISTER is applied atomically: a refusal stores none of its Contacts, and `force=True` clears only once every Contact is accepted. Refusals count in `siphon_registrar_refusals_total{reason}`, not as script errors |
