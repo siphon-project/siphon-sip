@@ -124,6 +124,26 @@ impl RedisBackend {
         format!("{}expired:{}:{}", self.config.key_prefix, marker, aor)
     }
 
+    /// The key that says the AoR's bindings were removed since its last save.
+    fn removed_key(&self, aor: &str) -> String {
+        format!("{}removed:{}", self.config.key_prefix, aor)
+    }
+
+    /// Delete an AoR's bindings without recording a removal.
+    async fn delete_bindings(&self, aor: &str) -> Result<(), BackendError> {
+        let link = self.link_for(aor);
+        let mut lease = link.lease().await?;
+        let mut pipe = redis::pipe();
+        pipe.atomic()
+            .del(self.key(aor))
+            .ignore()
+            .zrem(self.index_key(), aor)
+            .ignore();
+        pipe.query_async::<()>(&mut lease.connection)
+            .await
+            .map_err(|error| link.fail(&lease, error))
+    }
+
     /// The link of the shard holding `aor`.
     fn link_for(&self, aor: &str) -> &RedisLink {
         if self.links.len() == 1 {
@@ -239,6 +259,29 @@ impl RedisBackend {
 /// nodes' sweep ticks, so a late sweeper still loses the claim.
 const EXPIRY_CLAIM_TTL_SECS: u64 = 600;
 
+/// Remove an AoR's bindings and record that its registration was ended, for
+/// as long as the removed hash would have lived plus the claim lifetime: a
+/// node holding an older copy of those bindings loses its expiry claim for
+/// it. A hash already gone records nothing. KEYS: binding hash, removed key,
+/// index. ARGV: the AoR, the claim lifetime in milliseconds.
+const REMOVE_BINDINGS_SCRIPT: &str = r#"
+local ttl = redis.call('PTTL', KEYS[1])
+redis.call('DEL', KEYS[1])
+redis.call('ZREM', KEYS[3], ARGV[1])
+if ttl > 0 then
+  redis.call('SET', KEYS[2], 1, 'PX', ttl + tonumber(ARGV[2]))
+end
+return ttl
+"#;
+
+/// Claim an expiry unless the AoR's bindings were removed since its last
+/// save. KEYS: claim key, removed key. ARGV: the claim lifetime in seconds.
+const CLAIM_EXPIRY_SCRIPT: &str = r#"
+if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
+if redis.call('SET', KEYS[1], 1, 'NX', 'EX', ARGV[1]) then return 1 end
+return 0
+"#;
+
 /// `SCAN` batch size for the walks that remain (boot-time only).
 const SCAN_COUNT: usize = 1000;
 
@@ -320,8 +363,10 @@ impl RegistrarBackend for RedisBackend {
             .unwrap_or(0);
         // Nothing left that is still live: a save of only expired bindings is
         // a removal. Written as a hash it would have had no TTL to give it.
+        // It ran out rather than being ended, so it is not recorded as
+        // removed: the expiry is still claimed and announced once.
         if expiry <= now {
-            return self.remove(aor).await;
+            return self.delete_bindings(aor).await;
         }
 
         let key = self.key(aor);
@@ -331,7 +376,11 @@ impl RegistrarBackend for RedisBackend {
         // TTL, and move the AoR in the index, as one transaction: a reader
         // never sees the hash without its TTL or the index out of step.
         let mut pipe = redis::pipe();
-        pipe.atomic().del(&key).ignore();
+        pipe.atomic()
+            .del(&key)
+            .ignore()
+            .del(self.removed_key(aor))
+            .ignore();
         let mut hset = redis::cmd("HSET");
         hset.arg(&key);
         for contact in contacts {
@@ -406,14 +455,17 @@ impl RegistrarBackend for RedisBackend {
     async fn remove(&self, aor: &str) -> Result<(), BackendError> {
         let link = self.link_for(aor);
         let mut lease = link.lease().await?;
-        let mut pipe = redis::pipe();
-        pipe.atomic()
-            .del(self.key(aor))
-            .ignore()
-            .zrem(self.index_key(), aor)
-            .ignore();
-        pipe.query_async::<()>(&mut lease.connection)
+        redis::cmd("EVAL")
+            .arg(REMOVE_BINDINGS_SCRIPT)
+            .arg(3)
+            .arg(self.key(aor))
+            .arg(self.removed_key(aor))
+            .arg(self.index_key())
+            .arg(aor)
+            .arg(EXPIRY_CLAIM_TTL_SECS * 1000)
+            .query_async::<i64>(&mut lease.connection)
             .await
+            .map(|_| ())
             .map_err(|error| link.fail(&lease, error))
     }
 
@@ -553,18 +605,19 @@ impl RegistrarBackend for RedisBackend {
     async fn claim_expiry(&self, aor: &str, marker: &str) -> Result<bool, BackendError> {
         let link = self.link_for(aor);
         let mut lease = link.lease().await?;
-        // SET NX is the atomic claim. The key outlives the longest
-        // disagreement between nodes' sweeps, then goes by itself.
-        let claimed: Option<String> = redis::cmd("SET")
+        // SET NX is the atomic claim, refused while the AoR stands removed.
+        // The key outlives the longest disagreement between nodes' sweeps,
+        // then goes by itself.
+        let claimed: i64 = redis::cmd("EVAL")
+            .arg(CLAIM_EXPIRY_SCRIPT)
+            .arg(2)
             .arg(self.expiry_claim_key(aor, marker))
-            .arg(1)
-            .arg("NX")
-            .arg("EX")
+            .arg(self.removed_key(aor))
             .arg(EXPIRY_CLAIM_TTL_SECS)
             .query_async(&mut lease.connection)
             .await
             .map_err(|error| link.fail(&lease, error))?;
-        Ok(claimed.is_some())
+        Ok(claimed == 1)
     }
 
     async fn remove_aor_state(&self, aor: &str) -> Result<(), BackendError> {
