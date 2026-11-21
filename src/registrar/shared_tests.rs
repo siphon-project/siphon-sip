@@ -219,6 +219,56 @@ async fn a_node_does_not_announce_the_expiry_of_a_binding_another_node_refreshed
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_of_bindings_another_node_deregistered_runs_out_without_an_announcement() {
+    let store = Arc::new(MemoryBackend::new());
+    let (a, b) = (node(&store, "a", 1000), node(&store, "b", 1000));
+    let mut b_events = b.subscribe_events();
+    register(&a, "198.51.100.10", 2, 1);
+    settled(&a).await;
+    assert!(b.is_registered(AOR), "b caches the first generation");
+
+    // a refreshes and then de-registers while b does not look: b still
+    // holds the first generation, whose expiry is not the one a claimed.
+    register(&a, "198.51.100.10", 3600, 2);
+    settled(&a).await;
+    a.remove_all(AOR);
+    settled(&a).await;
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+
+    b.expire_stale();
+    assert_eq!(
+        expired_events(&mut b_events),
+        0,
+        "the registration was ended by a de-registration, not by expiry"
+    );
+    assert!(!b.is_registered(AOR));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registration_after_a_deregistration_is_announced_when_it_expires() {
+    let store = Arc::new(MemoryBackend::new());
+    let (a, b) = (node(&store, "a", 1000), node(&store, "b", 1000));
+    let (mut a_events, mut b_events) = (a.subscribe_events(), b.subscribe_events());
+    register(&a, "198.51.100.10", 3600, 1);
+    settled(&a).await;
+    a.remove_all(AOR);
+    settled(&a).await;
+
+    register(&a, "198.51.100.10", 2, 2);
+    settled(&a).await;
+    assert!(b.is_registered(AOR), "b caches the new registration");
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    a.expire_stale();
+    b.expire_stale();
+
+    assert_eq!(
+        expired_events(&mut a_events) + expired_events(&mut b_events),
+        1,
+        "the new registration's expiry is announced once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_a_shared_reader_a_node_sees_only_its_own_memory() {
     let store = Arc::new(MemoryBackend::new());
     let (a, b) = (node(&store, "a", 1000), {

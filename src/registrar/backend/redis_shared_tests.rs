@@ -167,3 +167,47 @@ async fn two_nodes_over_one_redis_share_bindings_and_announce_an_expiry_once() {
         "a removal reaches b within the window"
     );
 }
+
+/// A node whose copy of an AoR is a generation behind the store does not
+/// announce its expiry when another node de-registered the AoR in between;
+/// a registration after that is announced once when it runs out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_of_bindings_another_node_deregistered_runs_out_without_an_announcement() {
+    let Some(url) = test_url() else { return };
+    let prefix = unique_prefix("removed");
+    let a = node(connect(&url, &prefix).await, "a", 100);
+    let b = node(connect(&url, &prefix).await, "b", 100);
+    let (mut a_events, mut b_events) = (a.subscribe_events(), b.subscribe_events());
+    let aor = "sip:alice@ims.example.invalid";
+    let uri = SipUri::new("198.51.100.10".to_string()).with_user("alice".to_string());
+    let announced = |events: &mut tokio::sync::broadcast::Receiver<RegistrationEvent>| {
+        let mut count = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, RegistrationEvent::Expired { .. }) {
+                count += 1;
+            }
+        }
+        count
+    };
+
+    a.save(aor, uri.clone(), 2, 1.0, "call-1".to_string(), 1)
+        .expect("save");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(b.is_registered(aor), "b caches the first generation");
+    a.save(aor, uri.clone(), 3600, 1.0, "call-1".to_string(), 2)
+        .expect("save");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    a.remove_all(aor);
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    b.expire_stale();
+    assert_eq!(announced(&mut b_events), 0, "ended by a de-registration");
+
+    a.save(aor, uri, 2, 1.0, "call-2".to_string(), 1)
+        .expect("save");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(b.is_registered(aor), "b caches the new registration");
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    a.expire_stale();
+    b.expire_stale();
+    assert_eq!(announced(&mut a_events) + announced(&mut b_events), 1);
+}
