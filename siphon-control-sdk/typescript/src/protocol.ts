@@ -106,6 +106,11 @@ export interface HelloResult {
   app: string;
   protocol: number;
   subprotocol: string;
+  /**
+   * The boot epoch of the siphon-sip process that answered: new at every start.
+   * Absent from a server that predates it, `null` without a registrar.
+   */
+  instance_epoch?: string | null;
 }
 
 /** One channel in a `resync` reply — the id triple plus its state + vars. */

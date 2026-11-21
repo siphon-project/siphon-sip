@@ -31,6 +31,10 @@ export interface StubOptions {
   resyncChannels?: unknown[];
   /** Auto-answer the `hello` handshake (default true). */
   autoHello?: boolean;
+  /** The boot epoch `hello` reports, given the 1-based connection number. */
+  instanceEpoch?: (connection: number) => string;
+  /** Run right after `hello` was answered (push an event before any resync). */
+  afterHello?: (socket: WebSocket, connection: number) => void;
 }
 
 /** A protocol-speaking WebSocket stub the SDK's client can connect to. */
@@ -38,6 +42,7 @@ export class ControlStub {
   /** Every command frame the stub received, in order. */
   readonly received: CommandFrameLike[] = [];
   private readonly sockets = new Set<WebSocket>();
+  private connections = 0;
 
   private constructor(
     private readonly wss: WebSocketServer,
@@ -77,6 +82,7 @@ export class ControlStub {
 
   private onConnection(socket: WebSocket): void {
     this.sockets.add(socket);
+    const connection = ++this.connections;
     socket.on("close", () => this.sockets.delete(socket));
     socket.on("message", (data) => {
       const frame = JSON.parse(data.toString()) as CommandFrameLike;
@@ -84,14 +90,21 @@ export class ControlStub {
         return;
       }
       this.received.push(frame);
-      const reply = this.replyFor(frame, socket);
+      const reply = this.replyFor(frame, socket, connection);
       if (reply) {
         socket.send(JSON.stringify({ id: frame.id, type: "reply", ...reply }));
+      }
+      if (frame.verb === "hello" && reply) {
+        this.options.afterHello?.(socket, connection);
       }
     });
   }
 
-  private replyFor(frame: CommandFrameLike, socket: WebSocket): ReplyBody | undefined {
+  private replyFor(
+    frame: CommandFrameLike,
+    socket: WebSocket,
+    connection: number,
+  ): ReplyBody | undefined {
     if (frame.verb === "hello" && (this.options.autoHello ?? true)) {
       const args = frame.args ?? {};
       return {
@@ -100,6 +113,9 @@ export class ControlStub {
           app: (args.app as string) ?? "app",
           protocol: (args.protocol as number) ?? 1,
           subprotocol: SUBPROTOCOL,
+          ...(this.options.instanceEpoch
+            ? { instance_epoch: this.options.instanceEpoch(connection) }
+            : {}),
         },
       };
     }
@@ -117,6 +133,13 @@ export class ControlStub {
     const targets = socket ? [socket] : [...this.sockets];
     for (const target of targets) {
       target.send(JSON.stringify({ type: "event", ...event }));
+    }
+  }
+
+  /** Drop every connection from the server's side, as a restart would. */
+  dropConnections(): void {
+    for (const socket of this.sockets) {
+      socket.terminate();
     }
   }
 

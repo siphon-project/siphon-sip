@@ -319,6 +319,13 @@ pub struct HelloResult {
     pub protocol: u32,
     /// The negotiated subprotocol token.
     pub subprotocol: String,
+    /// The boot epoch of the siphon-sip process that answered: new at every
+    /// start, and the `instance_epoch` its registration state carries. An app
+    /// that sees it change knows the process restarted and what it held in
+    /// memory is gone. `None` from a server that predates it or has no
+    /// registrar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_epoch: Option<String>,
 }
 
 /// One channel in a `resync` reply — the id triple plus its current state + vars.
@@ -351,6 +358,27 @@ pub struct ResyncResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `hello` result from a server that predates the boot epoch still
+    /// parses, and one that names it carries it through.
+    #[test]
+    fn hello_result_epoch_is_optional() {
+        let old: HelloResult = serde_json::from_str(
+            r#"{"app":"ivr-app","protocol":1,"subprotocol":"siphon-control.v1"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.instance_epoch, None);
+        let new: HelloResult = serde_json::from_str(
+            r#"{"app":"ivr-app","protocol":1,"subprotocol":"siphon-control.v1","instance_epoch":"boot-2"}"#,
+        )
+        .unwrap();
+        assert_eq!(new.instance_epoch.as_deref(), Some("boot-2"));
+        let null: HelloResult = serde_json::from_str(
+            r#"{"app":"ivr-app","protocol":1,"subprotocol":"siphon-control.v1","instance_epoch":null}"#,
+        )
+        .unwrap();
+        assert_eq!(null.instance_epoch, None);
+    }
 
     #[test]
     fn command_frame_round_trip() {

@@ -87,6 +87,9 @@ export interface AppEvent {
 /** A handler for application-level events. */
 export type AppEventHandler = (event: AppEvent) => void;
 
+/** Called with the server's boot epoch each time the connection is re-established. */
+export type ReconnectHandler = (instanceEpoch: string | null) => void;
+
 /** Options for a UAS provisional / final response (`answer` / `progress`). */
 export interface ResponseOptions {
   code?: number;
@@ -2191,6 +2194,7 @@ class SipFacade {
   private handler: CallHandler | null = null;
   private callQueue: AsyncQueue<Call> | null = null;
   private appHandler: AppEventHandler | null = null;
+  private reconnectHandler: ReconnectHandler | null = null;
   private readonly channels = new Map<string, AsyncQueue<CallEvent>>();
 
   setHandler(handler: CallHandler): void {
@@ -2199,6 +2203,10 @@ class SipFacade {
 
   setAppHandler(handler: AppEventHandler): void {
     this.appHandler = handler;
+  }
+
+  setReconnectHandler(handler: ReconnectHandler): void {
+    this.reconnectHandler = handler;
   }
 
   setStream(): CallStream {
@@ -2210,8 +2218,10 @@ class SipFacade {
   handleClientEvent(event: ClientEvent, transport: CommandTransport): void {
     if (event.type === "event") {
       this.handleEvent(event.frame, transport);
-    } else {
+    } else if (event.type === "reattach") {
       this.reattach(event.snapshot, transport);
+    } else if (event.type === "reconnected") {
+      this.reconnectHandler?.(event.instanceEpoch);
     }
   }
 
@@ -2380,6 +2390,25 @@ export class SipClient {
    */
   onAppEvent(handler: AppEventHandler): void {
     this.facade.setAppHandler(handler);
+  }
+
+  /**
+   * Register a handler called each time the connection is lost and
+   * re-established, after its channels were re-attached and before any event of
+   * the new connection reaches {@link SipClient.onAppEvent}. Events pushed to
+   * the app while it was away are gone, so re-read whatever state the app keeps
+   * from events here ({@link SipClient.registrations}) and apply only events
+   * numbered above the reply's `seq`. The argument is the server's boot epoch,
+   * so a restart can be told from a dropped connection. Replaces any previous
+   * handler.
+   */
+  onReconnected(handler: ReconnectHandler): void {
+    this.facade.setReconnectHandler(handler);
+  }
+
+  /** The boot epoch the connection reached, as its last `hello` reported it. */
+  get instanceEpoch(): string | null {
+    return this.client.instanceEpoch;
   }
 
   /** Drive the supervised connection loop (reconnect + resync). */
