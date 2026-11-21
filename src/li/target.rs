@@ -146,13 +146,52 @@ pub enum MatchedParty {
     Terminating,
 }
 
-/// One warrant matching one message, and which party it matched.
+/// Where on a message a warrant's identifier was found.
+///
+/// Kept apart from [`MatchedParty`] because the party folds the Request-URI
+/// and the To together and calls a source address "originating", and neither
+/// is enough to say who *sent* a given message: the party in From sent a
+/// request and received a response, while the party at the source address sent
+/// whichever it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchedField {
+    /// The From header.
+    From,
+    /// The Request-URI.
+    RequestUri,
+    /// The To header.
+    To,
+    /// The address the message arrived from.
+    SourceAddress,
+}
+
+/// One warrant matching one message, and which party it matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
     /// The task whose warrant matched.
     pub x_id: XId,
     /// Which end of the call it names.
     pub party: MatchedParty,
+    /// Where on the message the identifier was found.
+    pub field: MatchedField,
+    /// The canonical index key that hit, which [`identifier_for_key`] turns
+    /// back into the identifier the ADMF provisioned.
+    pub key: String,
+}
+
+/// The identifier among `identifiers` that is indexed under `key`.
+///
+/// A task lists several identifiers and a message matches on one of them; the
+/// index only knows the canonical key, so this recovers which provisioned
+/// identifier that key came from. TS 103 221-2 clause 5.3.18 wants that one on
+/// the record, in the form it was provisioned in.
+pub fn identifier_for_key<'a>(
+    identifiers: &'a [TargetIdentifier],
+    key: &str,
+) -> Option<&'a TargetIdentifier> {
+    identifiers
+        .iter()
+        .find(|identifier| index_key(identifier).as_deref() == Some(key))
 }
 
 /// The matching index: canonical identifier key to the tasks provisioned on it.
@@ -227,12 +266,21 @@ impl TargetStore {
     /// provisioned by both IMPU and IMPI is the ordinary case. Returning it
     /// twice would mean two IRI records for one message.
     pub fn match_uri(&self, uri: &str) -> Vec<XId> {
+        self.match_uri_keyed(uri)
+            .into_iter()
+            .map(|(x_id, _)| x_id)
+            .collect()
+    }
+
+    /// [`match_uri`](Self::match_uri), with the canonical key each task was
+    /// found under: the first of the URI's candidate keys that names it.
+    fn match_uri_keyed(&self, uri: &str) -> Vec<(XId, String)> {
         let mut seen = HashSet::new();
         let mut matched = Vec::new();
         for key in candidate_keys(uri) {
             for x_id in self.tasks_for_key(&key) {
                 if seen.insert(x_id) {
-                    matched.push(x_id);
+                    matched.push((x_id, key.clone()));
                 }
             }
         }
@@ -276,15 +324,24 @@ impl TargetStore {
         // Ordered so the originating side is considered first and therefore
         // wins the deduplication.
         let candidates = [
-            (from_uri, MatchedParty::Originating),
-            (request_uri, MatchedParty::Terminating),
-            (to_uri, MatchedParty::Terminating),
+            (from_uri, MatchedParty::Originating, MatchedField::From),
+            (
+                request_uri,
+                MatchedParty::Terminating,
+                MatchedField::RequestUri,
+            ),
+            (to_uri, MatchedParty::Terminating, MatchedField::To),
         ];
-        for (uri, party) in candidates {
+        for (uri, party, field) in candidates {
             let Some(uri) = uri else { continue };
-            for x_id in self.match_uri(uri) {
+            for (x_id, key) in self.match_uri_keyed(uri) {
                 if seen.insert(x_id) {
-                    matched.push(Match { x_id, party });
+                    matched.push(Match {
+                        x_id,
+                        party,
+                        field,
+                        key,
+                    });
                 }
             }
         }
@@ -297,6 +354,8 @@ impl TargetStore {
                     matched.push(Match {
                         x_id,
                         party: MatchedParty::Originating,
+                        field: MatchedField::SourceAddress,
+                        key: address.to_string(),
                     });
                 }
             }

@@ -10,8 +10,7 @@
 //! the Mediation and Delivery Function sends onwards to the LEMF. X2 is the
 //! interface into the MDF, and TS 103 221-2 is what an MDF reads there.
 
-use super::pdu::{attribute_type, Attribute, PayloadDirection, PayloadFormat, Pdu, PduType};
-use super::target::MatchedParty;
+use super::pdu::{Attribute, PayloadFormat, Pdu, PduType};
 use super::IriEvent;
 use crate::config::{LiTlsConfig, LiX2Config};
 use std::collections::HashMap;
@@ -624,12 +623,12 @@ fn encode_iri_event(event: &IriEvent, sequence: u32) -> Result<Vec<u8>, super::p
     if let Some(destination) = event.destination_ip {
         attributes.push(Attribute::destination_address(destination));
     }
-    // Clause 5.3: which of the task's target identifiers this traffic matched.
-    // The LIID is the ADMF's name for the warrant and is what the MDF keys its
-    // handover on, so it is carried rather than left for the MDF to look up.
-    attributes.push(Attribute::text(
-        attribute_type::MATCHED_TARGET_IDENTIFIER,
-        &event.liid,
+    // Clause 5.3.18: which of the task's target identifiers this traffic
+    // matched. The LIID is not one of them and has no attribute on X2: it is
+    // the ADMF's name for the warrant, and the mediation function already
+    // holds it against the XID every PDU carries (clause 5.2.7).
+    attributes.push(Attribute::matched_target_identifier(
+        &event.matched_identifier,
     ));
 
     let payload = match &event.raw_message {
@@ -641,7 +640,7 @@ fn encode_iri_event(event: &IriEvent, sequence: u32) -> Result<Vec<u8>, super::p
             return Pdu {
                 pdu_type: PduType::X2,
                 payload_format: PayloadFormat::Proprietary,
-                payload_direction: direction_for(event.party),
+                payload_direction: event.direction,
                 x_id: event.x_id.as_bytes(),
                 correlation_id: event.correlation_id.to_be_bytes(),
                 attributes,
@@ -654,26 +653,13 @@ fn encode_iri_event(event: &IriEvent, sequence: u32) -> Result<Vec<u8>, super::p
     Pdu {
         pdu_type: PduType::X2,
         payload_format: PayloadFormat::Sip,
-        payload_direction: direction_for(event.party),
+        payload_direction: event.direction,
         x_id: event.x_id.as_bytes(),
         correlation_id: event.correlation_id.to_be_bytes(),
         attributes,
         payload,
     }
     .encode()
-}
-
-/// Direction relative to the target (clause 5.2.6).
-///
-/// The warrant names one party. A message the target originated is
-/// "sent from target"; one addressed to them is "sent to target". Which is
-/// which comes from the match, because the same INVITE is either depending on
-/// whether the warrant named the caller or the callee.
-fn direction_for(party: MatchedParty) -> PayloadDirection {
-    match party {
-        MatchedParty::Originating => PayloadDirection::SentFromTarget,
-        MatchedParty::Terminating => PayloadDirection::SentToTarget,
-    }
 }
 
 /// A one-line rendering of an event whose original bytes were not retained.
@@ -690,8 +676,10 @@ fn summarise(event: &IriEvent) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::x1::types::{DeliveryType, XId};
+    use super::super::x1::types::{DeliveryType, TargetIdentifier, XId};
     use super::*;
+    use crate::li::pdu::{attribute_type, PayloadDirection};
+    use crate::li::target::MatchedParty;
     use crate::li::IriEventType;
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::SystemTime;
@@ -772,6 +760,8 @@ mod tests {
             destination_ip: None,
             delivery_type: DeliveryType::X2AndX3,
             party: crate::li::target::MatchedParty::Originating,
+            matched_identifier: TargetIdentifier::E164Number("999000000001".to_string()),
+            direction: PayloadDirection::SentFromTarget,
             raw_message: Some(RAW_INVITE.to_vec()),
         }
     }
@@ -818,17 +808,299 @@ mod tests {
         assert_eq!(&encoded[header_length..], odd);
     }
 
+    /// Clause 5.2.6 is about the message, so the PDU carries the event's own
+    /// direction. The party the warrant names does not decide it: on a call the
+    /// target places, the far end's 180 travels to the target.
     #[test]
-    fn direction_follows_the_matched_party_not_the_method() {
+    fn direction_is_the_messages_own_not_the_matched_partys() {
         let mut event = test_iri_event();
-
         event.party = MatchedParty::Originating;
+
+        event.direction = PayloadDirection::SentToTarget;
+        let to_target = encode_iri_event(&event, 0).expect("event must frame");
+        assert_eq!(&to_target[14..16], &[0x00, 0x02], "sent to target");
+
+        event.direction = PayloadDirection::SentFromTarget;
         let from_target = encode_iri_event(&event, 0).expect("event must frame");
         assert_eq!(&from_target[14..16], &[0x00, 0x03], "sent from target");
 
         event.party = MatchedParty::Terminating;
-        let to_target = encode_iri_event(&event, 0).expect("event must frame");
-        assert_eq!(&to_target[14..16], &[0x00, 0x02], "sent to target");
+        let still_from_target = encode_iri_event(&event, 0).expect("event must frame");
+        assert_eq!(&still_from_target[14..16], &[0x00, 0x03]);
+
+        event.direction = PayloadDirection::Unknown;
+        let unknown = encode_iri_event(&event, 0).expect("event must frame");
+        assert_eq!(&unknown[14..16], &[0x00, 0x01], "not known to the POI");
+    }
+
+    /// An event at a fixed instant, so the whole PDU is a known answer.
+    fn known_answer_event() -> IriEvent {
+        let mut event = test_iri_event();
+        event.timestamp =
+            SystemTime::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_789);
+        event.direction = PayloadDirection::SentToTarget;
+        event
+    }
+
+    /// The whole PDU against TS 103 221-2 V1.10.1, octet by octet, written out
+    /// from the specification's tables rather than read back through anything
+    /// of ours: clause 5.2 for the header, 5.3.10 the timestamp, 5.3.9 the
+    /// sequence number, and 5.3.18 for attribute 17, which is the contents of
+    /// the X1 `TargetIdentifier` element as UTF-8 (its NOTE gives
+    /// `<imsi>204081234567890</imsi>` as the shape).
+    #[test]
+    fn the_x2_pdu_is_the_known_answer_for_a_matched_e164_number() {
+        let encoded = encode_iri_event(&known_answer_event(), 1).expect("event must frame");
+
+        let mut expected: Vec<u8> = vec![
+            0x00, 0x05, // version 0.5
+            0x00, 0x01, // X2 PDU
+            0x00, 0x00, 0x00, 0x65, // header length: 40 + 12 + 8 + 41
+            0x00, 0x00, 0x00, 0x39, // payload length: the 57-octet SIP message
+            0x00, 0x09, // payload format SIP
+            0x00, 0x02, // sent to target
+            // XID 11111111-2222-3333-4444-555555555555
+            0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55, //
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x92, // correlation 4242
+            0x00, 0x09, 0x00, 0x08, // timestamp, 8 octets
+            0x65, 0x53, 0xf1, 0x00, // 1 700 000 000 s
+            0x07, 0x5b, 0xcd, 0x15, // 123 456 789 ns
+            0x00, 0x08, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, // sequence number 1
+            0x00, 0x11, 0x00, 0x25, // matched target identifier, 37 octets
+        ];
+        expected.extend_from_slice(b"<e164Number>999000000001</e164Number>");
+        expected.extend_from_slice(RAW_INVITE);
+
+        assert_eq!(encoded, expected);
+    }
+
+    /// The attributes of an encoded PDU, by type, walked from the header
+    /// lengths the PDU itself declares.
+    fn attributes_of(encoded: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let header_length =
+            u32::from_be_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
+        let mut attributes = Vec::new();
+        let mut offset = 40;
+        while offset < header_length {
+            let kind = u16::from_be_bytes([encoded[offset], encoded[offset + 1]]);
+            let length = u16::from_be_bytes([encoded[offset + 2], encoded[offset + 3]]) as usize;
+            attributes.push((kind, encoded[offset + 4..offset + 4 + length].to_vec()));
+            offset += 4 + length;
+        }
+        attributes
+    }
+
+    fn matched_target_identifier_of(event: &IriEvent) -> Vec<String> {
+        let encoded = encode_iri_event(event, 0).expect("event must frame");
+        attributes_of(&encoded)
+            .into_iter()
+            .filter(|(kind, _)| *kind == 17)
+            .map(|(_, value)| String::from_utf8(value).expect("attribute 17 is UTF-8"))
+            .collect()
+    }
+
+    /// The LIID is the ADMF's name for the warrant, not a target identifier,
+    /// and has no attribute on X2: the PDU's XID names the task and the
+    /// mediation function holds the LIID against it.
+    #[test]
+    fn attribute_17_is_the_matched_target_identifier_never_the_liid() {
+        let mut event = test_iri_event();
+        event.liid = "LI-001".to_string();
+        assert_eq!(
+            matched_target_identifier_of(&event),
+            ["<e164Number>999000000001</e164Number>"]
+        );
+
+        let encoded = encode_iri_event(&event, 0).expect("event must frame");
+        let header_length =
+            u32::from_be_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
+        assert!(
+            !encoded[..header_length]
+                .windows(6)
+                .any(|window| window == b"LI-001"),
+            "the LIID is not a conditional attribute"
+        );
+    }
+
+    /// Each identifier under the element name and value form the X1 schema
+    /// gives it, since clause 5.3.18 defines the attribute by that schema.
+    #[test]
+    fn attribute_17_uses_the_x1_element_of_each_identifier_type() {
+        let cases = [
+            (
+                TargetIdentifier::SipUri("sip:alice@example.com".to_string()),
+                "<sipUri>sip:alice@example.com</sipUri>",
+            ),
+            (
+                TargetIdentifier::TelUri("tel:+999000000001".to_string()),
+                "<telUri>tel:+999000000001</telUri>",
+            ),
+            (
+                TargetIdentifier::Impu("sip:001010000000001@ims.example.com".to_string()),
+                "<impu>sip:001010000000001@ims.example.com</impu>",
+            ),
+            (
+                TargetIdentifier::Impi("001010000000001@ims.example.com".to_string()),
+                "<impi>001010000000001@ims.example.com</impi>",
+            ),
+            (
+                TargetIdentifier::Imsi("001010000000001".to_string()),
+                "<imsi>001010000000001</imsi>",
+            ),
+            (
+                TargetIdentifier::Ipv4Address(Ipv4Addr::new(192, 0, 2, 10)),
+                "<ipv4Address>192.0.2.10</ipv4Address>",
+            ),
+            (
+                TargetIdentifier::Ipv6Address("2001:db8::10".parse().expect("a literal address")),
+                "<ipv6Address>2001:0db8:0000:0000:0000:0000:0000:0010</ipv6Address>",
+            ),
+        ];
+        for (identifier, expected) in cases {
+            let mut event = test_iri_event();
+            event.matched_identifier = identifier;
+            assert_eq!(matched_target_identifier_of(&event), [expected]);
+        }
+    }
+
+    /// The attribute is element content, so what XML reserves is escaped: a
+    /// SIP URI may carry `&` in its headers part, and a bare one would leave
+    /// the mediation function with text it cannot parse.
+    #[test]
+    fn attribute_17_escapes_what_xml_reserves() {
+        let mut event = test_iri_event();
+        event.matched_identifier =
+            TargetIdentifier::SipUri("sip:alice@example.com?a=<1>&b=2".to_string());
+        assert_eq!(
+            matched_target_identifier_of(&event),
+            ["<sipUri>sip:alice@example.com?a=&lt;1&gt;&amp;b=2</sipUri>"]
+        );
+    }
+
+    /// Wireshark's own `li5g` dissector reading the PDU back. It shares none
+    /// of our reading of the specification, which a test of ours cannot say.
+    ///
+    /// Skips when `tshark` or `text2pcap` is not installed, or is too old to
+    /// know the protocol.
+    #[test]
+    fn wireshark_reads_back_the_matched_target_and_the_direction() {
+        use std::process::Command;
+
+        let fields = match Command::new("tshark").args(["-G", "fields"]).output() {
+            Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+            Err(_) => {
+                eprintln!("skipped: tshark is not installed");
+                return;
+            }
+        };
+        if !fields.contains("li5g.mti") {
+            eprintln!("skipped: this tshark has no li5g dissector");
+            return;
+        }
+
+        // tshark is commonly confined to a short list of readable paths, and
+        // the system temporary directory is on it where a checkout is not.
+        let directory = std::env::temp_dir().join(format!("siphon-x2-li5g-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let hex_path = directory.join("x2.hex");
+        let capture_path = directory.join("x2.pcap");
+
+        let mut frames = String::new();
+        for direction in [
+            PayloadDirection::SentToTarget,
+            PayloadDirection::SentFromTarget,
+        ] {
+            let mut event = known_answer_event();
+            event.direction = direction;
+            let encoded = encode_iri_event(&event, 1).expect("event must frame");
+            // `text2pcap`'s hex-dump form; an offset of zero starts a packet.
+            for (index, chunk) in encoded.chunks(16).enumerate() {
+                frames.push_str(&format!("{:06x}", index * 16));
+                for byte in chunk {
+                    frames.push_str(&format!(" {byte:02x}"));
+                }
+                frames.push('\n');
+            }
+        }
+        std::fs::write(&hex_path, frames).expect("the hex dump is writable");
+
+        let converted = Command::new("text2pcap")
+            .args(["-q", "-T", "1234,42069"])
+            .arg(&hex_path)
+            .arg(&capture_path)
+            .status();
+        let Ok(converted) = converted else {
+            eprintln!("skipped: text2pcap is not installed");
+            return;
+        };
+        assert!(converted.success(), "text2pcap must accept the dump");
+
+        let dissect = |arguments: &[&str]| {
+            let output = Command::new("tshark")
+                .arg("-r")
+                .arg(&capture_path)
+                .args(["-d", "tcp.port==42069,li5g"])
+                .args(arguments)
+                .output()
+                .expect("tshark ran a moment ago");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+
+        let read_back = dissect(&[
+            "-T",
+            "fields",
+            "-E",
+            "separator=|",
+            // The dissector adds each attribute to the tree twice, as the
+            // subtree's label and as the value under it.
+            "-E",
+            "occurrence=f",
+            "-e",
+            "li5g.pd",
+            "-e",
+            "li5g.mti",
+            "-e",
+            "li5g.xid",
+            "-e",
+            "li5g.cid",
+            "-e",
+            "li5g.sq",
+            "-e",
+            "sip.Method",
+        ]);
+        let tree = dissect(&["-V"]);
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let lines: Vec<&str> = read_back.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "2|<e164Number>999000000001</e164Number>|11111111-2222-3333-4444-555555555555|4242|1|INVITE",
+                "3|<e164Number>999000000001</e164Number>|11111111-2222-3333-4444-555555555555|4242|1|INVITE",
+            ],
+            "Wireshark must read back what was meant:\n{tree}"
+        );
+        // Only what the dissector said of the PDU and the SIP inside it; the
+        // fabricated TCP header above it has unknowns of its own.
+        let dissected: Vec<String> = tree
+            .split("Lawful Interception 5G")
+            .skip(1)
+            .map(|pdu| pdu.split("\nFrame ").next().unwrap_or(pdu).to_lowercase())
+            .collect();
+        assert_eq!(dissected.len(), 2, "both PDUs dissect as li5g:\n{tree}");
+        for pdu in &dissected {
+            for rejected in ["malformed", "unknown", "expert info"] {
+                assert!(
+                    !pdu.contains(rejected),
+                    "Wireshark flagged the PDU as {rejected}:\n{pdu}"
+                );
+            }
+            assert!(
+                pdu.contains("attribute type: matched target identifier (17)"),
+                "{pdu}"
+            );
+        }
     }
 
     #[test]
@@ -866,7 +1138,7 @@ mod tests {
             .is_some_and(|value| value == vec![198, 51, 100, 9]));
         assert!(
             find_attribute(attributes, attribute_type::MATCHED_TARGET_IDENTIFIER)
-                .is_some_and(|value| value == b"LI-001".to_vec())
+                .is_some_and(|value| value == b"<e164Number>999000000001</e164Number>".to_vec())
         );
     }
 

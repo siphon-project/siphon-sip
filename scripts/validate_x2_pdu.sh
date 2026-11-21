@@ -86,8 +86,8 @@ expect x2x3.payloadDirection 3
 expect x2x3.xid 00010203-0405-0607-0809-0a0b0c0d0e0f
 expect x2x3.correlationId 0x1122334455667788
 # 40 mandatory + timestamp (4+8) + sequence number (4+4) + matched target
-# identifier (4+6) = 70.
-expect x2x3.headerLength 70
+# identifier (4+37) = 101.
+expect x2x3.headerLength 101
 expect x2x3.payloadLength 38
 
 # Wireshark hands the payload to its own SIP dissector, so this also proves the
@@ -117,7 +117,7 @@ check_tree() {
 check_tree "version 0.5" 'Version: Major: 0, Minor: 5'
 check_tree "timestamp attribute" '2023-11-14 23:13:20\.123456789'
 check_tree "sequence number attribute" 'Sequence Number'
-check_tree "matched target identifier" 'LI-001'
+check_tree "matched target identifier" '<e164Number>999000000001</e164Number>'
 
 if [[ $status -ne 0 ]]; then
   echo "X2 PDU validation FAILED" >&2

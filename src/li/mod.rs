@@ -81,10 +81,12 @@ pub struct IriEvent {
     ///
     /// Its 16 bytes are the XID of every X2 and X3 PDU delivered for it.
     pub x_id: XId,
-    /// The handover identifier the mediation function keys on.
+    /// The warrant's LIID, for logs and audit.
     ///
     /// Taken from the task's `mediationDetails`; when the ADMF provisioned
     /// none, this is the XID's text form so the record is still attributable.
+    /// Not on the X2 wire, which has no attribute for it: the XID is what a
+    /// mediation function ties a record to its warrant by.
     pub liid: String,
     /// Correlation identifier for this session.
     ///
@@ -116,10 +118,16 @@ pub struct IriEvent {
     pub delivery_type: DeliveryType,
     /// Which end of the call the warrant names.
     ///
-    /// Carried on the record because a mediation function renders a session
-    /// relative to its target, and because the same value decides the
-    /// target-relative direction on the session's X3 packets.
+    /// The same value decides the target-relative direction on the session's
+    /// X3 packets. It does not decide this record's: see `direction`.
     pub party: crate::li::target::MatchedParty,
+    /// The target identifier this session was intercepted on, as provisioned
+    /// (TS 103 221-2 clause 5.3.18).
+    pub matched_identifier: x1::types::TargetIdentifier,
+    /// Whether this message was sent by the target or towards it
+    /// (TS 103 221-2 clause 5.2.6). Per message, unlike `party`: on a call the
+    /// target places, the far end's responses travel to the target.
+    pub direction: pdu::PayloadDirection,
     /// Where this event goes: exactly the X2-capable destinations the task
     /// names in `listOfDIDs`, resolved at match time.
     pub destinations: Vec<SocketAddr>,
@@ -399,6 +407,8 @@ impl LiManager {
             destination_ip: None,
             delivery_type: task.details.delivery_type,
             party: matched.party,
+            matched_identifier: matched.identifier.clone(),
+            direction: matched.direction,
             destinations,
             raw_message,
         }
@@ -574,6 +584,23 @@ mod tests {
         delivery: DeliveryType,
         liid: Option<&str>,
     ) -> XId {
+        provision_targets(
+            manager,
+            delivery,
+            liid,
+            vec![TargetIdentifier::SipUri(
+                "sip:alice@example.com".to_string(),
+            )],
+        )
+    }
+
+    /// [`provision`] for a warrant on the given target identifiers.
+    pub(super) fn provision_targets(
+        manager: &LiManager,
+        delivery: DeliveryType,
+        liid: Option<&str>,
+        target_identifiers: Vec<TargetIdentifier>,
+    ) -> XId {
         let d_id = DId::generate();
         manager
             .destinations()
@@ -593,9 +620,7 @@ mod tests {
             .tasks()
             .activate(TaskDetails {
                 x_id,
-                target_identifiers: vec![TargetIdentifier::SipUri(
-                    "sip:alice@example.com".to_string(),
-                )],
+                target_identifiers,
                 delivery_type: delivery,
                 list_of_dids: vec![d_id],
                 list_of_dsids: Vec::new(),
@@ -1097,6 +1122,50 @@ mod tests {
         assert_ne!(received.correlation_id, 0);
         assert_eq!(received.event_type, IriEventType::Begin);
         assert_eq!(received.delivery_type, DeliveryType::X2AndX3);
+    }
+
+    /// A warrant lists several identifiers; the record names the one the
+    /// traffic matched, in the form it was provisioned in, not the first and
+    /// not the form the traffic happened to write it in.
+    #[test]
+    fn an_iri_event_names_the_target_identifier_that_matched() {
+        let (manager, _iri, _audit) = manager();
+        provision_targets(
+            &manager,
+            DeliveryType::X2Only,
+            Some("LI-2026-0001"),
+            vec![
+                TargetIdentifier::SipUri("sip:alice@example.com".to_string()),
+                TargetIdentifier::E164Number("999000000001".to_string()),
+            ],
+        );
+        let event_for = |from: &str| {
+            let matched = manager
+                .check_message(None, Some(from), None, None)
+                .remove(0);
+            manager.build_iri_event(
+                &matched,
+                IriEventType::Begin,
+                "call-1@example.com",
+                "call-1@example.com",
+                "INVITE",
+                None,
+                from,
+                "sip:bob@example.com",
+                None,
+                None,
+                None,
+            )
+        };
+
+        assert_eq!(
+            event_for("<sip:+999000000001@example.com;user=phone>;tag=a").matched_identifier,
+            TargetIdentifier::E164Number("999000000001".to_string())
+        );
+        assert_eq!(
+            event_for("\"Alice\" <sip:Alice@Example.com>;tag=a").matched_identifier,
+            TargetIdentifier::SipUri("sip:alice@example.com".to_string())
+        );
     }
 
     #[test]

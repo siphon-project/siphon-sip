@@ -37,6 +37,8 @@
 use std::net::IpAddr;
 use std::time::SystemTime;
 
+use super::x1::types::TargetIdentifier;
+
 /// Major version of the PDU format (clause 5.2.1). Fixed at 0.
 pub const MAJOR_VERSION: u8 = 0;
 
@@ -136,7 +138,9 @@ impl PayloadFormat {
 ///
 /// Target-relative, not network-relative: the same message is "to target" or
 /// "from target" depending on which party the warrant names, which is why this
-/// is derived from the match and not from the socket the bytes arrived on.
+/// is derived from the match and not from the socket the bytes arrived on. And
+/// per message, not per call: the session works out for each one whether the
+/// target sent it (`li::session`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadDirection {
     /// Reserved; the value keepalive PDUs carry.
@@ -214,6 +218,30 @@ impl Attribute {
     /// A text-valued attribute (NFID, IPID, target identifiers).
     pub fn text(attribute_type: u16, value: &str) -> Self {
         Self::raw(attribute_type, value.as_bytes().to_vec())
+    }
+
+    /// The Matched Target Identifier attribute (type 17).
+    ///
+    /// ETSI TS 103 221-2 V1.10.1 clause 5.3.18: the target identifier the POI
+    /// matched, "given as a TargetIdentifier as defined in ETSI TS 103 221-1,
+    /// clause 6.2.1.2, table 6.2.1.2-2, as the contents of the
+    /// TargetIdentifier tag without the enclosing TargetIdentifier tag itself,
+    /// encoded in UTF-8". Its NOTE gives `<imsi>204081234567890</imsi>`: the
+    /// one child element, unprefixed, under the name and value form the X1
+    /// schema gives the identifier type. Not the LIID, which is the warrant's
+    /// name and identifies no target; the PDU's XID is what ties a record to
+    /// its task (clause 5.2.7).
+    ///
+    /// The value is element content, so the characters XML reserves are
+    /// escaped: a SIP URI may legitimately carry `&`.
+    pub fn matched_target_identifier(identifier: &TargetIdentifier) -> Self {
+        let name = identifier.element_name();
+        let value = identifier.value_text();
+        let value = quick_xml::escape::partial_escape(&value);
+        Self::text(
+            attribute_type::MATCHED_TARGET_IDENTIFIER,
+            &format!("<{name}>{value}</{name}>"),
+        )
     }
 
     /// The timestamp attribute: seconds then nanoseconds, both 32-bit.
@@ -633,7 +661,9 @@ mod tests {
                 SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789),
             ),
             Attribute::sequence_number(1),
-            Attribute::text(attribute_type::MATCHED_TARGET_IDENTIFIER, "LI-001"),
+            Attribute::matched_target_identifier(&TargetIdentifier::E164Number(
+                "999000000001".to_string(),
+            )),
         ];
         let encoded = pdu.encode().expect("well-formed PDU must encode");
 
