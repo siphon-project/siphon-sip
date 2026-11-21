@@ -55,13 +55,29 @@ impl ClientConfig {
 }
 
 /// An item on the client's generic event stream.
+///
+/// Non-exhaustive: match it with a wildcard arm, so a variant added later does
+/// not break the match.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ClientEvent {
     /// A pushed event frame from the server (any module).
     Event(EventFrame),
     /// A channel re-claimed after a reconnect — synthesized client-side from the
     /// `resync` reply so a facade can re-attach its per-call state.
     Reattach(ChannelSnapshot),
+    /// The connection was lost and has been re-established: `hello` and
+    /// `resync` are done (every [`ClientEvent::Reattach`] precedes this) and no
+    /// event of the new connection has been delivered yet. Events pushed to the
+    /// app while it was away are gone, so read whatever state the app keeps
+    /// from events (`registrations`, ...) here and apply only events numbered
+    /// above it. `instance_epoch` is the boot epoch of the server process, so a
+    /// restart can be told from a dropped connection; `None` from a server that
+    /// does not send it. Not emitted for the first connection.
+    Reconnected {
+        /// The server's boot epoch, when it sent one.
+        instance_epoch: Option<String>,
+    },
 }
 
 /// A generic subscription to the client's event stream (see
@@ -90,6 +106,12 @@ pub(crate) struct ClientShared {
     next_id: Arc<AtomicU64>,
     current: Mutex<Option<Arc<SessionCore>>>,
     event_sink: Mutex<Option<EventCallback>>,
+    /// While a reconnect is being announced, the frames of the new connection,
+    /// held so [`ClientEvent::Reconnected`] reaches the app first. `None`:
+    /// frames go straight through.
+    held: Mutex<Option<Vec<EventFrame>>>,
+    /// The boot epoch the last `hello` reported.
+    instance_epoch: Mutex<Option<String>>,
     shutdown: AtomicBool,
     shutdown_notify: Notify,
 }
@@ -109,7 +131,28 @@ impl ClientShared {
     /// [`ClientEvent::Event`] and forwards to the registered event callback.
     fn session_event_sink(self: &Arc<Self>) -> EventSink {
         let shared = Arc::clone(self);
-        Arc::new(move |frame: EventFrame| shared.emit(ClientEvent::Event(frame)))
+        Arc::new(move |frame: EventFrame| {
+            // The lock is held across the delivery, so a frame that arrives
+            // while `release_held` is flushing waits behind the ones before it.
+            let mut held = lock(&shared.held);
+            match held.as_mut() {
+                Some(frames) => frames.push(frame),
+                None => shared.emit(ClientEvent::Event(frame)),
+            }
+        })
+    }
+
+    /// Start holding the frames of the connection about to be made.
+    fn hold_events(&self) {
+        *lock(&self.held) = Some(Vec::new());
+    }
+
+    /// Deliver what was held, in order, and let frames through again.
+    fn release_held(&self) {
+        let mut held = lock(&self.held);
+        for frame in held.take().unwrap_or_default() {
+            self.emit(ClientEvent::Event(frame));
+        }
     }
 
     async fn connect_and_handshake(self: &Arc<Self>) -> Result<Arc<SessionCore>, ControlError> {
@@ -138,6 +181,7 @@ impl ClientShared {
             )));
         }
         info!(app = %self.config.app, protocol = hello.protocol, "control: handshake complete");
+        *lock(&self.instance_epoch) = hello.instance_epoch;
         Ok(core)
     }
 
@@ -195,6 +239,8 @@ impl ControlClient {
             next_id: Arc::new(AtomicU64::new(1)),
             current: Mutex::new(None),
             event_sink: Mutex::new(None),
+            held: Mutex::new(None),
+            instance_epoch: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
         });
@@ -235,6 +281,13 @@ impl ControlClient {
             .await
     }
 
+    /// The boot epoch of the siphon-sip process the current connection reached,
+    /// as its last `hello` reported it. `None` before a server that sends one
+    /// has answered.
+    pub fn instance_epoch(&self) -> Option<String> {
+        lock(&self.shared.instance_epoch).clone()
+    }
+
     /// Fetch the registered adapters' verb/event schema (`describe`).
     pub async fn describe(&self) -> Result<serde_json::Value, ControlError> {
         self.command(
@@ -262,7 +315,7 @@ impl ControlClient {
 
     /// Drive the client: keep the connection alive, reconnecting with backoff and
     /// re-attaching owned channels (`resync`, delivered as
-    /// [`ClientEvent::Reattach`]) after each reconnect. Returns `Ok(())` on
+    /// [`ClientEvent::Reattach`], then one [`ClientEvent::Reconnected`]) after each reconnect. Returns `Ok(())` on
     /// [`ControlClient::shutdown`], or a fatal error (token revoked →
     /// [`ControlError::Unauthorized`]).
     pub async fn run(&self) -> Result<(), ControlError> {
@@ -278,10 +331,17 @@ impl ControlClient {
                     if self.shared.shutdown.load(Ordering::Acquire) {
                         return Ok(());
                     }
+                    // The new connection's frames wait until the app has been
+                    // told it is a new connection.
+                    self.shared.hold_events();
                     match self.shared.connect_and_handshake().await {
                         Ok(core) => {
                             *lock(&self.shared.current) = Some(Arc::clone(&core));
                             self.shared.resync_and_reattach(&core).await;
+                            self.shared.emit(ClientEvent::Reconnected {
+                                instance_epoch: lock(&self.shared.instance_epoch).clone(),
+                            });
+                            self.shared.release_held();
                             core
                         }
                         Err(error @ ControlError::Unauthorized { .. }) => return Err(error),
