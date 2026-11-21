@@ -912,3 +912,67 @@ async fn an_attach_answered_after_its_warrant_was_withdrawn_is_detached() {
             .expect("released");
     }
 }
+
+/// Of two deliveries on one call the one whose warrant is withdrawn while its
+/// attach is out is on record as withdrawn in the same step as the change, with
+/// nothing awaited: the engine's answer, released afterwards or in the middle
+/// of whatever the detach is waiting for, finds it withdrawn and detaches it
+/// by name, and the other delivery goes on untouched.
+#[tokio::test]
+async fn a_withdrawal_is_on_record_at_once_while_another_delivery_stays() {
+    const CALL: &str = "mid-late-two@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let mut rig = Rig::unwatched(NativeTestEngine::start_with_x3_026().await).await;
+    rig.b2bua_call(CALL, true).await;
+    let mut known = super::intercept::known_targets(&rig.li);
+    rig.activate();
+    super::intercept::warrants_changed(&rig.state, &mut known).await;
+    assert_eq!(attach_outcomes(&mut rig.audit).await, (1, 0));
+
+    rig.engine.hold_attaches();
+    let second = second_warrant(&rig);
+    super::intercept::warrants_changed(&rig.state, &mut known).await;
+    for _ in 0..100 {
+        if rig.attached().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(rig.attached().len(), 2, "the second attach is out");
+    let withdrawn = rig
+        .li
+        .x3_attachments_for(CALL)
+        .into_iter()
+        .find(|attachment| attachment.x_id == second)
+        .expect("the second delivery is on record");
+
+    rig.li.tasks().deactivate(second).expect("deactivated");
+    super::intercept::warrants_changed(&rig.state, &mut known).await;
+    // Nothing has been awaited since the change.
+    assert!(
+        rig.li.x3_delivery_withdrawn(
+            CALL,
+            None,
+            (withdrawn.x_id, withdrawn.d_id, withdrawn.correlation_id)
+        ),
+        "the withdrawal is on record before the engine is asked anything"
+    );
+
+    rig.engine.release_attaches();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let detached = rig.engine.commands("detach_x3");
+    assert!(!detached.is_empty());
+    for command in &detached {
+        assert_eq!(
+            command.x3_delivery.as_ref().expect("by name").xid,
+            second.as_bytes(),
+            "only the withdrawn delivery is detached"
+        );
+    }
+    assert_eq!(engine_reports_its_ends(&rig).await, 1);
+    assert_eq!(faults_reported(&log), 0, "{}", log.rendered());
+    let live = rig.li.x3_attachments_for(CALL);
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].x_id, rig.warrant.x_id, "the other goes on");
+    assert_eq!(rig.engine.x3_delivery_count(), 1);
+}

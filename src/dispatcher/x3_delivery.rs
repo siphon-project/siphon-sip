@@ -444,10 +444,26 @@ pub(super) fn detach_unwarranted(state: &Arc<DispatcherState>) {
     if unwanted.is_empty() {
         return;
     }
+    // The withdrawal is put on record here, in this step and before anything
+    // is awaited or spawned, whatever the engine turns out to carry: an attach
+    // of one of these that is still out then finds itself withdrawn when it is
+    // answered ([`attach`]). What the engine lists decides only how the
+    // delivery is detached.
+    let withdrawn: Vec<_> = unwanted
+        .into_iter()
+        .map(|(record, gone, kept)| {
+            let moved = li.x3_detach_deliveries(&record, &gone);
+            (record, moved, kept)
+        })
+        .filter(|(_, moved, _)| !moved.is_empty())
+        .collect();
+    if withdrawn.is_empty() {
+        return;
+    }
     let (li, backend) = (li.clone(), Arc::clone(backend));
     tokio::spawn(async move {
-        for (record, gone, kept) in unwanted {
-            detach_unwarranted_record(&li, &backend, &record, gone, kept).await;
+        for (record, moved, kept) in withdrawn {
+            detach_unwarranted_record(&li, &backend, &record, moved, kept).await;
         }
     });
 }
@@ -469,11 +485,17 @@ async fn engine_names_deliveries(
     }
 }
 
+/// Send the detaches of deliveries already put on record as withdrawn
+/// ([`detach_unwarranted`]): by selector, or the leg's, or not at all and an
+/// error logged when the engine holds one delivery per call and another that
+/// is provisioned stays on the leg. In that last case the withdrawal stays on
+/// record, so an attach answered late is judged by the same rule
+/// ([`detach_late_attach`]).
 async fn detach_unwarranted_record(
     li: &LiManager,
     backend: &MediaBackend,
     record: &str,
-    gone: Vec<ActiveIntercept>,
+    moved: Vec<ActiveIntercept>,
     kept: Vec<ActiveIntercept>,
 ) {
     if let Some((conference_id, _)) = record.split_once('\u{1f}') {
@@ -486,7 +508,6 @@ async fn detach_unwarranted_record(
             );
             return;
         }
-        let moved = li.x3_detach_deliveries(record, &gone);
         let Some(first) = moved.first() else {
             return;
         };
@@ -511,7 +532,7 @@ async fn detach_unwarranted_record(
         return;
     }
     let mut scopes: Vec<Option<CallScope>> = Vec::new();
-    for attachment in &gone {
+    for attachment in &moved {
         if !scopes.contains(&attachment.scope) {
             scopes.push(attachment.scope.clone());
         }
@@ -524,34 +545,20 @@ async fn detach_unwarranted_record(
                 .cloned()
                 .collect()
         };
-        let (leaving, staying) = (on_leg(&gone), on_leg(&kept));
-        // With nothing provisioned left on the leg the withdrawal is put on
-        // record first, before anything is awaited: an attach of one of these
-        // that is still out then finds itself withdrawn when it is answered
-        // ([`attach`]), however long the engine takes to say what it lists.
-        let early = staying
-            .is_empty()
-            .then(|| li.x3_detach_deliveries(record, &leaving));
+        let (leaving, staying) = (on_leg(&moved), on_leg(&kept));
         let by_name = engine_names_deliveries(backend, record, scope.as_ref()).await;
-        let moved = match early {
-            Some(moved) => moved,
-            None => {
-                if !by_name {
-                    error!(
-                        call_id = %record, x_id = %leaving[0].x_id, still = %staying[0].x_id,
-                        "an X3 delivery is no longer provisioned but stays: the media engine \
-                         holds one delivery per call and cannot drop one warrant's copy while \
-                         another is provisioned on it"
-                    );
-                    continue;
-                }
-                li.x3_detach_deliveries(record, &leaving)
+        if !by_name {
+            if let Some(still) = staying.first() {
+                error!(
+                    call_id = %record, x_id = %leaving[0].x_id, still = %still.x_id,
+                    "an X3 delivery is no longer provisioned but stays: the media engine \
+                     holds one delivery per call and cannot drop one warrant's copy while \
+                     another is provisioned on it"
+                );
+                continue;
             }
-        };
-        if moved.is_empty() {
-            continue;
         }
-        detach_from_call(li, backend, record, moved).await;
+        detach_from_call(li, backend, record, leaving).await;
     }
 }
 
