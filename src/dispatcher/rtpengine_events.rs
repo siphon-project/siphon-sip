@@ -1144,8 +1144,10 @@ async fn on_x3_ended(
         Some(delivery) => x3_delivery_ended(Some(li), &ended, delivery),
         None => debug!(
             call_id = %ended.call_id,
+            %record,
             reason = %ended.reason,
-            "X3 content delivery ended while siphon's end of its call is unanswered"
+            "X3 delivery ended before the engine answered siphon's request to end it; \
+             judged on that answer"
         ),
     }
 }

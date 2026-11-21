@@ -756,6 +756,26 @@ impl LiManager {
         })
     }
 
+    /// Whether siphon has ended the engine call of a leg, or is ending it
+    /// (a `delete`, an `offer` replacing it) and has offered nothing since: a
+    /// delivery siphon detached and the engine does not know the call of
+    /// ended with the call, as siphon asked.
+    pub fn x3_engine_call_ended_by_siphon(&self, call_id: &str, scope: Option<&CallScope>) -> bool {
+        self.x3_attachments.get(call_id).is_some_and(|content| {
+            content
+                .legs
+                .iter()
+                .filter(|leg| leg.scope.as_ref() == scope)
+                .any(|leg| {
+                    (leg.attempt > 0 && !leg.offered)
+                        || leg
+                            .ended
+                            .iter()
+                            .any(|ended| ended.engine_call != EngineCallEnd::No)
+                })
+        })
+    }
+
     /// Every live delivery on record, each with the record it is on. A copy,
     /// so what is asked of other stores for each is asked with no guard held.
     pub fn x3_live_attachments(&self) -> Vec<(String, ActiveIntercept)> {
@@ -1400,6 +1420,25 @@ mod tests {
         assert!(manager.x3_attempt_in_progress(CALL, None, attempt + 1));
         manager.forget_x3_call(CALL);
         assert!(!manager.x3_attempt_in_progress(CALL, None, attempt + 1));
+    }
+
+    /// Whether siphon ended an engine call is what tells a detach the engine
+    /// answers "unknown call" for apart from a call the engine lost.
+    #[test]
+    fn the_end_of_an_engine_call_is_told_from_one_the_engine_lost() {
+        let manager = manager().0;
+        assert!(
+            !manager.x3_engine_call_ended_by_siphon(CALL, None),
+            "no record"
+        );
+        let attempt = attempt_offered(&manager);
+        manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt);
+        assert!(
+            !manager.x3_engine_call_ended_by_siphon(CALL, None),
+            "an engine call siphon did not end"
+        );
+        manager.x3_media_ended_by_siphon(CALL, None);
+        assert!(manager.x3_engine_call_ended_by_siphon(CALL, None), "ended");
     }
 
     #[test]

@@ -551,6 +551,10 @@ impl X3Model {
             Command::Delete { .. } if refuse_next("delete") => {
                 Some("delete: refused for the test".to_string())
             }
+            // The call is not there to detach from, as after siphon's `delete`.
+            Command::DetachX3 { call_id, .. } if refuse_next("detach_x3") => {
+                Some(format!("unknown call: {call_id}"))
+            }
             Command::ConferenceLeave { .. } if refuse_next("conference_leave") => {
                 Some("conference_leave: refused for the test".to_string())
             }
@@ -1299,7 +1303,7 @@ impl NativeTestEngine {
         self.gates[2].send_replace(true);
     }
 
-    /// Refuse the next `delete` or `conference_leave` (`verb`), leaving the
+    /// Refuse the next `delete`, `conference_leave` or `detach_x3` (`verb`), leaving the
     /// call or the seat as it is.
     pub(crate) fn refuse_next(&self, verb: &'static str) {
         if let Ok(mut verbs) = self.x3.refuse_next.lock() {

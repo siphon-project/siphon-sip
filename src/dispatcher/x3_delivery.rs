@@ -641,48 +641,83 @@ async fn detach_late_attach(li: &LiManager, backend: &MediaBackend, ask: &X3Ask)
 
 /// Detach a session's deliveries from its engine call, each leg's on the leg
 /// it was attached on.
-async fn detach_from_call(
+pub(super) async fn detach_from_call(
     li: &LiManager,
     backend: &MediaBackend,
     call_id: &str,
     attachments: Vec<ActiveIntercept>,
 ) {
-    // The legs with a delivery whose detach was already sent for the leg as a
-    // whole, on an engine that reads no name.
-    let mut detached_whole: Vec<Option<CallScope>> = Vec::new();
-    for attachment in attachments {
-        let scope = attachment.scope.as_ref();
-        let leg = backend.leg(call_id, scope);
-        let feature = X3Feature::MultiDelivery;
-        let by_name = match backend.x3_feature(feature, call_id, scope) {
-            Some(listed) => listed,
-            None => backend
-                .learn_x3_feature(feature, call_id, scope)
-                .await
-                .unwrap_or(false),
+    let mut scopes: Vec<Option<CallScope>> = Vec::new();
+    for attachment in &attachments {
+        if !scopes.contains(&attachment.scope) {
+            scopes.push(attachment.scope.clone());
+        }
+    }
+    for scope in scopes {
+        let leaving: Vec<&ActiveIntercept> = attachments
+            .iter()
+            .filter(|attachment| attachment.scope == scope)
+            .collect();
+        let Some(first) = leaving.first() else {
+            continue;
         };
-        // Idempotent on the engine, so a duplicate teardown is harmless.
-        let detached = if by_name {
-            let delivery = delivery_of(&attachment);
-            let detach = backend.detach_x3_delivery(leg.call_id(), &attachment.from_tag, &delivery);
-            leg.run(detach).await
-        } else if detached_whole.contains(&attachment.scope) {
-            Ok(())
+        let leg = backend.leg(call_id, scope.as_ref());
+        let by_name = engine_names_deliveries(backend, call_id, scope.as_ref()).await;
+        // Everything the leg carries is ending (the session's end, a call's
+        // end, every warrant withdrawn): one detach that names nothing ends
+        // every delivery on the leg, which is what an engine that holds one
+        // delivery per call does with any detach. Only a partial withdrawal,
+        // with a provisioned delivery left on the leg, names the deliveries
+        // that go. A detach per delivery would also let the end of the call
+        // overtake the later ones, and the engine answer "unknown call" to a
+        // detach of a call siphon had just ended.
+        let whole = !by_name
+            || li
+                .x3_attachments_for_leg(call_id, scope.as_ref())
+                .is_empty();
+        let mut results = Vec::new();
+        if whole {
+            // Idempotent on the engine, so a duplicate teardown is harmless.
+            results.push(
+                leg.run(backend.detach_x3(leg.call_id(), &first.from_tag))
+                    .await,
+            );
         } else {
-            detached_whole.push(attachment.scope.clone());
-            leg.run(backend.detach_x3(leg.call_id(), &attachment.from_tag))
-                .await
-        };
-        if let Err(error) = detached {
+            for attachment in &leaving {
+                let delivery = delivery_of(attachment);
+                let detach =
+                    backend.detach_x3_delivery(leg.call_id(), &attachment.from_tag, &delivery);
+                results.push(leg.run(detach).await);
+            }
+        }
+        for error in results.into_iter().filter_map(Result::err) {
+            // The engine has no call to detach from, and siphon ended it (a
+            // delete, a replacing offer) or is ending it: the delivery ended
+            // with the call, which is what siphon asked for.
+            if error.is_call_not_found()
+                && li.x3_engine_call_ended_by_siphon(call_id, scope.as_ref())
+            {
+                debug!(
+                    %call_id, %error,
+                    "LI: an X3 detach found the engine call already ended by siphon, \
+                     its deliveries ended with it"
+                );
+                continue;
+            }
             warn!(
-                x_id = %attachment.x_id, %call_id, %error,
+                x_id = %first.x_id, %call_id, %error,
                 "could not detach X3 content delivery"
             );
         }
-        li.audit(
-            crate::li::AuditOperation::MediaCaptureStopped,
-            Some(&attachment.x_id.to_string()),
-            format!("X3 detached call_id={call_id} leg={}", leg_name(scope)),
-        );
+        for attachment in &leaving {
+            li.audit(
+                crate::li::AuditOperation::MediaCaptureStopped,
+                Some(&attachment.x_id.to_string()),
+                format!(
+                    "X3 detached call_id={call_id} leg={}",
+                    leg_name(scope.as_ref())
+                ),
+            );
+        }
     }
 }

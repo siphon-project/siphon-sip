@@ -1146,3 +1146,93 @@ async fn a_replacing_offer_ends_the_engine_call_and_attaches_the_new_one_once() 
         assert_eq!(rig.li.x3_attachments_for(&call).len(), 1, "{case}");
     }
 }
+
+/// Two warrants on one call, on an engine that carries several deliveries: the
+/// BYE ends them in one detach that names nothing, and the script's `delete`
+/// that follows finds nothing to fault on. Both ends are reported clean, no
+/// warning or error is logged, and the records drain.
+#[tokio::test]
+async fn a_bye_ends_every_warrants_delivery_in_one_detach() {
+    const CALL: &str = "mid-two-bye@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let mut rig = Rig::on(NativeTestEngine::start_with_x3_026().await).await;
+    rig.b2bua_call(CALL, true).await;
+    rig.activate();
+    second_warrant(&rig);
+    assert_eq!(attach_outcomes(&mut rig.audit).await, (2, 0));
+
+    arrives(&rig.state, CALLER, &bye(CALL));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let detached = rig.engine.commands("detach_x3");
+    assert_eq!(detached.len(), 1, "one detach for the call");
+    assert!(detached[0].x3_delivery.is_none(), "naming no delivery");
+    backend_of(&rig.state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("the script's delete");
+    assert_eq!(engine_reports_its_ends(&rig).await, 2);
+    let rendered = log.rendered();
+    assert!(
+        !rendered.contains(" WARN ") && !rendered.contains(" ERROR "),
+        "{rendered}"
+    );
+    assert_eq!(faults_reported(&log), 0, "{rendered}");
+    assert_eq!(rig.li.x3_attachment_count(), 0, "the records drain");
+}
+
+/// The script's `delete` lands at the engine before the detach of a session's
+/// deliveries does. The engine answers the detach "unknown call" for a call
+/// siphon ended, which is the end siphon asked for and no fault; the
+/// deliveries ended with the call, and each end is clean.
+#[tokio::test]
+async fn a_detach_that_finds_the_call_ended_by_siphon_is_not_a_fault() {
+    const CALL: &str = "mid-two-delete-first@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let mut rig = Rig::on(NativeTestEngine::start_with_x3_026().await).await;
+    rig.b2bua_call(CALL, true).await;
+    rig.activate();
+    second_warrant(&rig);
+    assert_eq!(attach_outcomes(&mut rig.audit).await, (2, 0));
+
+    let session = rig.li.session_of_leg(CALL).expect("the call is decided");
+    let moved = rig.li.x3_detaching(CALL, &session.session_id);
+    assert_eq!(moved.len(), 2);
+    // The engine answers a detach of the call siphon deleted "unknown call".
+    rig.engine.refuse_next("detach_x3");
+    backend_of(&rig.state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("the script's delete");
+    super::x3_delivery::detach_from_call(&rig.li, &backend_of(&rig.state), CALL, moved).await;
+    assert_eq!(rig.engine.commands("detach_x3").len(), 1);
+    assert_eq!(engine_reports_its_ends(&rig).await, 2);
+    let rendered = log.rendered();
+    assert!(
+        !rendered.contains(" WARN ") && !rendered.contains(" ERROR "),
+        "{rendered}"
+    );
+    assert_eq!(faults_reported(&log), 0, "{rendered}");
+    assert_eq!(rig.li.x3_attachment_count(), 0, "the records drain");
+}
+
+/// A detach the engine answers "unknown call" for a call siphon did not end is
+/// a fault, loud as before.
+#[tokio::test]
+async fn an_unknown_call_siphon_did_not_end_is_still_a_fault() {
+    const CALL: &str = "mid-unknown@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let mut rig = Rig::on(NativeTestEngine::start_with_x3_026().await).await;
+    rig.b2bua_call(CALL, true).await;
+    rig.activate();
+    assert_eq!(attach_outcomes(&mut rig.audit).await, (1, 0));
+    rig.engine.refuse_next("detach_x3");
+    let session = rig.li.session_of_leg(CALL).expect("decided");
+    let moved = rig.li.x3_detaching(CALL, &session.session_id);
+    super::x3_delivery::detach_from_call(&rig.li, &backend_of(&rig.state), CALL, moved).await;
+    assert!(
+        log.rendered()
+            .contains("could not detach X3 content delivery"),
+        "{}",
+        log.rendered()
+    );
+}
