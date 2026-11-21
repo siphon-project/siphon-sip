@@ -76,6 +76,10 @@ impl AppEvent {
 
 pub(super) type AppEventHandler = Arc<dyn Fn(AppEvent) + Send + Sync>;
 
+/// Called with the server's boot epoch each time the connection is
+/// re-established.
+pub(super) type ReconnectHandler = Arc<dyn Fn(Option<String>) + Send + Sync>;
+
 /// The `next` of a page that followed `after`: pages run in AoR order, so a
 /// `next` that does not move past `after` would ask for the same page forever.
 fn advancing(after: &str, next: Option<String>) -> Result<Option<String>, ControlError> {
@@ -106,6 +110,18 @@ impl SipFacade {
         *lock(&self.app_handler) = Some(handler);
     }
 
+    pub(super) fn set_reconnect_handler(&self, handler: ReconnectHandler) {
+        *lock(&self.reconnect_handler) = Some(handler);
+    }
+
+    /// Tell the reconnect handler, if one is set, that the connection is back.
+    pub(super) fn deliver_reconnect(&self, instance_epoch: Option<String>) {
+        match lock(&self.reconnect_handler).clone() {
+            Some(handler) => handler(instance_epoch),
+            None => debug!("control(sip): no reconnect handler — reconnect not announced"),
+        }
+    }
+
     /// Hand a channel-less frame to the app event handler, if one is set.
     pub(super) fn deliver_app_event(&self, frame: EventFrame) {
         match lock(&self.app_handler).clone() {
@@ -126,6 +142,29 @@ impl SipClient {
         F: Fn(AppEvent) + Send + Sync + 'static,
     {
         self.facade.set_app_handler(Arc::new(handler));
+    }
+
+    /// Register a handler called each time the connection is lost and
+    /// re-established, after its channels were re-attached and before any
+    /// event of the new connection reaches
+    /// [`set_app_event_handler`](Self::set_app_event_handler). Events pushed to
+    /// the app while it was away are gone, so re-read whatever state the app
+    /// keeps from events here ([`registrations`](Self::registrations)) and
+    /// apply only events numbered above the reply's `seq`. The argument is the
+    /// server's boot epoch, so a restart can be told from a dropped connection.
+    /// Called on the client's receive path: keep it quick, or hand the work off.
+    /// Replaces any previous handler.
+    pub fn set_reconnect_handler<F>(&self, handler: F)
+    where
+        F: Fn(Option<String>) + Send + Sync + 'static,
+    {
+        self.facade.set_reconnect_handler(Arc::new(handler));
+    }
+
+    /// The boot epoch of the siphon-sip process the connection reached, as
+    /// its last `hello` reported it.
+    pub fn instance_epoch(&self) -> Option<String> {
+        self.client.instance_epoch()
     }
 
     /// Everything the registrar holds now, and the `seq` it is current to

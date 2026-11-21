@@ -1145,6 +1145,7 @@ pub(crate) struct SipFacade {
     call_tx: Mutex<Option<mpsc::UnboundedSender<Call>>>,
     channels: Mutex<HashMap<String, mpsc::UnboundedSender<CallEvent>>>,
     app_handler: Mutex<Option<app_event::AppEventHandler>>,
+    reconnect_handler: Mutex<Option<app_event::ReconnectHandler>>,
 }
 
 impl SipFacade {
@@ -1154,6 +1155,7 @@ impl SipFacade {
             call_tx: Mutex::new(None),
             channels: Mutex::new(HashMap::new()),
             app_handler: Mutex::new(None),
+            reconnect_handler: Mutex::new(None),
         })
     }
 
@@ -1181,6 +1183,7 @@ impl SipFacade {
         match event {
             ClientEvent::Event(frame) => self.handle_event(frame, commander),
             ClientEvent::Reattach(snapshot) => self.reattach(snapshot, commander),
+            ClientEvent::Reconnected { instance_epoch } => self.deliver_reconnect(instance_epoch),
         }
     }
 

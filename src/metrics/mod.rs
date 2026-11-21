@@ -18,6 +18,7 @@ pub mod log_writer;
 pub mod pool_connect;
 mod python_stats;
 pub mod rate_limit;
+pub mod registrar_backend;
 pub mod send_queue;
 pub mod stale_shed;
 pub mod subscribe_notify;

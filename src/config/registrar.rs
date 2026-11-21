@@ -180,6 +180,10 @@ pub struct RedisBackendConfig {
     /// `0` turns read-through off: lookups read only this process's memory,
     /// loaded at boot and written through (the behaviour before it existed).
     pub read_through_ttl_ms: u64,
+    /// Hold `/admin/ready` at 503 until the backend has been connected
+    /// (default false). The backend is retried in the background either way;
+    /// off, the node takes traffic on memory alone meanwhile.
+    pub required_for_readiness: bool,
 }
 
 #[derive(Deserialize)]
@@ -203,6 +207,8 @@ struct RawRedisBackendConfig {
     pub presence_key_prefix: String,
     #[serde(default = "default_read_through_ttl_ms")]
     pub read_through_ttl_ms: u64,
+    #[serde(default)]
+    pub required_for_readiness: bool,
 }
 
 impl TryFrom<RawRedisBackendConfig> for RedisBackendConfig {
@@ -228,6 +234,7 @@ impl TryFrom<RawRedisBackendConfig> for RedisBackendConfig {
             ttl_slack_secs: raw.ttl_slack_secs,
             presence_key_prefix: raw.presence_key_prefix,
             read_through_ttl_ms: raw.read_through_ttl_ms,
+            required_for_readiness: raw.required_for_readiness,
         })
     }
 }
@@ -253,6 +260,10 @@ pub struct PostgresBackendConfig {
     pub url: String,
     #[serde(default = "default_postgres_table")]
     pub table: String,
+    /// Hold `/admin/ready` at 503 until the backend has been connected
+    /// (default false). The backend is retried in the background either way.
+    #[serde(default)]
+    pub required_for_readiness: bool,
 }
 
 fn default_postgres_table() -> String {

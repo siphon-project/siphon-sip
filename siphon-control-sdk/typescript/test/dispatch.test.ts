@@ -122,6 +122,42 @@ describe("application-level events on SipClient", () => {
   });
 });
 
+describe("reconnect on SipClient", () => {
+  it("announces a reconnect with the new boot epoch before the first event of the connection", async () => {
+    const stub = await ControlStub.start({
+      instanceEpoch: (connection) => `boot-${connection}`,
+      // The second connection pushes an event the instant it has said hello,
+      // before the client has had the chance to resync.
+      afterHello: (socket, connection) => {
+        if (connection > 1) {
+          stub.pushEvent({ event: "RegistrationChanged", app: "ivr-app", payload: {} }, socket);
+        }
+      },
+    });
+    cleanup.push(() => stub.stop());
+
+    const sip = await SipClient.connect({
+      url: stub.url(),
+      app: "ivr-app",
+      token: "s3cr3t",
+      reconnectBackoffMs: 20,
+    });
+    expect(sip.instanceEpoch).toBe("boot-1");
+    const seen: string[] = [];
+    sip.onReconnected((epoch) => seen.push(`reconnected:${epoch}`));
+    sip.onAppEvent((event) => seen.push(`event:${event.kind}`));
+    const runPromise = sip.run();
+
+    stub.dropConnections();
+    await waitFor(() => seen.length === 2, 3000);
+    expect(seen).toEqual(["reconnected:boot-2", "event:RegistrationChanged"]);
+    expect(sip.instanceEpoch).toBe("boot-2");
+
+    sip.shutdown();
+    await runPromise;
+  });
+});
+
 describe("registration state on SipClient", () => {
   it("types a RegistrationChanged and reads both state verbs", async () => {
     const stub = await ControlStub.start({

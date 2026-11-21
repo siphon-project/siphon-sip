@@ -297,7 +297,13 @@ pub trait RegistrarBackend: Send + Sync + std::fmt::Debug {
         aor: &str,
     ) -> impl std::future::Future<Output = Result<Vec<StoredContact>, BackendError>> + Send;
 
-    /// Remove all contacts for an AoR.
+    /// Remove all contacts for an AoR: its registration was ended (a
+    /// de-registration, an administrative removal), not left to run out.
+    ///
+    /// A backend several nodes share also records that ending until the
+    /// bindings it removed would have run out, so that a node still holding
+    /// an older copy of them loses [`claim_expiry`](Self::claim_expiry) for it.
+    /// The next [`save`](Self::save) of the AoR forgets it.
     fn remove(
         &self,
         aor: &str,
@@ -381,8 +387,11 @@ pub trait RegistrarBackend: Send + Sync + std::fmt::Debug {
     ///
     /// Every node that cached the AoR sees its bindings run out, and only one
     /// may tell the script (`RegistrationEvent::Expired`): the first claim of
-    /// a `(aor, marker)` pair wins, atomically, and later ones lose. The
-    /// default always wins, which is right for a backend one node owns.
+    /// a `(aor, marker)` pair wins, atomically, and later ones lose. Every
+    /// claim loses while the AoR's last [`remove`](Self::remove) stands: its
+    /// registration ended explicitly, and the copy that ran out is older than
+    /// that ending. The default always wins, which is right for a backend one
+    /// node owns.
     fn claim_expiry(
         &self,
         aor: &str,
@@ -501,6 +510,8 @@ pub struct MemoryBackend {
     aor_state: dashmap::DashMap<String, StoredAorState>,
     /// `(aor, marker)` expiries already claimed.
     claimed: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    /// AoRs removed since their last save: their expiry claims lose.
+    removed: dashmap::DashMap<String, ()>,
 }
 
 impl MemoryBackend {
@@ -509,6 +520,7 @@ impl MemoryBackend {
             data: dashmap::DashMap::new(),
             aor_state: dashmap::DashMap::new(),
             claimed: std::sync::Mutex::new(std::collections::HashSet::new()),
+            removed: dashmap::DashMap::new(),
         }
     }
 }
@@ -524,6 +536,7 @@ impl RegistrarBackend for MemoryBackend {
         if contacts.is_empty() {
             self.data.remove(aor);
         } else {
+            self.removed.remove(aor);
             self.data.insert(aor.to_string(), contacts.to_vec());
         }
         Ok(())
@@ -538,7 +551,9 @@ impl RegistrarBackend for MemoryBackend {
     }
 
     async fn remove(&self, aor: &str) -> Result<(), BackendError> {
-        self.data.remove(aor);
+        if self.data.remove(aor).is_some() {
+            self.removed.insert(aor.to_string(), ());
+        }
         Ok(())
     }
 
@@ -588,6 +603,9 @@ impl RegistrarBackend for MemoryBackend {
     }
 
     async fn claim_expiry(&self, aor: &str, marker: &str) -> Result<bool, BackendError> {
+        if self.removed.contains_key(aor) {
+            return Ok(false);
+        }
         Ok(self
             .claimed
             .lock()
@@ -857,6 +875,29 @@ pub async fn restore_from_backend<B: RegistrarBackend>(
     backend: &B,
     registrar: &super::Registrar,
 ) -> Result<(usize, usize), BackendError> {
+    restore_into(backend, registrar, false).await
+}
+
+/// [`restore_from_backend`] into a registrar that is already taking
+/// registrations: what a backend that answered after start-up restores.
+///
+/// A binding this process holds for the same contact wins over the stored one,
+/// bindings of an AoR that exist only in the backend are added beside the live
+/// ones, and auxiliary state this process already set is kept. Run
+/// [`Registrar::evict_connection_oriented`](super::Registrar::evict_connection_oriented)
+/// over the result: the stored stream bindings name connections that are gone.
+pub async fn restore_from_backend_keeping_live<B: RegistrarBackend>(
+    backend: &B,
+    registrar: &super::Registrar,
+) -> Result<(usize, usize), BackendError> {
+    restore_into(backend, registrar, true).await
+}
+
+async fn restore_into<B: RegistrarBackend>(
+    backend: &B,
+    registrar: &super::Registrar,
+    keep_live: bool,
+) -> Result<(usize, usize), BackendError> {
     let aors = backend.all_aors().await?;
     let mut aor_count = 0usize;
     let mut contact_count = 0usize;
@@ -896,7 +937,11 @@ pub async fn restore_from_backend<B: RegistrarBackend>(
                 .sort_by(|a, b| b.q.partial_cmp(&a.q).unwrap_or(std::cmp::Ordering::Equal));
             contact_count += contacts_for_aor.len();
             aor_count += 1;
-            registrar.install_bindings(aor, contacts_for_aor);
+            if keep_live {
+                registrar.merge_restored_bindings(aor, contacts_for_aor);
+            } else {
+                registrar.install_bindings(aor, contacts_for_aor);
+            }
         }
     }
 
@@ -906,7 +951,11 @@ pub async fn restore_from_backend<B: RegistrarBackend>(
     // `aors` and just enumerate everything the backend has.
     for aor in backend.all_aor_state_aors().await? {
         if let Some(state) = backend.load_aor_state(&aor).await? {
-            registrar.apply_aor_state(&aor, state);
+            if keep_live {
+                registrar.apply_aor_state_unless_held(&aor, state);
+            } else {
+                registrar.apply_aor_state(&aor, state);
+            }
         }
     }
 

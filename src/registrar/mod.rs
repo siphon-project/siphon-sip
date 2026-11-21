@@ -7,8 +7,10 @@
 //! are feature-gated for later phases.
 
 pub mod backend;
+pub mod backend_status;
 pub(crate) mod contact_index;
 pub mod event_hold;
+mod late_attach;
 pub(crate) mod proxy_grant;
 pub mod reginfo;
 pub mod restore_eviction;
@@ -117,6 +119,16 @@ pub fn normalize_aor_cow(uri: &str) -> std::borrow::Cow<'_, str> {
 /// arrives for them.
 pub(crate) fn is_stream_transport(transport: Option<Transport>) -> bool {
     transport.is_some_and(Transport::is_stream)
+}
+
+/// Whether the contact can only be reached over the connection its REGISTER
+/// arrived on: a stream transport, by the recorded `source_transport` or, when
+/// a row predates that field, by the Contact URI's `transport` parameter.
+fn needs_connection(contact: &Contact) -> bool {
+    is_stream_transport(contact.source_transport)
+        || contact.uri.get_param("transport").is_some_and(|transport| {
+            Transport::from_scheme(transport).is_some_and(Transport::is_stream)
+        })
 }
 
 /// What kind of registration the contact represents.
@@ -1045,99 +1057,33 @@ impl Registrar {
         self.release_cleared(&primary, removed, sequence);
     }
 
-    /// Evict all connection-oriented contacts (TCP/TLS/WS/WSS) from the registrar.
+    /// Evict the restored contacts that need a transport connection (TCP, TLS,
+    /// WS, WSS). Returns how many were evicted.
     ///
-    /// Called after restart: these contacts reference transport connections that
-    /// no longer exist, so they are unreachable.  Emits `Deregistered` events
-    /// and writes through to the backend so `@registrar.on_change` handlers fire.
+    /// A binding restored after a restart references a connection that died
+    /// with the old process, so it reads as registered but cannot be reached
+    /// until the UE registers again. Runs once the restore is done and before
+    /// any listener accepts, so no REGISTER can land in between.
+    ///
+    /// A contact needs a connection when the transport its REGISTER arrived on
+    /// is a stream one (`source_transport`, which every binding records), or,
+    /// for the rows an older release stored without it, when its Contact URI
+    /// says so. A binding this boot accepted (stamped with this process's
+    /// epoch) holds a live connection and is never touched, which is what lets
+    /// a backend that connects late run the same eviction over what it
+    /// restored. Goes through [`evict_restored`](Self::evict_restored): the
+    /// indexes, the backend and the gauge are updated, `Deregistered` fires,
+    /// and a binding another instance accepted stays in a shared backend.
     pub fn evict_connection_oriented(&self) -> usize {
-        let mut evicted = 0usize;
-        let aors: Vec<String> = self.bindings.iter().map(|e| e.key().clone()).collect();
-        // Tokens harvested from evicted contacts; pruned from the reverse
-        // index after the per-AoR loop so we don't hold the bindings entry
-        // guard across the tokens DashMap write (different shards, but
-        // explicit ordering keeps reasoning easy).
-        let mut tokens_to_remove: Vec<String> = Vec::new();
-        let mut conns_to_deindex: Vec<(u64, String)> = Vec::new();
-
-        for aor in aors {
-            let before;
-            let after;
-            let mut snapshot = None;
-
-            if let Some(mut entry) = self.bindings.get_mut(&aor) {
-                before = entry.value().len();
-                let indexed = self.contact_index.keys_of(entry.value());
-                entry.value_mut().retain(|c| {
-                    let transport = c.uri.get_param("transport").unwrap_or("");
-                    let evict = matches!(
-                        transport.to_ascii_lowercase().as_str(),
-                        "tcp" | "tls" | "ws" | "wss"
-                    );
-                    if evict {
-                        if let Some(token) = &c.flow_token {
-                            tokens_to_remove.push(token.to_string());
-                        }
-                        if is_stream_transport(c.source_transport) {
-                            if let Some(id) = c.inbound_connection_id {
-                                conns_to_deindex.push((id, aor.clone()));
-                            }
-                        }
-                    }
-                    !evict
-                });
-                after = entry.value().len();
-                self.contact_index.replace(
-                    &aor,
-                    indexed,
-                    self.contact_index.keys_of(entry.value()),
-                );
-                if before != after {
-                    let stored: Vec<backend::StoredContact> = entry
-                        .value()
-                        .iter()
-                        .map(backend::StoredContact::from_contact)
-                        .collect();
-                    snapshot = Some((stored, self.write_sequence()));
-                }
-            } else {
-                continue;
-            }
-
-            if before == after {
-                continue; // nothing evicted for this AoR
-            }
-
-            evicted += before - after;
-
-            if after == 0 {
-                // All contacts were connection-oriented — remove the AoR,
-                // unless a save refilled it since.
-                self.bindings
-                    .remove_if(&aor, |_, contacts| contacts.is_empty());
-                if let Some(metrics) = crate::metrics::try_metrics() {
-                    metrics.registrations_active.dec();
-                }
-            }
-            // An emptied snapshot writes as a removal; a mixed one writes back
-            // the surviving contacts.
-            if let Some((stored, sequence)) = snapshot {
-                self.persist_aor(&aor, stored, sequence);
-            }
-            self.emit_event(RegistrationEvent::Deregistered {
-                aor,
-                exchange: None,
-            });
-        }
-
-        for token in &tokens_to_remove {
-            self.tokens.remove(token);
-        }
-        for (id, aor) in &conns_to_deindex {
-            self.deindex_connection(*id, aor);
-        }
-
-        evicted
+        let own_epoch = self.instance_epoch();
+        self.evict_restored(|contact| {
+            needs_connection(contact)
+                && !matches!(
+                    (own_epoch.as_deref(), contact.instance_epoch()),
+                    (Some(own), Some(accepted)) if own == accepted
+                )
+        })
+        .len()
     }
 
     /// Look up routable contacts for an AoR. Returns non-expired UE-side
@@ -4704,6 +4650,90 @@ mod tests {
         let contacts = registrar.lookup("sip:alice@example.com");
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].uri.host, "10.0.0.1");
+    }
+
+    /// What decides that a binding needs a connection is the transport its
+    /// REGISTER arrived on, not whether the Contact URI says so: a `sip:`
+    /// Contact with no `transport` parameter registered over TCP is just as
+    /// bound to a connection that died with the old process.
+    #[test]
+    fn evict_connection_oriented_decides_by_source_transport() {
+        let registrar = Registrar::default();
+        for (aor, transport, call_id) in [
+            ("sip:tcp@example.com", Transport::Tcp, "c1"),
+            ("sip:tls@example.com", Transport::Tls, "c2"),
+            ("sip:udp@example.com", Transport::Udp, "c3"),
+        ] {
+            registrar
+                .save_full(
+                    aor,
+                    contact_uri("phone", "192.0.2.10"),
+                    3600,
+                    1.0,
+                    call_id.into(),
+                    1,
+                    None,
+                    Some(transport),
+                    None,
+                    None,
+                    vec![],
+                    FlowCapture::default(),
+                    Vec::new(),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(registrar.evict_connection_oriented(), 2);
+        assert!(!registrar.is_registered("sip:tcp@example.com"));
+        assert!(!registrar.is_registered("sip:tls@example.com"));
+        assert!(registrar.is_registered("sip:udp@example.com"));
+    }
+
+    /// Only what a previous process wrote is evicted: a binding this boot
+    /// accepted holds a live connection, so a later eviction (a backend that
+    /// came up after the listeners) leaves it alone.
+    #[test]
+    fn evict_connection_oriented_keeps_bindings_this_boot_accepted() {
+        let earlier = Registrar::default();
+        earlier.set_instance_identity(InstanceIdentity {
+            id: "node-a".into(),
+            epoch: "earlier-boot".into(),
+        });
+        let registrar = Registrar::default();
+        registrar.set_instance_identity(InstanceIdentity {
+            id: "node-a".into(),
+            epoch: "this-boot".into(),
+        });
+        let stream_uri = |user: &str| {
+            contact_uri(user, "192.0.2.10").with_param("transport".to_string(), Some("tcp".into()))
+        };
+        for (target, user) in [(&earlier, "restored"), (&registrar, "live")] {
+            target
+                .save_full(
+                    &format!("sip:{user}@example.com"),
+                    stream_uri(user),
+                    3600,
+                    1.0,
+                    user.into(),
+                    1,
+                    None,
+                    Some(Transport::Tcp),
+                    None,
+                    None,
+                    vec![],
+                    FlowCapture::default(),
+                    Vec::new(),
+                )
+                .unwrap();
+        }
+        registrar.install_bindings(
+            "sip:restored@example.com",
+            earlier.lookup_all("sip:restored@example.com"),
+        );
+
+        assert_eq!(registrar.evict_connection_oriented(), 1);
+        assert!(!registrar.is_registered("sip:restored@example.com"));
+        assert!(registrar.is_registered("sip:live@example.com"));
     }
 
     #[test]

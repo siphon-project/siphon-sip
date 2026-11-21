@@ -233,6 +233,9 @@ struct ClientInner {
     handler: Mutex<Option<Py<PyAny>>>,
     /// The `@client.on_app_event` handler, for application-level events.
     app_handler: Mutex<Option<Py<PyAny>>>,
+    /// The `@client.on_reconnect` handler, told each time the connection is
+    /// re-established.
+    reconnect_handler: Mutex<Option<Py<PyAny>>>,
     /// Set by `close()`: nothing more is handed to a handler. See
     /// [`UnlessClosed`].
     closed: Arc<AtomicBool>,
@@ -268,6 +271,7 @@ impl ControlClient {
                 client: tokio::sync::Mutex::new(None),
                 handler: Mutex::new(None),
                 app_handler: Mutex::new(None),
+                reconnect_handler: Mutex::new(None),
                 closed: Arc::new(AtomicBool::new(false)),
             }),
         }
@@ -291,6 +295,31 @@ impl ControlClient {
     fn on_app_event(&self, py: Python<'_>, handler: Py<PyAny>) -> Py<PyAny> {
         *lock(&self.inner.app_handler) = Some(handler.clone_ref(py));
         handler
+    }
+
+    /// Register the handler told each time the connection is lost and
+    /// re-established. Usable as a decorator: `@client.on_reconnect`.
+    ///
+    /// Called as `handler(instance_epoch)` (the server's boot epoch, or `None`
+    /// from a server that does not send one; it changes when the server
+    /// restarted), and may be `async`. Events pushed to the app while it was
+    /// away are gone, so re-read the state the app keeps from events
+    /// (`await client.registrations()`) and apply only events numbered above
+    /// the reply's `seq`. Not called for the first connection. Handlers run
+    /// concurrently, so an event handler can start before this one finishes:
+    /// the `seq` rule is what keeps the copy right. Installed by `run()`.
+    fn on_reconnect(&self, py: Python<'_>, handler: Py<PyAny>) -> Py<PyAny> {
+        *lock(&self.inner.reconnect_handler) = Some(handler.clone_ref(py));
+        handler
+    }
+
+    /// The boot epoch of the siphon-sip process the connection reached, as its
+    /// last `hello` reported it; `None` before the client connected or from a
+    /// server that does not send one.
+    #[getter]
+    fn instance_epoch(&self) -> Option<String> {
+        let guard = self.inner.client.try_lock().ok()?;
+        guard.as_ref()?.instance_epoch()
     }
 
     /// Connect + `hello` (idempotent). Returns an awaitable resolving to `None`.
@@ -552,6 +581,9 @@ impl ControlClient {
         let app_handler = lock(&self.inner.app_handler)
             .as_ref()
             .map(|h| h.clone_ref(py));
+        let reconnect_handler = lock(&self.inner.reconnect_handler)
+            .as_ref()
+            .map(|h| h.clone_ref(py));
         // Running is what opens a client: one run again after a `close()`
         // dispatches again.
         let closed = Arc::clone(&self.inner.closed);
@@ -560,6 +592,14 @@ impl ControlClient {
             let client = ensure_client(&inner).await?;
             if let Some(app_handler) = app_handler {
                 install_app_event_bridge(&client, app_handler, locals.clone(), closed.clone());
+            }
+            if let Some(reconnect_handler) = reconnect_handler {
+                install_reconnect_bridge(
+                    &client,
+                    reconnect_handler,
+                    locals.clone(),
+                    closed.clone(),
+                );
             }
             if let Some(handler) = handler {
                 install_handler_bridge(&client, handler, locals, closed);
@@ -598,6 +638,7 @@ impl ControlClient {
         self.shutdown();
         *lock(&self.inner.handler) = None;
         *lock(&self.inner.app_handler) = None;
+        *lock(&self.inner.reconnect_handler) = None;
     }
 
     /// `async with ControlClient(...) as client:` — closes on the way out,
@@ -693,6 +734,30 @@ fn install_app_event_bridge(
     });
 }
 
+/// Bridge reconnects to the stored Python handler: each is handed over as
+/// `handler(instance_epoch)` on the asyncio loop captured in `locals`, off the
+/// client's receive path.
+fn install_reconnect_bridge(
+    client: &SipClient,
+    handler: Py<PyAny>,
+    locals: TaskLocals,
+    closed: Arc<AtomicBool>,
+) {
+    client.set_reconnect_handler(move |instance_epoch: Option<String>| {
+        let Some(handler) = attach_if_running(|py| handler.clone_ref(py)) else {
+            return;
+        };
+        let locals = locals.clone();
+        let closed = closed.clone();
+        tokio::spawn(dispatch_handler(
+            handler,
+            locals,
+            closed,
+            move |py: Python<'_>| (instance_epoch,).into_pyobject(py),
+        ));
+    });
+}
+
 /// What a handler returned, awaited on the event loop unless its client or
 /// server was closed first.
 ///
@@ -761,6 +826,27 @@ async fn dispatch_app_event(
     event: AppEvent,
     closed: Arc<AtomicBool>,
 ) {
+    let name = event.frame.event.clone();
+    let payload = event.payload;
+    dispatch_handler(handler, locals, closed, move |py: Python<'_>| {
+        let py_payload = json_to_py(py, &payload)?;
+        (name, py_payload).into_pyobject(py)
+    })
+    .await;
+}
+
+/// Call `handler` with the arguments `arguments` builds, on the asyncio loop in
+/// `locals`, and await what it returns when it is a coroutine. Does nothing on
+/// a closed loop or a closed client.
+async fn dispatch_handler<Arguments>(
+    handler: Py<PyAny>,
+    locals: TaskLocals,
+    closed: Arc<AtomicBool>,
+    arguments: Arguments,
+) where
+    Arguments:
+        for<'py> FnOnce(Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyTuple>> + Send + 'static,
+{
     // A closed loop cannot run the handler; see `dispatch_to_python`.
     let loop_usable = attach_if_running(|py| {
         locals
@@ -773,12 +859,9 @@ async fn dispatch_app_event(
     if loop_usable != Some(true) {
         return;
     }
-    let name = event.frame.event.clone();
-    let payload = event.payload;
     let scoped = pyo3_async_runtimes::tokio::scope(locals, async move {
         let awaitable = attach_if_running(|py| -> PyResult<Option<_>> {
-            let py_payload = json_to_py(py, &payload)?;
-            call_handler(py, &handler, (name, py_payload).into_pyobject(py)?, &closed)
+            call_handler(py, &handler, arguments(py)?, &closed)
         })?;
         Some(match awaitable {
             Ok(Some(future)) => future.await.map(|_| ()),

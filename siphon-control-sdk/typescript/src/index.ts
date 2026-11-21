@@ -142,6 +142,7 @@ export {
 export type {
   AppEvent,
   AppEventHandler,
+  ReconnectHandler,
   CallEvent,
   CallHandler,
   DialTarget,

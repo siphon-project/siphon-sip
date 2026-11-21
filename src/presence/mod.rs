@@ -516,8 +516,14 @@ impl PresenceStore {
     }
 
     /// Put back a subscription read from the backend at boot: into the store
-    /// and its resource's watchers, without writing it through again.
+    /// and its resource's watchers, without writing it through again. A
+    /// subscription the store already holds is kept.
     pub fn restore_subscription(&self, mut subscription: Subscription) {
+        // One created since this process started (a backend that answered
+        // late) is newer than the one read back.
+        if self.subscriptions.contains_key(&subscription.id) {
+            return;
+        }
         subscription.generation = next_generation();
         let resource = subscription.resource.clone();
         let subscription_id = subscription.id.clone();

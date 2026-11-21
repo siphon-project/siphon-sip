@@ -11,6 +11,8 @@ mod python_thread;
 pub(crate) mod shutdown_sequence;
 use shutdown_sequence::run_shutdown_sequence;
 mod event_clock;
+mod registrar_backend;
+mod restored_stream_eviction;
 mod sbi_callbacks;
 mod sbi_notif_tls;
 
@@ -31,6 +33,8 @@ use bootstrap::*;
 pub use python_thread::build_runtime;
 #[cfg(test)]
 use python_thread::*;
+use registrar_backend::{init_registrar_backend, register_registrar_backend_readiness};
+use restored_stream_eviction::evict_restored_stream_bindings_at_startup;
 
 use std::sync::Arc;
 
@@ -920,7 +924,7 @@ impl SiphonServer {
         // --- Restore registrar contacts + iFC profiles from backend ---
         // Must run after ISC singleton init so ifc_store_arc() is available
         // for the iFC Redis restore in init_ifc_redis_backend().
-        init_registrar_backend(&config).await;
+        let registrar_backend_status = init_registrar_backend(&config).await;
 
         // --- Host-registered user namespaces ---
         // Run each factory under Python::attach, then store the resulting
@@ -1034,6 +1038,11 @@ impl SiphonServer {
             } else {
                 None
             };
+
+        // --- Evict the stream bindings the restore brought back ---
+        // After the IPsec reconcile above, before any listener is up: see
+        // `evict_restored_stream_bindings`.
+        evict_restored_stream_bindings_at_startup();
 
         // --- STIR/SHAKEN namespace (siphon.stir) ---
         //
@@ -2541,6 +2550,7 @@ impl SiphonServer {
         }
         // Probes each cache's Redis; `/admin/ready` is 503 while one is down.
         cache_manager.watch_backends(&drain.participants);
+        register_registrar_backend_readiness(registrar_backend_status, &drain.participants);
 
         // --- HTTP admin API (health/readiness probes + registration inspection) ---
         let config_reloader = config_document.map(|(path, document)| {
@@ -2614,17 +2624,6 @@ impl SiphonServer {
         // Keep the sender alive for the lifetime of the server so the listener
         // task never sees a "channel closed" error when no DTMF activity happens.
         let _rtpengine_events_keepalive = rtpengine_events_tx;
-
-        // Evict connection-oriented contacts restored from the backend
-        if let Some(registrar) = crate::script::api::registrar_arc() {
-            let evicted = registrar.evict_connection_oriented();
-            if evicted > 0 {
-                info!(
-                    evicted,
-                    "evicted connection-oriented contacts after restart"
-                );
-            }
-        }
 
         info!("{product_name} ready — press Ctrl+C to stop");
 
