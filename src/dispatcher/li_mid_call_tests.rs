@@ -693,6 +693,10 @@ async fn a_bye_between_the_snapshot_and_the_decision_attaches_nothing() {
 
     arrives(&rig.state, CALLER, &bye(CALL));
     let decided = rig.li.remembered_session_count();
+    assert!(
+        super::intercept::decide_live_dialog(&rig.state, &rig.li, &snapshot[0]).is_none(),
+        "a dialog that ended is not decided, though its media is still up"
+    );
     super::intercept::warrant_live_dialog(&rig.state, &rig.li, &snapshot[0]);
     assert_eq!(
         rig.li.remembered_session_count(),
@@ -756,6 +760,16 @@ async fn a_concurrent_ack_and_scan_make_one_decision_and_one_delivery() {
             arrives(&rig.state, CALLER, &on_call(CALLER_ACK, &call));
         }
         assert_eq!(rig.li.remembered_session_count(), 1, "{case}: one decision");
+        // The ACK was recorded on the decision that stands, so its
+        // retransmission is recognised and writes nothing again: a decision
+        // written over the first one would have lost that.
+        let before = drain_iri(&mut rig.iri).len();
+        assert_eq!(before, 1, "{case}: the ACK is one X2 record");
+        arrives(&rig.state, CALLER, &on_call(CALLER_ACK, &call));
+        assert!(
+            drain_iri(&mut rig.iri).is_empty(),
+            "{case}: the retransmitted ACK is a duplicate"
+        );
         let session = rig.li.session_of_leg(&call).expect("decided");
         assert_eq!(
             &*session.session_id,
@@ -826,4 +840,75 @@ async fn a_conference_only_dialog_survives_the_sweep_and_is_attached_on_its_seat
         .delete(CALL, "caller-tag")
         .await
         .expect("freed");
+}
+
+/// An attach the engine has taken and not yet answered when its warrant is
+/// deactivated is detached when the answer comes: the engine is delivering,
+/// and nothing else would stop it. One more detach follows the answer, the end
+/// the engine reports is the one siphon asked for, nothing reaches the ADMF as
+/// a fault, and the record drains. The same for a warrant changed to ask for
+/// no content and for a destination removed.
+#[tokio::test]
+async fn an_attach_answered_after_its_warrant_was_withdrawn_is_detached() {
+    use crate::li::x1::types::DeliveryType;
+    for case in ["deactivated", "x2 only", "destination removed"] {
+        let call = format!("mid-late-{}@192.0.2.10", case.replace(' ', "-"));
+        let (log, _guard) = capture_log();
+        let mut rig = Rig::on(NativeTestEngine::start_with_x3_026().await).await;
+        rig.b2bua_call(&call, true).await;
+        rig.engine.hold_attaches();
+        rig.activate();
+        // The attach is out: the engine has it, and its answer is held.
+        for _ in 0..100 {
+            if !rig.attached().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(rig.attached().len(), 1, "{case}");
+
+        match case {
+            "deactivated" => {
+                rig.li
+                    .tasks()
+                    .deactivate(rig.warrant.x_id)
+                    .expect("deactivated");
+            }
+            "x2 only" => {
+                let mut details = rig.warrant.clone();
+                details.delivery_type = DeliveryType::X2Only;
+                rig.li.tasks().modify(details).expect("modified");
+            }
+            _ => {
+                let d_id = rig.warrant.list_of_dids[0];
+                rig.li.destinations().remove(d_id).expect("removed");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        rig.engine.release_attaches();
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            rig.engine.commands("detach_x3").len(),
+            2,
+            "{case}: the withdrawal's, and the one the late answer owes"
+        );
+        assert_eq!(engine_reports_its_ends(&rig).await, 1, "{case}");
+        assert_eq!(faults_reported(&log), 0, "{case}: {}", log.rendered());
+        assert!(
+            log.rendered().contains("landed after its warrant"),
+            "{case}: {}",
+            log.rendered()
+        );
+        assert_eq!(
+            rig.engine.x3_delivery_count(),
+            0,
+            "{case}: nothing delivers"
+        );
+        assert_eq!(rig.li.x3_attachment_count(), 0, "{case}: the record drains");
+        let _ = attach_outcomes(&mut rig.audit).await;
+        backend_of(&rig.state)
+            .delete(&call, "caller-tag")
+            .await
+            .expect("released");
+    }
 }

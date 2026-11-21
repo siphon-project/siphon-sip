@@ -234,6 +234,18 @@ async fn attach(li: LiManager, backend: Arc<MediaBackend>, ask: X3Ask) {
         }
     };
     let error = match attached {
+        Ok(())
+            if li.x3_delivery_withdrawn(&ask.record, leg.scope(), (x_id, d_id, correlation_id)) =>
+        {
+            // Withdrawn or ended while the attach was out: the engine took it
+            // and is delivering, and nothing else will detach it.
+            info!(
+                %x_id, %d_id, %call_id, %delivery, correlation_id,
+                "LI: an X3 attach landed after its warrant or session was withdrawn, detaching it"
+            );
+            detach_late_attach(&li, &backend, &ask).await;
+            return;
+        }
         Ok(()) => {
             info!(
                 %x_id, %d_id, %call_id, %delivery, correlation_id,
@@ -513,23 +525,104 @@ async fn detach_unwarranted_record(
                 .collect()
         };
         let (leaving, staying) = (on_leg(&gone), on_leg(&kept));
-        if !engine_names_deliveries(backend, record, scope.as_ref()).await {
-            if let Some(still) = staying.first() {
-                error!(
-                    call_id = %record, x_id = %leaving[0].x_id, still = %still.x_id,
-                    "an X3 delivery is no longer provisioned but stays: the media engine \
-                     holds one delivery per call and cannot drop one warrant's copy while \
-                     another is provisioned on it"
-                );
-                continue;
+        // With nothing provisioned left on the leg the withdrawal is put on
+        // record first, before anything is awaited: an attach of one of these
+        // that is still out then finds itself withdrawn when it is answered
+        // ([`attach`]), however long the engine takes to say what it lists.
+        let early = staying
+            .is_empty()
+            .then(|| li.x3_detach_deliveries(record, &leaving));
+        let by_name = engine_names_deliveries(backend, record, scope.as_ref()).await;
+        let moved = match early {
+            Some(moved) => moved,
+            None => {
+                if !by_name {
+                    error!(
+                        call_id = %record, x_id = %leaving[0].x_id, still = %staying[0].x_id,
+                        "an X3 delivery is no longer provisioned but stays: the media engine \
+                         holds one delivery per call and cannot drop one warrant's copy while \
+                         another is provisioned on it"
+                    );
+                    continue;
+                }
+                li.x3_detach_deliveries(record, &leaving)
             }
-        }
-        let moved = li.x3_detach_deliveries(record, &leaving);
+        };
         if moved.is_empty() {
             continue;
         }
         detach_from_call(li, backend, record, moved).await;
     }
+}
+
+/// Detach an attach the engine answered after it was withdrawn: by its
+/// warrant, address and Correlation ID on an engine that carries several
+/// deliveries, else the leg's (or the seat's), and that only when no
+/// provisioned delivery is left on it. The withdrawal put the end on record as
+/// one siphon asked for, so the end the engine reports is clean.
+async fn detach_late_attach(li: &LiManager, backend: &MediaBackend, ask: &X3Ask) {
+    let attachment = &ask.attachment;
+    let leg = backend.leg(&ask.call_id, ask.scope());
+    let staying: Vec<ActiveIntercept> = li
+        .x3_attachments_for(&ask.record)
+        .into_iter()
+        .filter(|held| held.scope.as_ref() == leg.scope())
+        .collect();
+    let detached = match ask.seat.as_ref() {
+        Some(seat) => {
+            if let Some(still) = staying.first() {
+                error!(
+                    call_id = %ask.call_id, x_id = %attachment.x_id, still = %still.x_id,
+                    "an X3 delivery on a conference seat landed after its warrant was \
+                     withdrawn, but the seat carries another that is provisioned and \
+                     cannot drop one"
+                );
+                return;
+            }
+            backend.detach_x3_seat(seat).await
+        }
+        None => {
+            let by_name = engine_names_deliveries(backend, &ask.call_id, leg.scope()).await;
+            if !by_name {
+                if let Some(still) = staying.first() {
+                    error!(
+                        call_id = %ask.call_id, x_id = %attachment.x_id, still = %still.x_id,
+                        "an X3 delivery landed after its warrant was withdrawn, but the \
+                         media engine holds one delivery per call and cannot drop one \
+                         warrant's copy while another is provisioned on it"
+                    );
+                    return;
+                }
+            }
+            match by_name {
+                true => {
+                    let delivery = delivery_of(attachment);
+                    let detach =
+                        backend.detach_x3_delivery(leg.call_id(), &attachment.from_tag, &delivery);
+                    leg.run(detach).await
+                }
+                false => {
+                    leg.run(backend.detach_x3(leg.call_id(), &attachment.from_tag))
+                        .await
+                }
+            }
+        }
+    };
+    if let Err(error) = detached {
+        warn!(
+            x_id = %attachment.x_id, call_id = %ask.call_id, %error,
+            "could not detach an X3 content delivery that landed after its warrant was withdrawn"
+        );
+    }
+    li.audit(
+        crate::li::AuditOperation::MediaCaptureStopped,
+        Some(&attachment.x_id.to_string()),
+        format!(
+            "X3 detached call_id={} leg={} (attach landed after withdrawal)",
+            ask.call_id,
+            leg_name(leg.scope())
+        ),
+    );
 }
 
 /// Detach a session's deliveries from its engine call, each leg's on the leg

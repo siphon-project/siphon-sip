@@ -868,15 +868,13 @@ fn seat_refusal(command: &Command) -> Option<String> {
 }
 
 /// Wait while a test holds the answers of the command's kind: an
-/// `answer_local`'s, or a `delete`'s.
-async fn held_answer(
-    command: &Command,
-    answers_open: &mut tokio::sync::watch::Receiver<bool>,
-    deletes_open: &mut tokio::sync::watch::Receiver<bool>,
-) {
+/// `answer_local`'s, a `delete`'s, or an `attach_x3`'s.
+async fn held_answer(command: &Command, gates: &mut [tokio::sync::watch::Receiver<bool>; 3]) {
+    let [answers_open, deletes_open, attaches_open] = gates;
     let gate = match command {
         Command::AnswerLocal { .. } => answers_open,
         Command::Delete { .. } => deletes_open,
+        Command::AttachX3 { .. } => attaches_open,
         _ => return,
     };
     let _ = gate.wait_for(|open| *open).await;
@@ -892,12 +890,12 @@ pub(crate) struct NativeTestEngine {
     commands: Arc<Mutex<Vec<NativeCommand>>>,
     live: LiveCalls,
     x3: Arc<X3Model>,
-    /// Open (the default) lets `answer_local` answer; closed holds every answer
-    /// until it opens, so a test can act while a set-up is provably pending.
-    answers: tokio::sync::watch::Sender<bool>,
-    /// The same for `delete`: closed, a delete is acted on and its answer
-    /// held, so a test can report something while the command is out.
-    deletes: tokio::sync::watch::Sender<bool>,
+    /// Gates on the answers of `answer_local`, `delete` and `attach_x3`, in
+    /// that order. Open (the default) answers; closed holds every answer until
+    /// it opens, so a test can act while a command is provably out: report an
+    /// end (a delete is acted on and its answer held), or withdraw a warrant
+    /// (the engine holds the delivery of an attach whose answer is held).
+    gates: [tokio::sync::watch::Sender<bool>; 3],
 }
 
 /// The calls the engine holds, keyed the way the engine keys a call:
@@ -968,6 +966,7 @@ impl NativeTestEngine {
         let x3_model = Arc::clone(&x3);
         let (answers, answers_open) = tokio::sync::watch::channel(true);
         let (deletes, deletes_open) = tokio::sync::watch::channel(true);
+        let (attaches, attaches_open) = tokio::sync::watch::channel(true);
         let next_play_id = Arc::new(std::sync::atomic::AtomicU64::new(
             NATIVE_ENGINE_FIRST_PLAY_ID,
         ));
@@ -980,8 +979,11 @@ impl NativeTestEngine {
                 let local = Arc::clone(&local);
                 let x3 = Arc::clone(&x3_model);
                 let next_play_id = Arc::clone(&next_play_id);
-                let mut answers_open = answers_open.clone();
-                let mut deletes_open = deletes_open.clone();
+                let mut gates = [
+                    answers_open.clone(),
+                    deletes_open.clone(),
+                    attaches_open.clone(),
+                ];
                 tokio::spawn(async move {
                     let mut buffer = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -1231,7 +1233,7 @@ impl NativeTestEngine {
                                 video_declined: None,
                             },
                         };
-                        held_answer(&request.command, &mut answers_open, &mut deletes_open).await;
+                        held_answer(&request.command, &mut gates).await;
                         let Ok(bytes) = frame::encode(&Response {
                             id: request.id,
                             result,
@@ -1250,8 +1252,7 @@ impl NativeTestEngine {
             commands,
             live,
             x3,
-            answers,
-            deletes,
+            gates: [answers, deletes, attaches],
         }
     }
 
@@ -1280,12 +1281,22 @@ impl NativeTestEngine {
 
     /// Hold every `delete` answer until [`release_deletes`](Self::release_deletes).
     pub(crate) fn hold_deletes(&self) {
-        self.deletes.send_replace(false);
+        self.gates[1].send_replace(false);
     }
 
     /// Answer the held `delete`s, and every one after.
     pub(crate) fn release_deletes(&self) {
-        self.deletes.send_replace(true);
+        self.gates[1].send_replace(true);
+    }
+
+    /// Hold every `attach_x3` answer until [`release_attaches`](Self::release_attaches).
+    pub(crate) fn hold_attaches(&self) {
+        self.gates[2].send_replace(false);
+    }
+
+    /// Answer the held `attach_x3`s, and every one after.
+    pub(crate) fn release_attaches(&self) {
+        self.gates[2].send_replace(true);
     }
 
     /// Refuse the next `delete` or `conference_leave` (`verb`), leaving the
@@ -1306,12 +1317,12 @@ impl NativeTestEngine {
 
     /// Hold every `answer_local` answer until [`release_answers`](Self::release_answers).
     pub(crate) fn hold_answers(&self) {
-        self.answers.send_replace(false);
+        self.gates[0].send_replace(false);
     }
 
     /// Answer the held `answer_local`s, and every one after.
     pub(crate) fn release_answers(&self) {
-        self.answers.send_replace(true);
+        self.gates[0].send_replace(true);
     }
 
     /// Whether the engine holds the unscoped `call_id`: created and not

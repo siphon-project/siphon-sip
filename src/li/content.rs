@@ -713,6 +713,35 @@ impl LiManager {
         detached
     }
 
+    /// Whether siphon ended or withdrew a delivery that was asked for while
+    /// the attach was out: it is on its leg's ended deliveries, siphon's end
+    /// of it not yet reported ended by the engine (its warrant was deactivated
+    /// or changed, its destination removed, its session ended). An engine that
+    /// answers such an attach `Ok` is delivering content nothing warrants, and
+    /// it is detached. A delivery the engine itself ended, or one asked for
+    /// again since (live), is not this one's to detach.
+    pub fn x3_delivery_withdrawn(
+        &self,
+        call_id: &str,
+        scope: Option<&CallScope>,
+        (x_id, d_id, correlation_id): (XId, DId, u64),
+    ) -> bool {
+        self.x3_attachments.get(call_id).is_some_and(|content| {
+            let live = content.attachments.iter().any(|attachment| {
+                attachment.scope.as_ref() == scope
+                    && asked(attachment) == (x_id, d_id, correlation_id)
+            });
+            !live
+                && content
+                    .legs
+                    .iter()
+                    .filter(|leg| leg.scope.as_ref() == scope)
+                    .flat_map(|leg| &leg.ended)
+                    .flat_map(|ended| &ended.attachments)
+                    .any(|attachment| asked(attachment) == (x_id, d_id, correlation_id))
+        })
+    }
+
     /// Every live delivery on record, each with the record it is on. A copy,
     /// so what is asked of other stores for each is asked with no guard held.
     pub fn x3_live_attachments(&self) -> Vec<(String, ActiveIntercept)> {
