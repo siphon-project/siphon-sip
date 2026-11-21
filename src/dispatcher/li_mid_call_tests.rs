@@ -11,8 +11,9 @@
 //! in-process native engine, with the warrant held back until the call is up.
 
 use super::li_session_tests::{
-    arrives, attach_outcomes, backend_of, drain_iri, intercepting_on_the_engine, leg_session,
-    proxied_response, CALLER, CALLER_ACK, CALLER_INVITE,
+    arrives, attach_outcomes, backend_of, capture_log, drain_iri, engine_events, engine_reports,
+    faults_reported, intercepting_on_the_engine_watching, leg_session, proxied_response, CALLER,
+    CALLER_ACK, CALLER_INVITE,
 };
 use super::*;
 use crate::li::x1::message::TaskDetails;
@@ -59,7 +60,17 @@ struct Rig {
 
 impl Rig {
     async fn on(engine: NativeTestEngine) -> Self {
-        let (state, engine, li, iri, audit) = intercepting_on_the_engine(engine).await;
+        Self::watching(engine, true).await
+    }
+
+    /// With no watcher: the test drives the scan itself.
+    async fn unwatched(engine: NativeTestEngine) -> Self {
+        Self::watching(engine, false).await
+    }
+
+    async fn watching(engine: NativeTestEngine, watching: bool) -> Self {
+        let (state, engine, li, iri, audit) =
+            intercepting_on_the_engine_watching(engine, watching).await;
         let warrant = li.tasks().list()[0].details.clone();
         li.tasks()
             .deactivate(warrant.x_id)
@@ -508,13 +519,311 @@ async fn the_live_dialog_index_drains_after_completed_refused_and_cancelled_call
         CALLS,
         "only the refused B2BUA calls, which no message ends, are left"
     );
-    rig.li.sweep_live_dialogs(
+    super::intercept::sweep_live_dialogs(
+        state,
+        &rig.li,
         std::time::Instant::now() + crate::li::live_dialogs::LIVE_DIALOG_GRACE * 2,
-        |call_id| {
-            state.call_actors.find_by_sip_call_id(call_id).is_some()
-                || sessions.get(call_id).is_some()
-        },
     );
     assert_eq!(rig.li.live_dialog_count(), 0, "and the sweep releases them");
     assert_eq!(rig.li.remembered_session_count(), 0);
+}
+
+/// A second warrant on the same target, to the same destination.
+fn second_warrant(rig: &Rig) -> crate::li::x1::types::XId {
+    let mut second = rig.warrant.clone();
+    second.x_id = crate::li::x1::types::XId::generate();
+    let x_id = second.x_id;
+    rig.li.tasks().activate(second).expect("second warrant");
+    x_id
+}
+
+/// A warrant on somebody who is not on any call here, so that interception
+/// stays on while the warrant under test comes and goes.
+fn keep_intercepting(rig: &Rig) {
+    let mut bystander = rig.warrant.clone();
+    bystander.x_id = crate::li::x1::types::XId::generate();
+    bystander.target_identifiers = vec![TargetIdentifier::SipUri("sip:carol@example.com".into())];
+    rig.li
+        .tasks()
+        .activate(bystander)
+        .expect("bystander warrant");
+}
+
+/// The engine says each delivery siphon detached has ended.
+async fn engine_reports_its_ends(rig: &Rig) -> usize {
+    let events = engine_events(&rig.state);
+    let ends = rig.engine.take_x3_ends();
+    let count = ends.len();
+    for end in ends {
+        engine_reports(&events, end).await;
+    }
+    count
+}
+
+/// A warrant deactivated while its call is up stops its delivery: one detach,
+/// the end the engine reports is the one siphon asked for, so it is clean and
+/// nothing reaches the ADMF as a fault, and the record drains.
+#[tokio::test]
+async fn a_deactivated_warrant_detaches_its_delivery_cleanly() {
+    const CALL: &str = "mid-deactivated@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let mut rig = Rig::on(NativeTestEngine::start_with_x3().await).await;
+    rig.b2bua_call(CALL, true).await;
+    rig.activate();
+    assert_eq!(attach_outcomes(&mut rig.audit).await, (1, 0));
+
+    rig.li
+        .tasks()
+        .deactivate(rig.warrant.x_id)
+        .expect("deactivated");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(rig.engine.commands("detach_x3").len(), 1, "exactly one");
+    assert_eq!(engine_reports_its_ends(&rig).await, 1);
+    assert_eq!(faults_reported(&log), 0, "{}", log.rendered());
+    assert!(!log.rendered().contains("ERROR"), "{}", log.rendered());
+    assert_eq!(rig.li.x3_attachment_count(), 0, "the record drains");
+    assert!(rig.li.x3_attachments_for(CALL).is_empty());
+}
+
+/// Of two warrants on a call on an engine that carries several deliveries,
+/// the one deactivated is detached by its own name and the other goes on.
+#[tokio::test]
+async fn only_the_deactivated_warrants_delivery_is_detached() {
+    const CALL: &str = "mid-two-warrants@192.0.2.10";
+    let (log, _guard) = capture_log();
+    let mut rig = Rig::on(NativeTestEngine::start_with_x3_026().await).await;
+    rig.b2bua_call(CALL, true).await;
+    rig.activate();
+    let second = second_warrant(&rig);
+    assert_eq!(attach_outcomes(&mut rig.audit).await, (2, 0));
+    assert_eq!(rig.attached().len(), 2);
+
+    rig.li.tasks().deactivate(second).expect("deactivated");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let detached = rig.engine.commands("detach_x3");
+    assert_eq!(detached.len(), 1);
+    assert_eq!(
+        detached[0].x3_delivery.as_ref().expect("by name").xid,
+        second.as_bytes(),
+        "only its triple"
+    );
+    assert_eq!(engine_reports_its_ends(&rig).await, 1);
+    assert_eq!(faults_reported(&log), 0, "{}", log.rendered());
+    let live = rig.li.x3_attachments_for(CALL);
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].x_id, rig.warrant.x_id, "the other goes on");
+}
+
+/// A warrant changed to ask for no content stops its delivery; a destination
+/// removed does too; and a warrant retargeted at somebody else no longer
+/// covers the call.
+#[tokio::test]
+async fn a_warrant_that_no_longer_asks_for_the_delivery_detaches_it() {
+    use crate::li::x1::types::DeliveryType;
+    for case in ["x2 only", "destination removed", "target changed"] {
+        let call = format!("mid-withdrawn-{}@192.0.2.10", case.replace(' ', "-"));
+        let (log, _guard) = capture_log();
+        let mut rig = Rig::on(NativeTestEngine::start_with_x3().await).await;
+        rig.b2bua_call(&call, true).await;
+        rig.activate();
+        assert_eq!(attach_outcomes(&mut rig.audit).await, (1, 0), "{case}");
+
+        match case {
+            "x2 only" => {
+                let mut details = rig.warrant.clone();
+                details.delivery_type = DeliveryType::X2Only;
+                rig.li.tasks().modify(details).expect("modified");
+            }
+            "destination removed" => {
+                let d_id = rig.warrant.list_of_dids[0];
+                rig.li.destinations().remove(d_id).expect("removed");
+            }
+            _ => {
+                let mut details = rig.warrant.clone();
+                details.target_identifiers =
+                    vec![TargetIdentifier::SipUri("sip:carol@example.com".into())];
+                rig.li.tasks().modify(details).expect("modified");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(rig.engine.commands("detach_x3").len(), 1, "{case}");
+        assert_eq!(engine_reports_its_ends(&rig).await, 1, "{case}");
+        assert_eq!(faults_reported(&log), 0, "{case}: {}", log.rendered());
+        assert_eq!(rig.li.x3_attachment_count(), 0, "{case}");
+        backend_of(&rig.state)
+            .delete(&call, "caller-tag")
+            .await
+            .expect("released");
+    }
+}
+
+/// A warrant deactivated is not attached again by the call's next ACK.
+#[tokio::test]
+async fn a_deactivated_warrant_is_not_attached_again_by_a_later_ack() {
+    const CALL: &str = "mid-no-reattach@192.0.2.10";
+    let mut rig = Rig::on(NativeTestEngine::start_with_x3().await).await;
+    rig.b2bua_call(CALL, true).await;
+    rig.activate();
+    assert_eq!(attach_outcomes(&mut rig.audit).await, (1, 0));
+    keep_intercepting(&rig);
+    rig.li
+        .tasks()
+        .deactivate(rig.warrant.x_id)
+        .expect("deactivated");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(rig.engine.commands("detach_x3").len(), 1);
+
+    arrives(&rig.state, CALLER, &on_call(CALLER_ACK, CALL));
+    assert_eq!(attach_outcomes(&mut rig.audit).await, (0, 0));
+    assert_eq!(rig.attached().len(), 1, "not asked again");
+    assert!(rig.li.x3_attachments_for(CALL).is_empty());
+}
+
+/// A call that ends between the scan copying the index and deciding it is
+/// left alone.
+#[tokio::test]
+async fn a_bye_between_the_snapshot_and_the_decision_attaches_nothing() {
+    const CALL: &str = "mid-bye-before-decide@192.0.2.10";
+    let mut rig = Rig::unwatched(NativeTestEngine::start_with_x3().await).await;
+    arrives(&rig.state, CALLER, &on_call(CALLER_INVITE, CALL));
+    rig.proxied_media(CALL, true).await;
+    rig.activate();
+    let snapshot = rig.li.live_dialogs();
+    assert_eq!(snapshot.len(), 1);
+
+    arrives(&rig.state, CALLER, &bye(CALL));
+    let decided = rig.li.remembered_session_count();
+    super::intercept::warrant_live_dialog(&rig.state, &rig.li, &snapshot[0]);
+    assert_eq!(
+        rig.li.remembered_session_count(),
+        decided,
+        "the scan decided nothing of its own"
+    );
+    assert_eq!(attach_outcomes(&mut rig.audit).await.0, 0);
+    assert!(rig.attached().is_empty());
+}
+
+/// A call that ends between the scan deciding it and attaching it is not
+/// attached, and the decision the scan made is released.
+#[tokio::test]
+async fn a_bye_between_the_decision_and_the_attach_attaches_nothing() {
+    const CALL: &str = "mid-bye-before-attach@192.0.2.10";
+    let mut rig = Rig::unwatched(NativeTestEngine::start_with_x3().await).await;
+    arrives(&rig.state, CALLER, &on_call(CALLER_INVITE, CALL));
+    rig.proxied_media(CALL, true).await;
+    rig.activate();
+    let snapshot = rig.li.live_dialogs();
+
+    let decided = super::intercept::decide_live_dialog(&rig.state, &rig.li, &snapshot[0])
+        .expect("a warrant covers the call and it is up");
+    assert_eq!(rig.li.remembered_session_count(), 1);
+    // The BYE the dispatcher takes meanwhile releases the dialog.
+    rig.li.live_dialog_ended(CALL);
+    super::intercept::attach_live_dialog(&rig.state, &rig.li, &snapshot[0], decided);
+    assert_eq!(attach_outcomes(&mut rig.audit).await.0, 0);
+    assert!(rig.attached().is_empty());
+    assert_eq!(
+        rig.li.remembered_session_count(),
+        0,
+        "the decision is released"
+    );
+}
+
+/// A message of the dialog and the scan that decide one session at once make
+/// one decision, one Correlation ID, and one delivery for each warrant and
+/// destination, whichever inserts first.
+#[tokio::test]
+async fn a_concurrent_ack_and_scan_make_one_decision_and_one_delivery() {
+    for (case, scan_first) in [("the ack wins", true), ("the scan wins", false)] {
+        let call = format!("mid-race-{}@192.0.2.10", scan_first);
+        let mut rig = Rig::unwatched(NativeTestEngine::start_with_x3().await).await;
+        arrives(&rig.state, CALLER, &on_call(CALLER_INVITE, &call));
+        rig.proxied_media(&call, true).await;
+        rig.activate();
+        let snapshot = rig.li.live_dialogs();
+
+        if scan_first {
+            // The ACK decides the session while the scan is between looking
+            // and inserting.
+            let state = Arc::clone(&rig.state);
+            let ack = on_call(CALLER_ACK, &call);
+            crate::li::session::pause::once_before_insert(move |_| {
+                arrives(&state, CALLER, &ack);
+            });
+            super::intercept::warrant_live_dialog(&rig.state, &rig.li, &snapshot[0]);
+        } else {
+            super::intercept::warrant_live_dialog(&rig.state, &rig.li, &snapshot[0]);
+            arrives(&rig.state, CALLER, &on_call(CALLER_ACK, &call));
+        }
+        assert_eq!(rig.li.remembered_session_count(), 1, "{case}: one decision");
+        let session = rig.li.session_of_leg(&call).expect("decided");
+        assert_eq!(
+            &*session.session_id,
+            call.as_str(),
+            "{case}: the dialog's key"
+        );
+        assert_eq!(attach_outcomes(&mut rig.audit).await, (1, 0), "{case}");
+        assert_eq!(rig.attached().len(), 1, "{case}: one delivery");
+        let live = rig.li.x3_attachments_for(&call);
+        assert_eq!(live.len(), 1, "{case}");
+        assert_eq!(
+            live[0].correlation_id,
+            rig.li
+                .correlation_for(&rig.li.tasks().list()[0], &session.session_id),
+            "{case}: one correlation"
+        );
+        backend_of(&rig.state)
+            .delete(&call, "caller-tag")
+            .await
+            .expect("released");
+    }
+}
+
+/// A party seated in a room with no call actor and no media session is a call
+/// that is up: the sweep keeps its dialog past the grace, and a warrant
+/// activated later attaches on its seat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conference_only_dialog_survives_the_sweep_and_is_attached_on_its_seat() {
+    use crate::rtpengine::backend::{ConferenceRole, ConferenceSeat};
+    const CALL: &str = "mid-seat-sweep@192.0.2.10";
+    const ROOM: &str = "room-mid-seat-sweep";
+    let mut rig = Rig::on(NativeTestEngine::start_with_x3().await).await;
+    arrives(&rig.state, CALLER, &on_call(CALLER_INVITE, CALL));
+    backend_of(&rig.state)
+        .conference_join(
+            CALL,
+            ConferenceSeat {
+                conference_id: ROOM.to_string(),
+                from_tag: "caller-tag".to_string(),
+            },
+            "v=0\r\n",
+            ConferenceRole::Talker,
+            &NgFlags::default(),
+        )
+        .await
+        .expect("seated");
+    assert!(rig
+        .state
+        .rtpengine_sessions
+        .as_ref()
+        .expect("a store")
+        .get(CALL)
+        .is_none());
+
+    super::intercept::sweep_live_dialogs(
+        &rig.state,
+        &rig.li,
+        std::time::Instant::now() + crate::li::live_dialogs::LIVE_DIALOG_GRACE * 2,
+    );
+    assert_eq!(rig.li.live_dialog_count(), 1, "the seat keeps it");
+
+    rig.activate();
+    assert_eq!(attach_outcomes(&mut rig.audit).await, (1, 0));
+    let attached = rig.attached();
+    assert_eq!(attached.len(), 1);
+    assert_eq!(attached[0].call_id, ROOM);
+    backend_of(&rig.state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("freed");
 }

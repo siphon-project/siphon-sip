@@ -166,24 +166,32 @@ impl LiveDialogs {
             .collect()
     }
 
+    /// Whether this very dialog (the Call-ID, opened at `opened`) is still
+    /// held: a Call-ID used again for a new call is not it.
+    fn is_held(&self, call_id: &str, opened: Instant) -> bool {
+        self.dialogs
+            .get(call_id)
+            .is_some_and(|dialog| dialog.opened == opened)
+    }
+
     /// Release what is over: past the age bound, or past the grace with
     /// `is_live` saying nothing holds the call.
-    fn sweep(&self, now: Instant, is_live: impl Fn(&str) -> bool) {
-        let candidates: Vec<(Box<str>, Instant)> = self
+    fn sweep(&self, now: Instant, is_live: impl Fn(&LiveDialog) -> bool) {
+        let candidates: Vec<LiveDialog> = self
             .dialogs
             .iter()
             .filter(|dialog| now.saturating_duration_since(dialog.opened) >= LIVE_DIALOG_GRACE)
-            .map(|dialog| (dialog.key().clone(), dialog.opened))
+            .map(|dialog| dialog.value().clone())
             .collect();
-        for (call_id, opened) in candidates {
-            let over_age = now.saturating_duration_since(opened) >= MAX_LIVE_DIALOG_AGE;
+        for dialog in candidates {
+            let over_age = now.saturating_duration_since(dialog.opened) >= MAX_LIVE_DIALOG_AGE;
             // Asked with no guard held, then removed only if it is still the
             // dialog that was asked about: the Call-ID may have been used
             // again in between.
-            if over_age || !is_live(&call_id) {
+            if over_age || !is_live(&dialog) {
                 let removed = self
                     .dialogs
-                    .remove_if(&*call_id, |_, dialog| dialog.opened == opened);
+                    .remove_if(&*dialog.call_id, |_, held| held.opened == dialog.opened);
                 if removed.is_some() {
                     self.count.fetch_sub(1, Ordering::AcqRel);
                 }
@@ -245,9 +253,14 @@ impl LiManager {
         self.live_dialogs.snapshot()
     }
 
+    /// Whether `dialog` is still the one held under its Call-ID.
+    pub fn live_dialog_held(&self, dialog: &LiveDialog) -> bool {
+        self.live_dialogs.is_held(&dialog.call_id, dialog.opened)
+    }
+
     /// Release the dialogs that are over. `is_live` says whether anything
-    /// still holds the call named by a Call-ID (a B2BUA call, or media).
-    pub fn sweep_live_dialogs(&self, now: Instant, is_live: impl Fn(&str) -> bool) {
+    /// still holds the call of a dialog (a B2BUA call, media, a seat).
+    pub fn sweep_live_dialogs(&self, now: Instant, is_live: impl Fn(&LiveDialog) -> bool) {
         self.live_dialogs.sweep(now, is_live);
     }
 
@@ -255,6 +268,11 @@ impl LiManager {
     /// [`TaskStore::subscribe`](super::x1::store::TaskStore::subscribe).
     pub fn subscribe_tasks(&self) -> tokio::sync::watch::Receiver<u64> {
         self.tasks.subscribe()
+    }
+
+    /// A receiver woken whenever a destination is modified or removed.
+    pub fn subscribe_destinations(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.destinations.subscribe()
     }
 }
 
@@ -341,7 +359,7 @@ mod tests {
         open(&manager, "gone@example.com");
         open(&manager, "held@example.com");
         let later = Instant::now() + LIVE_DIALOG_GRACE + Duration::from_secs(1);
-        manager.sweep_live_dialogs(later, |call_id| call_id == "held@example.com");
+        manager.sweep_live_dialogs(later, |dialog| &*dialog.call_id == "held@example.com");
         let held: Vec<_> = manager.live_dialogs();
         assert_eq!(held.len(), 1);
         assert_eq!(&*held[0].call_id, "held@example.com");

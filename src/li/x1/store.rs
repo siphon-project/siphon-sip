@@ -183,15 +183,37 @@ impl StoredDestination {
 }
 
 /// The destination store, keyed by DID.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DestinationStore {
     destinations: Arc<DashMap<DId, StoredDestination>>,
+    /// Woken when a destination is modified or removed: a delivery to it that
+    /// is under way may no longer be provisioned
+    /// ([`DestinationStore::subscribe`]).
+    changed: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl Default for DestinationStore {
+    fn default() -> Self {
+        Self {
+            destinations: Arc::default(),
+            changed: Arc::new(tokio::sync::watch::channel(0).0),
+        }
+    }
 }
 
 impl DestinationStore {
     /// An empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A receiver woken whenever a destination is modified or removed.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    fn notify_changed(&self) {
+        self.changed.send_modify(|count| *count += 1);
     }
 
     /// Create a destination. Refuses a DID that already exists.
@@ -245,6 +267,8 @@ impl DestinationStore {
             ));
         }
         existing.details = details;
+        drop(existing);
+        self.notify_changed();
         Ok(())
     }
 
@@ -253,7 +277,8 @@ impl DestinationStore {
     /// The caller must have already checked that no task references it — see
     /// [`TaskStore::tasks_referencing`].
     pub fn remove(&self, d_id: DId) -> Result<StoredDestination, X1Error> {
-        self.destinations
+        let removed = self
+            .destinations
             .remove(&d_id)
             .map(|(_, destination)| destination)
             .ok_or_else(|| {
@@ -261,12 +286,15 @@ impl DestinationStore {
                     ErrorCode::DidDoesNotExist,
                     format!("destination {d_id} is not provisioned"),
                 )
-            })
+            });
+        self.notify_changed();
+        removed
     }
 
     /// Remove every destination.
     pub fn remove_all(&self) {
         self.destinations.clear();
+        self.notify_changed();
     }
 
     /// Look one up.

@@ -304,10 +304,10 @@ fn track_live_dialog(message: &SipMessage, inbound: &InboundMessage, li: &crate:
 }
 
 /// Follow the warrants, so one activated while a call is up takes effect at
-/// once and not at the call's next message.
+/// once and not at the call's next message, and one withdrawn stops at once.
 ///
-/// Wakes on every change of the provisioned warrants and scans the dialogs
-/// seen opening ([`warrants_changed`]). Holds the dispatcher state weakly, as
+/// Wakes on every change of the provisioned warrants and destinations and
+/// acts on it ([`warrants_changed`]). Holds the dispatcher state weakly, as
 /// [`watch_engine_calls`] does, and ends with it: on the next change, or at
 /// the next poll when there is none.
 pub(super) fn watch_warrants(state: &Arc<DispatcherState>) {
@@ -315,20 +315,29 @@ pub(super) fn watch_warrants(state: &Arc<DispatcherState>) {
         return;
     };
     let mut changes = li.subscribe_tasks();
+    let mut destination_changes = li.subscribe_destinations();
+    let mut known = known_targets(li);
     let state = Arc::downgrade(state);
     tokio::spawn(async move {
         loop {
-            match tokio::time::timeout(WARRANT_WATCH_POLL, changes.changed()).await {
-                Ok(Ok(())) => {}
-                // Every warrant store is gone.
-                Ok(Err(_)) => return,
+            let woken = tokio::time::timeout(WARRANT_WATCH_POLL, async {
+                tokio::select! {
+                    changed = changes.changed() => changed.is_ok(),
+                    changed = destination_changes.changed() => changed.is_ok(),
+                }
+            })
+            .await;
+            match woken {
+                Ok(true) => {}
+                // Every store is gone.
+                Ok(false) => return,
                 Err(_) if state.strong_count() == 0 => return,
                 Err(_) => continue,
             }
             let Some(state) = state.upgrade() else {
                 return;
             };
-            warrants_changed(&state).await;
+            warrants_changed(&state, &mut known).await;
         }
     });
 }
@@ -340,8 +349,28 @@ const WARRANT_WATCH_POLL: std::time::Duration = std::time::Duration::from_secs(3
 /// How many dialogs a scan looks at before it lets other tasks run.
 const WARRANT_SCAN_CHUNK: usize = 256;
 
-/// The warrants have changed: find the live dialogs one now covers and start
-/// its interception on each.
+/// The targets each provisioned warrant names.
+type KnownTargets = std::collections::HashMap<
+    crate::li::x1::types::XId,
+    Vec<crate::li::x1::types::TargetIdentifier>,
+>;
+
+pub(super) fn known_targets(li: &crate::li::LiManager) -> KnownTargets {
+    li.tasks()
+        .list()
+        .into_iter()
+        .map(|task| (task.details.x_id, task.details.target_identifiers))
+        .collect()
+}
+
+/// The warrants or destinations have changed.
+///
+/// What is no longer provisioned is detached first, on every change
+/// ([`x3_delivery::detach_unwarranted`]): a warrant deactivated, one that now
+/// asks for no content or names another destination, a destination removed,
+/// and a warrant whose target changed and no longer names a call that is up.
+/// Then the live dialogs a warrant covers now are found and their interception
+/// started ([`warrant_live_dialog`]).
 ///
 /// The dialogs are copied out of the index first, so nothing is held while
 /// each is matched and asked of the call stores. A dialog no warrant names is
@@ -349,14 +378,26 @@ const WARRANT_SCAN_CHUNK: usize = 256;
 /// keeps what it has and adds what is new; each attach is idempotent per
 /// record, attempt and delivery ([`attach_x3`]), so doing it again asks for
 /// nothing twice.
-pub(super) async fn warrants_changed(state: &Arc<DispatcherState>) {
+pub(super) async fn warrants_changed(state: &Arc<DispatcherState>, known: &mut KnownTargets) {
     let Some(li) = state.li_manager.as_ref() else {
         return;
     };
+    let now = known_targets(li);
+    let retargeted: Vec<_> = now
+        .iter()
+        .filter(|(x_id, targets)| known.get(x_id).is_some_and(|before| before != *targets))
+        .map(|(x_id, _)| *x_id)
+        .collect();
+    *known = now;
+    let dialogs = li.live_dialogs();
+    if !retargeted.is_empty() {
+        retract_dropped_targets(li, &dialogs, &retargeted);
+    }
+    super::x3_delivery::detach_unwarranted(state);
     if !li.is_intercepting() {
         return;
     }
-    for (scanned, dialog) in li.live_dialogs().into_iter().enumerate() {
+    for (scanned, dialog) in dialogs.into_iter().enumerate() {
         if scanned % WARRANT_SCAN_CHUNK == WARRANT_SCAN_CHUNK - 1 {
             tokio::task::yield_now().await;
         }
@@ -364,8 +405,41 @@ pub(super) async fn warrants_changed(state: &Arc<DispatcherState>) {
     }
 }
 
+/// A warrant's target was changed: a call it covered, as the call opened, and
+/// that it no longer names stops being covered. Only calls this node saw
+/// open, and only warrants whose target changed, so a call matched on some
+/// later message's identities is never dropped by an unrelated change.
+fn retract_dropped_targets(
+    li: &crate::li::LiManager,
+    dialogs: &[crate::li::live_dialogs::LiveDialog],
+    retargeted: &[crate::li::x1::types::XId],
+) {
+    for dialog in dialogs {
+        let Some(session) = li.session_of_leg(&dialog.call_id) else {
+            continue;
+        };
+        let named: Vec<_> = li
+            .tasks()
+            .match_message(
+                Some(&dialog.request_uri),
+                Some(&dialog.from),
+                Some(&dialog.to),
+                dialog.source_ip,
+            )
+            .into_iter()
+            .map(|matched| matched.task.details.x_id)
+            .collect();
+        for matched in &session.matches {
+            let x_id = matched.task.details.x_id;
+            if retargeted.contains(&x_id) && !named.contains(&x_id) {
+                li.drop_session_warrant(&session.session_id, x_id);
+            }
+        }
+    }
+}
+
 /// What a live dialog's call is, as far as content is concerned.
-struct LiveCall {
+pub(super) struct LiveCall {
     owner: Option<crate::li::CallOwner>,
     answered: bool,
 }
@@ -374,9 +448,12 @@ struct LiveCall {
 ///
 /// A B2BUA call is up while its actor is not terminated, and answered in the
 /// state it says. A proxied call is up while the media path holds a session
-/// for it (or a seat in a room), and answered once that has its answer. Nothing else is: a dialog
-/// whose call has ended is no business of a warrant.
-fn live_call(
+/// for it or a party of it sits in a conference room, and answered once that
+/// has its answer or the party is seated. Nothing else is: a dialog whose
+/// call has ended is no business of a warrant. The sweep of the dialog index
+/// asks this too ([`sweep_live_dialogs`]), so what is swept is what the scan
+/// would not act on.
+pub(super) fn live_call(
     state: &DispatcherState,
     dialog: &crate::li::live_dialogs::LiveDialog,
 ) -> Option<LiveCall> {
@@ -413,21 +490,54 @@ fn live_call(
     })
 }
 
+/// Release the dialogs whose call is gone. See [`live_call`].
+pub(super) fn sweep_live_dialogs(
+    state: &DispatcherState,
+    li: &crate::li::LiManager,
+    now: std::time::Instant,
+) {
+    li.sweep_live_dialogs(now, |dialog| live_call(state, dialog).is_some());
+}
+
+/// A live dialog a warrant covers, decided and not yet attached.
+pub(super) struct DecidedLiveDialog {
+    session: crate::li::SessionView,
+    answered: bool,
+    offerer_tag: String,
+}
+
 /// Decide the session of one live dialog a warrant covers, and start the
 /// delivery of its content where the call's media is.
 ///
 /// The session is decided as its dialog-forming INVITE would have been
-/// ([`crate::li::LiManager::decide_live_dialog`]), and no X2 is emitted: that
-/// resumes at the call's next message. The content is attached on the sites
-/// the message paths use. An answered call is attached as its ACK attaches
-/// it, a joined seat on the seat. A call that is not answered is attached as
-/// its offer attaches it, on an engine that takes an interception there; on
-/// one that does not, its ACK asks, as before.
-fn warrant_live_dialog(
+/// ([`crate::li::LiManager::decide_live_dialog`]), under the key a message of
+/// the dialog decides it under, and no X2 is emitted: that resumes at the
+/// call's next message. The content is attached on the sites the message
+/// paths use. An answered call is attached as its ACK attaches it, a joined
+/// seat on the seat. A call that is not answered is attached as its offer
+/// attaches it, on an engine that takes an interception there; on one that
+/// does not, its ACK asks, as before.
+pub(super) fn warrant_live_dialog(
     state: &Arc<DispatcherState>,
     li: &crate::li::LiManager,
     dialog: &crate::li::live_dialogs::LiveDialog,
 ) {
+    if let Some(decided) = decide_live_dialog(state, li, dialog) {
+        attach_live_dialog(state, li, dialog, decided);
+    }
+}
+
+/// The first half of [`warrant_live_dialog`]: whether a warrant covers the
+/// dialog and its call is up, and the session decided.
+pub(super) fn decide_live_dialog(
+    state: &Arc<DispatcherState>,
+    li: &crate::li::LiManager,
+    dialog: &crate::li::live_dialogs::LiveDialog,
+) -> Option<DecidedLiveDialog> {
+    // The dialog may have ended since it was copied out of the index.
+    if !li.live_dialog_held(dialog) {
+        return None;
+    }
     let covered = li.tasks().match_message(
         Some(&dialog.request_uri),
         Some(&dialog.from),
@@ -435,20 +545,18 @@ fn warrant_live_dialog(
         dialog.source_ip,
     );
     if covered.is_empty() {
-        return;
+        return None;
     }
     let call_id: &str = &dialog.call_id;
-    let Some(call) = live_call(state, dialog) else {
-        return;
-    };
+    let call = live_call(state, dialog)?;
     let media = dialog_media(state, call_id);
     let offerer_tag = media
         .as_ref()
         .and_then(|media| media.offerer_tag.clone())
         .or_else(|| dialog.caller_tag().map(str::to_string));
-    let mut session = li.decide_live_dialog(dialog, call.owner, media, call.answered);
+    let session = li.decide_live_dialog(dialog, call.owner, media, call.answered);
     if session.matches.is_empty() {
-        return;
+        return None;
     }
     debug!(
         call_id = %call_id,
@@ -461,15 +569,44 @@ fn warrant_live_dialog(
         .iter()
         .any(|matched| matched.task.details.delivery_type.includes_content())
     {
-        return;
+        return None;
     }
     let Some(offerer_tag) = offerer_tag else {
         error!(
             session = %session.session_id,
             "a content warrant matched a live call with no From-tag; cannot attach X3"
         );
-        return;
+        return None;
     };
+    Some(DecidedLiveDialog {
+        session,
+        answered: call.answered,
+        offerer_tag,
+    })
+}
+
+/// The second half of [`warrant_live_dialog`]: attach what was decided, if the
+/// call is still up. A BYE or a failure can have ended it since it was
+/// decided, and what is attached for a call that has ended is warranted
+/// content asked of an engine call that is not there.
+pub(super) fn attach_live_dialog(
+    state: &Arc<DispatcherState>,
+    li: &crate::li::LiManager,
+    dialog: &crate::li::live_dialogs::LiveDialog,
+    decided: DecidedLiveDialog,
+) {
+    let call_id: &str = &dialog.call_id;
+    let DecidedLiveDialog {
+        mut session,
+        answered,
+        offerer_tag,
+    } = decided;
+    if !li.live_dialog_held(dialog) || live_call(state, dialog).is_none() {
+        // Over: the decision made for it goes with it, as the message that
+        // ended it would have released it.
+        li.forget_session(&session.session_id);
+        return;
+    }
     // A party already seated in a room has its media in the seat.
     if let Some(held) = crate::rtpengine::MediaBackend::conference_seat(call_id) {
         let seat = crate::li::Seat {
@@ -480,7 +617,7 @@ fn warrant_live_dialog(
             session = seated;
         }
     }
-    if call.answered {
+    if answered {
         attach_at_ack(state, session, offerer_tag);
     } else {
         attach_at_offer(state, &session, call_id, &offerer_tag);

@@ -622,10 +622,14 @@ impl LiManager {
         self.resolve_session_inner(call_id, facts, identities, owner, media, false)
     }
 
-    /// [`resolve_session_with`](Self::resolve_session_with). `media_on_open`
-    /// asks the media path what it holds for a dialog-forming INVITE too,
-    /// which only a decision made after the fact needs: the INVITE that is
-    /// being decided as it arrives has no media yet.
+    /// [`resolve_session_with`](Self::resolve_session_with). `live` says the
+    /// dialog is already up and is being decided after the fact, from the
+    /// identities of its dialog-forming INVITE ([`Self::decide_live_dialog`]).
+    /// It asks the media path what it holds for it, which the INVITE that is
+    /// decided as it arrives has none of yet, and keys the session as any
+    /// later message of the dialog would (the Call-ID, or the call's internal
+    /// id), not under an id of its own: whichever of the two decides a
+    /// dialog second finds the first's decision there.
     fn resolve_session_inner(
         &self,
         call_id: &str,
@@ -633,7 +637,7 @@ impl LiManager {
         identities: &Identities<'_>,
         owner: impl FnOnce() -> Option<CallOwner>,
         media: impl FnOnce() -> Option<DialogMedia>,
-        media_on_open: bool,
+        live: bool,
     ) -> SessionView {
         if !self.is_intercepting() {
             return SessionView::unwarranted(call_id);
@@ -713,7 +717,7 @@ impl LiManager {
         }
         // A warrant that starts in the middle of a call nothing is remembered
         // of: the media path says where the call's media is, and who offered.
-        let known_to_media = ((media_on_open || !facts.opens_dialog()) && !matches.is_empty())
+        let known_to_media = ((live || !facts.opens_dialog()) && !matches.is_empty())
             .then(media)
             .flatten()
             .unwrap_or_default();
@@ -774,7 +778,7 @@ impl LiManager {
                     Arc::from(owner.a_leg_call_id),
                     true,
                 )
-            } else if facts.opens_dialog() {
+            } else if facts.opens_dialog() && !live {
                 (
                     Arc::from(uuid::Uuid::new_v4().to_string()),
                     Arc::clone(&call_id),
@@ -784,7 +788,9 @@ impl LiManager {
                 (Arc::clone(&call_id), Arc::clone(&call_id), false)
             };
 
-        self.insert_decision(
+        #[cfg(test)]
+        pause::before_insert(&call_id);
+        let inserted = self.insert_decision(
             &session_id,
             &primary_call_id,
             &call_id,
@@ -793,6 +799,21 @@ impl LiManager {
             bound_to_call,
             caller_tag_known,
         );
+        if !inserted {
+            // A message of the same session decided it between this one
+            // looking and inserting. That decision stands, and this adopts it.
+            if let Some(view) = self.refresh(
+                &session_id,
+                &call_id,
+                generation,
+                facts,
+                identities,
+                &sender,
+                &mut (&mut None, &mut Vec::new()),
+            ) {
+                return view;
+            }
+        }
         if called_party_leg {
             self.note_called_party_leg(&session_id, &call_id);
         }
@@ -1453,7 +1474,7 @@ impl LiManager {
         matched: Vec<SessionMatch>,
         bound_to_call: bool,
         caller_tag: Option<Box<str>>,
-    ) {
+    ) -> bool {
         // Bounded, because the key is attacker-supplied. Clearing on overflow
         // costs a re-derivation, never a missed interception.
         if self.decisions.len() >= MAX_REMEMBERED_SESSIONS {
@@ -1475,28 +1496,87 @@ impl LiManager {
                 }
             }
         }
-        self.decisions.insert(
-            Arc::clone(session_id),
-            SessionDecision {
-                generation,
-                matched,
-                seen: HashSet::new(),
-                primary_call_id: Arc::clone(primary_call_id),
-                legs: Vec::new(),
-                bound_to_call,
-                invite_session: false,
-                established: false,
-                invite_branches: Vec::new(),
-                ended_at: None,
-                seats: Vec::new(),
-                caller_tag,
-                called_party_legs: Vec::new(),
-                ended_by_bye: false,
-                engine_calls: Vec::new(),
-            },
-        );
+        // Insert only if absent, in one step: two messages of one session
+        // that both found nothing must not each write a decision, the second
+        // taking the first's (its recorded messages, its end, its engine
+        // calls) away.
+        let dashmap::mapref::entry::Entry::Vacant(vacant) =
+            self.decisions.entry(Arc::clone(session_id))
+        else {
+            return false;
+        };
+        vacant.insert(SessionDecision {
+            generation,
+            matched,
+            seen: HashSet::new(),
+            primary_call_id: Arc::clone(primary_call_id),
+            legs: Vec::new(),
+            bound_to_call,
+            invite_session: false,
+            established: false,
+            invite_branches: Vec::new(),
+            ended_at: None,
+            seats: Vec::new(),
+            caller_tag,
+            called_party_legs: Vec::new(),
+            ended_by_bye: false,
+            engine_calls: Vec::new(),
+        });
         self.alias(primary_call_id, session_id);
         self.alias(call_id, session_id);
+        true
+    }
+
+    /// Whether the session `session_id` is covered by the warrant `x_id`, as
+    /// decided; `None` when there is no decision to say. The decision is
+    /// re-read for each delivery, so a warrant that no longer names the call
+    /// stops covering it.
+    pub(super) fn session_names_warrant(&self, session_id: &str, x_id: XId) -> Option<bool> {
+        self.decisions
+            .get(session_id)
+            .map(|decision| decision.matched.iter().any(|known| known.x_id == x_id))
+    }
+
+    /// The warrant `x_id` no longer names the call of `session_id`: drop it
+    /// from the decision, so what the session is owed under it stops.
+    pub fn drop_session_warrant(&self, session_id: &str, x_id: XId) {
+        if let Some(mut decision) = self.decisions.get_mut(session_id) {
+            decision.matched.retain(|known| known.x_id != x_id);
+        }
+    }
+}
+
+/// A place for a test to act between a message deciding a session and
+/// inserting the decision.
+#[cfg(test)]
+pub(crate) mod pause {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut(&str)>;
+
+    thread_local! {
+        static BEFORE_INSERT: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` once with the Call-ID, the next time this thread is about
+    /// to insert a decision.
+    pub(crate) fn once_before_insert(hook: impl FnOnce(&str) + 'static) {
+        let mut hook = Some(hook);
+        BEFORE_INSERT.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |call_id| {
+                if let Some(hook) = hook.take() {
+                    hook(call_id);
+                }
+            }));
+        });
+    }
+
+    pub(super) fn before_insert(call_id: &str) {
+        // Taken out first: the hook may resolve messages itself.
+        let taken = BEFORE_INSERT.with(|slot| slot.borrow_mut().take());
+        if let Some(mut hook) = taken {
+            hook(call_id);
+        }
     }
 }
 

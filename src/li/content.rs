@@ -713,6 +713,103 @@ impl LiManager {
         detached
     }
 
+    /// Every live delivery on record, each with the record it is on. A copy,
+    /// so what is asked of other stores for each is asked with no guard held.
+    pub fn x3_live_attachments(&self) -> Vec<(String, ActiveIntercept)> {
+        self.x3_attachments
+            .iter()
+            .flat_map(|content| {
+                let record = content.key().clone();
+                content
+                    .value()
+                    .attachments
+                    .iter()
+                    .map(|attachment| (record.clone(), attachment.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Whether a delivery is still provisioned: its warrant exists and asks
+    /// for content, it still names the delivery's destination at the same
+    /// address, and the call it is on is still one the warrant names. A
+    /// delivery whose session has no decision left to say is taken to be.
+    pub fn x3_still_warranted(&self, attachment: &ActiveIntercept) -> bool {
+        let Some(task) = self.tasks.get(attachment.x_id) else {
+            return false;
+        };
+        if !task.details.delivery_type.includes_content() {
+            return false;
+        }
+        let named = self
+            .tasks
+            .destinations_for_interface(attachment.x_id, true)
+            .iter()
+            .any(|destination| {
+                destination.details.d_id == attachment.d_id
+                    && destination
+                        .details
+                        .delivery_address
+                        .socket_addr()
+                        .is_some_and(|address| address.to_string() == attachment.delivery)
+            });
+        named
+            && self
+                .session_names_warrant(&attachment.session_id, attachment.x_id)
+                .unwrap_or(true)
+    }
+
+    /// siphon is detaching these deliveries of a record, and no others
+    /// (their warrant, destination or target is no longer provisioned): they
+    /// stop being live and stay on record until the engine reports each
+    /// ended, as a detach siphon asked for, which is not a fault. Returns the
+    /// ones that were live, so one that ended meanwhile, or that another scan
+    /// took, is not detached twice. The session is not ended: the call goes
+    /// on, and its other deliveries with it.
+    pub fn x3_detach_deliveries(
+        &self,
+        call_id: &str,
+        deliveries: &[ActiveIntercept],
+    ) -> Vec<ActiveIntercept> {
+        let Some(mut content) = self.x3_attachments.get_mut(call_id) else {
+            return Vec::new();
+        };
+        let (detached, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut content.attachments)
+            .into_iter()
+            .partition(|attachment| {
+                deliveries.iter().any(|wanted| {
+                    asked(wanted) == asked(attachment)
+                        && wanted.scope == attachment.scope
+                        && wanted.session_id == attachment.session_id
+                })
+            });
+        content.attachments = kept;
+        let mut scopes: Vec<Option<CallScope>> = Vec::new();
+        for attachment in &detached {
+            if !scopes.contains(&attachment.scope) {
+                scopes.push(attachment.scope.clone());
+            }
+        }
+        for scope in scopes {
+            let attachments = detached
+                .iter()
+                .filter(|attachment| attachment.scope == scope)
+                .cloned()
+                .collect();
+            let leg = content.leg(scope.as_ref());
+            leg.ended.push_back(Ended {
+                attempt: leg.attempt,
+                detached: true,
+                engine_call: EngineCallEnd::No,
+                attachments,
+                held: Vec::new(),
+                refused: Vec::new(),
+                offered: false,
+            });
+        }
+        detached
+    }
+
     /// A message shows the session `session_id` live on a call it had ended
     /// on: its Call-ID opens a new dialog, or the answer to its INVITE beat
     /// the CANCEL that was taken for its end. It is owed its content again.

@@ -391,6 +391,147 @@ pub(super) fn detach_x3(session: &crate::li::SessionView, state: &Arc<Dispatcher
     });
 }
 
+/// Detach the deliveries that are no longer provisioned: their warrant was
+/// deactivated or now asks for no content, it no longer names the call's
+/// target, or its destination is gone.
+///
+/// The call goes on, so only those deliveries are detached, and each is put
+/// on record as a detach siphon asked for before the engine is sent it
+/// ([`LiManager::x3_detach_deliveries`]), so the end the engine reports is
+/// clean and no fault reaches the ADMF.
+///
+/// An engine that lists `x3_multi_delivery` detaches each by its warrant,
+/// delivery address and Correlation ID. One that does not holds one delivery
+/// per call and detaches the call's, so it is detached only when no
+/// provisioned delivery is left on the leg. One is, and a single-delivery
+/// engine cannot drop one warrant's copy: the record is left and the call and
+/// warrant are logged, not hidden. A conference seat is detached as a whole
+/// on the same terms.
+pub(super) fn detach_unwarranted(state: &Arc<DispatcherState>) {
+    let (Some(li), Some(backend)) = (state.li_manager.as_ref(), state.rtpengine_set.as_ref())
+    else {
+        return;
+    };
+    // Judged with no guard on the record held: each asks other stores.
+    let mut unwanted: Vec<(String, Vec<ActiveIntercept>, Vec<ActiveIntercept>)> = Vec::new();
+    for (record, attachment) in li.x3_live_attachments() {
+        let warranted = li.x3_still_warranted(&attachment);
+        let position = match unwanted.iter().position(|(held, _, _)| *held == record) {
+            Some(position) => position,
+            None => {
+                unwanted.push((record, Vec::new(), Vec::new()));
+                unwanted.len() - 1
+            }
+        };
+        match warranted {
+            true => unwanted[position].2.push(attachment),
+            false => unwanted[position].1.push(attachment),
+        }
+    }
+    unwanted.retain(|(_, gone, _)| !gone.is_empty());
+    if unwanted.is_empty() {
+        return;
+    }
+    let (li, backend) = (li.clone(), Arc::clone(backend));
+    tokio::spawn(async move {
+        for (record, gone, kept) in unwanted {
+            detach_unwarranted_record(&li, &backend, &record, gone, kept).await;
+        }
+    });
+}
+
+/// Whether the engine call's leg carries several deliveries and so detaches
+/// each by name.
+async fn engine_names_deliveries(
+    backend: &MediaBackend,
+    call_id: &str,
+    scope: Option<&CallScope>,
+) -> bool {
+    let feature = X3Feature::MultiDelivery;
+    match backend.x3_feature(feature, call_id, scope) {
+        Some(listed) => listed,
+        None => backend
+            .learn_x3_feature(feature, call_id, scope)
+            .await
+            .unwrap_or(false),
+    }
+}
+
+async fn detach_unwarranted_record(
+    li: &LiManager,
+    backend: &MediaBackend,
+    record: &str,
+    gone: Vec<ActiveIntercept>,
+    kept: Vec<ActiveIntercept>,
+) {
+    if let Some((conference_id, _)) = record.split_once('\u{1f}') {
+        // A seat's deliveries are one detach of the seat.
+        if let Some(still) = kept.first() {
+            error!(
+                call_id = %conference_id, x_id = %still.x_id,
+                "an X3 delivery on a conference seat is no longer provisioned, but the \
+                 seat still carries another that is, and cannot drop one"
+            );
+            return;
+        }
+        let moved = li.x3_detach_deliveries(record, &gone);
+        let Some(first) = moved.first() else {
+            return;
+        };
+        let seat = ConferenceSeat {
+            conference_id: conference_id.to_string(),
+            from_tag: first.from_tag.clone(),
+        };
+        let detached = backend.detach_x3_seat(&seat).await;
+        for attachment in moved {
+            if let Err(error) = &detached {
+                warn!(
+                    x_id = %attachment.x_id, %conference_id, %error,
+                    "could not detach X3 content delivery from a conference seat"
+                );
+            }
+            li.audit(
+                crate::li::AuditOperation::MediaCaptureStopped,
+                Some(&attachment.x_id.to_string()),
+                format!("X3 detached conference_id={conference_id} (warrant withdrawn)"),
+            );
+        }
+        return;
+    }
+    let mut scopes: Vec<Option<CallScope>> = Vec::new();
+    for attachment in &gone {
+        if !scopes.contains(&attachment.scope) {
+            scopes.push(attachment.scope.clone());
+        }
+    }
+    for scope in scopes {
+        let on_leg = |attachments: &[ActiveIntercept]| -> Vec<ActiveIntercept> {
+            attachments
+                .iter()
+                .filter(|attachment| attachment.scope == scope)
+                .cloned()
+                .collect()
+        };
+        let (leaving, staying) = (on_leg(&gone), on_leg(&kept));
+        if !engine_names_deliveries(backend, record, scope.as_ref()).await {
+            if let Some(still) = staying.first() {
+                error!(
+                    call_id = %record, x_id = %leaving[0].x_id, still = %still.x_id,
+                    "an X3 delivery is no longer provisioned but stays: the media engine \
+                     holds one delivery per call and cannot drop one warrant's copy while \
+                     another is provisioned on it"
+                );
+                continue;
+            }
+        }
+        let moved = li.x3_detach_deliveries(record, &leaving);
+        if moved.is_empty() {
+            continue;
+        }
+        detach_from_call(li, backend, record, moved).await;
+    }
+}
+
 /// Detach a session's deliveries from its engine call, each leg's on the leg
 /// it was attached on.
 async fn detach_from_call(

@@ -975,6 +975,22 @@ pub(super) async fn intercepting_on_the_engine(
     mpsc::Receiver<IriEvent>,
     mpsc::Receiver<AuditEntry>,
 ) {
+    intercepting_on_the_engine_watching(engine, true).await
+}
+
+/// [`intercepting_on_the_engine`], with the warrant watcher installed only
+/// when `watching`: a test that drives the scan itself, step by step, has
+/// no watcher racing it.
+pub(super) async fn intercepting_on_the_engine_watching(
+    engine: NativeTestEngine,
+    watching: bool,
+) -> (
+    Arc<DispatcherState>,
+    NativeTestEngine,
+    LiManager,
+    mpsc::Receiver<IriEvent>,
+    mpsc::Receiver<AuditEntry>,
+) {
     let mut dispatcher = test_dispatcher();
     dispatcher.state.rtpengine_set = Some(engine.backend());
     dispatcher.state.rtpengine_profiles = Some(Arc::new(crate::rtpengine::ProfileRegistry::new()));
@@ -983,7 +999,9 @@ pub(super) async fn intercepting_on_the_engine(
     dispatcher.state.rtpengine_sessions = Some(sessions);
     let (state, li, iri, audit) = intercepting_on(dispatcher);
     super::intercept::watch_engine_calls(&state);
-    super::intercept::watch_warrants(&state);
+    if watching {
+        super::intercept::watch_warrants(&state);
+    }
     (state, engine, li, iri, audit)
 }
 
