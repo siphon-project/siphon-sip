@@ -139,35 +139,52 @@ pub(super) fn intercept_message(
 
         // Content capture stops when the session ends, on whichever leg the
         // end arrives: a far end that hangs up sends its BYE on the callee
-        // leg. There is no matching "start" here: the attachment is made at
-        // the ACK, below, because the engine has no call to intercept until
-        // the script has offered it one.
+        // leg. There is no matching "start" here: the engine has no call to
+        // intercept until the script has offered it one, so the attachment is
+        // made when that offer reaches the engine ([`watch_engine_calls`]), or
+        // at the ACK, below, on an engine that cannot take it that early.
         if event_type == crate::li::IriEventType::End {
             detach_x3(&session.engine_call_id, state);
         }
 
-        // X3 attaches when the media session is established, not when the
-        // warrant matches.
+        // X3 attaches when the media session exists at the engine, not when
+        // the warrant matches.
         //
         // Interception is matched here, before the script runs, so a script
         // cannot decline a warrant. The attachment cannot be made here though,
         // because the engine only learns of a call when the script offers it
-        // there and this runs first. Two earlier placements were both too
-        // early, and the engine said so rather than accepting them:
+        // there and this runs first: asked at the dialog-forming INVITE, the
+        // engine answered "unknown call".
         //
-        //   at the dialog-forming INVITE  — "unknown call": the offer had not
-        //                                   reached the engine yet.
-        //   at the answer                 — "no answered second leg": the
-        //                                   response had not been dispatched
-        //                                   yet, so the script had not answered
-        //                                   it to the engine.
+        // Where it is made depends on the engine.
         //
-        // The ACK is the first message that arrives with the session already
-        // established: RFC 3261 §13 completes the offer/answer there, both legs
-        // are answered in the engine, and it is in-dialog so it cannot be
-        // confused with the INVITE. Attaching there means one attempt that
-        // succeeds, which matters because a failed attempt is a compliance
-        // signal reported to the ADMF and must not be routine.
+        // **At the offer**, on a siphon-rtp that lists `x3_attach_at_offer`
+        // in `node_info` (0.25.1 and later, when it is provisioned for X3).
+        // That engine takes an interception on a call that is offered but not
+        // answered: it opens the delivery connection at once, puts the taps on
+        // at the first answer (a 183 with SDP included) and keeps the one
+        // connection, Correlation ID and sequence through the final answer and
+        // every re-offer. So the attach is sent as soon as the script's offer
+        // has succeeded ([`watch_engine_calls`]), off the INVITE's path, and
+        // the first packet after the answer and all early media are delivered.
+        //
+        // **At the ACK**, on an engine that does not list the feature (an
+        // older siphon-rtp refuses an unanswered call: "no answered second
+        // leg") and for whatever an offer did not attach: a warrant or a
+        // destination added since, a leg on an engine without the feature, a
+        // call the engine answered itself. Asked at the answer instead, the
+        // older engine refused as well, since the response had not been
+        // dispatched yet and the script had not answered it to the engine. The
+        // ACK is the first message that arrives with the session established:
+        // RFC 3261 §13 completes the offer/answer there, both legs are
+        // answered in the engine, and it is in-dialog so it cannot be confused
+        // with the INVITE.
+        //
+        // Either way each `(leg, warrant, destination)` is asked for once per
+        // engine call: the request is recorded before it is sent, and the ACK
+        // asks only for what has no record ([`attach_x3`]). That matters
+        // because a failed attempt is a compliance signal reported to the ADMF
+        // and must not be routine.
         //
         // Only an ACK on the session's anchoring dialog. The engine knows the
         // call by that dialog's Call-ID and keys the interception on its
@@ -177,22 +194,40 @@ pub(super) fn intercept_message(
         // And only the ACK of an answer. The ACK of a 486 looks the same here,
         // but by then the media session is gone: the engine would refuse an
         // unknown call, and that refusal would reach the ADMF as warranted
-        // content going undelivered on a call that never had any.
+        // content going undelivered on a call that never had any. The ACK of a
+        // rejected re-INVITE acknowledges no new media either.
         if is_ack(message, &method) {
             if unanswered {
                 debug!(
                     call_id = %call_id,
                     session = %session.session_id,
-                    "LI: ACK of a failure response, the call was not answered and has no content"
+                    "LI: ACK of a failure response, it acknowledges no media to deliver"
                 );
-            } else if session.on_primary_leg {
-                attach_x3(matched, &session, message, state);
-            } else {
+            } else if !session.on_primary_leg {
                 debug!(
                     call_id = %call_id,
                     session = %session.session_id,
                     "LI: ACK on a callee leg, X3 stays on the caller leg's attachment"
                 );
+            } else {
+                // The engine keys an interception on the offerer's tag, which
+                // is the dialog's From-tag.
+                match from_tag(message) {
+                    Some(from_tag) => {
+                        let legs = intercepted_legs(state, &session.engine_call_id)
+                            .into_iter()
+                            .map(|leg| {
+                                let attempt = li.x3_attempt(&session.engine_call_id, leg.as_ref());
+                                (leg, attempt)
+                            })
+                            .collect();
+                        attach_x3(matched, &session, &from_tag, legs, state);
+                    }
+                    None => error!(
+                        xid = %x_id,
+                        "a content warrant matched a message with no From-tag; cannot attach X3"
+                    ),
+                }
             }
         }
     }
@@ -238,10 +273,30 @@ pub(super) fn create_b2bua_call(state: &DispatcherState, a_leg: Leg) -> String {
 /// already refused a content warrant this node cannot service, so reaching here
 /// means the backend can do it; a failure at the command is therefore a real
 /// delivery fault and is reported to the ADMF rather than logged and forgotten.
+///
+/// `from_tag` is the offerer's tag, which the engine keys the interception on,
+/// and `legs` the legs of the call to tap, each with the number of its engine
+/// call's attempt as the caller found it ([`LiManager::x3_attempt`]): every
+/// leg the call has at its ACK ([`intercepted_legs`]), or the one leg an offer
+/// has just anchored.
+///
+/// Each `(leg, warrant, destination)` is recorded before the engine is asked,
+/// and asked only when it had no record: an offer and an ACK, or two ACKs (a
+/// re-INVITE has its own), then ask once between them, and a delivery end
+/// that beats the engine's answer finds its attachment. Attaching twice would
+/// open a second interception on the same leg and deliver every packet to the
+/// agency twice. Nothing is asked for a leg whose engine call siphon has ended
+/// since the caller looked.
+///
+/// Every leg of the call is tapped: on a proxy that anchored both legs of one
+/// call under per-call scopes there is no single engine call that carries all
+/// of its content, and a leg left untapped is content the agency never
+/// receives.
 pub(super) fn attach_x3(
     matched: &crate::li::x1::store::TaskMatch,
     session: &crate::li::SessionView,
-    message: &SipMessage,
+    from_tag: &str,
+    legs: Vec<(Option<crate::rtpengine::CallScope>, u64)>,
     state: &Arc<DispatcherState>,
 ) {
     let call_id: &str = &session.engine_call_id;
@@ -259,58 +314,11 @@ pub(super) fn attach_x3(
         );
         return;
     };
-    // The engine keys an interception on the offerer's tag, which is the
-    // dialog's From-tag.
-    let from_tag = message.headers.get("From").and_then(|from| {
-        from.split(';')
-            .find(|part| part.trim().starts_with("tag="))
-            .map(|tag| tag.trim().trim_start_matches("tag=").to_string())
-    });
-    let Some(from_tag) = from_tag else {
+    let x_id = matched.task.details.x_id;
+    let named = li.tasks().destinations_for_interface(x_id, true);
+    if named.is_empty() {
         error!(
-            xid = %matched.task.details.x_id,
-            "a content warrant matched a message with no From-tag; cannot attach X3"
-        );
-        return;
-    };
-
-    // Exactly the content-capable destinations this warrant named, less the
-    // ones already being delivered to.
-    //
-    // Several messages in a dialog carry SDP — the 183, the 200, a re-INVITE —
-    // and any of them can be the one that finds the session established, so
-    // this runs more than once per call by design. Attaching twice would open a
-    // second interception on the same leg and deliver every packet to the
-    // agency twice.
-    //
-    // Every leg of the call is tapped ([`intercepted_legs`]): on a proxy that
-    // anchored both legs of one call under per-call scopes there is no single
-    // engine call that carries all of its content, and a leg left untapped is
-    // content the agency never receives. So each destination is attached once
-    // per leg, keyed `(destination, leg)`.
-    let already: std::collections::HashSet<_> = li
-        .x3_attachments_for(call_id)
-        .into_iter()
-        .filter(|attachment| attachment.x_id == matched.task.details.x_id)
-        .map(|attachment| (attachment.d_id, attachment.scope))
-        .collect();
-    let legs = intercepted_legs(state, call_id);
-    let named = li
-        .tasks()
-        .destinations_for_interface(matched.task.details.x_id, true);
-    let destinations: Vec<_> = named
-        .iter()
-        .flat_map(|destination| legs.iter().map(move |leg| (destination, leg.clone())))
-        .filter(|(destination, leg)| !already.contains(&(destination.details.d_id, leg.clone())))
-        .collect();
-    if !already.is_empty() && destinations.is_empty() {
-        // Everything this warrant names is already attached; nothing to do and
-        // nothing wrong.
-        return;
-    }
-    if destinations.is_empty() {
-        error!(
-            xid = %matched.task.details.x_id,
+            xid = %x_id,
             "a content warrant named no content-capable destination — refusing to \
              attach rather than deliver nowhere"
         );
@@ -318,7 +326,7 @@ pub(super) fn attach_x3(
     }
 
     let correlation_id = li.correlation_for(&matched.task, &session.session_id);
-    let xid = matched.task.details.x_id.as_bytes();
+    let xid = x_id.as_bytes();
     // TS 103 221-2 §5.2.6 measures a delivered packet's direction against the
     // target, so which end the warrant names is load-bearing rather than
     // cosmetic: getting it wrong inverts the direction on every packet.
@@ -331,17 +339,34 @@ pub(super) fn attach_x3(
         }
     };
 
-    for (destination, scope) in destinations {
+    let attachments = named
+        .iter()
+        .flat_map(|destination| legs.iter().map(move |leg| (destination, leg)));
+    for (destination, (scope, attempt)) in attachments {
         let Some(delivery) = destination.details.delivery_address.socket_addr() else {
             continue;
         };
+        let d_id = destination.details.d_id;
+        let attempt = *attempt;
+        let recorded = li.register_x3_attachment(
+            call_id,
+            crate::li::ActiveIntercept {
+                x_id,
+                d_id,
+                from_tag: from_tag.to_string(),
+                correlation_id,
+                scope: scope.clone(),
+            },
+            attempt,
+        );
+        if !recorded {
+            continue;
+        }
         let leg = backend.leg(call_id, scope.as_ref());
         let backend = Arc::clone(backend);
         let li = li.clone();
         let call_id = call_id.to_string();
-        let from_tag = from_tag.clone();
-        let x_id = matched.task.details.x_id;
-        let d_id = destination.details.d_id;
+        let from_tag = from_tag.to_string();
         tokio::spawn(async move {
             let delivery_address = delivery.to_string();
             let attached = leg.run(backend.attach_x3(
@@ -352,18 +377,8 @@ pub(super) fn attach_x3(
                 correlation_id,
                 target_leg,
             ));
-            match attached.await {
+            let error = match attached.await {
                 Ok(()) => {
-                    li.record_x3_attachment(
-                        &call_id,
-                        crate::li::ActiveIntercept {
-                            x_id,
-                            d_id,
-                            from_tag: from_tag.clone(),
-                            correlation_id,
-                            scope: leg.scope().cloned(),
-                        },
-                    );
                     info!(
                         %x_id, %d_id, %call_id, %delivery, correlation_id,
                         scope = leg.scope().map(crate::rtpengine::CallScope::as_str),
@@ -377,34 +392,181 @@ pub(super) fn attach_x3(
                             leg_name(leg.scope())
                         ),
                     );
+                    return;
                 }
-                Err(error) => {
-                    // Warranted content is not being delivered. The ADMF has to
-                    // hear about it — this is the whole point of the
-                    // network-element-to-ADMF direction.
-                    error!(
-                        %x_id, %d_id, %call_id, %error,
-                        "could not attach X3 content delivery — warranted content is \
-                         NOT being delivered for this call"
-                    );
-                    li.audit(
-                        crate::li::AuditOperation::MediaCaptureStarted,
-                        Some(&x_id.to_string()),
-                        format!(
-                            "X3 attach FAILED call_id={call_id} leg={}: {error}",
-                            leg_name(leg.scope())
-                        ),
-                    );
-                    report_destination_fault(
-                        &li,
-                        d_id,
-                        crate::li::x1::types::TaskReportType::TerminatingFault,
-                        format!("could not attach X3 delivery for task {x_id}: {error}"),
-                    )
-                    .await;
-                }
+                Err(error) => error,
+            };
+            // The record goes either way: nothing is being delivered on it.
+            let failed = li.x3_attach_failed(&call_id, leg.scope(), x_id, d_id, attempt);
+            if failed == crate::li::FailedAttach::EndedBySiphon && error.is_call_not_found() {
+                // siphon deleted the engine call while the attach was on its
+                // way (a CANCEL, a rejection): there is no call to intercept
+                // and nothing warranted went undelivered.
+                debug!(
+                    %x_id, %d_id, %call_id, %error,
+                    "LI: the media was released before X3 could attach, no content to deliver"
+                );
+                return;
             }
+            // Warranted content is not being delivered. The ADMF has to
+            // hear about it — this is the whole point of the
+            // network-element-to-ADMF direction.
+            error!(
+                %x_id, %d_id, %call_id, %error,
+                "could not attach X3 content delivery — warranted content is \
+                 NOT being delivered for this call"
+            );
+            li.audit(
+                crate::li::AuditOperation::MediaCaptureStarted,
+                Some(&x_id.to_string()),
+                format!(
+                    "X3 attach FAILED call_id={call_id} leg={}: {error}",
+                    leg_name(leg.scope())
+                ),
+            );
+            report_destination_fault(
+                &li,
+                d_id,
+                crate::li::x1::types::TaskReportType::TerminatingFault,
+                format!("could not attach X3 delivery for task {x_id}: {error}"),
+            )
+            .await;
         });
+    }
+}
+
+/// The From-tag of `message`.
+fn from_tag(message: &SipMessage) -> Option<String> {
+    message.headers.get("From").and_then(|from| {
+        from.split(';')
+            .find(|part| part.trim().starts_with("tag="))
+            .map(|tag| tag.trim().trim_start_matches("tag=").to_string())
+    })
+}
+
+/// Follow the engine calls siphon creates and ends, for the content delivery
+/// of intercepted calls.
+///
+/// Registers with the media backend to be told of every engine call an
+/// `offer` creates there and of every one siphon ends (a `delete`, or an
+/// `offer` replacing a call), whichever path did it: a script's
+/// `rtpengine.offer()` / `rtpengine.delete()` on a proxied request or a B2BUA
+/// call, or siphon's own for a dial, a route, a failure or a teardown.
+///
+/// An offer is where content delivery is attached on an engine that accepts
+/// an interception before the answer ([`media_offered`]). siphon ending the
+/// engine call is the one way a delivery ends with its call that is not a
+/// fault, and it frees the leg for the next engine call's attachment
+/// ([`LiManager::x3_media_ended_by_siphon`]).
+///
+/// Only the native engine tells anyone; on rtpengine and rtpproxy, which
+/// cannot deliver X3, this registers nothing.
+pub(super) fn watch_engine_calls(state: &Arc<DispatcherState>) {
+    use crate::rtpengine::siphon_rtp::EngineCallChange;
+    if state.li_manager.is_none() {
+        return;
+    }
+    let Some(backend) = state.rtpengine_set.as_ref() else {
+        return;
+    };
+    // Weak, because the state owns the backend the observer is kept by.
+    let state = Arc::downgrade(state);
+    backend.observe_calls(Box::new(move |call| {
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        let (Some(li), Some(backend)) = (state.li_manager.as_ref(), state.rtpengine_set.as_ref())
+        else {
+            return;
+        };
+        // The node's own scope is the call's own media, as the ACK path names it.
+        let scope = call.scope.filter(|scope| !backend.is_node_scope(scope));
+        match call.change {
+            // Before the frame is written: one map lookup, which misses for
+            // every call no content warrant covers.
+            EngineCallChange::Ending => li.x3_media_ended_by_siphon(call.call_id, scope),
+            EngineCallChange::Offered => {
+                media_offered(&state, call.call_id, call.from_tag, scope.cloned());
+            }
+        }
+    }));
+}
+
+/// A call's media has just been offered to the engine: if a content warrant
+/// covers the call and the engine takes an interception this early, ask for
+/// it now.
+///
+/// Runs inside the offer, between the engine accepting it and the rewritten
+/// SDP going back to whoever offered, so it only decides: the attach itself
+/// is spawned ([`attach_x3`]), and so is the one `node_info` round trip that
+/// asks a freshly connected engine what it lists. The INVITE is neither held
+/// nor failed by any of it. No Python is attached here and none is taken.
+fn media_offered(
+    state: &Arc<DispatcherState>,
+    call_id: &str,
+    from_tag: &str,
+    scope: Option<crate::rtpengine::CallScope>,
+) {
+    let (Some(li), Some(backend)) = (state.li_manager.as_ref(), state.rtpengine_set.as_ref())
+    else {
+        return;
+    };
+    if !li.is_intercepting() {
+        return;
+    }
+    // The session interception decided on the INVITE, which ran before the
+    // script that made this offer. An offer under an engine call-id that is
+    // not the session's anchoring Call-ID (a dial's own allocation, a transfer
+    // re-anchoring an answered call) names no session, and its content stays
+    // with the ACK's attachment.
+    let Some(session) = li.session_of_leg(call_id) else {
+        return;
+    };
+    if !session.on_primary_leg
+        || !session
+            .matches
+            .iter()
+            .any(|matched| matched.task.details.delivery_type.includes_content())
+    {
+        return;
+    }
+    // The engine call this offer created. An attach decided for it is not
+    // made once siphon has ended it, which a CANCEL can do before the engine
+    // has said what it lists.
+    let attempt = li.x3_attempt(call_id, scope.as_ref());
+    let attach = {
+        let state = Arc::clone(state);
+        let from_tag = from_tag.to_string();
+        let legs = vec![(scope.clone(), attempt)];
+        move || {
+            for matched in &session.matches {
+                attach_x3(matched, &session, &from_tag, legs.clone(), &state);
+            }
+        }
+    };
+    match backend.x3_attach_at_offer(call_id, scope.as_ref()) {
+        Some(true) => attach(),
+        // An engine that does not take it this early: the ACK attaches.
+        Some(false) => {}
+        // The first intercepted offer on this connection: ask the engine what
+        // it lists, off the offer's path.
+        None => {
+            let backend = Arc::clone(backend);
+            let call_id = call_id.to_string();
+            tokio::spawn(async move {
+                match backend
+                    .learn_x3_attach_at_offer(&call_id, scope.as_ref())
+                    .await
+                {
+                    Ok(true) => attach(),
+                    Ok(false) => {}
+                    Err(error) => warn!(
+                        %call_id, %error,
+                        "LI: could not read the media engine's features, X3 attaches at the ACK"
+                    ),
+                }
+            });
+        }
     }
 }
 

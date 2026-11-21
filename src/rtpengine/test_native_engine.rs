@@ -298,6 +298,13 @@ fn x3_command(command: &Command) -> (Option<Recorded>, Option<String>, bool, boo
     }
 }
 
+/// What [`NativeTestEngine::start`] lists in `node_info.features`.
+const NATIVE_ENGINE_FEATURES: [&str; 3] = ["relay", "scope", "conference_seat"];
+
+/// What an engine provisioned for X3 that takes `attach_x3` on an offered,
+/// unanswered call lists on top of that.
+pub(crate) const NATIVE_ENGINE_X3_AT_OFFER: &str = "x3_attach_at_offer";
+
 /// The engine's `node_info` answer to request `id`, listing `features`.
 fn node_info_answer(id: u64, features: &[String]) -> serde_json::Value {
     serde_json::json!({
@@ -433,6 +440,26 @@ fn recording_command(command: &Command) -> (Option<Recorded>, Option<String>, bo
     }
 }
 
+/// The engine's refusal of an `attach_x3` on a call it answered itself
+/// (`answer_local`) and that no `offer_far` grew a far leg on: there is no
+/// second party whose content a warrant covers. The reason is the engine's.
+fn no_second_leg(
+    command: &Command,
+    scope: &Option<String>,
+    local: &Mutex<HashSet<(Option<String>, String)>>,
+    grown: &Mutex<HashSet<String>>,
+) -> Option<String> {
+    let Command::AttachX3 { call_id, .. } = command else {
+        return None;
+    };
+    let answered_locally = local
+        .lock()
+        .is_ok_and(|local| local.contains(&(scope.clone(), call_id.clone())));
+    let has_far_leg = grown.lock().is_ok_and(|grown| grown.contains(call_id));
+    (answered_locally && !has_far_leg)
+        .then(|| "attach_x3: the call has no second leg to intercept".to_string())
+}
+
 /// The engine's refusal of a `conference_seat` into a full room: one whose id
 /// starts `full-`.
 fn seat_refusal(command: &Command) -> Option<String> {
@@ -471,7 +498,16 @@ impl NativeTestEngine {
     /// Start the engine on a loopback port. Serves every connection the client
     /// opens until the test's runtime ends.
     pub(crate) async fn start() -> NativeTestEngine {
-        NativeTestEngine::start_with_features(&["relay", "scope", "conference_seat"]).await
+        NativeTestEngine::start_with_features(&NATIVE_ENGINE_FEATURES).await
+    }
+
+    /// [`NativeTestEngine::start`] for an engine that also lists
+    /// `x3_attach_at_offer`: one provisioned for X3 that takes an
+    /// interception on a call before its callee answers.
+    pub(crate) async fn start_with_x3_at_offer() -> NativeTestEngine {
+        let mut features = NATIVE_ENGINE_FEATURES.to_vec();
+        features.push(NATIVE_ENGINE_X3_AT_OFFER);
+        NativeTestEngine::start_with_features(&features).await
     }
 
     /// [`NativeTestEngine::start`] for an engine whose `node_info` lists
@@ -489,6 +525,8 @@ impl NativeTestEngine {
         // The calls `offer_far` grew a far leg on, which `answer` completes
         // with the caller's own answer and a `delete` with a `to_tag` drops.
         let grown: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        // The calls `answer_local` created: the engine is their far side.
+        let local: LiveCalls = Arc::new(Mutex::new(HashSet::new()));
         let (answers, answers_open) = tokio::sync::watch::channel(true);
         let next_play_id = Arc::new(std::sync::atomic::AtomicU64::new(
             NATIVE_ENGINE_FIRST_PLAY_ID,
@@ -499,6 +537,7 @@ impl NativeTestEngine {
                 let recorded = Arc::clone(&recorded);
                 let held = Arc::clone(&held);
                 let grown = Arc::clone(&grown);
+                let local = Arc::clone(&local);
                 let next_play_id = Arc::clone(&next_play_id);
                 let mut answers_open = answers_open.clone();
                 tokio::spawn(async move {
@@ -547,7 +586,20 @@ impl NativeTestEngine {
                         let refusal = grown_call
                             .as_ref()
                             .and_then(|grown| grown.refusal.clone())
-                            .or_else(|| seat_refusal(&request.command));
+                            .or_else(|| seat_refusal(&request.command))
+                            .or_else(|| no_second_leg(&request.command, &scope, &local, &grown));
+                        if let Ok(mut local) = local.lock() {
+                            match &request.command {
+                                Command::AnswerLocal { call_id, .. } => {
+                                    local.insert((scope.clone(), call_id.clone()));
+                                }
+                                Command::Offer { call_id, .. }
+                                | Command::Delete { call_id, .. } => {
+                                    local.remove(&(scope.clone(), call_id.clone()));
+                                }
+                                _ => {}
+                            }
+                        }
                         let (record, sdp, creates, needs_call) = match &request.command {
                             _ if grown_call.is_some() => grown_call
                                 .map(|grown| (Some(grown.record), grown.sdp, false, true))

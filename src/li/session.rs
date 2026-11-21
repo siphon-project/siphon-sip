@@ -77,10 +77,10 @@ pub(super) struct SessionDecision {
     /// Whether that INVITE was answered. After the answer a failure response
     /// belongs to a re-INVITE or another in-dialog request and ends nothing.
     established: bool,
-    /// The top `Via` branches of the INVITEs seen on the session, newest last:
-    /// what the ACK of a failure response carries. See
-    /// [`LiManager::acknowledges_unanswered_invite`].
-    invite_branches: Vec<Box<str>>,
+    /// The top `Via` branches of the INVITEs seen on the session, newest last,
+    /// each with whether it was a re-INVITE: what the ACK of a failure
+    /// response carries. See [`LiManager::acknowledges_unanswered_invite`].
+    invite_branches: Vec<(Box<str>, bool)>,
     /// When the session ended, if it has. It is kept for [`SESSION_GRACE`]
     /// after that, so the stragglers of a teardown still correlate.
     ended_at: Option<Instant>,
@@ -207,6 +207,18 @@ impl SessionMatch {
 
     /// The match as delivery sees it for `sender`'s message, re-reading the
     /// task so a `ModifyTask` is honoured on the very next message.
+    /// The match as a caller that is not a message sees it (the media path):
+    /// no message, so no direction.
+    fn task_match_of_no_message(&self, manager: &LiManager) -> Option<TaskMatch> {
+        manager.tasks.get(self.x_id).map(|task| TaskMatch {
+            task,
+            party: self.party,
+            identifier: self.identifier.clone(),
+            field: self.field,
+            direction: PayloadDirection::Unknown,
+        })
+    }
+
     fn task_match(&self, manager: &LiManager, sender: &Sender<'_>) -> Option<TaskMatch> {
         manager.tasks.get(self.x_id).map(|task| TaskMatch {
             task,
@@ -566,7 +578,9 @@ impl LiManager {
                 if decision.invite_branches.len() >= MAX_INVITE_BRANCHES_PER_SESSION {
                     decision.invite_branches.remove(0);
                 }
-                decision.invite_branches.push(Box::from(branch));
+                decision
+                    .invite_branches
+                    .push((Box::from(branch), facts.to_tagged));
             }
         }
         let answered = !facts.request
@@ -590,8 +604,8 @@ impl LiManager {
         event_type
     }
 
-    /// Whether an ACK acknowledges a failure response to an INVITE on a
-    /// session that was never answered, so there is no media to deliver.
+    /// Whether an ACK acknowledges a failure response to an INVITE, so there
+    /// is no media session of that INVITE's to deliver.
     ///
     /// Interception sees every ACK, because it runs ahead of the transaction
     /// layer that would absorb this one. RFC 3261 tells the two kinds apart by
@@ -601,10 +615,14 @@ impl LiManager {
     /// far end through a proxy or siphon itself as a B2BUA, where no failure
     /// response ever arrives on the caller's leg to be noticed.
     ///
-    /// Both conditions are required, and every doubt resolves to `false`,
-    /// which attaches: a sender that reuses the INVITE's branch on the ACK of
-    /// a 2xx is wrong but its call was answered and its content is owed, and a
-    /// branch without the magic cookie identifies nothing.
+    /// Decided per INVITE, on the branch the ACK carries. For a re-INVITE that
+    /// is the whole of it: its ACK on its own branch is the ACK of its
+    /// rejection, whatever the session's state. For the INVITE that opened the
+    /// session one doubt resolves to `false`, which attaches: a sender that
+    /// reuses that INVITE's branch on the ACK of its 2xx is wrong, but its
+    /// call was answered and its content is owed, so the branch decides only
+    /// while no 2xx has been seen. A branch without the magic cookie
+    /// identifies nothing.
     pub fn acknowledges_unanswered_invite(
         &self,
         view: &SessionView,
@@ -622,12 +640,44 @@ impl LiManager {
         self.decisions
             .get(&*view.session_id)
             .is_some_and(|decision| {
-                !decision.established
-                    && decision
-                        .invite_branches
-                        .iter()
-                        .any(|invite_branch| &**invite_branch == branch)
+                decision
+                    .invite_branches
+                    .iter()
+                    .any(|(invite_branch, re_invite)| {
+                        &**invite_branch == branch && (*re_invite || !decision.established)
+                    })
             })
+    }
+
+    /// The warranted session `call_id` is a leg of, as interception last
+    /// decided it. `None` for a Call-ID no message has been intercepted on.
+    ///
+    /// For a caller that is not a message: the media path, told that a leg was
+    /// offered to the engine. Nothing is matched or decided here, so a warrant
+    /// provisioned since the session's last message is picked up by its next
+    /// message, as before.
+    pub fn session_of_leg(&self, call_id: &str) -> Option<SessionView> {
+        let session_id = self
+            .aliases
+            .get(call_id)
+            .map(|alias| Arc::clone(alias.value()))
+            .or_else(|| {
+                self.decisions
+                    .get(call_id)
+                    .map(|decision| Arc::clone(decision.key()))
+            })?;
+        let decision = self.decisions.get(&*session_id)?;
+        let matches = decision
+            .matched
+            .iter()
+            .filter_map(|known| known.task_match_of_no_message(self))
+            .collect();
+        Some(SessionView {
+            on_primary_leg: &*decision.primary_call_id == call_id,
+            engine_call_id: Arc::clone(&decision.primary_call_id),
+            session_id: Arc::clone(&session_id),
+            matches,
+        })
     }
 
     /// Record that a message instance has been intercepted, once.
@@ -675,6 +725,10 @@ impl LiManager {
             for leg in &decision.legs {
                 self.aliases.remove(&**leg);
             }
+            // The engine call's content record goes with its session. Asked
+            // whatever the session matches now: a warrant deactivated since
+            // may have left one.
+            self.forget_x3_call(&decision.primary_call_id);
         }
     }
 
@@ -688,6 +742,7 @@ impl LiManager {
         if !self.is_intercepting() {
             self.decisions.clear();
             self.aliases.clear();
+            self.forget_idle_x3_calls();
             return;
         }
         let mut released = Vec::new();
@@ -833,6 +888,7 @@ impl LiManager {
             );
             self.decisions.clear();
             self.aliases.clear();
+            self.forget_idle_x3_calls();
         }
         // A leg that had a decision of its own (unwarranted, from before the
         // warrant) is now part of this session.
@@ -1645,10 +1701,53 @@ mod tests {
             "only an ACK acknowledges anything"
         );
 
-        // Once answered, an ACK is never taken for the ACK of a failure,
-        // whatever branch a careless sender put on it.
+        // Once answered, an ACK is never taken for the ACK of the opening
+        // INVITE's failure, whatever branch a careless sender put on it.
         manager.note_message(&opening, &response("INVITE", 200));
         assert!(!manager.acknowledges_unanswered_invite(&opening, &ack(Some("z9hG4bK-invite"))));
+    }
+
+    #[test]
+    fn the_ack_of_a_rejected_re_invite_is_the_ack_of_a_failure() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2Only, None);
+        let opening = manager.resolve_session(CALLER_LEG, &invite(), &caller(), || None);
+        manager.note_message(&opening, &invite());
+        manager.note_message(&opening, &response("INVITE", 200));
+
+        let re_invite = MessageFacts {
+            branch: Some("z9hG4bK-re-invite"),
+            ..request("INVITE")
+        };
+        manager.note_message(&opening, &re_invite);
+        manager.note_message(&opening, &response("INVITE", 488));
+        assert!(
+            manager.acknowledges_unanswered_invite(&opening, &ack(Some("z9hG4bK-re-invite"))),
+            "RFC 3261 §17.1.1.3: an ACK on the re-INVITE's branch acknowledges its rejection"
+        );
+        // An accepted re-INVITE is ACKed on a branch of its own (§13.2.2.4).
+        assert!(!manager.acknowledges_unanswered_invite(&opening, &ack(Some("z9hG4bK-re-ack"))));
+    }
+
+    #[test]
+    fn a_leg_resolves_to_its_session_without_a_message() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2Only, None);
+        assert!(manager.session_of_leg(CALLER_LEG).is_none(), "never seen");
+
+        let internal_id = warranted_call(&manager);
+        let caller_leg = manager.session_of_leg(CALLER_LEG).expect("a session");
+        assert_eq!(&*caller_leg.session_id, internal_id.as_str());
+        assert!(caller_leg.on_primary_leg);
+        assert_eq!(caller_leg.matches.len(), 1);
+
+        manager.resolve_session(CALLEE_LEG, &response("INVITE", 180), &callee(), || {
+            Some(owned_by(&internal_id))
+        });
+        let callee_leg = manager.session_of_leg(CALLEE_LEG).expect("a session");
+        assert_eq!(callee_leg.session_id, caller_leg.session_id);
+        assert!(!callee_leg.on_primary_leg);
+        assert_eq!(&*callee_leg.engine_call_id, CALLER_LEG);
     }
 
     #[test]

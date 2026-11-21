@@ -31,6 +31,7 @@
 //! values explicitly rather than letting each side derive its own.
 
 pub mod asn1;
+mod content;
 pub mod pdu;
 pub mod session;
 pub mod siprec;
@@ -50,6 +51,7 @@ use crate::config::{LawfulInterceptConfig, MediaBackendKind};
 use x1::store::{ContentCapability, DestinationStore, StoredTask, TaskMatch, TaskStore};
 use x1::types::{DeliveryType, XId};
 
+pub use content::{EndedDelivery, FailedAttach};
 pub use session::{CallOwner, Identities, MessageFacts, SessionView, SESSION_GRACE};
 #[cfg(test)]
 use session::{MAX_REMEMBERED_SESSIONS, MAX_SEEN_PER_SESSION};
@@ -238,9 +240,9 @@ pub struct LiManager {
     /// configured. Needed on the delivery path so a content-loss event can be
     /// reported rather than only logged.
     x1_client: Arc<std::sync::OnceLock<Arc<x1::client::X1Client>>>,
-    /// Live X3 interceptions, keyed by the call-id the media engine knows the
-    /// call by: the caller leg's SIP Call-ID, whichever leg asked.
-    x3_attachments: Arc<DashMap<String, Vec<ActiveIntercept>>>,
+    /// X3 interceptions, keyed by the call-id the media engine knows the call
+    /// by: the caller leg's SIP Call-ID, whichever leg asked. See [`content`].
+    x3_attachments: Arc<DashMap<String, content::CallContent>>,
     /// Per-session matching decisions, keyed by session id.
     ///
     /// See [`LiManager::resolve_session`].
@@ -472,71 +474,6 @@ impl LiManager {
     /// The ADMF client, if the outbound direction is configured.
     pub fn x1_client(&self) -> Option<Arc<x1::client::X1Client>> {
         self.x1_client.get().cloned()
-    }
-
-    /// Record that content delivery started for a call.
-    pub fn record_x3_attachment(&self, call_id: &str, attachment: ActiveIntercept) {
-        self.x3_attachments
-            .entry(call_id.to_string())
-            .or_default()
-            .push(attachment);
-    }
-
-    /// Every live interception on a call.
-    pub fn x3_attachments_for(&self, call_id: &str) -> Vec<ActiveIntercept> {
-        self.x3_attachments
-            .get(call_id)
-            .map(|entry| entry.clone())
-            .unwrap_or_default()
-    }
-
-    /// The live interceptions on one leg of a call: its own media (`None`)
-    /// or the leg anchored under a per-call `scope`.
-    pub fn x3_attachments_for_leg(
-        &self,
-        call_id: &str,
-        scope: Option<&crate::rtpengine::CallScope>,
-    ) -> Vec<ActiveIntercept> {
-        self.x3_attachments_for(call_id)
-            .into_iter()
-            .filter(|attachment| attachment.scope.as_ref() == scope)
-            .collect()
-    }
-
-    /// Drop and return one leg's interceptions, when that leg's delivery
-    /// ended; the call's other legs keep theirs.
-    pub fn take_x3_attachments_for_leg(
-        &self,
-        call_id: &str,
-        scope: Option<&crate::rtpengine::CallScope>,
-    ) -> Vec<ActiveIntercept> {
-        let mut taken = Vec::new();
-        if let Some(mut attachments) = self.x3_attachments.get_mut(call_id) {
-            let (leg, others): (Vec<_>, Vec<_>) = std::mem::take(&mut *attachments)
-                .into_iter()
-                .partition(|attachment| attachment.scope.as_ref() == scope);
-            *attachments = others;
-            taken = leg;
-        }
-        self.x3_attachments
-            .remove_if(call_id, |_, attachments| attachments.is_empty());
-        taken
-    }
-
-    /// Drop and return a call's interceptions, at teardown.
-    pub fn take_x3_attachments(&self, call_id: &str) -> Vec<ActiveIntercept> {
-        self.x3_attachments
-            .remove(call_id)
-            .map(|(_, attachments)| attachments)
-            .unwrap_or_default()
-    }
-
-    /// How many calls currently have content delivery attached.
-    ///
-    /// Used by the per-module leak guard: this must drain to zero as calls end,
-    /// or the map grows for the life of the process.
-    pub fn x3_attachment_count(&self) -> usize {
-        self.x3_attachments.len()
     }
 }
 

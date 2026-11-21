@@ -1082,6 +1082,33 @@ async fn on_x3_loss(
     }
 }
 
+/// The reason the engine gives an interception that ended because its call
+/// was torn down, as [`crate::rtpengine::events::X3EndedEvent::reason`]
+/// renders it.
+pub(super) const X3_ENDED_WITH_THE_CALL: &str = "CallEnded";
+
+/// Whether the end of a delivery is nothing the ADMF needs to hear of.
+///
+/// An orderly end is siphon's own detach. The engine ending a delivery with
+/// its call is as orderly when siphon ended that engine call
+/// (`ended_by_siphon`): it issued the `delete`, or the `offer` that replaced
+/// the call. Every way a call's media is released goes through siphon, so
+/// that one fact covers a caller hanging up, a call refused or rung out with
+/// or without early media, a script rejecting or terminating, and a failed
+/// attempt released before the call is routed again.
+///
+/// Anything else is delivery stopping for a reason the ADMF should hear: the
+/// engine ending a call siphon did not delete (it timed the call out, or lost
+/// it), the mediation function closing, the delivery connection failing. And
+/// any drop at all means content was lost.
+pub(super) fn x3_end_is_clean(
+    ended: &crate::rtpengine::events::X3EndedEvent,
+    ended_by_siphon: bool,
+) -> bool {
+    ended.dropped == 0
+        && (ended.orderly || (ended_by_siphon && ended.reason == X3_ENDED_WITH_THE_CALL))
+}
+
 /// The end of one leg's delivery. Only that leg's record goes: on a call
 /// whose scoped legs are each tapped, the other legs are still delivering.
 async fn on_x3_ended(
@@ -1089,58 +1116,54 @@ async fn on_x3_ended(
     ended: crate::rtpengine::events::X3EndedEvent,
     scope: Option<CallScope>,
 ) {
-    // An orderly end is our own detach. Anything else means
-    // delivery stopped for a reason the ADMF should hear,
-    // and any drop at all means content was lost.
-    if ended.orderly && ended.dropped == 0 {
+    // The delivery this end belongs to, dropped from the record either way so
+    // the map does not grow across calls: that of an engine call siphon ended,
+    // oldest first, else the one in progress.
+    let delivery = state
+        .li_manager
+        .as_ref()
+        .map(|li| li.x3_delivery_ended(&ended.call_id, scope.as_ref()));
+    let ended_by_siphon = delivery.as_ref().is_some_and(|delivery| delivery.by_siphon);
+    if x3_end_is_clean(&ended, ended_by_siphon) {
         info!(
-            call_id = %ended.call_id,
-            delivered = ended.delivered,
-            "X3 content delivery ended cleanly"
-        );
-    } else {
-        error!(
             call_id = %ended.call_id,
             reason = %ended.reason,
             delivered = ended.delivered,
-            dropped = ended.dropped,
-            "X3 content delivery ended without a clean detach or with \
-             dropped content"
+            "X3 content delivery ended cleanly"
         );
+        return;
     }
-    if let Some(li) = state.li_manager.as_ref() {
-        // The engine has stopped; drop our record either
-        // way so the map does not grow across calls.
-        let attachments = if ended.orderly && ended.dropped == 0 {
-            li.take_x3_attachments_for_leg(&ended.call_id, scope.as_ref())
-        } else {
-            li.x3_attachments_for_leg(&ended.call_id, scope.as_ref())
-        };
-        if !(ended.orderly && ended.dropped == 0) {
-            for attachment in attachments {
-                let li = li.clone();
-                let detail = format!(
-                    "X3 delivery ended for task {}{} ({}): {} delivered, {} \
-                 dropped",
-                    attachment.x_id,
-                    leg_suffix(attachment.scope.as_ref()),
-                    ended.reason,
-                    ended.delivered,
-                    ended.dropped
-                );
-                let d_id = attachment.d_id;
-                tokio::spawn(async move {
-                    report_destination_fault(
-                        &li,
-                        d_id,
-                        crate::li::x1::types::TaskReportType::TerminatingFault,
-                        detail,
-                    )
-                    .await;
-                });
-            }
-            li.take_x3_attachments_for_leg(&ended.call_id, scope.as_ref());
-        }
+    error!(
+        call_id = %ended.call_id,
+        reason = %ended.reason,
+        delivered = ended.delivered,
+        dropped = ended.dropped,
+        "X3 content delivery ended without a clean detach or with \
+         dropped content"
+    );
+    let (Some(li), Some(delivery)) = (state.li_manager.as_ref(), delivery) else {
+        return;
+    };
+    for attachment in delivery.attachments {
+        let li = li.clone();
+        let detail = format!(
+            "X3 delivery ended for task {}{} ({}): {} delivered, {} dropped",
+            attachment.x_id,
+            leg_suffix(attachment.scope.as_ref()),
+            ended.reason,
+            ended.delivered,
+            ended.dropped
+        );
+        let d_id = attachment.d_id;
+        tokio::spawn(async move {
+            report_destination_fault(
+                &li,
+                d_id,
+                crate::li::x1::types::TaskReportType::TerminatingFault,
+                detail,
+            )
+            .await;
+        });
     }
 }
 

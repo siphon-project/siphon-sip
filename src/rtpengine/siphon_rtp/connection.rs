@@ -21,6 +21,7 @@ use super::identity::{auth_frame_for, authenticate, controller_id};
 use super::per_call::{event_scope, report_under_leg};
 use super::scope::{require_scope_support, CallScope, CallScopes};
 use super::waiters::Waiters;
+use super::x3_at_offer::X3AtOffer;
 use super::{PlayWaiter, HANDSHAKE_REQUEST_ID, READ_CHUNK};
 use crate::rtpengine::error::RtpEngineError;
 use crate::rtpengine::events::RtpEngineEvent;
@@ -37,6 +38,7 @@ pub(super) async fn connection_manager(
     address: SocketAddr,
     control_secret: Option<String>,
     scopes: Arc<CallScopes>,
+    x3_at_offer: Arc<X3AtOffer>,
     timeout_ms: u64,
     pending: Arc<DashMap<u64, oneshot::Sender<CmdResult>>>,
     play_pending: Arc<DashMap<u64, PlayWaiter>>,
@@ -126,6 +128,7 @@ pub(super) async fn connection_manager(
         // the initial backoff forever.
         backoff = INITIAL_BACKOFF;
         scopes.connected();
+        x3_at_offer.forget();
         *writer.lock().await = Some(write_half);
         let _ = connected_tx.send(true);
         info!(%address, "siphon-rtp control connection established");

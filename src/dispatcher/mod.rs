@@ -936,6 +936,7 @@ pub async fn run(
     spawn_diameter_incoming(&state, diameter_incoming_rx);
 
     spawn_rtpengine_events(&state, rtpengine_events_rx);
+    intercept::watch_engine_calls(&state);
 
     spawn_conference_change_events(Arc::new(RunningDispatcher));
 
