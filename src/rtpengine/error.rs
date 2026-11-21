@@ -62,6 +62,28 @@ impl RtpEngineError {
     }
 }
 
+/// The reasons siphon-rtp refuses an `attach_x3` with while the call is
+/// changing shape under it, each of which says to ask again (0.25.2: a
+/// re-answer of the dialog in progress, and the local pipeline of a call the
+/// engine answered itself being rebuilt).
+const X3_ATTACH_RETRY_REASONS: [&str; 2] = [
+    "the call is being re-answered; retry the attach",
+    "local media pipeline is being rebuilt; retry the attach",
+];
+
+impl RtpEngineError {
+    /// Whether the engine refused an `attach_x3` for a reason that passes: the
+    /// call is there and can be intercepted, a moment from now.
+    pub fn is_x3_attach_retryable(&self) -> bool {
+        match self {
+            RtpEngineError::EngineError(reason) => X3_ATTACH_RETRY_REASONS
+                .iter()
+                .any(|retryable| reason.contains(retryable)),
+            _ => false,
+        }
+    }
+}
+
 impl RtpEngineError {
     /// Whether the engine refused because it only relays this call's media.
     ///
@@ -142,6 +164,30 @@ mod tests {
         let error = RtpEngineError::Decode("test".to_string());
         let debug = format!("{:?}", error);
         assert!(debug.contains("Decode"));
+    }
+
+    #[test]
+    fn an_attach_refused_while_the_call_changes_shape_is_retryable() {
+        for reason in [
+            "attach_x3: the call is being re-answered; retry the attach once it is",
+            "attach_x3: the call's local media pipeline is being rebuilt; retry the attach once it is up",
+        ] {
+            assert!(
+                RtpEngineError::EngineError(reason.to_string()).is_x3_attach_retryable(),
+                "{reason}"
+            );
+        }
+        for reason in [
+            "attach_x3: the call has no second leg to intercept",
+            "unknown call: 1-abc@host",
+            "attach_x3: a WebSocket-takeover call (ws_uri) has no relayed second party to intercept",
+        ] {
+            assert!(
+                !RtpEngineError::EngineError(reason.to_string()).is_x3_attach_retryable(),
+                "{reason}"
+            );
+        }
+        assert!(!RtpEngineError::Timeout { timeout_ms: 1000 }.is_x3_attach_retryable());
     }
 
     #[test]

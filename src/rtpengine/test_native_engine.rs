@@ -13,6 +13,14 @@
 //! `play_media`, `stop_media` or `delete` on a call it does not hold is refused
 //! with the engine's own `unknown call: <call-id>`. A test that deletes a
 //! session too early therefore sees the refusal a deployment would.
+//!
+//! It models what siphon-rtp 0.25.2 does with a lawful interception, as far
+//! as the commands go ([`X3Model`]): a seat that joined a room is attached by
+//! naming the room and the seat's tag, on an engine that lists
+//! `x3_conference_seat`; a call it answered itself is attached on one that
+//! lists `x3_single_leg` and refused on any other; `conference_seat` is taken
+//! on an intercepted call; an `echo` on an intercepted call, and an attach on
+//! an echoing one, are refused. It reports no events: a test sends those.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -277,16 +285,26 @@ impl Recorded {
 }
 
 /// What the engine records of an X3 attach or detach, and whether it needs the
-/// call: an interception taps a call the engine holds.
-fn x3_command(command: &Command) -> (Option<Recorded>, Option<String>, bool, bool) {
+/// call: an interception taps a call the engine holds, or (`on_seat`) a seat
+/// that joined a room, which has no call. `detail` is an attach's
+/// `target_leg`.
+fn x3_command(command: &Command, on_seat: bool) -> (Option<Recorded>, Option<String>, bool, bool) {
     match command {
         Command::AttachX3 {
-            call_id, from_tag, ..
+            call_id,
+            from_tag,
+            target_leg,
+            ..
         } => (
-            Some(Recorded::new("attach_x3", call_id, from_tag)),
+            Some(Recorded {
+                detail: serde_json::to_value(target_leg)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string)),
+                ..Recorded::new("attach_x3", call_id, from_tag)
+            }),
             None,
             false,
-            true,
+            !on_seat,
         ),
         Command::DetachX3 { call_id, from_tag } => (
             Some(Recorded::new("detach_x3", call_id, from_tag)),
@@ -294,7 +312,201 @@ fn x3_command(command: &Command) -> (Option<Recorded>, Option<String>, bool, boo
             false,
             false,
         ),
+        Command::Echo {
+            call_id,
+            from_tag,
+            enabled,
+            ..
+        } => (
+            Some(Recorded {
+                detail: Some(enabled.to_string()),
+                ..Recorded::new("echo", call_id, from_tag)
+            }),
+            None,
+            false,
+            true,
+        ),
         _ => (None, None, false, false),
+    }
+}
+
+/// What [`NativeTestEngine::start`] lists in `node_info.features`.
+const NATIVE_ENGINE_FEATURES: [&str; 3] = ["relay", "scope", "conference_seat"];
+
+/// What an engine provisioned for X3 that takes `attach_x3` on an offered,
+/// unanswered call lists on top of that.
+pub(crate) const NATIVE_ENGINE_X3_AT_OFFER: &str = "x3_attach_at_offer";
+
+/// What a siphon-rtp 0.25.2 provisioned for X3 lists beside it: an
+/// interception on a seat that joined a room, and on a call it answered
+/// itself.
+pub(crate) const NATIVE_ENGINE_X3_CONFERENCE_SEAT: &str = "x3_conference_seat";
+pub(crate) const NATIVE_ENGINE_X3_SINGLE_LEG: &str = "x3_single_leg";
+
+/// A room whose id starts with this closes while a call's leg is being moved
+/// into it: the engine refuses the `conference_seat` with the call's media
+/// path already stopped, and ends the call's interception.
+pub(crate) const NATIVE_ENGINE_CLOSING_ROOM: &str = "closing-";
+
+/// The engine's refusal of an `echo` on an intercepted call.
+pub(crate) const NATIVE_ENGINE_ECHO_REFUSED: &str = "echo: a lawful-interception delivery is \
+    attached to this call and echo bypasses its tap; detach_x3 first";
+
+/// The engine's refusal of an `attach_x3` on a call that is being re-answered.
+pub(crate) const NATIVE_ENGINE_ATTACH_RETRY: &str =
+    "attach_x3: the call is being re-answered; retry the attach once it is";
+
+/// What the engine keeps of its interceptions, to answer as siphon-rtp 0.25.2
+/// does: the seats that joined a room, the calls and seats with an
+/// interception attached, and the calls in echo mode.
+#[derive(Default)]
+struct X3Model {
+    /// Whether `node_info` lists `x3_conference_seat` and `x3_single_leg`.
+    conference_seat: bool,
+    single_leg: bool,
+    /// The verbs whose next command is refused, once each.
+    refuse_next: Mutex<Vec<&'static str>>,
+    /// How many more `attach_x3` to refuse with a reason that says to retry.
+    retry_refusals: Mutex<u32>,
+    seats: Mutex<HashSet<(String, String)>>,
+    intercepted: Mutex<HashSet<(Option<String>, String)>>,
+    echoing: Mutex<HashSet<(Option<String>, String)>>,
+}
+
+impl X3Model {
+    fn listing(features: &[String]) -> Self {
+        let lists = |name: &str| features.iter().any(|feature| feature == name);
+        X3Model {
+            conference_seat: lists(NATIVE_ENGINE_X3_CONFERENCE_SEAT),
+            single_leg: lists(NATIVE_ENGINE_X3_SINGLE_LEG),
+            ..X3Model::default()
+        }
+    }
+
+    /// Whether an X3 command names a seat that joined a room, on an engine
+    /// that intercepts one. Any other engine looks for a call and finds none.
+    fn names_seat(&self, command: &Command) -> bool {
+        let (Command::AttachX3 {
+            call_id, from_tag, ..
+        }
+        | Command::DetachX3 { call_id, from_tag }) = command
+        else {
+            return false;
+        };
+        self.conference_seat
+            && self
+                .seats
+                .lock()
+                .is_ok_and(|seats| seats.contains(&(call_id.clone(), from_tag.clone())))
+    }
+
+    /// The engine's refusal of a command an interception rules out.
+    fn refusal(
+        &self,
+        command: &Command,
+        scope: &Option<String>,
+        local: &Mutex<HashSet<(Option<String>, String)>>,
+        grown: &Mutex<HashSet<String>>,
+    ) -> Option<String> {
+        let holds = |set: &Mutex<HashSet<(Option<String>, String)>>, call_id: &String| {
+            set.lock()
+                .is_ok_and(|set| set.contains(&(scope.clone(), call_id.clone())))
+        };
+        let refused_for_now = || {
+            self.retry_refusals.lock().is_ok_and(|mut left| {
+                let refuse = *left > 0;
+                *left = left.saturating_sub(1);
+                refuse
+            })
+        };
+        let refuse_next = |verb: &'static str| {
+            self.refuse_next.lock().is_ok_and(|mut verbs| {
+                let position = verbs.iter().position(|held| *held == verb);
+                position.map(|index| verbs.remove(index)).is_some()
+            })
+        };
+        match command {
+            Command::Delete { .. } if refuse_next("delete") => {
+                Some("delete: refused for the test".to_string())
+            }
+            Command::ConferenceLeave { .. } if refuse_next("conference_leave") => {
+                Some("conference_leave: refused for the test".to_string())
+            }
+            Command::AttachX3 { .. } if refused_for_now() => {
+                Some(NATIVE_ENGINE_ATTACH_RETRY.to_string())
+            }
+            Command::AttachX3 { call_id, .. } if holds(&self.echoing, call_id) => {
+                Some("attach_x3: the call is in echo mode, which bypasses the tap".to_string())
+            }
+            // Before 0.25.2 a call the engine answered itself, and that no
+            // `offer_far` grew a far leg on, had no second party to intercept.
+            Command::AttachX3 { call_id, .. } if !self.single_leg => {
+                let has_far_leg = grown.lock().is_ok_and(|grown| grown.contains(call_id));
+                (holds(local, call_id) && !has_far_leg)
+                    .then(|| "attach_x3: the call has no second leg to intercept".to_string())
+            }
+            Command::Echo {
+                call_id,
+                enabled: true,
+                ..
+            } if holds(&self.intercepted, call_id) => Some(NATIVE_ENGINE_ECHO_REFUSED.to_string()),
+            Command::ConferenceSeat { conference_id, .. }
+                if conference_id.starts_with(NATIVE_ENGINE_CLOSING_ROOM) =>
+            {
+                Some(
+                    "conference_seat: the room closed before the seat opened; the call's \
+                     media path is stopped, delete the call"
+                        .to_string(),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// Keep what an accepted command changed.
+    fn accepted(&self, command: &Command, scope: &Option<String>) {
+        let key = |call_id: &String| (scope.clone(), call_id.clone());
+        let (Ok(mut seats), Ok(mut intercepted), Ok(mut echoing)) = (
+            self.seats.lock(),
+            self.intercepted.lock(),
+            self.echoing.lock(),
+        ) else {
+            return;
+        };
+        match command {
+            Command::ConferenceJoin {
+                conference_id,
+                from_tag,
+                ..
+            } => {
+                seats.insert((conference_id.clone(), from_tag.clone()));
+            }
+            Command::ConferenceLeave {
+                conference_id,
+                from_tag,
+            } => {
+                seats.remove(&(conference_id.clone(), from_tag.clone()));
+            }
+            Command::AttachX3 { call_id, .. } => {
+                intercepted.insert(key(call_id));
+            }
+            Command::DetachX3 { call_id, .. } => {
+                intercepted.remove(&key(call_id));
+            }
+            Command::Delete { call_id, .. } => {
+                intercepted.remove(&key(call_id));
+                echoing.remove(&key(call_id));
+            }
+            Command::Echo {
+                call_id, enabled, ..
+            } => {
+                match enabled {
+                    true => echoing.insert(key(call_id)),
+                    false => echoing.remove(&key(call_id)),
+                };
+            }
+            _ => {}
+        }
     }
 }
 
@@ -449,6 +661,21 @@ fn seat_refusal(command: &Command) -> Option<String> {
     }
 }
 
+/// Wait while a test holds the answers of the command's kind: an
+/// `answer_local`'s, or a `delete`'s.
+async fn held_answer(
+    command: &Command,
+    answers_open: &mut tokio::sync::watch::Receiver<bool>,
+    deletes_open: &mut tokio::sync::watch::Receiver<bool>,
+) {
+    let gate = match command {
+        Command::AnswerLocal { .. } => answers_open,
+        Command::Delete { .. } => deletes_open,
+        _ => return,
+    };
+    let _ = gate.wait_for(|open| *open).await;
+}
+
 /// The `play_id` the engine hands the first playback it accepts; each later one
 /// gets the next.
 pub(crate) const NATIVE_ENGINE_FIRST_PLAY_ID: u64 = 7001;
@@ -458,9 +685,13 @@ pub(crate) struct NativeTestEngine {
     address: SocketAddr,
     commands: Arc<Mutex<Vec<NativeCommand>>>,
     live: LiveCalls,
+    x3: Arc<X3Model>,
     /// Open (the default) lets `answer_local` answer; closed holds every answer
     /// until it opens, so a test can act while a set-up is provably pending.
     answers: tokio::sync::watch::Sender<bool>,
+    /// The same for `delete`: closed, a delete is acted on and its answer
+    /// held, so a test can report something while the command is out.
+    deletes: tokio::sync::watch::Sender<bool>,
 }
 
 /// The calls the engine holds, keyed the way the engine keys a call:
@@ -471,7 +702,29 @@ impl NativeTestEngine {
     /// Start the engine on a loopback port. Serves every connection the client
     /// opens until the test's runtime ends.
     pub(crate) async fn start() -> NativeTestEngine {
-        NativeTestEngine::start_with_features(&["relay", "scope", "conference_seat"]).await
+        NativeTestEngine::start_with_features(&NATIVE_ENGINE_FEATURES).await
+    }
+
+    /// [`NativeTestEngine::start`] for an engine that also lists
+    /// `x3_attach_at_offer`: one provisioned for X3 that takes an
+    /// interception on a call before its callee answers.
+    pub(crate) async fn start_with_x3_at_offer() -> NativeTestEngine {
+        let mut features = NATIVE_ENGINE_FEATURES.to_vec();
+        features.push(NATIVE_ENGINE_X3_AT_OFFER);
+        NativeTestEngine::start_with_features(&features).await
+    }
+
+    /// [`NativeTestEngine::start`] for a siphon-rtp 0.25.2 provisioned for
+    /// X3: it lists `x3_attach_at_offer`, `x3_conference_seat` and
+    /// `x3_single_leg`.
+    pub(crate) async fn start_with_x3() -> NativeTestEngine {
+        let mut features = NATIVE_ENGINE_FEATURES.to_vec();
+        features.extend([
+            NATIVE_ENGINE_X3_AT_OFFER,
+            NATIVE_ENGINE_X3_CONFERENCE_SEAT,
+            NATIVE_ENGINE_X3_SINGLE_LEG,
+        ]);
+        NativeTestEngine::start_with_features(&features).await
     }
 
     /// [`NativeTestEngine::start`] for an engine whose `node_info` lists
@@ -489,7 +742,12 @@ impl NativeTestEngine {
         // The calls `offer_far` grew a far leg on, which `answer` completes
         // with the caller's own answer and a `delete` with a `to_tag` drops.
         let grown: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        // The calls `answer_local` created: the engine is their far side.
+        let local: LiveCalls = Arc::new(Mutex::new(HashSet::new()));
+        let x3 = Arc::new(X3Model::listing(&features));
+        let x3_model = Arc::clone(&x3);
         let (answers, answers_open) = tokio::sync::watch::channel(true);
+        let (deletes, deletes_open) = tokio::sync::watch::channel(true);
         let next_play_id = Arc::new(std::sync::atomic::AtomicU64::new(
             NATIVE_ENGINE_FIRST_PLAY_ID,
         ));
@@ -499,8 +757,11 @@ impl NativeTestEngine {
                 let recorded = Arc::clone(&recorded);
                 let held = Arc::clone(&held);
                 let grown = Arc::clone(&grown);
+                let local = Arc::clone(&local);
+                let x3 = Arc::clone(&x3_model);
                 let next_play_id = Arc::clone(&next_play_id);
                 let mut answers_open = answers_open.clone();
+                let mut deletes_open = deletes_open.clone();
                 tokio::spawn(async move {
                     let mut buffer = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -547,7 +808,21 @@ impl NativeTestEngine {
                         let refusal = grown_call
                             .as_ref()
                             .and_then(|grown| grown.refusal.clone())
-                            .or_else(|| seat_refusal(&request.command));
+                            .or_else(|| seat_refusal(&request.command))
+                            .or_else(|| x3.refusal(&request.command, &scope, &local, &grown));
+                        let on_seat = x3.names_seat(&request.command);
+                        if let Ok(mut local) = local.lock() {
+                            match &request.command {
+                                Command::AnswerLocal { call_id, .. } => {
+                                    local.insert((scope.clone(), call_id.clone()));
+                                }
+                                Command::Offer { call_id, .. }
+                                | Command::Delete { call_id, .. } => {
+                                    local.remove(&(scope.clone(), call_id.clone()));
+                                }
+                                _ => {}
+                            }
+                        }
                         let (record, sdp, creates, needs_call) = match &request.command {
                             _ if grown_call.is_some() => grown_call
                                 .map(|grown| (Some(grown.record), grown.sdp, false, true))
@@ -679,9 +954,9 @@ impl NativeTestEngine {
                                 false,
                                 true,
                             ),
-                            Command::AttachX3 { .. } | Command::DetachX3 { .. } => {
-                                x3_command(&request.command)
-                            }
+                            Command::AttachX3 { .. }
+                            | Command::DetachX3 { .. }
+                            | Command::Echo { .. } => x3_command(&request.command, on_seat),
                             Command::ConferenceSeat { .. }
                             | Command::ConferenceJoin { .. }
                             | Command::ConferenceLeave { .. } => seat_command(&request.command),
@@ -695,7 +970,7 @@ impl NativeTestEngine {
                                 refused = true;
                             } else if creates {
                                 live.insert(key);
-                            } else if record.name == "delete" {
+                            } else if record.name == "delete" && refusal.is_none() {
                                 live.remove(&key);
                             }
                         }
@@ -706,6 +981,9 @@ impl NativeTestEngine {
                         }
                         let recording_id =
                             recording_id_for(&request.command, refused, &next_play_id);
+                        if !refused && refusal.is_none() {
+                            x3.accepted(&request.command, &scope);
+                        }
                         let unknown_call = record
                             .as_ref()
                             .map(|record| format!("unknown call: {}", record.call_id));
@@ -733,9 +1011,7 @@ impl NativeTestEngine {
                                 video_declined: None,
                             },
                         };
-                        if matches!(request.command, Command::AnswerLocal { .. }) {
-                            let _ = answers_open.wait_for(|open| *open).await;
-                        }
+                        held_answer(&request.command, &mut answers_open, &mut deletes_open).await;
                         let Ok(bytes) = frame::encode(&Response {
                             id: request.id,
                             result,
@@ -753,7 +1029,35 @@ impl NativeTestEngine {
             address,
             commands,
             live,
+            x3,
             answers,
+            deletes,
+        }
+    }
+
+    /// Hold every `delete` answer until [`release_deletes`](Self::release_deletes).
+    pub(crate) fn hold_deletes(&self) {
+        self.deletes.send_replace(false);
+    }
+
+    /// Answer the held `delete`s, and every one after.
+    pub(crate) fn release_deletes(&self) {
+        self.deletes.send_replace(true);
+    }
+
+    /// Refuse the next `delete` or `conference_leave` (`verb`), leaving the
+    /// call or the seat as it is.
+    pub(crate) fn refuse_next(&self, verb: &'static str) {
+        if let Ok(mut verbs) = self.x3.refuse_next.lock() {
+            verbs.push(verb);
+        }
+    }
+
+    /// Refuse the next `count` `attach_x3` as a call being re-answered is:
+    /// with a reason that says to ask again.
+    pub(crate) fn refuse_attaches_for_now(&self, count: u32) {
+        if let Ok(mut left) = self.x3.retry_refusals.lock() {
+            *left = count;
         }
     }
 

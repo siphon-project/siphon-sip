@@ -99,6 +99,18 @@ impl CallActorStore {
         })
     }
 
+    /// Whether the leg `leg_call_id` of `call_id` was dialled to a target of a
+    /// replacement on the call (a transfer's third party), and not for the
+    /// call's called party.
+    pub fn is_replacement_target_leg(&self, call_id: &str, leg_call_id: &str) -> bool {
+        self.calls.get(call_id).is_some_and(|call| {
+            call.refer_subscriptions
+                .iter()
+                .flat_map(|subscription| &subscription.targets)
+                .any(|target| target.leg_call_id == leg_call_id)
+        })
+    }
+
     /// Record a target a replacement just dialled, and arm its deadline.
     ///
     /// Each is entered as its own INVITE goes out, not once all of them have:

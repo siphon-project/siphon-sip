@@ -30,6 +30,7 @@ pub fn init() -> Result<(), prometheus::Error> {
     cache::init(&metrics.registry)?;
     enum_servers::init(&metrics.registry)?;
     event_lag::init(&metrics.registry)?;
+    super::li::init(&metrics.registry)?;
     ipsec::init(&metrics.registry)?;
     log_writer::init(&metrics.registry)?;
     rate_limit::init(&metrics.registry)?;

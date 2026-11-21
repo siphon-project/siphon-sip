@@ -254,6 +254,8 @@ mod lcr_ring_timeout_tests;
 #[cfg(test)]
 mod lcr_route_bookkeeping_tests;
 #[cfg(test)]
+mod li_conference_tests;
+#[cfg(test)]
 mod li_session_tests;
 #[cfg(test)]
 mod listener_identity_tests;
@@ -936,6 +938,7 @@ pub async fn run(
     spawn_diameter_incoming(&state, diameter_incoming_rx);
 
     spawn_rtpengine_events(&state, rtpengine_events_rx);
+    intercept::watch_engine_calls(&state);
 
     spawn_conference_change_events(Arc::new(RunningDispatcher));
 

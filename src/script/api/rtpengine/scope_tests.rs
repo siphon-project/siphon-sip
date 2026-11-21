@@ -595,3 +595,88 @@ async fn a_media_verb_scope_on_a_b2bua_call_is_refused() {
     }
     assert!(engine.all_commands().is_empty());
 }
+
+/// What the observer was told: creating or ending, Call-ID, offerer's tag,
+/// per-call scope.
+type CallSeen = (&'static str, String, String, Option<String>);
+
+/// A script's `rtpengine.offer()` tells the backend's engine-call observer of
+/// the call it created, with the leg's scope: the hook lawful intercept
+/// attaches content delivery from. Each such `offer` is told as ending
+/// whatever engine call was under that id first, since the engine replaces
+/// it.
+///
+/// `rtpengine.offer()` on a call already anchored, which is what a script
+/// does on a re-INVITE, goes to the engine as `reoffer`. The engine keeps the
+/// call and everything attached to it, so the observer is told nothing: the
+/// call's content delivery is neither ended nor asked for again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scripts_offer_is_told_to_the_engine_call_observer_and_its_re_offer_is_not() {
+    use crate::rtpengine::siphon_rtp::EngineCallChange;
+    Python::initialize();
+    let engine = NativeTestEngine::start().await;
+    let backend = engine.backend();
+    let told: Arc<Mutex<Vec<CallSeen>>> = Arc::default();
+    let seen = Arc::clone(&told);
+    backend.observe_calls(Box::new(move |call| {
+        // How each end turned out is the content record's business.
+        if matches!(
+            call.change,
+            EngineCallChange::Ended
+                | EngineCallChange::Answered
+                | EngineCallChange::EndFailed
+                | EngineCallChange::SeatLeft
+                | EngineCallChange::SeatLeaveFailed
+        ) {
+            return;
+        }
+        seen.lock().expect("the call log").push((
+            match call.change {
+                EngineCallChange::Ending => "ending",
+                EngineCallChange::Offered => "offered",
+                EngineCallChange::AnsweredLocally => "answered_locally",
+                EngineCallChange::SeatJoined => "seat_joined",
+                EngineCallChange::SeatLeaving => "seat_leaving",
+                _ => "outcome",
+            },
+            call.call_id.to_string(),
+            call.from_tag.to_string(),
+            call.scope.map(|scope| scope.as_str().to_string()),
+        ));
+    }));
+    let sessions = Arc::new(MediaSessionStore::new());
+    let namespace = PyRtpEngine::new(backend, Arc::clone(&sessions), registry());
+
+    drive(
+        namespace,
+        "\
+async def run(engine, invite_orig, invite_term, reply_orig, reply_term, bye):
+    await engine.offer(invite_orig, profile='access_v4')
+    await engine.offer(invite_term, profile='access_v6', scope='term')
+    await engine.offer(invite_orig, profile='access_v4')
+",
+    )
+    .await
+    .expect("the call runs");
+
+    let leg = |change, scope: Option<&str>| {
+        (
+            change,
+            CALL_ID.to_string(),
+            "tag-a".to_string(),
+            scope.map(str::to_string),
+        )
+    };
+    assert_eq!(
+        *told.lock().expect("the call log"),
+        vec![
+            leg("ending", None),
+            leg("offered", None),
+            leg("ending", Some("term")),
+            leg("offered", Some("term")),
+        ],
+        "each first offer once, the re-offer not at all"
+    );
+    assert_eq!(engine.commands("offer").len(), 2);
+    assert_eq!(engine.commands("reoffer").len(), 1);
+}

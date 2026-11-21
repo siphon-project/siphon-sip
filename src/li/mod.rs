@@ -31,6 +31,7 @@
 //! values explicitly rather than letting each side derive its own.
 
 pub mod asn1;
+mod content;
 pub mod pdu;
 pub mod session;
 pub mod siprec;
@@ -50,7 +51,11 @@ use crate::config::{LawfulInterceptConfig, MediaBackendKind};
 use x1::store::{ContentCapability, DestinationStore, StoredTask, TaskMatch, TaskStore};
 use x1::types::{DeliveryType, XId};
 
-pub use session::{CallOwner, Identities, MessageFacts, SessionView, SESSION_GRACE};
+pub use content::{seat_record, EndedDelivery, FailedAttach, HeldEnd, X3Registration};
+pub use session::{
+    CallOwner, DialogMedia, EngineCallSide, Identities, MessageFacts, Seat, SessionView,
+    SESSION_GRACE,
+};
 #[cfg(test)]
 use session::{MAX_REMEMBERED_SESSIONS, MAX_SEEN_PER_SESSION};
 
@@ -213,6 +218,9 @@ pub struct ActiveIntercept {
     pub from_tag: String,
     /// The session correlation, shared with this session's X2 records.
     pub correlation_id: u64,
+    /// The session the delivery is for. Two calls bridged onto one engine
+    /// call are two sessions there; one session asking again is not.
+    pub session_id: Arc<str>,
     /// The per-call media scope of the leg the content is taken from
     /// (`rtpengine.offer(..., scope=)`), `None` for the call's own media.
     ///
@@ -238,9 +246,13 @@ pub struct LiManager {
     /// configured. Needed on the delivery path so a content-loss event can be
     /// reported rather than only logged.
     x1_client: Arc<std::sync::OnceLock<Arc<x1::client::X1Client>>>,
-    /// Live X3 interceptions, keyed by the call-id the media engine knows the
-    /// call by: the caller leg's SIP Call-ID, whichever leg asked.
-    x3_attachments: Arc<DashMap<String, Vec<ActiveIntercept>>>,
+    /// X3 interceptions, keyed by the call-id the media engine knows the call
+    /// by: the caller leg's SIP Call-ID, whichever leg asked. See [`content`].
+    x3_attachments: Arc<DashMap<String, content::CallContent>>,
+    /// End reports whose record was released while they still waited for the
+    /// answer to an end siphon asked for. See
+    /// [`LiManager::take_unanswered_x3_ends`].
+    unanswered_x3_ends: Arc<std::sync::Mutex<content::UnansweredEnds>>,
     /// Per-session matching decisions, keyed by session id.
     ///
     /// See [`LiManager::resolve_session`].
@@ -248,6 +260,11 @@ pub struct LiManager {
     /// Leg Call-ID to the session it belongs to, for every leg whose session
     /// is not keyed on its own Call-ID.
     aliases: Arc<DashMap<Arc<str>, Arc<str>>>,
+    /// The sessions with media on each engine call siphon made under an id of
+    /// its own minting, by that id.
+    ///
+    /// See [`LiManager::adopt_engine_call`].
+    minted_engine_calls: Arc<DashMap<String, Vec<Arc<str>>>>,
 }
 
 impl LiManager {
@@ -275,8 +292,10 @@ impl LiManager {
             config: Arc::new(config),
             x1_client: Arc::new(std::sync::OnceLock::new()),
             x3_attachments: Arc::new(DashMap::new()),
+            unanswered_x3_ends: Arc::default(),
             decisions: Arc::new(DashMap::new()),
             aliases: Arc::new(DashMap::new()),
+            minted_engine_calls: Arc::new(DashMap::new()),
         };
 
         let _ = manager.audit_sender.try_send(AuditEntry {
@@ -342,13 +361,20 @@ impl LiManager {
     ///
     /// Honours a value the ADMF provisioned; otherwise derives a stable
     /// non-zero one from the session id.
+    ///
+    /// One value for the life of the session (TS 103 221-2 clause 6 ties a
+    /// session's X2 and X3 records together by it). The first one used for a
+    /// warrant on a session is the session's: a `ModifyTask` that changes the
+    /// task's Correlation ID applies to the sessions that start after it, and
+    /// does not split one in progress between two.
     pub fn correlation_for(&self, task: &StoredTask, session_id: &str) -> u64 {
-        match task.details.correlation_id {
+        let fresh = match task.details.correlation_id {
             // Zero is reserved on the wire, so a provisioned zero is treated as
             // "not provisioned" rather than emitted.
             Some(provisioned) if provisioned != 0 => provisioned,
             _ => correlation_from_call_id(session_id),
-        }
+        };
+        self.session_correlation(session_id, task.details.x_id, fresh)
     }
 
     /// The LIID a task's records carry.
@@ -472,71 +498,6 @@ impl LiManager {
     /// The ADMF client, if the outbound direction is configured.
     pub fn x1_client(&self) -> Option<Arc<x1::client::X1Client>> {
         self.x1_client.get().cloned()
-    }
-
-    /// Record that content delivery started for a call.
-    pub fn record_x3_attachment(&self, call_id: &str, attachment: ActiveIntercept) {
-        self.x3_attachments
-            .entry(call_id.to_string())
-            .or_default()
-            .push(attachment);
-    }
-
-    /// Every live interception on a call.
-    pub fn x3_attachments_for(&self, call_id: &str) -> Vec<ActiveIntercept> {
-        self.x3_attachments
-            .get(call_id)
-            .map(|entry| entry.clone())
-            .unwrap_or_default()
-    }
-
-    /// The live interceptions on one leg of a call: its own media (`None`)
-    /// or the leg anchored under a per-call `scope`.
-    pub fn x3_attachments_for_leg(
-        &self,
-        call_id: &str,
-        scope: Option<&crate::rtpengine::CallScope>,
-    ) -> Vec<ActiveIntercept> {
-        self.x3_attachments_for(call_id)
-            .into_iter()
-            .filter(|attachment| attachment.scope.as_ref() == scope)
-            .collect()
-    }
-
-    /// Drop and return one leg's interceptions, when that leg's delivery
-    /// ended; the call's other legs keep theirs.
-    pub fn take_x3_attachments_for_leg(
-        &self,
-        call_id: &str,
-        scope: Option<&crate::rtpengine::CallScope>,
-    ) -> Vec<ActiveIntercept> {
-        let mut taken = Vec::new();
-        if let Some(mut attachments) = self.x3_attachments.get_mut(call_id) {
-            let (leg, others): (Vec<_>, Vec<_>) = std::mem::take(&mut *attachments)
-                .into_iter()
-                .partition(|attachment| attachment.scope.as_ref() == scope);
-            *attachments = others;
-            taken = leg;
-        }
-        self.x3_attachments
-            .remove_if(call_id, |_, attachments| attachments.is_empty());
-        taken
-    }
-
-    /// Drop and return a call's interceptions, at teardown.
-    pub fn take_x3_attachments(&self, call_id: &str) -> Vec<ActiveIntercept> {
-        self.x3_attachments
-            .remove(call_id)
-            .map(|(_, attachments)| attachments)
-            .unwrap_or_default()
-    }
-
-    /// How many calls currently have content delivery attached.
-    ///
-    /// Used by the per-module leak guard: this must drain to zero as calls end,
-    /// or the map grows for the life of the process.
-    pub fn x3_attachment_count(&self) -> usize {
-        self.x3_attachments.len()
     }
 }
 

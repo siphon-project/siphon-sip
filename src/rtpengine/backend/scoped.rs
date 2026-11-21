@@ -36,7 +36,7 @@ use super::MediaBackend;
 use crate::rtpengine::error::RtpEngineError;
 use crate::rtpengine::events::RtpEngineEvent;
 use crate::rtpengine::profile::NgFlags;
-use crate::rtpengine::siphon_rtp::CallScope;
+use crate::rtpengine::siphon_rtp::{CallScope, X3Feature};
 
 /// The call-id rtpengine and rtpproxy know the leg of `call_id` under `scope`
 /// by: `<call-id>;<scope>`, or the Call-ID itself without a scope.
@@ -150,6 +150,54 @@ impl MediaBackend {
             Self::SiphonRtp(set) => set.node_scope() == Some(scope),
             Self::RtpEngine(_) | Self::RtpProxy(_) => false,
         }
+    }
+
+    /// Register `observer` to be told of every engine call siphon creates (an
+    /// `offer`) or ends (a `delete`, or an `offer` replacing a call), the
+    /// latter before the frame is written.
+    ///
+    /// siphon-rtp only, the one backend X3 content delivery exists on;
+    /// rtpengine and rtpproxy tell nobody.
+    pub fn observe_calls(&self, observer: crate::rtpengine::siphon_rtp::EngineCallObserver) {
+        if let Self::SiphonRtp(set) = self {
+            set.observe_calls(observer);
+        }
+    }
+
+    /// Whether the engine holding the leg of `call_id` under `scope` listed
+    /// `feature` in `node_info`, which a siphon-rtp does only when it is
+    /// provisioned for X3. `None` while that engine has not been asked;
+    /// rtpengine and rtpproxy never list one.
+    pub fn x3_feature(
+        &self,
+        feature: X3Feature,
+        call_id: &str,
+        scope: Option<&CallScope>,
+    ) -> Option<bool> {
+        match self {
+            Self::SiphonRtp(set) => set.x3_feature(feature, call_id, scope),
+            Self::RtpEngine(_) | Self::RtpProxy(_) => Some(false),
+        }
+    }
+
+    /// [`MediaBackend::x3_feature`], asking the engine when it has not been
+    /// asked on this connection.
+    pub async fn learn_x3_feature(
+        &self,
+        feature: X3Feature,
+        call_id: &str,
+        scope: Option<&CallScope>,
+    ) -> Result<bool, RtpEngineError> {
+        match self {
+            Self::SiphonRtp(set) => set.learn_x3_feature(feature, call_id, scope).await,
+            Self::RtpEngine(_) | Self::RtpProxy(_) => Ok(false),
+        }
+    }
+
+    /// [`MediaBackend::x3_feature`] for `x3_attach_at_offer`: whether that
+    /// engine accepts `attach_x3` on a call that is offered and not answered.
+    pub fn x3_attach_at_offer(&self, call_id: &str, scope: Option<&CallScope>) -> Option<bool> {
+        self.x3_feature(X3Feature::AttachAtOffer, call_id, scope)
     }
 
     /// [`MediaBackend::offer`] under `scope`.
