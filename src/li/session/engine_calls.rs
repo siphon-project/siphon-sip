@@ -74,7 +74,7 @@ impl LiManager {
                 });
             if last {
                 self.minted_engine_calls.remove(&*minted.id);
-                self.forget_x3_call(&minted.id);
+                self.forget_x3_call_of(&minted.id, session_id);
             }
         }
     }

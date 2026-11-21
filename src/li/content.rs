@@ -302,6 +302,20 @@ impl CallContent {
             .collect()
     }
 
+    /// Whether any delivery on this record, live or ended and not yet
+    /// reported, belongs to a session other than `session_id`.
+    fn held_for_another(&self, session_id: &str) -> bool {
+        self.attachments
+            .iter()
+            .chain(
+                self.legs
+                    .iter()
+                    .flat_map(|leg| &leg.ended)
+                    .flat_map(|ended| &ended.attachments),
+            )
+            .any(|attachment| &*attachment.session_id != session_id)
+    }
+
     /// Whether a delivery is asked for, live, or ended by siphon and not yet
     /// reported ended.
     fn delivering(&self) -> bool {
@@ -1043,8 +1057,26 @@ impl LiManager {
     /// whether siphon ended that delivery, and warranted content going
     /// unaccounted for is not something to lose with a map entry. It is kept
     /// for [`Self::take_unanswered_x3_ends`].
+    #[cfg(test)]
     pub(super) fn forget_x3_call(&self, call_id: &str) {
-        let Some((_, content)) = self.x3_attachments.remove(call_id) else {
+        self.forget_x3_call_if(call_id, |_| true);
+    }
+
+    /// [`Self::forget_x3_call`] for the session `session_id` that is
+    /// releasing it: a record that holds a delivery of any other session is
+    /// that session's, and stays. A stale decision released for a call that
+    /// another session now owns (a decision made before the warrant, found
+    /// again by a leg's next message) must not take the interception of the
+    /// live session away with it.
+    pub(super) fn forget_x3_call_of(&self, call_id: &str, session_id: &str) {
+        self.forget_x3_call_if(call_id, |content| !content.held_for_another(session_id));
+    }
+
+    fn forget_x3_call_if(&self, call_id: &str, release: impl Fn(&CallContent) -> bool) {
+        let Some((_, content)) = self
+            .x3_attachments
+            .remove_if(call_id, |_, content| release(content))
+        else {
             return;
         };
         let orphaned = content.orphaned();

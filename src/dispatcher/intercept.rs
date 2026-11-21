@@ -442,6 +442,8 @@ fn retract_dropped_targets(
 pub(super) struct LiveCall {
     owner: Option<crate::li::CallOwner>,
     answered: bool,
+    /// The Call-IDs of the call's callee legs.
+    other_legs: Vec<String>,
 }
 
 /// Whether `dialog` is a call that is up, and whether it is answered.
@@ -466,10 +468,18 @@ pub(super) fn live_call(
         let replacement_target = state
             .call_actors
             .is_replacement_target_leg(&internal_id, call_id);
+        let other_legs = state
+            .call_actors
+            .get_call(&internal_id)?
+            .b_legs
+            .iter()
+            .map(|leg| leg.dialog.call_id.clone())
+            .collect();
         let owner = call_owner(state, internal_id, replacement_target)?;
         return Some(LiveCall {
             owner: Some(owner),
             answered: call_state == crate::b2bua::actor::CallState::Answered,
+            other_legs,
         });
     }
     let session = state
@@ -484,6 +494,7 @@ pub(super) fn live_call(
     }
     Some(LiveCall {
         owner: None,
+        other_legs: Vec::new(),
         answered: seated
             || dialog.answered
             || session.is_some_and(|session| session.to_tag.is_some()),
@@ -554,7 +565,7 @@ pub(super) fn decide_live_dialog(
         .as_ref()
         .and_then(|media| media.offerer_tag.clone())
         .or_else(|| dialog.caller_tag().map(str::to_string));
-    let session = li.decide_live_dialog(dialog, call.owner, media, call.answered);
+    let session = li.decide_live_dialog(dialog, call.owner, media, call.answered, &call.other_legs);
     if session.matches.is_empty() {
         return None;
     }

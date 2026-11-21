@@ -43,7 +43,7 @@ fn wire_of(udp: &flume::Receiver<OutboundMessage>) -> Vec<Sent> {
 /// the delivery is live.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hold_relayed_by_the_b2bua_after_a_mid_call_warrant_attaches_nothing_more() {
-    hold_after_a_mid_call_warrant(false).await;
+    hold_after_a_mid_call_warrant(false, false).await;
 }
 
 /// The same on a node that was intercepting for another warrant all along: the
@@ -51,12 +51,27 @@ async fn a_hold_relayed_by_the_b2bua_after_a_mid_call_warrant_attaches_nothing_m
 /// unwarranted, and the engine told it of the call's media.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hold_after_a_mid_call_warrant_on_a_call_interception_saw_set_up_attaches_nothing_more() {
-    hold_after_a_mid_call_warrant(true).await;
+    hold_after_a_mid_call_warrant(true, false).await;
 }
 
-async fn hold_after_a_mid_call_warrant(setup_was_seen: bool) {
+/// The production shape: another warrant is on while the call is set up and
+/// answered, so each leg's messages were decided as unwarranted and the engine's
+/// answer registered the callee leg's stale decision on the call's engine
+/// call. The warrant then names the callee, so the callee's 200 to the hold
+/// finds that stale decision and matches. Releasing it must not take the
+/// live interception of the engine call with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_leg_decision_found_by_the_holds_200_does_not_take_the_calls_interception() {
+    hold_after_a_mid_call_warrant(true, true).await;
+}
+
+async fn hold_after_a_mid_call_warrant(setup_was_seen: bool, target_callee: bool) {
     let engine = NativeTestEngine::start_with_x3_026().await;
-    let prefix = if setup_was_seen { 63000 } else { 62000 };
+    let prefix = match (setup_was_seen, target_callee) {
+        (false, _) => 62000,
+        (true, false) => 63000,
+        (true, true) => 64000,
+    };
     let call = anchored(prefix, &engine, OPEN).await;
     let (caller, callee) = (caller_of(&call), callee_of(&call));
     acks(&call.dispatcher.state, &caller);
@@ -106,6 +121,13 @@ async fn hold_after_a_mid_call_warrant(setup_was_seen: bool) {
     state.li_manager = Some(li.clone());
     let state = Arc::new(state);
     super::intercept::watch_engine_calls(&state);
+    li.live_dialog_opened(
+        &a_call_id,
+        &callee_uri,
+        &caller.from,
+        &invite_to,
+        Some(caller_ip),
+    );
     if setup_was_seen {
         // Another warrant keeps interception on, so every message is decided,
         // the call's as unwarranted.
@@ -154,19 +176,16 @@ async fn hold_after_a_mid_call_warrant(setup_was_seen: bool) {
         let (raw_ack, ack) = request_from(&caller, "ACK", 1, None);
         super::intercept::intercept_message(&ack, &inbound(&caller.address, &raw_ack), &state);
     }
-    li.live_dialog_opened(
-        &a_call_id,
-        &callee_uri,
-        &caller.from,
-        &invite_to,
-        Some(caller_ip),
-    );
 
     let mut known = super::intercept::known_targets(&li);
     li.tasks()
         .activate(TaskDetails {
             x_id: XId::generate(),
-            target_identifiers: vec![TargetIdentifier::SipUri(caller_uri.to_string())],
+            target_identifiers: vec![TargetIdentifier::SipUri(if target_callee {
+                invite_to.trim_matches(['<', '>']).to_string()
+            } else {
+                caller_uri.to_string()
+            })],
             delivery_type: DeliveryType::X2AndX3,
             list_of_dids: vec![d_id],
             list_of_dsids: Vec::new(),
@@ -258,6 +277,32 @@ async fn hold_after_a_mid_call_warrant(setup_was_seen: bool) {
         "the delivery is live"
     );
     assert_eq!(engine.x3_delivery_count(), 1);
+
+    // The caller hangs up: one detach, and the end the engine reports is
+    // found on the record with the delivery on it, clean, and not left to the
+    // unanswered path of a record that was released and made again.
+    let (raw_bye, bye) = request_from(&caller, "BYE", 3, None);
+    super::intercept::intercept_message(&bye, &inbound(&caller.address, &raw_bye), &state);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(engine.commands("detach_x3").len(), 1, "the BYE detaches");
+    let ends = engine.take_x3_ends();
+    assert_eq!(ends.len(), 1);
+    let crate::rtpengine::events::RtpEngineEvent::X3Ended(ended) = &ends[0] else {
+        panic!("an X3 end");
+    };
+    let delivery = li
+        .x3_delivery_end_reported(&a_call_id, None, ended)
+        .expect("judged at once");
+    assert_eq!(
+        delivery.attachments.len(),
+        1,
+        "the record held the delivery"
+    );
+    assert!(super::rtpengine_events::x3_end_is_clean(
+        ended,
+        delivery.by_siphon
+    ));
+    assert!(li.take_unanswered_x3_ends(10).is_empty());
 }
 
 fn caller_of_parts(party: &Party) -> Party {

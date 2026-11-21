@@ -850,7 +850,9 @@ impl LiManager {
         owner: Option<CallOwner>,
         media: Option<DialogMedia>,
         answered: bool,
+        other_legs: &[String],
     ) -> SessionView {
+        let owner_of_legs = owner.clone();
         let facts = MessageFacts {
             request: true,
             method: "INVITE",
@@ -883,6 +885,29 @@ impl LiManager {
             // A dialog-forming INVITE opened it, as it would have.
             decision.invite_session = true;
             decision.established |= answered;
+        }
+        // The call's other legs were decided too while it was set up, as
+        // unwarranted when no warrant covered it. Those decisions are stale
+        // now: retired here, in the step that makes the call's own, and each
+        // leg resolved to the call's session, so no later message of the leg
+        // finds the stale one and releases what it knew of the call.
+        for leg in other_legs {
+            if self.aliases.contains_key(leg.as_str()) {
+                continue;
+            }
+            if let Some((_, stale)) = self
+                .decisions
+                .remove_if(leg.as_str(), |_, decision| decision.matched.is_empty())
+            {
+                self.release_engine_calls(leg, &stale.engine_calls);
+            }
+            self.alias(leg, &view.session_id);
+            if owner_of_legs
+                .as_ref()
+                .is_some_and(|owner| owner.dialled_for_called_party(leg))
+            {
+                self.note_called_party_leg(&view.session_id, leg);
+            }
         }
         view
     }
@@ -1287,9 +1312,9 @@ impl LiManager {
             // The engine call's content record goes with its session. Asked
             // whatever the session matches now: a warrant deactivated since
             // may have left one.
-            self.forget_x3_call(&decision.primary_call_id);
+            self.forget_x3_call_of(&decision.primary_call_id, session_id);
             for (seat, _) in &decision.seats {
-                self.forget_x3_call(&seat.record());
+                self.forget_x3_call_of(&seat.record(), session_id);
             }
             self.release_engine_calls(session_id, &decision.engine_calls);
         }
@@ -3213,7 +3238,7 @@ mod tests {
             "<sip:alice@example.com>;tag=caller",
             "<sip:bob@example.com>",
         );
-        let view = manager.decide_live_dialog(&dialog, None, None, true);
+        let view = manager.decide_live_dialog(&dialog, None, None, true, &[]);
         assert_eq!(view.matches.len(), 1);
         assert_eq!(view.matches[0].party, MatchedParty::Originating);
         assert!(view.on_primary_leg);
@@ -3236,7 +3261,7 @@ mod tests {
             "<sip:alice@example.com>;tag=caller",
             "<sip:bob@example.com>",
         );
-        let view = manager.decide_live_dialog(&dialog, None, None, true);
+        let view = manager.decide_live_dialog(&dialog, None, None, true, &[]);
         assert_eq!(view.matches.len(), 1);
         assert_eq!(view.matches[0].party, MatchedParty::Terminating);
     }
@@ -3250,7 +3275,7 @@ mod tests {
             "<sip:carol@example.com>;tag=caller",
             "<sip:dave@example.com>",
         );
-        let view = manager.decide_live_dialog(&dialog, None, None, true);
+        let view = manager.decide_live_dialog(&dialog, None, None, true, &[]);
         assert!(view.matches.is_empty());
         assert_eq!(manager.remembered_session_count(), 0);
     }
@@ -3264,8 +3289,8 @@ mod tests {
             "<sip:alice@example.com>;tag=caller",
             "<sip:bob@example.com>",
         );
-        let first = manager.decide_live_dialog(&dialog, None, None, true);
-        let again = manager.decide_live_dialog(&dialog, None, None, true);
+        let first = manager.decide_live_dialog(&dialog, None, None, true, &[]);
+        let again = manager.decide_live_dialog(&dialog, None, None, true, &[]);
         assert_eq!(first.session_id, again.session_id);
         assert_eq!(manager.remembered_session_count(), 1);
         assert!(iri.try_recv().is_err(), "deciding emits no X2");
@@ -3297,7 +3322,7 @@ mod tests {
                 "<sip:alice@example.com>;tag=caller",
                 "<sip:bob@example.com>",
             );
-            let view = manager.decide_live_dialog(&dialog, None, None, answered);
+            let view = manager.decide_live_dialog(&dialog, None, None, answered, &[]);
             assert_eq!(
                 manager.note_message(&view, &response("INVITE", 491)),
                 expected,
@@ -3320,7 +3345,7 @@ mod tests {
             a_leg_call_id: "live-6@example.com".to_string(),
             replacement_target: false,
         };
-        let view = manager.decide_live_dialog(&dialog, Some(owner), None, true);
+        let view = manager.decide_live_dialog(&dialog, Some(owner), None, true, &[]);
         assert_eq!(&*view.session_id, "internal-6");
         assert!(view.on_primary_leg);
         manager.sweep_sessions(Instant::now(), |session_id| session_id == "internal-6");
@@ -3343,8 +3368,146 @@ mod tests {
             offerer_tag: Some("caller".to_string()),
             minted: Some(("minted-7".to_string(), "live-7@example.com".to_string())),
         };
-        let view = manager.decide_live_dialog(&dialog, None, Some(media), true);
+        let view = manager.decide_live_dialog(&dialog, None, Some(media), true, &[]);
         assert_eq!(&*view.engine_call_id, "minted-7");
         assert!(view.offerer_is_caller);
+    }
+
+    fn live_delivery(session_id: &str) -> crate::li::ActiveIntercept {
+        crate::li::ActiveIntercept {
+            x_id: XId::generate(),
+            d_id: crate::li::x1::types::DId::generate(),
+            delivery: "192.0.2.50:42069".to_string(),
+            from_tag: "caller".to_string(),
+            correlation_id: 7,
+            session_id: Arc::from(session_id),
+            scope: None,
+        }
+    }
+
+    /// An unwarranted decision keyed by the Call-ID of a call a warrant now
+    /// covers is released when a later message of a leg finds it stale. The
+    /// content record under that Call-ID is the live session's, with its
+    /// attachment, and is not the stale decision's to drop.
+    #[test]
+    fn releasing_an_unwarranted_session_leaves_another_sessions_interception_alone() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2AndX3, None);
+        let view = manager.resolve_session(
+            "shared-call@example.com",
+            &invite(),
+            &Identities {
+                request_uri: Some("sip:dave@example.com"),
+                from_uri: Some("<sip:carol@example.com>;tag=c"),
+                to_uri: Some("<sip:dave@example.com>"),
+                source_ip: None,
+            },
+            || None,
+        );
+        assert!(view.matches.is_empty(), "nothing names these two");
+        let attempt = manager.x3_attempt("shared-call@example.com", None);
+        assert!(manager.register_x3_attachment(
+            "shared-call@example.com",
+            live_delivery("the-live-session"),
+            attempt
+        ));
+
+        manager.forget_session(&view.session_id);
+        assert_eq!(
+            manager.x3_attachments_for("shared-call@example.com").len(),
+            1,
+            "the live session's delivery is still on record"
+        );
+    }
+
+    /// A session releasing its own record still takes it with it.
+    #[test]
+    fn releasing_a_session_releases_its_own_content_record() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2AndX3, None);
+        let view = manager.resolve_session(
+            "own-call@example.com",
+            &invite(),
+            &Identities {
+                request_uri: Some("sip:dave@example.com"),
+                from_uri: Some("<sip:carol@example.com>;tag=c"),
+                to_uri: Some("<sip:dave@example.com>"),
+                source_ip: None,
+            },
+            || None,
+        );
+        let attempt = manager.x3_attempt("own-call@example.com", None);
+        assert!(manager.register_x3_attachment(
+            "own-call@example.com",
+            live_delivery(&view.session_id),
+            attempt
+        ));
+        manager.forget_session(&view.session_id);
+        assert_eq!(manager.x3_call_count(), 0);
+    }
+
+    /// A stale decision of a leg of the call, left from before the warrant,
+    /// is retired when the scan decides the call, and the leg resolves to the
+    /// call's session.
+    #[test]
+    fn deciding_a_live_call_retires_the_stale_decisions_of_its_legs() {
+        let (manager, _iri, _audit) = manager();
+        // Another warrant keeps interception on while the call is set up.
+        provision_targets(
+            &manager,
+            DeliveryType::X2AndX3,
+            None,
+            vec![TargetIdentifier::SipUri(
+                "sip:carol@example.com".to_string(),
+            )],
+        );
+        let stale = manager.resolve_session(
+            "leg-b@example.com",
+            &response("INVITE", 200),
+            &callee(),
+            || None,
+        );
+        assert!(stale.matches.is_empty());
+        assert_eq!(manager.remembered_session_count(), 1);
+        manager.adopt_engine_call(
+            "leg-b@example.com",
+            "leg-a@example.com",
+            EngineCallSide::Answerer,
+        );
+        assert_eq!(
+            manager.sessions_on_engine_call("leg-a@example.com").len(),
+            1
+        );
+
+        provision(&manager, DeliveryType::X2AndX3, None);
+        let dialog = live(
+            "leg-a@example.com",
+            "<sip:alice@example.com>;tag=caller",
+            "<sip:bob@example.com>",
+        );
+        let owner = CallOwner {
+            internal_id: "internal-leg".to_string(),
+            a_leg_call_id: "leg-a@example.com".to_string(),
+            replacement_target: false,
+        };
+        let view = manager.decide_live_dialog(
+            &dialog,
+            Some(owner),
+            None,
+            true,
+            &["leg-b@example.com".to_string()],
+        );
+        assert_eq!(&*view.session_id, "internal-leg");
+        assert_eq!(manager.remembered_session_count(), 1, "only the call's own");
+        assert!(manager
+            .sessions_on_engine_call("leg-a@example.com")
+            .is_empty());
+        assert_eq!(
+            manager
+                .session_of_leg("leg-b@example.com")
+                .map(|view| view.session_id),
+            Some(Arc::from("internal-leg")),
+            "the leg resolves to the call's session"
+        );
     }
 }
