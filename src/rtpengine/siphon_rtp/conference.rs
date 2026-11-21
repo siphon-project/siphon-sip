@@ -307,6 +307,9 @@ impl SiphonRtpClient {
         let detach = Command::DetachX3 {
             call_id: conference_id.to_string(),
             from_tag: from_tag.to_string(),
+            xid: None,
+            delivery: None,
+            correlation_id: None,
         };
         expect_ok(self.request_framed(None, detach).await?)
     }

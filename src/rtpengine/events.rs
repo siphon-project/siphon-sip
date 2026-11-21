@@ -849,6 +849,22 @@ pub struct X3StartedEvent {
     pub correlation_id: u64,
 }
 
+/// Which of a call's content deliveries an engine event is about: the three
+/// values the `attach_x3` that started it carried.
+///
+/// An engine call carries one delivery per warrant, destination and
+/// Correlation ID on a siphon-rtp that lists `x3_multi_delivery` (0.26.0 and
+/// later), and that engine names the one on every loss and end it reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct X3Delivery {
+    /// The 16-byte interception task identifier.
+    pub xid: [u8; 16],
+    /// Where the Mediation Function is dialled, as given on the attach.
+    pub address: String,
+    /// The session's Correlation ID.
+    pub correlation_id: u64,
+}
+
 /// Payload of [`RtpEngineEvent::X3Loss`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct X3LossEvent {
@@ -856,6 +872,9 @@ pub struct X3LossEvent {
     pub call_id: String,
     /// The leg's `from_tag`.
     pub from_tag: String,
+    /// The delivery that lost content. `None` from an engine before
+    /// siphon-rtp 0.26.0, which held one delivery per call and named none.
+    pub delivery: Option<X3Delivery>,
     /// Packets dropped on this interception so far.
     pub dropped: u64,
     /// Packets successfully handed to the delivery transport so far.
@@ -872,6 +891,9 @@ pub struct X3EndedEvent {
     pub call_id: String,
     /// The leg's `from_tag`.
     pub from_tag: String,
+    /// The delivery that ended. `None` from an engine before siphon-rtp
+    /// 0.26.0, which held one delivery per call and named none.
+    pub delivery: Option<X3Delivery>,
     /// Why delivery stopped, as the engine described it.
     pub reason: String,
     /// Whether the engine called this an orderly end.

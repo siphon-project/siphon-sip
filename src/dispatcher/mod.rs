@@ -104,6 +104,7 @@ mod timers;
 mod uac_transactions;
 #[cfg(test)]
 mod unprotected_response_tests;
+mod x3_delivery;
 
 #[cfg(test)]
 mod a_leg_reliable_provisional_tests;
@@ -256,7 +257,11 @@ mod lcr_route_bookkeeping_tests;
 #[cfg(test)]
 mod li_conference_tests;
 #[cfg(test)]
+mod li_multi_delivery_tests;
+#[cfg(test)]
 mod li_session_tests;
+#[cfg(test)]
+mod li_ws_takeover_tests;
 #[cfg(test)]
 mod listener_identity_tests;
 #[cfg(test)]

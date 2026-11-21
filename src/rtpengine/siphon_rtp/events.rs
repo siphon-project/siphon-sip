@@ -248,12 +248,16 @@ pub(super) fn convert_event(event: Event) -> RtpEngineEvent {
         Event::X3Loss {
             call_id,
             from_tag,
+            xid,
+            delivery,
+            correlation_id,
             dropped,
             delivered,
             dropped_since_ms,
         } => RtpEngineEvent::X3Loss(X3LossEvent {
             call_id,
             from_tag,
+            delivery: x3_delivery(xid, delivery, correlation_id),
             dropped,
             delivered,
             dropped_since_ms,
@@ -261,12 +265,16 @@ pub(super) fn convert_event(event: Event) -> RtpEngineEvent {
         Event::X3Ended {
             call_id,
             from_tag,
+            xid,
+            delivery,
+            correlation_id,
             reason,
             delivered,
             dropped,
         } => RtpEngineEvent::X3Ended(X3EndedEvent {
             call_id,
             from_tag,
+            delivery: x3_delivery(xid, delivery, correlation_id),
             // `X3EndReason` is `#[non_exhaustive]`, so it is rendered rather
             // than mirrored: a reason this build has not heard of still means
             // delivery stopped, and the counts are what the record needs.
@@ -434,4 +442,19 @@ pub(super) fn convert_leg_summary(leg: ProtoLegSummary) -> CallLegSummary {
         payload_type: leg.payload_type,
         media_started_at_unix_ms: leg.media_started_at_unix_ms,
     }
+}
+
+/// The delivery an `x3_loss` or an `x3_ended` names. An engine that carries
+/// several deliveries on a call fills all three values; one from before it
+/// could sends none, and an event with only some names no delivery.
+fn x3_delivery(
+    xid: Option<siphon_rtp_proto::Xid>,
+    delivery: Option<String>,
+    correlation_id: Option<u64>,
+) -> Option<crate::rtpengine::events::X3Delivery> {
+    Some(crate::rtpengine::events::X3Delivery {
+        xid: *xid?.as_bytes(),
+        address: delivery?,
+        correlation_id: correlation_id?,
+    })
 }
