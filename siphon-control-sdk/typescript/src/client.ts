@@ -62,7 +62,18 @@ function resolveConfig(config: ClientConfig): ResolvedConfig {
 /** An item on the client's generic event stream. */
 export type ClientEvent =
   | { type: "event"; frame: EventFrame }
-  | { type: "reattach"; snapshot: ChannelSnapshot };
+  | { type: "reattach"; snapshot: ChannelSnapshot }
+  /**
+   * The connection was lost and has been re-established: `hello` and `resync`
+   * are done (every `reattach` precedes this) and no event of the new
+   * connection has been delivered yet. Events pushed while the app was away are
+   * gone, so read whatever state the app keeps from events here and apply only
+   * events numbered above it. `instanceEpoch` is the server's boot epoch (a
+   * restart changes it), `null` when the server does not send one. Not emitted
+   * for the first connection. Match on `type` with a default branch: kinds may
+   * be added.
+   */
+  | { type: "reconnected"; instanceEpoch: string | null };
 
 type EventCallback = (event: ClientEvent) => void;
 
@@ -92,6 +103,9 @@ export class ControlClient {
   private current: Session | null = null;
   private eventCallback: EventCallback | null = null;
   private shutdownRequested = false;
+  /** Frames of a connection being announced, held so `reconnected` is first. */
+  private held: EventFrame[] | null = null;
+  private epoch: string | null = null;
   private readonly shutdownWaiters: Array<() => void> = [];
 
   private constructor(config: ClientConfig) {
@@ -140,6 +154,14 @@ export class ControlClient {
     return session.command(module, verb, target, args);
   }
 
+  /**
+   * The boot epoch of the siphon-sip process the connection reached, as its
+   * last `hello` reported it; `null` before one that sends it has answered.
+   */
+  get instanceEpoch(): string | null {
+    return this.epoch;
+  }
+
   /** Fetch the registered adapters' verb/event schema (`describe`). */
   async describe(): Promise<unknown> {
     return this.command(null, DESCRIBE, null, null);
@@ -174,6 +196,9 @@ export class ControlClient {
         if (this.shutdownRequested) {
           return;
         }
+        // The new connection's frames wait until the app has been told it is a
+        // new connection.
+        this.held = [];
         try {
           session = await this.connectAndHandshake();
         } catch (error) {
@@ -188,6 +213,8 @@ export class ControlClient {
         }
         this.current = session;
         await this.resyncAndReattach(session);
+        this.emit({ type: "reconnected", instanceEpoch: this.epoch });
+        this.releaseHeld();
       }
 
       await Promise.race([session.waitClosed(), this.shutdownSignal()]);
@@ -227,7 +254,13 @@ export class ControlClient {
       socket,
       this.nextId,
       this.config.replyTimeoutMs,
-      (frame) => this.emit({ type: "event", frame }),
+      (frame) => {
+        if (this.held) {
+          this.held.push(frame);
+        } else {
+          this.emit({ type: "event", frame });
+        }
+      },
     );
     const result = (await session.command(null, HELLO, null, {
       app: this.config.app,
@@ -239,7 +272,17 @@ export class ControlClient {
         `server negotiated subprotocol ${JSON.stringify(result?.subprotocol)}, expected ${JSON.stringify(SUBPROTOCOL)}`,
       );
     }
+    this.epoch = result.instance_epoch ?? null;
     return session;
+  }
+
+  /** Deliver what was held, in order, and let frames through again. */
+  private releaseHeld(): void {
+    const held = this.held ?? [];
+    this.held = null;
+    for (const frame of held) {
+      this.emit({ type: "event", frame });
+    }
   }
 
   private openSocket(): Promise<WebSocket> {

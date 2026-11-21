@@ -17,8 +17,8 @@ use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 
 use siphon_control_client::{
-    ClientConfig, ControlClient, ControlError, ControlErrorCode, PeerHangupPolicy, ServerConfig,
-    SipClient, SipServer,
+    ClientConfig, ClientEvent, ControlClient, ControlError, ControlErrorCode, PeerHangupPolicy,
+    ServerConfig, SipClient, SipServer,
 };
 
 const APP: &str = "ivr-app";
@@ -35,6 +35,10 @@ struct Stub {
     resync_channels: Mutex<Vec<serde_json::Value>>,
     /// When true, connection index 0 closes right after replying `hello`.
     close_first_after_hello: bool,
+    /// When true, every connection after the first pushes an application-level
+    /// event the instant it has replied `hello`, before the client has had a
+    /// chance to `resync`.
+    push_event_after_hello: bool,
 }
 
 async fn start_stub(stub: Arc<Stub>) -> SocketAddr {
@@ -87,10 +91,24 @@ async fn drive_stub(mut socket: WebSocket, stub: Arc<Stub>) {
             send_ok(
                 &mut socket,
                 &id,
-                serde_json::json!({ "app": APP, "protocol": 1, "subprotocol": "siphon-control.v1" }),
+                serde_json::json!({
+                    "app": APP,
+                    "protocol": 1,
+                    "subprotocol": "siphon-control.v1",
+                    "instance_epoch": format!("boot-{}", index + 1),
+                }),
             )
             .await;
             said_hello = true;
+            if stub.push_event_after_hello && index > 0 {
+                let event = serde_json::json!({
+                    "type": "event",
+                    "event": "RegistrationChanged",
+                    "app": APP,
+                    "payload": { "aor": "sip:200@example.com" },
+                });
+                let _ = socket.send(Message::Text(event.to_string().into())).await;
+            }
             if stub.close_first_after_hello && index == 0 {
                 let _ = socket.send(Message::Close(None)).await;
                 return;
@@ -553,6 +571,50 @@ async fn reconnect_resyncs_and_reattaches_owned_calls() {
         stub.conn_count.load(Ordering::SeqCst) >= 2,
         "the client reconnected"
     );
+
+    client.shutdown();
+}
+
+/// A reconnect that re-claims no channel is still announced, with the new
+/// process's `instance_epoch`, and before any event of the new connection: an
+/// app reads its whole state on it, so an event delivered ahead of it would be
+/// applied to a copy that is about to be replaced.
+#[tokio::test]
+async fn a_reconnect_is_announced_before_the_first_event_of_the_new_connection() {
+    let stub = Arc::new(Stub {
+        close_first_after_hello: true,
+        push_event_after_hello: true,
+        ..Default::default()
+    });
+    let addr = start_stub(Arc::clone(&stub)).await;
+
+    let client = Arc::new(ControlClient::connect(client_config(addr)).await.unwrap());
+    assert_eq!(client.instance_epoch().as_deref(), Some("boot-1"));
+    let mut events = client.events();
+    let driver = Arc::clone(&client);
+    tokio::spawn(async move {
+        let _ = driver.run().await;
+    });
+
+    let first = tokio::time::timeout(Duration::from_secs(5), events.next())
+        .await
+        .expect("an event")
+        .expect("present");
+    match first {
+        ClientEvent::Reconnected { instance_epoch } => {
+            assert_eq!(instance_epoch.as_deref(), Some("boot-2"));
+        }
+        other => panic!("the reconnect must come first, got {other:?}"),
+    }
+    let second = tokio::time::timeout(Duration::from_secs(5), events.next())
+        .await
+        .expect("an event")
+        .expect("present");
+    match second {
+        ClientEvent::Event(frame) => assert_eq!(frame.event, "RegistrationChanged"),
+        other => panic!("the held event follows, got {other:?}"),
+    }
+    assert_eq!(client.instance_epoch().as_deref(), Some("boot-2"));
 
     client.shutdown();
 }

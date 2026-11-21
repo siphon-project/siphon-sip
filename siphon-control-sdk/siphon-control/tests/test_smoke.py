@@ -210,6 +210,7 @@ async def _serve_stub():
 def test_module_surface():
     assert hasattr(ControlClient, "on_call")
     assert hasattr(ControlClient, "on_app_event")
+    assert hasattr(ControlClient, "on_reconnect")
     assert hasattr(ControlServer, "on_call")
     assert hasattr(ControlServer, "serve")
     assert hasattr(ControlServer, "run")
@@ -340,6 +341,71 @@ def test_on_app_event_dispatch():
             assert payload["aor"] == "sip:201@example.com"
             assert payload["state"] == "early"
             assert payload["remote_identity"]["display_name"] is None
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
+def test_on_reconnect_names_the_new_boot_epoch():
+    """A reconnect reaches `@client.on_reconnect` with the server's boot epoch,
+    and `client.instance_epoch` follows the last `hello`."""
+
+    async def scenario():
+        connections = 0
+
+        async def handler(websocket):
+            nonlocal connections
+            connections += 1
+            index = connections
+            async for message in websocket:
+                frame = json.loads(message)
+                if frame.get("verb") == "hello":
+                    await _reply_ok(
+                        websocket,
+                        frame["id"],
+                        {
+                            "app": APP,
+                            "protocol": 1,
+                            "subprotocol": SUBPROTOCOL,
+                            "instance_epoch": f"boot-{index}",
+                        },
+                    )
+                elif frame.get("verb") == "test_drop":
+                    await _reply_ok(websocket, frame["id"], {})
+                    await websocket.close()
+                    return
+                else:
+                    await _reply_ok(websocket, frame["id"], {})
+
+        async with websockets.serve(
+            handler, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            client = ControlClient(
+                app=APP,
+                token=TOKEN,
+                url=f"ws://127.0.0.1:{port}/control/ws",
+                reconnect_backoff_ms=50,
+            )
+            fired = asyncio.get_event_loop().create_future()
+
+            @client.on_reconnect
+            async def reconnected(instance_epoch):
+                if not fired.done():
+                    fired.set_result(instance_epoch)
+
+            await client.connect()
+            assert client.instance_epoch == "boot-1"
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            assert not fired.done(), "the first connection is not a reconnect"
+            await client.command("test_drop")
+
+            assert await asyncio.wait_for(fired, timeout=5) == "boot-2"
+            assert client.instance_epoch == "boot-2"
 
             client.shutdown()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):

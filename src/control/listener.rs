@@ -361,14 +361,21 @@ fn handle_hello(
 
     *said_hello = true;
     conn.events.push_reply(
-        ControlResult::Ok(serde_json::json!({
-            "app": app,
-            "protocol": PROTOCOL_VERSION,
-            "subprotocol": SUBPROTOCOL,
-        }))
-        .into_reply(id),
+        ControlResult::Ok(hello_result(app, super::registration::instance_epoch())).into_reply(id),
     );
     true
+}
+
+/// The `result` of a successful `hello`: the negotiated protocol and the boot
+/// epoch of this process (`null` without a registrar), so an app that
+/// reconnects can tell a restart from a dropped connection.
+fn hello_result(app: &str, instance_epoch: Option<String>) -> serde_json::Value {
+    serde_json::json!({
+        "app": app,
+        "protocol": PROTOCOL_VERSION,
+        "subprotocol": SUBPROTOCOL,
+        "instance_epoch": instance_epoch,
+    })
 }
 
 /// Route a command to the consumer and, when its *local* reply arrives, enqueue
@@ -604,7 +611,19 @@ mod tests {
         let reply = next_json(&mut ws).await;
         assert_eq!(reply["status"], "ok");
         assert_eq!(reply["result"]["subprotocol"], "siphon-control.v1");
+        assert!(
+            reply["result"].get("instance_epoch").is_some(),
+            "hello names the boot epoch (null without a registrar)"
+        );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn hello_names_the_boot_epoch() {
+        let result = hello_result("ivr-app", Some("boot-7".to_string()));
+        assert_eq!(result["instance_epoch"], "boot-7");
+        assert_eq!(result["subprotocol"], "siphon-control.v1");
+        assert!(hello_result("ivr-app", None)["instance_epoch"].is_null());
     }
 
     #[tokio::test]
