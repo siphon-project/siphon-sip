@@ -1,6 +1,7 @@
 //! The media backend's asynchronous event stream.
 
 use super::*;
+use crate::li::EndedDelivery;
 use crate::rtpengine::CallScope;
 
 /// Drain the media backend's asynchronous event stream — DTMF, the
@@ -1057,7 +1058,9 @@ async fn on_x3_loss(
          content did not reach the agency"
     );
     if let Some(li) = state.li_manager.as_ref() {
-        for attachment in li.x3_attachments_for_leg(&loss.call_id, scope.as_ref()) {
+        // A joined conference seat's delivery is recorded under the seat.
+        let record = li.x3_record_of_event(&loss.call_id, &loss.from_tag);
+        for attachment in li.x3_attachments_for_leg(&record, scope.as_ref()) {
             let li = li.clone();
             let detail = format!(
                 "X3 delivery loss on task {}{}: {} packet(s) dropped, {} \
@@ -1116,15 +1119,71 @@ async fn on_x3_ended(
     ended: crate::rtpengine::events::X3EndedEvent,
     scope: Option<CallScope>,
 ) {
-    // The delivery this end belongs to, dropped from the record either way so
-    // the map does not grow across calls: that of an engine call siphon ended,
-    // oldest first, else the one in progress.
-    let delivery = state
-        .li_manager
-        .as_ref()
-        .map(|li| li.x3_delivery_ended(&ended.call_id, scope.as_ref()));
-    let ended_by_siphon = delivery.as_ref().is_some_and(|delivery| delivery.by_siphon);
-    if x3_end_is_clean(&ended, ended_by_siphon) {
+    let Some(li) = state.li_manager.as_ref() else {
+        return x3_delivery_ended(None, &ended, EndedDelivery::unknown());
+    };
+    // A joined conference seat's delivery is recorded under the seat, which
+    // its end names by the room and the seat's tag.
+    let record = li.x3_record_of_event(&ended.call_id, &ended.from_tag);
+    // The delivery this end belongs to, dropped from the record so the map
+    // does not grow across calls: that of an engine call siphon ended, oldest
+    // first, else the one in progress. `None` while siphon has asked the
+    // engine to end that engine call and the engine has not answered: whether
+    // this end is the one siphon asked for is what the answer says, so it is
+    // judged when the answer comes ([`x3_end_answered`]).
+    match li.x3_delivery_end_reported(&record, scope.as_ref(), &ended) {
+        Some(delivery) => x3_delivery_ended(Some(li), &ended, delivery),
+        None => debug!(
+            call_id = %ended.call_id,
+            reason = %ended.reason,
+            "X3 content delivery ended while siphon's end of its call is unanswered"
+        ),
+    }
+}
+
+/// The engine answered an end siphon asked for: judge the end reports that
+/// waited for it.
+pub(super) fn x3_end_answered(li: &crate::li::LiManager, held: Vec<crate::li::HeldEnd>) {
+    for crate::li::HeldEnd { ended, delivery } in held {
+        x3_delivery_ended(Some(li), &ended, delivery);
+    }
+}
+
+/// How many unanswered end reports one sweep hands to the ADMF. The rest stay
+/// queued for the next, so a burst is spread and not spawned at once.
+const UNANSWERED_X3_ENDS_PER_SWEEP: usize = 64;
+
+/// Report the X3 ends that were still waiting for the answer to an end siphon
+/// asked for when their record was released: nothing answered, so nothing
+/// says siphon ended those deliveries. And, for each destination, how many
+/// more there was no room to keep.
+pub(super) fn report_unanswered_x3_ends(li: &crate::li::LiManager) {
+    x3_end_answered(li, li.take_unanswered_x3_ends(UNANSWERED_X3_ENDS_PER_SWEEP));
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    for (d_id, count) in li.take_overflowed_x3_ends() {
+        let li = li.clone();
+        let detail = format!(
+            "{count} X3 delivery end report(s) for this destination were not accounted \
+             for and could not be reported one by one: too many were waiting"
+        );
+        error!(%d_id, count, "X3 delivery ends went unaccounted for and unreported singly");
+        runtime.spawn(async move {
+            let fault = crate::li::x1::types::TaskReportType::TerminatingFault;
+            report_destination_fault(&li, d_id, fault, detail).await;
+        });
+    }
+}
+
+/// Judge the end of `delivery` the engine reported as `ended`, and report it
+/// to the ADMF unless it is clean. Spawns the reports; waits on nothing.
+fn x3_delivery_ended(
+    li: Option<&crate::li::LiManager>,
+    ended: &crate::rtpengine::events::X3EndedEvent,
+    delivery: EndedDelivery,
+) {
+    if x3_end_is_clean(ended, delivery.by_siphon) {
         info!(
             call_id = %ended.call_id,
             reason = %ended.reason,
@@ -1141,7 +1200,12 @@ async fn on_x3_ended(
         "X3 content delivery ended without a clean detach or with \
          dropped content"
     );
-    let (Some(li), Some(delivery)) = (state.li_manager.as_ref(), delivery) else {
+    let Some(li) = li else {
+        return;
+    };
+    // An end can be judged as a command future is dropped, which a shutdown
+    // does outside the runtime: the error above is then all there is.
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
     };
     for attachment in delivery.attachments {
@@ -1155,7 +1219,7 @@ async fn on_x3_ended(
             ended.dropped
         );
         let d_id = attachment.d_id;
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             report_destination_fault(
                 &li,
                 d_id,

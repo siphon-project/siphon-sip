@@ -124,29 +124,27 @@ struct ScopedRequest<'a> {
 /// default: a call verb sent without the scope would silently address the
 /// unscoped call, while a scope on a verb that takes none is refused by the
 /// engine, loudly. `list` is scoped: the engine answers with the calls of the
-/// frame's scope, and a reap must see this node's. The conference verbs name a
-/// room, not a call, and the engine refuses a scope on them.
+/// frame's scope, and a reap must see this node's.
+///
+/// The room verbs name a room, not a call, and the engine refuses a scope on
+/// every one of them. Which those are is the protocol's own answer
+/// ([`Command::is_conference`], the test the engine applies), so a scoped
+/// node can seat, call out, answer, bridge and unbridge in rooms, and a room
+/// verb the protocol gains needs no line here. `conference_seat` is not one:
+/// it names the call whose leg it moves.
 fn carries_scope(command: &Command) -> bool {
-    !matches!(
-        command,
-        Command::Ping
-            | Command::Authenticate { .. }
-            | Command::NodeInfo
-            | Command::Statistics
-            | Command::Load
-            | Command::Drain
-            | Command::Undrain
-            | Command::Restore { .. }
-            | Command::ConferenceJoin { .. }
-            | Command::ConferenceLeave { .. }
-            | Command::ConferenceRoute { .. }
-            | Command::ConferenceBridge { .. }
-            | Command::ConferencePlay { .. }
-            | Command::ConferenceStopPlay { .. }
-            | Command::ConferenceSetPlayGain { .. }
-            | Command::ConferenceStartRecording { .. }
-            | Command::ConferenceStopRecording { .. }
-    )
+    !command.is_conference()
+        && !matches!(
+            command,
+            Command::Ping
+                | Command::Authenticate { .. }
+                | Command::NodeInfo
+                | Command::Statistics
+                | Command::Load
+                | Command::Drain
+                | Command::Undrain
+                | Command::Restore { .. }
+        )
 }
 
 /// Frame `request`, with `scope` on it when there is one and the verb names a
@@ -424,7 +422,7 @@ mod tests {
                 Some(_) => {
                     json!({"id": id, "result": "error", "reason": "scope on a conference verb"})
                 }
-                None if room == "conference_join" => {
+                None if room == "conference_join" || room == "conference_offer" => {
                     json!({"id": id, "result": "ok", "sdp": "m=audio 31000 RTP/AVP 0\r\n"})
                 }
                 None => ok(id),
@@ -847,6 +845,100 @@ mod tests {
         }
     }
 
+    /// A scoped node calls a participant out and seats it on the answer, and
+    /// unlinks two rooms: `conference_offer`, `conference_answer` and
+    /// `conference_unbridge` name a room like every other room verb, and the
+    /// engine refuses a scope on them, so they are sent without one.
+    #[tokio::test]
+    async fn a_scoped_node_offers_answers_and_unbridges_rooms_without_a_scope() {
+        let mut engine = FakeEngine::start().await;
+        let (event_tx, _events) = mpsc::channel::<RtpEngineEvent>(16);
+        let set = super::super::SiphonRtpClientSet::with_scope(
+            vec![(engine.address, 2_000, 1)],
+            None,
+            Some(CallScope::try_from("mrf".to_string()).expect("valid")),
+            5_000,
+            event_tx,
+        )
+        .expect("set");
+        set.conference_offer(
+            "room-1",
+            "dave",
+            ConferenceRole::Talker,
+            &NgFlags::default(),
+            siphon_rtp_proto::ConferenceDtmf::Events,
+        )
+        .await
+        .expect("the engine offers the seat");
+        set.conference_answer("room-1", "dave", "v=0\r\n", None)
+            .await
+            .expect("the engine seats the answer");
+        set.conference_unbridge("room-1", "room-2")
+            .await
+            .expect("the engine unlinks the rooms");
+
+        let frames: Vec<Value> = engine
+            .frames()
+            .await
+            .iter()
+            .map(|frame| serde_json::from_str(frame).expect("json"))
+            .collect();
+        for verb in [
+            "conference_offer",
+            "conference_answer",
+            "conference_unbridge",
+        ] {
+            let frame = frames
+                .iter()
+                .find(|frame| frame["command"] == verb)
+                .unwrap_or_else(|| panic!("{verb} was sent"));
+            assert!(frame.get("scope").is_none(), "{verb}: {frame}");
+        }
+    }
+
+    /// What names a room is the engine protocol's own answer
+    /// (`Command::is_conference`), so a room verb it gains is unscoped here
+    /// without being listed again.
+    #[test]
+    fn every_room_verb_of_the_protocol_goes_without_a_scope() {
+        let room = || "room-1".to_string();
+        for command in [
+            Command::ConferenceOffer {
+                conference_id: room(),
+                from_tag: "tag-a".into(),
+                role: ConferenceRole::Talker,
+                profile: Default::default(),
+                dtmf: Default::default(),
+            },
+            Command::ConferenceAnswer {
+                conference_id: room(),
+                from_tag: "tag-a".into(),
+                sdp: "v=0\r\n".into(),
+                received_from: None,
+            },
+            Command::ConferenceUnbridge {
+                conference_id_a: room(),
+                conference_id_b: "room-2".into(),
+            },
+            Command::ConferenceLeave {
+                conference_id: room(),
+                from_tag: "tag-a".into(),
+            },
+        ] {
+            assert!(command.is_conference(), "{command:?}");
+            assert!(!carries_scope(&command), "{command:?}");
+        }
+        // A call's leg moved into a room names the call, and keeps its scope.
+        let seat = Command::ConferenceSeat {
+            call_id: "call-1".into(),
+            from_tag: "tag-a".into(),
+            conference_id: room(),
+            role: ConferenceRole::Talker,
+            dtmf: Default::default(),
+        };
+        assert!(carries_scope(&seat));
+    }
+
     /// On a scoped set a room still follows its first seat (its affinity key
     /// starts with U+001F, which no Call-ID holds), while calls carry the scope.
     #[tokio::test]
@@ -915,8 +1007,8 @@ mod tests {
 
     /// The engine refuses a scope on a `conference_*` verb (a room is named by
     /// its own id, not a Call-ID) and on the verbs that name no call, so a
-    /// scoped node sends those as before. Every conference verb is listed by
-    /// name in `carries_scope`; this pins one on the wire and the rest by kind.
+    /// scoped node sends those as before. This pins one on the wire and the
+    /// node verbs by kind.
     #[test]
     fn a_scoped_node_sends_conference_and_node_verbs_without_a_scope() {
         let scope = CallScope::try_from("mrf".to_string()).expect("valid");

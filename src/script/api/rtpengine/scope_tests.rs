@@ -619,10 +619,25 @@ async fn a_scripts_offer_is_told_to_the_engine_call_observer_and_its_re_offer_is
     let told: Arc<Mutex<Vec<CallSeen>>> = Arc::default();
     let seen = Arc::clone(&told);
     backend.observe_calls(Box::new(move |call| {
+        // How each end turned out is the content record's business.
+        if matches!(
+            call.change,
+            EngineCallChange::Ended
+                | EngineCallChange::Answered
+                | EngineCallChange::EndFailed
+                | EngineCallChange::SeatLeft
+                | EngineCallChange::SeatLeaveFailed
+        ) {
+            return;
+        }
         seen.lock().expect("the call log").push((
             match call.change {
                 EngineCallChange::Ending => "ending",
                 EngineCallChange::Offered => "offered",
+                EngineCallChange::AnsweredLocally => "answered_locally",
+                EngineCallChange::SeatJoined => "seat_joined",
+                EngineCallChange::SeatLeaving => "seat_leaving",
+                _ => "outcome",
             },
             call.call_id.to_string(),
             call.from_tag.to_string(),

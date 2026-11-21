@@ -69,8 +69,9 @@ pub use scope::CallScope;
 use scope::CallScopes;
 use waiters::Waiters;
 pub use waiters::{DigitRead, DigitReadEnd, DigitReadLimits};
-use x3_at_offer::{CallWatch, X3AtOffer};
-pub use x3_at_offer::{EngineCall, EngineCallChange, EngineCallObserver};
+pub(crate) use x3_at_offer::PendingEnd;
+use x3_at_offer::{CallWatch, X3Features};
+pub use x3_at_offer::{EngineCall, EngineCallChange, EngineCallObserver, X3Feature};
 
 /// Read buffer chunk size for the control connection.
 const READ_CHUNK: usize = 8192;
@@ -259,9 +260,9 @@ pub struct SiphonRtpClient {
     /// The scope every frame naming a call carries (`media.siphon_rtp.scope`),
     /// and the per-call scopes scripts named in its place.
     scopes: Arc<CallScopes>,
-    /// Whether the connected engine listed `x3_attach_at_offer` in
-    /// `node_info`, when it has been asked on this connection.
-    x3_at_offer: Arc<X3AtOffer>,
+    /// Which X3 features the connected engine listed in `node_info`, when it
+    /// has been asked on this connection.
+    x3_features: Arc<X3Features>,
     /// Active call-ids (offer→insert, delete→remove) — mirrors `RtpEngineSet`'s
     /// affinity count for the `rtpengine.active_sessions` Python getter.
     sessions: DashMap<String, ()>,
@@ -312,13 +313,13 @@ impl SiphonRtpClient {
         let (connected_tx, connected_rx) = watch::channel(false);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
         let scopes = Arc::new(CallScopes::new(scope));
-        let x3_at_offer = Arc::new(X3AtOffer::default());
+        let x3_features = Arc::new(X3Features::default());
 
         tokio::spawn(connection_manager(
             address,
             control_secret,
             Arc::clone(&scopes),
-            Arc::clone(&x3_at_offer),
+            Arc::clone(&x3_features),
             timeout_ms,
             Arc::clone(&pending),
             Arc::clone(&play_pending),
@@ -340,7 +341,7 @@ impl SiphonRtpClient {
             writer,
             connected: connected_rx,
             scopes,
-            x3_at_offer,
+            x3_features,
             sessions: DashMap::new(),
             _shutdown_tx: shutdown_tx,
         })
@@ -366,8 +367,18 @@ impl SiphonRtpClient {
         scope: Option<&CallScope>,
         command: Command,
     ) -> Result<CmdResult, RtpEngineError> {
+        self.request_framed(scope.or(self.scopes.node()), command)
+            .await
+    }
+
+    /// Send `command` in a frame carrying exactly `frame_scope`: none for a
+    /// verb that names a conference room and not a call.
+    async fn request_framed(
+        &self,
+        frame_scope: Option<&CallScope>,
+        command: Command,
+    ) -> Result<CmdResult, RtpEngineError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let frame_scope = scope.or(self.scopes.node());
         let bytes = scope::encode_request(frame_scope, &Request { id, command })
             .map_err(|error| RtpEngineError::Protocol(format!("frame encode failed: {error}")))?;
 
@@ -383,9 +394,9 @@ impl SiphonRtpClient {
         match outcome {
             Ok(result) => {
                 // Whoever asked, and for whatever feature: the answer also
-                // says whether this engine takes an X3 attach at the offer.
+                // says what this engine can intercept.
                 if let Ok(CmdResult::NodeInfo { node }) = &result {
-                    self.x3_at_offer.record(&node.features);
+                    self.x3_features.record(&node.features);
                 }
                 result
             }
@@ -1329,6 +1340,7 @@ impl SiphonRtpClientSet {
             .answer_local(call_id, from_tag, offer_sdp, flags)
             .await?;
         self.bind_affinity(call_id);
+        self.calls.answered_locally(call_id, from_tag, flags);
         Ok(result)
     }
 
