@@ -1035,6 +1035,13 @@ impl SiphonServer {
                 None
             };
 
+        // --- Evict the stream bindings the restore brought back ---
+        // After the IPsec reconcile above, before any listener is up: see
+        // `evict_restored_stream_bindings`.
+        if let Some(registrar) = crate::script::api::registrar_arc() {
+            evict_restored_stream_bindings(registrar);
+        }
+
         // --- STIR/SHAKEN namespace (siphon.stir) ---
         //
         // Must be wired BEFORE `ScriptEngine::new()` so the script's top-level
@@ -2614,17 +2621,6 @@ impl SiphonServer {
         // Keep the sender alive for the lifetime of the server so the listener
         // task never sees a "channel closed" error when no DTMF activity happens.
         let _rtpengine_events_keepalive = rtpengine_events_tx;
-
-        // Evict connection-oriented contacts restored from the backend
-        if let Some(registrar) = crate::script::api::registrar_arc() {
-            let evicted = registrar.evict_connection_oriented();
-            if evicted > 0 {
-                info!(
-                    evicted,
-                    "evicted connection-oriented contacts after restart"
-                );
-            }
-        }
 
         info!("{product_name} ready — press Ctrl+C to stop");
 
