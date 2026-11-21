@@ -297,7 +297,13 @@ pub trait RegistrarBackend: Send + Sync + std::fmt::Debug {
         aor: &str,
     ) -> impl std::future::Future<Output = Result<Vec<StoredContact>, BackendError>> + Send;
 
-    /// Remove all contacts for an AoR.
+    /// Remove all contacts for an AoR: its registration was ended (a
+    /// de-registration, an administrative removal), not left to run out.
+    ///
+    /// A backend several nodes share also records that ending until the
+    /// bindings it removed would have run out, so that a node still holding
+    /// an older copy of them loses [`claim_expiry`](Self::claim_expiry) for it.
+    /// The next [`save`](Self::save) of the AoR forgets it.
     fn remove(
         &self,
         aor: &str,
@@ -381,8 +387,11 @@ pub trait RegistrarBackend: Send + Sync + std::fmt::Debug {
     ///
     /// Every node that cached the AoR sees its bindings run out, and only one
     /// may tell the script (`RegistrationEvent::Expired`): the first claim of
-    /// a `(aor, marker)` pair wins, atomically, and later ones lose. The
-    /// default always wins, which is right for a backend one node owns.
+    /// a `(aor, marker)` pair wins, atomically, and later ones lose. Every
+    /// claim loses while the AoR's last [`remove`](Self::remove) stands: its
+    /// registration ended explicitly, and the copy that ran out is older than
+    /// that ending. The default always wins, which is right for a backend one
+    /// node owns.
     fn claim_expiry(
         &self,
         aor: &str,
@@ -501,6 +510,8 @@ pub struct MemoryBackend {
     aor_state: dashmap::DashMap<String, StoredAorState>,
     /// `(aor, marker)` expiries already claimed.
     claimed: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    /// AoRs removed since their last save: their expiry claims lose.
+    removed: dashmap::DashMap<String, ()>,
 }
 
 impl MemoryBackend {
@@ -509,6 +520,7 @@ impl MemoryBackend {
             data: dashmap::DashMap::new(),
             aor_state: dashmap::DashMap::new(),
             claimed: std::sync::Mutex::new(std::collections::HashSet::new()),
+            removed: dashmap::DashMap::new(),
         }
     }
 }
@@ -524,6 +536,7 @@ impl RegistrarBackend for MemoryBackend {
         if contacts.is_empty() {
             self.data.remove(aor);
         } else {
+            self.removed.remove(aor);
             self.data.insert(aor.to_string(), contacts.to_vec());
         }
         Ok(())
@@ -538,7 +551,9 @@ impl RegistrarBackend for MemoryBackend {
     }
 
     async fn remove(&self, aor: &str) -> Result<(), BackendError> {
-        self.data.remove(aor);
+        if self.data.remove(aor).is_some() {
+            self.removed.insert(aor.to_string(), ());
+        }
         Ok(())
     }
 
@@ -588,6 +603,9 @@ impl RegistrarBackend for MemoryBackend {
     }
 
     async fn claim_expiry(&self, aor: &str, marker: &str) -> Result<bool, BackendError> {
+        if self.removed.contains_key(aor) {
+            return Ok(false);
+        }
         Ok(self
             .claimed
             .lock()
