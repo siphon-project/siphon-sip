@@ -871,8 +871,10 @@ async fn every_engine_call_a_control_verb_mints_is_attached() {
 
 /// A warrant activated after the call's media was moved onto an engine call
 /// siphon minted, on a node that had nothing provisioned until then and so
-/// remembers nothing of the call: what the media path holds says where the
-/// media is, and the next ACK attaches there, not under the Call-ID.
+/// remembers no decision of the call: the dialog index finds it and what the
+/// media path holds says where the media is. The attach is made at the
+/// activation, on that engine call and not under the Call-ID, and the next
+/// ACK asks for nothing more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mid_call_warrant_attaches_on_the_engine_call_the_media_moved_to() {
     const CALL: &str = "mid-call-on-minted@192.0.2.10";
@@ -909,6 +911,7 @@ async fn a_mid_call_warrant_attaches_on_the_engine_call_the_media_moved_to() {
         ..super::li_session_tests::leg_session(CALL)
     });
     sessions.record_parties(CALL, &minted, &[(CALL, Some("caller-tag"))]);
+    sessions.set_to_tag(CALL, "target-tag".to_string());
     assert_eq!(
         attach_outcomes(&mut audit).await,
         (0, 0),
@@ -918,14 +921,24 @@ async fn a_mid_call_warrant_attaches_on_the_engine_call_the_media_moved_to() {
     li.tasks()
         .activate(warrant)
         .expect("the warrant arrives mid-call");
-    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
-    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+    assert_eq!(
+        attach_outcomes(&mut audit).await,
+        (1, 0),
+        "attached at the activation, with no message from either party"
+    );
     let attached = engine.commands("attach_x3");
     assert_eq!(attached.len(), 1);
     assert_eq!(attached[0].call_id, minted, "on the live allocation");
     assert!(!attached[0].refused);
     assert_eq!(attached[0].detail.as_deref(), Some("caller"));
     assert_eq!(li.x3_attachments_for(&minted).len(), 1);
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    assert_eq!(attach_outcomes(&mut audit).await, (0, 0));
+    assert_eq!(
+        engine.commands("attach_x3").len(),
+        1,
+        "the ACK asks for nothing"
+    );
     backend
         .delete(&minted, "caller-tag")
         .await
