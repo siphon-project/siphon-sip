@@ -389,12 +389,22 @@ pub(super) fn detach_x3(session: &crate::li::SessionView, state: &Arc<Dispatcher
                 conference_id: seat.conference_id.to_string(),
                 from_tag: seat.tag.to_string(),
             };
-            let detached = backend.detach_x3_seat(&held).await;
+            // siphon's leave of the seat is answered: the engine ended the
+            // seat's deliveries with it, and a detach would only be answered
+            // `unknown call`. A leave still out is not enough, the engine may
+            // refuse it and the seat then keeps delivering.
+            let detached = match li.x3_engine_call_end_committed(&seat.record(), None) {
+                true => Ok(()),
+                false => backend.detach_x3_seat(&held).await,
+            };
             for attachment in attachments {
                 if let Err(error) = &detached {
-                    warn!(
-                        x_id = %attachment.x_id, conference_id = %seat.conference_id, %error,
-                        "could not detach X3 content delivery from a conference seat"
+                    seat_detach_failed(
+                        &li,
+                        &attachment.x_id.to_string(),
+                        &seat.conference_id,
+                        &seat.record(),
+                        error,
                     );
                 }
                 li.audit(
@@ -408,6 +418,34 @@ pub(super) fn detach_x3(session: &crate::li::SessionView, state: &Arc<Dispatcher
             }
         }
     });
+}
+
+/// A detach of a conference seat's deliveries failed.
+///
+/// The engine has no seat to detach from, and siphon took the seat out (the
+/// script's `conference_leave`, which reached the engine ahead of the detach)
+/// or is taking it out: the deliveries ended with the seat, which is what
+/// siphon asked for, and is no warning. Any other failure, or an unknown seat
+/// siphon did not take out, is one.
+fn seat_detach_failed(
+    li: &LiManager,
+    x_id: &str,
+    conference_id: &str,
+    record: &str,
+    error: &crate::rtpengine::RtpEngineError,
+) {
+    if error.is_call_not_found() && li.x3_engine_call_ended_by_siphon(record, None) {
+        debug!(
+            %x_id, %conference_id, %error,
+            "LI: an X3 seat detach found the seat already taken out by siphon, \
+             its deliveries ended with it"
+        );
+        return;
+    }
+    warn!(
+        %x_id, %conference_id, %error,
+        "could not detach X3 content delivery from a conference seat"
+    );
 }
 
 /// Detach the deliveries that are no longer provisioned: their warrant was
@@ -525,9 +563,12 @@ async fn detach_unwarranted_record(
         let detached = backend.detach_x3_seat(&seat).await;
         for attachment in moved {
             if let Err(error) = &detached {
-                warn!(
-                    x_id = %attachment.x_id, %conference_id, %error,
-                    "could not detach X3 content delivery from a conference seat"
+                seat_detach_failed(
+                    li,
+                    &attachment.x_id.to_string(),
+                    conference_id,
+                    record,
+                    error,
                 );
             }
             li.audit(
