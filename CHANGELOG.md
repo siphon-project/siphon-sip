@@ -13,6 +13,10 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Security
+
+- The `siphon` binary is built with url 2.5.9 (RUSTSEC-2026-0592: unbounded recursion in `Url::origin()` on nested `blob:` URLs).
+
 ### Added
 
 - **`registrar.redis.required_for_readiness` and `registrar.postgres.required_for_readiness`, and the `siphon_registrar_backend_up` gauge.** `true` holds `/admin/ready` at 503 until the registrar backend has been connected (default `false`); the gauge is 0 until it has.
