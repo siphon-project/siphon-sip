@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use super::{
     CallOwner, Identities, LiManager, MatchedParty, MessageFacts, MessageOn, PayloadDirection,
-    Sender, SessionDecision, SessionMatch,
+    Sender, SessionDecision, SessionMatch, MAX_INVITE_BRANCHES_PER_SESSION,
 };
 use crate::li::x1::store::TaskMatch;
 use crate::li::x1::types::XId;
@@ -95,6 +95,69 @@ impl LiManager {
     pub(super) fn clear_decisions(&self) {
         self.decisions.clear();
         self.warranted_sessions.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether any warrant is provisioned on a node with lawful intercept on:
+    /// one relaxed load. The gate of deciding a session on a frame siphon
+    /// sends, which only a warrant makes any use of.
+    pub fn any_active_task(&self) -> bool {
+        self.config.enabled && self.tasks.any_active()
+    }
+
+    /// Decide the session of an initial INVITE siphon sends on a Call-ID no
+    /// message has resolved (a call it originates, or a leg of a call no
+    /// warrant covered): when a warrant names the INVITE's parties, the
+    /// session exists from here, so the INVITE, a CANCEL, the ACK and
+    /// everything after are recorded. An INVITE no warrant names remembers
+    /// nothing.
+    ///
+    /// The session's lifecycle stays the arriving messages': all that is noted
+    /// here is that an INVITE opened it, which they need to tell a failed
+    /// re-INVITE from a failed call.
+    pub fn decide_outbound_invite(
+        &self,
+        call_id: &str,
+        facts: &MessageFacts<'_>,
+        identities: &Identities<'_>,
+        owner: impl FnOnce() -> Option<CallOwner>,
+    ) -> Option<Arc<str>> {
+        if !self.any_active_task() || !facts.opens_dialog() {
+            return None;
+        }
+        let named = self.tasks.match_message(
+            identities.request_uri,
+            identities.from_uri,
+            identities.to_uri,
+            None,
+        );
+        if named.is_empty() {
+            return None;
+        }
+        let view = self.resolve_session_inner(call_id, facts, identities, owner, || None, false);
+        if view.matches.is_empty() {
+            return None;
+        }
+        if let Some(mut decision) = self.decisions.get_mut(&*view.session_id) {
+            decision.invite_session = true;
+            if let Some(branch) = facts.branch {
+                if decision.invite_branches.len() < MAX_INVITE_BRANCHES_PER_SESSION {
+                    decision.invite_branches.push((Box::from(branch), false));
+                }
+            }
+        }
+        Some(view.session_id)
+    }
+
+    /// Whether the target of the warrant `x_id` owns the dialog the session is
+    /// anchored on, which is the call's caller on a B2BUA call.
+    pub fn target_owns_anchor(&self, session_id: &str, x_id: XId) -> bool {
+        self.decisions.get(session_id).is_none_or(|decision| {
+            decision
+                .matched
+                .iter()
+                .find(|known| known.x_id == x_id)
+                .is_none_or(|known| known.target_owns_anchor)
+        })
     }
 
     /// Give back the count a removed decision held.
@@ -541,6 +604,113 @@ mod tests {
         assert_eq!(manager.remembered_session_count(), 100);
         assert!(!manager.any_warranted_session());
         assert_eq!(manager.warranted_sessions.load(Ordering::Relaxed), 0);
+    }
+
+    fn siphons_invite() -> Identities<'static> {
+        Identities {
+            request_uri: Some("sip:bob@example.com"),
+            from_uri: Some("<sip:15550100001@192.0.2.1>;tag=s"),
+            to_uri: Some("<sip:bob@example.com>"),
+            source_ip: None,
+        }
+    }
+
+    fn answer_to_siphons_invite() -> Identities<'static> {
+        Identities {
+            request_uri: None,
+            from_uri: Some("<sip:15550100001@192.0.2.1>;tag=s"),
+            to_uri: Some("<sip:bob@example.com>;tag=c"),
+            source_ip: None,
+        }
+    }
+
+    #[test]
+    fn an_originated_invite_decides_the_session_of_the_called_target() {
+        let (manager, _iri, _audit) = manager();
+        provision_targets(&manager, DeliveryType::X2Only, None, bob());
+        let session_id = manager
+            .decide_outbound_invite(DIALOG, &invite(), &siphons_invite(), || None)
+            .expect("a warrant names the callee");
+        let sent = manager
+            .outbound_matches(session_id, DIALOG, &invite(), &siphons_invite())
+            .expect("decided");
+        assert_eq!(sent.matches.len(), 1);
+        assert_eq!(sent.matches[0].party, MatchedParty::Terminating);
+        // Not a request that opens nothing, and not one nobody names.
+        assert!(manager
+            .decide_outbound_invite(
+                "other@example.com",
+                &facts(true, "BYE", None, true),
+                &siphons_invite(),
+                || None
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn originated_calls_that_complete_and_that_fail_drain() {
+        let (manager, _iri, _audit) = manager();
+        provision_targets(&manager, DeliveryType::X2Only, None, bob());
+        for index in 0..100 {
+            let completed = format!("completed-{index}@example.com");
+            let failed = format!("failed-{index}@example.com");
+            let cancelled = format!("cancelled-{index}@example.com");
+            let bound = format!("bound-{index}@example.com");
+            for call_id in [&completed, &failed, &cancelled] {
+                manager
+                    .decide_outbound_invite(call_id, &invite(), &siphons_invite(), || None)
+                    .expect("decided");
+            }
+            // A leg of a call nothing else covered joins that call's id.
+            let owner = CallOwner {
+                internal_id: format!("call-{index}"),
+                a_leg_call_id: format!("a-leg-{index}@example.com"),
+                replacement_target: false,
+            };
+            manager
+                .decide_outbound_invite(&bound, &invite(), &siphons_invite(), || Some(owner))
+                .expect("decided");
+
+            // What arrives drives the lifecycle.
+            let answered = manager.resolve_session(
+                &completed,
+                &facts(false, "INVITE", Some(200), true),
+                &answer_to_siphons_invite(),
+                || None,
+            );
+            manager.note_message(&answered, &facts(false, "INVITE", Some(200), true));
+            manager.note_message(&answered, &facts(true, "BYE", None, true));
+            for call_id in [&failed, &cancelled] {
+                let refused = manager.resolve_session(
+                    call_id,
+                    &facts(false, "INVITE", Some(487), true),
+                    &answer_to_siphons_invite(),
+                    || None,
+                );
+                manager.note_message(&refused, &facts(false, "INVITE", Some(487), true));
+            }
+        }
+        assert!(manager.any_warranted_session());
+        // The legs bound to a call are marked ended by the first sweep, the rest by
+        // what arrived; each is released a grace after.
+        manager.sweep_sessions(Instant::now(), |_| false);
+        manager.sweep_sessions(Instant::now() + super::super::SESSION_GRACE, |_| false);
+        assert_eq!(manager.remembered_session_count(), 0);
+        assert_eq!(manager.session_alias_count(), 0);
+        assert!(!manager.any_warranted_session());
+    }
+
+    #[test]
+    fn the_task_gate_follows_the_provisioned_warrants() {
+        let (manager, _iri, _audit) = manager();
+        assert!(!manager.any_active_task());
+        let x_id = provision_targets(&manager, DeliveryType::X2Only, None, bob());
+        assert!(manager.any_active_task());
+        manager.tasks().deactivate(x_id).expect("deactivates");
+        assert!(!manager.any_active_task());
+        provision_targets(&manager, DeliveryType::X2Only, None, bob());
+        manager.tasks().deactivate_all();
+        assert!(!manager.any_active_task());
     }
 
     #[test]

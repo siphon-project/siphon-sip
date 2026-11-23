@@ -364,6 +364,9 @@ pub struct TaskStore {
     /// progress, so a session decided as "no warrant" a moment earlier must be
     /// decided again rather than trusted.
     generation: Arc<AtomicU64>,
+    /// How many tasks are provisioned, readable without walking the map: the
+    /// gate of work that is only owed while a warrant exists.
+    active: Arc<std::sync::atomic::AtomicUsize>,
     /// Carries the generation to whoever acts on a change as it happens
     /// ([`TaskStore::subscribe`]), rather than at the next message of a call.
     changed: Arc<tokio::sync::watch::Sender<u64>>,
@@ -378,6 +381,7 @@ impl TaskStore {
             destinations,
             content_capability,
             generation: Arc::new(AtomicU64::new(0)),
+            active: Arc::default(),
             changed: Arc::new(tokio::sync::watch::channel(0).0),
         }
     }
@@ -398,13 +402,23 @@ impl TaskStore {
         self.generation.load(Ordering::Acquire)
     }
 
+    /// Whether any task is provisioned: one relaxed load.
+    pub fn any_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed) > 0
+    }
+
     /// Invalidate every cached matching decision.
     ///
     /// Called from each mutation that can change what matches. It is
     /// deliberately coarse: a warrant provisioned or withdrawn is rare and a
     /// missed interception is not survivable, so every session is re-decided
     /// rather than reasoning about which ones could have been affected.
+    fn sync_active(&self) {
+        self.active.store(self.tasks.len(), Ordering::Relaxed);
+    }
+
     fn bump_generation(&self) {
+        self.sync_active();
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         // `send_replace` stores the value with no receiver listening too, so
         // a subscriber that arrives later still reads the current one.
@@ -649,15 +663,14 @@ impl TaskStore {
     pub fn deactivate(&self, x_id: XId) -> Result<StoredTask, X1Error> {
         self.index.remove(x_id);
         self.bump_generation();
-        self.tasks
-            .remove(&x_id)
-            .map(|(_, task)| task)
-            .ok_or_else(|| {
-                X1Error::new(
-                    ErrorCode::XidDoesNotExist,
-                    format!("task {x_id} is not provisioned"),
-                )
-            })
+        let removed = self.tasks.remove(&x_id);
+        self.sync_active();
+        removed.map(|(_, task)| task).ok_or_else(|| {
+            X1Error::new(
+                ErrorCode::XidDoesNotExist,
+                format!("task {x_id} is not provisioned"),
+            )
+        })
     }
 
     /// Deactivate every task, returning how many were removed.

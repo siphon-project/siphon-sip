@@ -384,7 +384,10 @@ async fn nothing_is_tapped_while_no_session_is_warranted() {
     let (state, li, mut iri, _audit) = intercepting_for(test_dispatcher(), "sip:alice@example.com");
     let _tap = tests_support::install(&li, Some(Arc::clone(&state.call_actors)));
     assert!(!li.any_warranted_session());
-    assert!(!li_tap_wanted(), "the gate is shut");
+    assert!(
+        li_tap_wanted(),
+        "a warrant exists, so an originated INVITE may open a session"
+    );
 
     // A frame of a call nobody intercepted, though a warrant is provisioned.
     leaves(&state, CALLER, &answer("200 OK"));
@@ -444,4 +447,206 @@ async fn a_connection_the_pool_opens_is_tapped() {
     assert_eq!(events.len(), 1, "the pool branch skips deliver, and taps");
     assert_eq!(events[0].direction, SentToTarget);
     assert_eq!(events[0].destination_ip, Some(destination.ip()));
+}
+/// A script that puts every initial INVITE into B2BUA mode.
+const B2BUA_SCRIPT: &str = concat!(
+    "from siphon import b2bua\n",
+    "\n",
+    "@b2bua.on_invite\n",
+    "def on_invite(call):\n",
+    "    call.dial(\"sip:15550100042@198.51.100.77:5060\")\n",
+);
+
+/// A response siphon sends on the dialled leg, to the called party's request.
+const BYE_OK_TO_CALLED: &str = concat!(
+    "SIP/2.0 200 OK\r\n",
+    "Via: SIP/2.0/UDP 198.51.100.77:5060;branch=z9hG4bK-far-bye\r\n",
+    "From: <sip:15550100042@198.51.100.77>;tag=callee-tag\r\n",
+    "To: <sip:15550100001@192.0.2.1>;tag=siphon-leg\r\n",
+    "Call-ID: b2b-callee@192.0.2.1\r\n",
+    "CSeq: 2 BYE\r\n",
+    "Content-Length: 0\r\n",
+    "\r\n",
+);
+
+/// The X2 stream of a called target on a B2BUA call is the wire to and from
+/// that target and nothing else: not the caller's INVITE (which is not sent to
+/// the target; siphon's own is), not the caller's ACK, not what siphon sends
+/// the caller.
+#[tokio::test]
+async fn a_called_target_of_a_b2bua_call_gets_exactly_the_wire_to_and_from_it() {
+    use crate::li::pdu::PayloadDirection::SentFromTarget;
+    let (state, li, mut iri, _audit) = intercepting_for(
+        super::test_dispatcher::test_dispatcher_with_script(B2BUA_SCRIPT),
+        CALLED,
+    );
+    let _tap = tests_support::install(&li, Some(Arc::clone(&state.call_actors)));
+    let internal_id = caller_calls(&state);
+    dial(&state, &internal_id, CALLEE_CALL_ID);
+
+    leaves(&state, CALLER, &answer("100 Trying"));
+    leaves(
+        &state,
+        CALLEE,
+        &on_the_dialled_leg("INVITE", 1, "", "dialled-invite"),
+    );
+    arrives(
+        &state,
+        CALLEE,
+        &super::li_session_tests::callee_response(CALLEE_CALL_ID, "180 Ringing"),
+    );
+    arrives(
+        &state,
+        CALLEE,
+        &super::li_session_tests::callee_response(CALLEE_CALL_ID, "200 OK"),
+    );
+    leaves(&state, CALLER, &answer("200 OK"));
+    leaves(
+        &state,
+        CALLEE,
+        &on_the_dialled_leg("ACK", 1, ";tag=callee-tag", "dialled-ack"),
+    );
+    arrives(&state, CALLER, CALLER_ACK);
+    arrives(
+        &state,
+        CALLEE,
+        &super::li_session_tests::callee_request("BYE", 2, "z9hG4bK-far-bye"),
+    );
+    leaves(&state, CALLEE, BYE_OK_TO_CALLED);
+    let bye_to_caller = concat!(
+        "BYE sip:alice@192.0.2.10:5060 SIP/2.0\r\n",
+        "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-siphon-bye\r\n",
+        "From: <sip:15550100042@siphon.example.com>;tag=siphon-tag\r\n",
+        "To: <sip:alice@example.com>;tag=caller-tag\r\n",
+        "Call-ID: caller-call@192.0.2.10\r\n",
+        "CSeq: 9 BYE\r\n",
+        "Content-Length: 0\r\n",
+        "\r\n",
+    );
+    leaves(&state, CALLER, bye_to_caller);
+
+    let events = drain_iri(&mut iri);
+    let stream: Vec<_> = events
+        .iter()
+        .map(|event| {
+            (
+                event.sip_method.as_str(),
+                event.status_code,
+                event.direction,
+            )
+        })
+        .collect();
+    assert_eq!(
+        stream,
+        [
+            ("INVITE", None, SentToTarget),
+            ("INVITE", Some(180), SentFromTarget),
+            ("INVITE", Some(200), SentFromTarget),
+            ("ACK", None, SentToTarget),
+            ("BYE", None, SentFromTarget),
+            ("BYE", Some(200), SentToTarget),
+        ],
+        "exactly the wire to and from the target"
+    );
+    assert_eq!(events[0].event_type, IriEventType::Begin);
+    assert_eq!(events[0].call_id, CALLEE_CALL_ID, "siphon's dialled INVITE");
+    let correlation = correlation_from_call_id(&internal_id);
+    assert!(events
+        .iter()
+        .all(|event| event.correlation_id == correlation));
+}
+
+/// In proxy mode the INVITE is relayed to the target, so the arrival is the
+/// record of it.
+#[tokio::test]
+async fn a_called_targets_opening_invite_is_kept_in_proxy_mode() {
+    let (state, _li, mut iri, _audit) = intercepting_for(test_dispatcher(), CALLED);
+    arrives(&state, CALLER, CALLER_INVITE);
+    let events = drain_iri(&mut iri);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].sip_method, "INVITE");
+}
+
+/// A call siphon originates to a target has no inbound INVITE: the outbound
+/// one decides the session, and it, a CANCEL and everything after are recorded.
+#[tokio::test]
+async fn a_call_siphon_originates_to_a_target_is_decided_on_its_invite() {
+    let (state, li, mut iri, _audit) = intercepting_for(test_dispatcher(), ORIGINATED_TARGET);
+    let _tap = tests_support::install(&li, Some(Arc::clone(&state.call_actors)));
+    assert!(!li.any_warranted_session());
+
+    leaves(
+        &state,
+        CALLEE,
+        &on_the_dialled_leg("INVITE", 1, "", "originated"),
+    );
+    leaves(
+        &state,
+        CALLEE,
+        &on_the_dialled_leg("CANCEL", 1, "", "originated"),
+    );
+    arrives(
+        &state,
+        CALLEE,
+        &super::li_session_tests::callee_response(CALLEE_CALL_ID, "487 Request Terminated"),
+    );
+    leaves(
+        &state,
+        CALLEE,
+        &on_the_dialled_leg("ACK", 1, ";tag=callee-tag", "originated"),
+    );
+
+    let events = drain_iri(&mut iri);
+    assert_eq!(
+        summary(&events),
+        [
+            ("INVITE".to_string(), None),
+            ("CANCEL".to_string(), None),
+            ("INVITE".to_string(), Some(487)),
+            ("ACK".to_string(), None),
+        ]
+    );
+    assert_eq!(events[0].event_type, IriEventType::Begin);
+    assert!(events
+        .iter()
+        .all(|event| event.correlation_id == events[0].correlation_id));
+}
+
+/// The target of a call siphon originates, as the dialled leg names it.
+const ORIGINATED_TARGET: &str = "sip:15550100042@198.51.100.77";
+
+/// With no warrant provisioned the tap decides nothing and clones nothing.
+#[tokio::test]
+async fn an_originated_invite_decides_nothing_while_no_warrant_is_provisioned() {
+    let (state, li, mut iri, _audit) = intercepting_for(test_dispatcher(), ORIGINATED_TARGET);
+    li.tasks().deactivate_all();
+    let _tap = tests_support::install(&li, Some(Arc::clone(&state.call_actors)));
+    assert!(!li.any_active_task());
+    assert!(!li_tap_wanted());
+
+    leaves(
+        &state,
+        CALLEE,
+        &on_the_dialled_leg("INVITE", 1, "", "originated"),
+    );
+
+    assert!(drain_iri(&mut iri).is_empty());
+    assert_eq!(li.remembered_session_count(), 0);
+}
+
+/// An originated INVITE that no warrant names decides and remembers nothing.
+#[tokio::test]
+async fn an_originated_invite_no_warrant_names_is_not_remembered() {
+    let (state, li, mut iri, _audit) =
+        intercepting_for(test_dispatcher(), "sip:someone-else@example.com");
+    let _tap = tests_support::install(&li, Some(Arc::clone(&state.call_actors)));
+
+    leaves(
+        &state,
+        CALLEE,
+        &on_the_dialled_leg("INVITE", 1, "", "originated"),
+    );
+
+    assert!(drain_iri(&mut iri).is_empty());
+    assert_eq!(li.remembered_session_count(), 0);
 }

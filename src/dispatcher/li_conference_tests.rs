@@ -2131,10 +2131,10 @@ async fn a_transfers_third_leg_is_never_from_a_called_target() {
     );
 
     let seen = directions(&drain_iri(&mut iri));
-    // The warrant names the called party. The caller's INVITE arrives before
-    // the call exists, so it is recorded as any first message of a session is;
-    // the caller's ACK after it is on a leg that is not the target's, and is
-    // not.
+    // The warrant names the called party. This fixture's script has no B2BUA
+    // handler, so the caller's INVITE is one a proxy relays to the target and
+    // is recorded (a B2BUA's is withheld, `li_outbound_tests`); the caller's
+    // ACK after it is on a leg that is not the target's, and is not.
     assert_eq!(
         seen[..2],
         [

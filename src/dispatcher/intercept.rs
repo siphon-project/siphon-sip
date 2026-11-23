@@ -129,7 +129,14 @@ pub(super) fn intercept_message(
         // recorded for a warrant whose target is on the other leg, and what
         // siphon sends the target on its own leg is ([`super::x2_outbound`]).
         // The session still lives by every message that arrives.
-        if !li.is_on_target_leg(&session.session_id, call_id, x_id) {
+        // The same for the INVITE that opens a call B2BUA mode takes, for a
+        // warrant on the called party: it is not sent to the target, siphon's
+        // own INVITE is. Which mode takes it is known here, ahead of the
+        // script, and a proxied INVITE is relayed to the target as it is.
+        let withheld_opening = facts.opens_dialog()
+            && !li.target_owns_anchor(&session.session_id, x_id)
+            && b2bua_takes_opening_invite(state, message);
+        if withheld_opening || !li.is_on_target_leg(&session.session_id, call_id, x_id) {
             if event_type == crate::li::IriEventType::End {
                 super::x3_delivery::detach_x3(&session, state);
             }
@@ -861,6 +868,14 @@ fn b2bua_owner(
     };
     let internal_id = held.or_else(|| replaced_call(state, message))?;
     call_owner(&state.call_actors, internal_id, replacement_target)
+}
+
+/// Whether B2BUA mode takes the initial INVITE `message` as a new call, as the
+/// request path decides it once the script is reached.
+fn b2bua_takes_opening_invite(state: &DispatcherState, message: &SipMessage) -> bool {
+    let engine_state = state.engine.state();
+    super::b2bua::b2bua_mode_active(&engine_state, state)
+        && super::b2bua::b2bua_takes_invite(&engine_state, state, message)
 }
 
 /// The owner of the call `call_id` is a leg of, in `store`, with no message to

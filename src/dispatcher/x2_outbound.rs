@@ -35,7 +35,8 @@ pub(crate) fn li_tap_wanted() -> bool {
     if let Some(wanted) = tests_support::wanted() {
         return wanted;
     }
-    crate::server::li_manager_ref().is_some_and(LiManager::any_warranted_session)
+    crate::server::li_manager_ref()
+        .is_some_and(|li| li.any_warranted_session() || li.any_active_task())
 }
 
 /// Record one frame that is about to leave, if it goes to the target of a
@@ -81,7 +82,11 @@ pub(crate) fn tap_frame(
     source_local_addr: Option<SocketAddr>,
     relayed: bool,
 ) {
-    if !li.any_warranted_session() {
+    // An initial INVITE siphon sends on a Call-ID nothing has resolved (a call
+    // it originates) may open a warranted session, but only while a warrant
+    // exists.
+    let may_decide = !relayed && li.any_active_task() && frame.starts_with(b"INVITE ");
+    if !li.any_warranted_session() && !may_decide {
         return;
     }
     // A header scan first: a frame of a call that is not intercepted is not
@@ -89,13 +94,13 @@ pub(crate) fn tap_frame(
     let Some(call_id) = crate::capture::call_id_from_bytes(frame) else {
         return;
     };
+    let owner_of = || store.and_then(|store| super::intercept::owner_of_leg(store, &call_id));
     // The leg's session before anything is parsed: a frame of a call that is
     // not intercepted costs the header scan and one lookup.
-    let Some(session_id) = li.outbound_leg(&call_id, || {
-        store.and_then(|store| super::intercept::owner_of_leg(store, &call_id))
-    }) else {
+    let leg = li.outbound_leg(&call_id, owner_of);
+    if leg.is_none() && !may_decide {
         return;
-    };
+    }
     let Ok(message) = parse_sip_message_bytes(frame) else {
         return;
     };
@@ -132,6 +137,13 @@ pub(crate) fn tap_frame(
         source_ip: None,
     };
 
+    let session_id = match leg {
+        Some(session_id) => session_id,
+        None => match li.decide_outbound_invite(&call_id, &facts, &identities, owner_of) {
+            Some(session_id) => session_id,
+            None => return,
+        },
+    };
     let Some(session) = li.outbound_matches(session_id, &call_id, &facts, &identities) else {
         return;
     };
@@ -247,7 +259,7 @@ pub(crate) mod tests_support {
         TAP.with(|slot| {
             slot.borrow()
                 .as_ref()
-                .map(|(li, _)| li.any_warranted_session())
+                .map(|(li, _)| li.any_warranted_session() || li.any_active_task())
         })
     }
 }
