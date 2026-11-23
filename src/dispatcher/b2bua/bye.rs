@@ -266,22 +266,24 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
     // the A-leg Call-ID (the store key), which is NOT the incoming BYE's Call-ID
     // when the BYE comes from the B-leg (or from the survivor/target after a
     // terminate-transfer re-anchor).
-    let (other_leg, media_key, adopted) = match state.call_actors.get_call(&call_id) {
-        Some(call) => {
-            let other_leg = if from_a_leg {
-                call.winner
-                    .and_then(|winner_index| call.b_legs.get(winner_index).cloned())
-            } else {
-                Some(call.a_leg.clone())
-            };
-            (
-                other_leg,
-                call.a_leg.dialog.call_id.clone(),
-                call.adoption.is_some(),
-            )
-        }
-        None => return,
-    };
+    let (other_leg, media_key, adopted, siphon_is_far_party) =
+        match state.call_actors.get_call(&call_id) {
+            Some(call) => {
+                let other_leg = if from_a_leg {
+                    call.winner
+                        .and_then(|winner_index| call.b_legs.get(winner_index).cloned())
+                } else {
+                    Some(call.a_leg.clone())
+                };
+                (
+                    other_leg,
+                    call.a_leg.dialog.call_id.clone(),
+                    call.adoption.is_some(),
+                    call.b_legs.is_empty(),
+                )
+            }
+            None => return,
+        };
 
     // Send 200 OK to the BYE sender on the socket the BYE arrived on (multi-homed
     // UDP source-port parity — the in-dialog BYE now lands on the A-leg's anchored
@@ -324,6 +326,16 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
         // A call merged into a room has its far party as its one leg.
         None if adopted => {
             debug!(call_id = %call_id, "B2BUA: adopted call — its seat goes with the media delete")
+        }
+        // A call siphon answered itself and never dialled: a bot hand-over
+        // (`answer=True`), a conference factory seat, `answer_local`, a control
+        // `answer` with nothing dialled. Those calls never push a B-leg (a dial
+        // that failed clears its legs again, `clear_b_legs`), so `b_legs` is
+        // empty and `winner` stays unset; siphon is the far party and the 200
+        // above is all the caller's BYE is owed. A call that has B-legs but no
+        // winner (or a winner index past them) is inconsistent and still warns.
+        None if siphon_is_far_party => {
+            debug!(call_id = %call_id, "B2BUA: call answered by siphon itself — no other leg to send a BYE to")
         }
         None => warn!(call_id = %call_id, "B2BUA: no winning B-leg for BYE"),
     }

@@ -13,6 +13,14 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- The caller's BYE on a call siphon answered itself and never dialled (a bot
+  hand-over, a conference factory seat, `answer_local`, a control-plane
+  `answer`) no longer logs `B2BUA: no winning B-leg for BYE` at WARN. Such a
+  call has no B-leg and the 200 is all the BYE is owed, so it is logged at
+  debug. A call with B-legs none of which won still warns.
+
 ## [1.17.1] — 2026-11-23
 
 ### Fixed
