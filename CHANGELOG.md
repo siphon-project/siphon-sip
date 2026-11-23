@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.17.1] — 2026-11-23
+
 ### Fixed
 
 - **LI: X2 now carries every SIP message siphon sends to a target, not only what it receives.** Interception tapped inbound bytes only, so everything siphon generated toward the target never reached the mediation function: its 100 Trying and local answers (`answer_local`, a conference factory's 200, a script reply), the 200 to the target's BYE, the 202 and sipfrag NOTIFYs of a REFER, teardown BYEs (`max_call_duration`, `b2bua.terminate`, session timer), session refresh, PRACK, ACK and CANCEL on a leg siphon dialled, and the copy a B2BUA builds for the target's leg. They are now recorded where they leave (the transport send path, and the TCP/TLS connections the pool opens), payload direction 2, under the call's Correlation ID. A resent frame is one record, a proxy's relayed copy stays the record its arrival made, and a frame siphon sends does not begin or end a session. A node with no warranted session pays one relaxed load per frame.
