@@ -1072,6 +1072,16 @@ pub(super) fn faults_reported(log: &crate::log_capture::LogBuffer) -> usize {
         .count()
 }
 
+/// The warnings and errors siphon itself logged. A dependency's own (hickory
+/// on a runner's hosts file, say) is the machine's, not the code under test's.
+pub(super) fn own_warnings(log: &crate::log_capture::LogBuffer) -> Vec<String> {
+    log.rendered()
+        .lines()
+        .filter(|line| line.contains(" WARN siphon") || line.contains(" ERROR siphon"))
+        .map(str::to_string)
+        .collect()
+}
+
 /// The call is set up to the caller's INVITE, in either mode.
 fn invite_arrives(state: &Arc<DispatcherState>, proxied: bool) -> Option<String> {
     if proxied {
