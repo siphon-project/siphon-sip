@@ -1128,6 +1128,12 @@ async fn on_x3_ended(
     // A joined conference seat's delivery is recorded under the seat, which
     // its end names by the room and the seat's tag.
     let record = li.x3_record_of_event(&ended.call_id, &ended.from_tag);
+    debug!(
+        call_id = %ended.call_id, %record, reason = %ended.reason, orderly = ended.orderly,
+        delivered = ended.delivered, dropped = ended.dropped,
+        delivery = ?ended.delivery, scope = scope.as_ref().map(CallScope::as_str),
+        "LI: the engine reported an X3 delivery ended"
+    );
     // The delivery this end belongs to, dropped from the record so the map
     // does not grow across calls: that of an engine call siphon ended, oldest
     // first, else the one in progress. `None` while siphon has asked the
@@ -1138,8 +1144,10 @@ async fn on_x3_ended(
         Some(delivery) => x3_delivery_ended(Some(li), &ended, delivery),
         None => debug!(
             call_id = %ended.call_id,
+            %record,
             reason = %ended.reason,
-            "X3 content delivery ended while siphon's end of its call is unanswered"
+            "X3 delivery ended before the engine answered siphon's request to end it; \
+             judged on that answer"
         ),
     }
 }

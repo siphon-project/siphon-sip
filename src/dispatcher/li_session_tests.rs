@@ -975,6 +975,22 @@ pub(super) async fn intercepting_on_the_engine(
     mpsc::Receiver<IriEvent>,
     mpsc::Receiver<AuditEntry>,
 ) {
+    intercepting_on_the_engine_watching(engine, true).await
+}
+
+/// [`intercepting_on_the_engine`], with the warrant watcher installed only
+/// when `watching`: a test that drives the scan itself, step by step, has
+/// no watcher racing it.
+pub(super) async fn intercepting_on_the_engine_watching(
+    engine: NativeTestEngine,
+    watching: bool,
+) -> (
+    Arc<DispatcherState>,
+    NativeTestEngine,
+    LiManager,
+    mpsc::Receiver<IriEvent>,
+    mpsc::Receiver<AuditEntry>,
+) {
     let mut dispatcher = test_dispatcher();
     dispatcher.state.rtpengine_set = Some(engine.backend());
     dispatcher.state.rtpengine_profiles = Some(Arc::new(crate::rtpengine::ProfileRegistry::new()));
@@ -983,6 +999,9 @@ pub(super) async fn intercepting_on_the_engine(
     dispatcher.state.rtpengine_sessions = Some(sessions);
     let (state, li, iri, audit) = intercepting_on(dispatcher);
     super::intercept::watch_engine_calls(&state);
+    if watching {
+        super::intercept::watch_warrants(&state);
+    }
     (state, engine, li, iri, audit)
 }
 
@@ -1051,6 +1070,16 @@ pub(super) fn faults_reported(log: &crate::log_capture::LogBuffer) -> usize {
     log.rendered()
         .matches("could not be reported to the ADMF")
         .count()
+}
+
+/// The warnings and errors siphon itself logged. A dependency's own (hickory
+/// on a runner's hosts file, say) is the machine's, not the code under test's.
+pub(super) fn own_warnings(log: &crate::log_capture::LogBuffer) -> Vec<String> {
+    log.rendered()
+        .lines()
+        .filter(|line| line.contains(" WARN siphon") || line.contains(" ERROR siphon"))
+        .map(str::to_string)
+        .collect()
 }
 
 /// The call is set up to the caller's INVITE, in either mode.
