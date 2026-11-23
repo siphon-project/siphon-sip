@@ -1000,6 +1000,7 @@ mod tests {
         for group in 0..GROUPS {
             outbound
                 .send(OutboundMessage {
+                    relayed: false,
                     connection_id: ConnectionId::default(),
                     transport: Transport::Udp,
                     destination: peer_addr,
@@ -1107,6 +1108,7 @@ mod tests {
         for index in 0..MESSAGES {
             outbound
                 .send(OutboundMessage {
+                    relayed: false,
                     connection_id: ConnectionId::default(),
                     transport: Transport::Udp,
                     destination: peer_addr,
@@ -1138,6 +1140,7 @@ mod tests {
 
     fn message_to(destination: SocketAddr) -> OutboundMessage {
         OutboundMessage {
+            relayed: false,
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
             destination,

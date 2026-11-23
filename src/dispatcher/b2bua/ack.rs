@@ -261,37 +261,38 @@ pub fn arm_reliable_provisional_retransmit_on(
             let sleep = tokio::time::sleep(interval);
             tokio::pin!(sleep);
             tokio::select! {
-                _ = entry.cancel.notified() => return,
-                _ = entry.stop.notified() => break,
-                _ = &mut sleep => {
-                    if tokio::time::Instant::now() >= deadline {
-                        warn!(
-                            call_id = %key.0, rseq = key.1,
-                            "RFC 3262: no PRACK after 32s — giving up reliable 1xx retransmits"
-                        );
-                        store.remove_if(&key, |_, current| Arc::ptr_eq(current, &entry));
-                        return;
-                    }
-                    debug!(
-                        call_id = %key.0, rseq = key.1, interval_ms = interval.as_millis() as u64,
-                        "retransmitting reliable 1xx (RFC 3262)"
-                    );
-                    if let Some(capture) = &capture {
-                        capture.capture(route.destination, route.transport, &bytes);
-                    }
-                    let _ = outbound.send(OutboundMessage {
-                        followups: None,
-                        connection_id: route.connection_id,
-                        transport: route.transport,
-                        destination: route.destination,
-                        data: bytes.clone(),
-                        source_local_addr: route.source_local_addr,
-                        server_name: None,
-                        verify_server: None,
-                    });
-                    interval = (interval * 2).min(cap);
-                }
-            }
+                           _ = entry.cancel.notified() => return,
+                           _ = entry.stop.notified() => break,
+                           _ = &mut sleep => {
+                               if tokio::time::Instant::now() >= deadline {
+                                   warn!(
+                                       call_id = %key.0, rseq = key.1,
+                                       "RFC 3262: no PRACK after 32s — giving up reliable 1xx retransmits"
+                                   );
+                                   store.remove_if(&key, |_, current| Arc::ptr_eq(current, &entry));
+                                   return;
+                               }
+                               debug!(
+                                   call_id = %key.0, rseq = key.1, interval_ms = interval.as_millis() as u64,
+                                   "retransmitting reliable 1xx (RFC 3262)"
+                               );
+                               if let Some(capture) = &capture {
+                                   capture.capture(route.destination, route.transport, &bytes);
+                               }
+                               let _ = outbound.send(OutboundMessage {
+            relayed: false,
+                                   followups: None,
+                                   connection_id: route.connection_id,
+                                   transport: route.transport,
+                                   destination: route.destination,
+                                   data: bytes.clone(),
+                                   source_local_addr: route.source_local_addr,
+                                   server_name: None,
+                                   verify_server: None,
+                               });
+                               interval = (interval * 2).min(cap);
+                           }
+                       }
         }
 
         // A final response went to the peer: no more retransmissions, but a
@@ -413,35 +414,36 @@ pub fn start_2xx_retransmits(
             let sleep = tokio::time::sleep(interval);
             tokio::pin!(sleep);
             tokio::select! {
-                _ = unacked.cancel.notified() => break,
-                _ = &mut sleep => {
-                    if tokio::time::Instant::now() >= unacked.deadline {
-                        debug!(
-                            call_id = %key,
-                            "A-leg 2xx still unACKed at 64*T1: retransmission stopped, the timer sweep ends the call"
-                        );
-                        break;
-                    }
-                    debug!(
-                        call_id = %key, interval_ms = interval.as_millis() as u64,
-                        "retransmitting A-leg 2xx (RFC 3261 §13.3.1.4)"
-                    );
-                    if let Some(capture) = &capture {
-                        capture.capture(destination, transport, &bytes);
-                    }
-                    let _ = outbound.send(OutboundMessage {
-                        followups: None,
-                        connection_id,
-                        transport,
-                        destination,
-                        data: bytes.clone(),
-                        source_local_addr,
-                        server_name: None,
-                        verify_server: None,
-                    });
-                    interval = (interval * 2).min(timers.t2);
-                }
-            }
+                           _ = unacked.cancel.notified() => break,
+                           _ = &mut sleep => {
+                               if tokio::time::Instant::now() >= unacked.deadline {
+                                   debug!(
+                                       call_id = %key,
+                                       "A-leg 2xx still unACKed at 64*T1: retransmission stopped, the timer sweep ends the call"
+                                   );
+                                   break;
+                               }
+                               debug!(
+                                   call_id = %key, interval_ms = interval.as_millis() as u64,
+                                   "retransmitting A-leg 2xx (RFC 3261 §13.3.1.4)"
+                               );
+                               if let Some(capture) = &capture {
+                                   capture.capture(destination, transport, &bytes);
+                               }
+                               let _ = outbound.send(OutboundMessage {
+            relayed: false,
+                                   followups: None,
+                                   connection_id,
+                                   transport,
+                                   destination,
+                                   data: bytes.clone(),
+                                   source_local_addr,
+                                   server_name: None,
+                                   verify_server: None,
+                               });
+                               interval = (interval * 2).min(timers.t2);
+                           }
+                       }
         }
     });
 }

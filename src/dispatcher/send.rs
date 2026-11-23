@@ -19,6 +19,47 @@ pub(super) fn send_outbound_from(
     source_local_addr: Option<SocketAddr>,
     state: &DispatcherState,
 ) {
+    send_outbound_marked(
+        data,
+        transport,
+        destination,
+        connection_id,
+        source_local_addr,
+        false,
+        state,
+    );
+}
+
+/// [`send_outbound_from`] for a message a proxy passes on as it received it.
+/// Lawful intercept has recorded it on arrival and skips this copy.
+pub(super) fn send_relayed_from(
+    data: Bytes,
+    transport: Transport,
+    destination: SocketAddr,
+    connection_id: ConnectionId,
+    source_local_addr: Option<SocketAddr>,
+    state: &DispatcherState,
+) {
+    send_outbound_marked(
+        data,
+        transport,
+        destination,
+        connection_id,
+        source_local_addr,
+        true,
+        state,
+    );
+}
+
+fn send_outbound_marked(
+    data: Bytes,
+    transport: Transport,
+    destination: SocketAddr,
+    connection_id: ConnectionId,
+    source_local_addr: Option<SocketAddr>,
+    relayed: bool,
+    state: &DispatcherState,
+) {
     let (destination, source_local_addr) =
         protected_udp_egress(&data, transport, destination, source_local_addr, state);
 
@@ -33,6 +74,7 @@ pub(super) fn send_outbound_from(
     }
 
     let outbound_message = OutboundMessage {
+        relayed,
         connection_id,
         transport,
         destination,
@@ -240,6 +282,7 @@ pub(super) fn send_frames_in_order_from(
     );
 
     let outbound_message = OutboundMessage {
+        relayed: false,
         connection_id,
         transport,
         destination,
@@ -275,6 +318,46 @@ pub(super) fn send_message_from(
     source_local_addr: Option<SocketAddr>,
     state: &DispatcherState,
 ) {
+    send_message_marked(
+        message,
+        transport,
+        destination,
+        connection_id,
+        source_local_addr,
+        false,
+        state,
+    );
+}
+
+/// [`send_message_from`] for a response a proxy passes on as it received it.
+pub(super) fn send_relayed_message_from(
+    message: SipMessage,
+    transport: Transport,
+    destination: SocketAddr,
+    connection_id: ConnectionId,
+    source_local_addr: Option<SocketAddr>,
+    state: &DispatcherState,
+) {
+    send_message_marked(
+        message,
+        transport,
+        destination,
+        connection_id,
+        source_local_addr,
+        true,
+        state,
+    );
+}
+
+pub(super) fn send_message_marked(
+    message: SipMessage,
+    transport: Transport,
+    destination: SocketAddr,
+    connection_id: ConnectionId,
+    source_local_addr: Option<SocketAddr>,
+    relayed: bool,
+    state: &DispatcherState,
+) {
     let data = Bytes::from(message.to_bytes());
     remember_invite_final(&message, &data, state);
 
@@ -284,12 +367,13 @@ pub(super) fn send_message_from(
         "sending message"
     );
 
-    send_outbound_from(
+    send_outbound_marked(
         data,
         transport,
         destination,
         connection_id,
         source_local_addr,
+        relayed,
         state,
     );
 }

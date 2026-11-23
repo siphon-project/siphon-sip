@@ -188,6 +188,7 @@ async fn udp_roundtrip() {
     // Send response back through outbound channel
     outbound_tx
         .send_async(OutboundMessage {
+            relayed: false,
             followups: None,
             connection_id: inbound.connection_id,
             transport: inbound.transport,
@@ -266,6 +267,7 @@ async fn tcp_roundtrip() {
     // Send response back through outbound channel (routed via connection_map)
     outbound_tx
         .send_async(OutboundMessage {
+            relayed: false,
             followups: None,
             connection_id: inbound.connection_id,
             transport: inbound.transport,
@@ -436,6 +438,7 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
     );
     outbound_tx
         .send_async(OutboundMessage {
+            relayed: false,
             followups: None,
             connection_id: ConnectionId::default(),
             transport: Transport::Tcp,
@@ -617,6 +620,7 @@ async fn tls_roundtrip() {
     // Send response back
     outbound_tx
         .send_async(OutboundMessage {
+            relayed: false,
             followups: None,
             connection_id: inbound.connection_id,
             transport: inbound.transport,
@@ -698,6 +702,7 @@ async fn ws_roundtrip() {
     // Send response back through outbound channel
     outbound_tx
         .send_async(OutboundMessage {
+            relayed: false,
             followups: None,
             connection_id: inbound.connection_id,
             transport: inbound.transport,
@@ -799,6 +804,7 @@ async fn wss_roundtrip() {
     // Send response back
     outbound_tx
         .send_async(OutboundMessage {
+            relayed: false,
             followups: None,
             connection_id: inbound.connection_id,
             transport: inbound.transport,

@@ -894,6 +894,15 @@ pub struct OutboundMessage {
     /// listener), but honour this for free by writing the frames into the same
     /// per-connection channel in order.
     pub followups: Option<Vec<Bytes>>,
+    /// Whether this is a message a proxy passes on as it received it (a
+    /// relayed request or response), not one siphon builds. The lawful
+    /// intercept tap skips it: what was received is already recorded as it
+    /// arrived, and the relayed copy would be the same message twice.
+    ///
+    /// `false` for everything siphon generates. Defaulting to `false` makes a
+    /// relay site that forgets to set it show up as a duplicate record, not a
+    /// missing one.
+    pub relayed: bool,
 }
 
 impl OutboundMessage {
@@ -1040,6 +1049,18 @@ impl OutboundRouter {
                     );
                 }
             }
+        }
+
+        // Lawful intercept X2 for what siphon sends to a target. One relaxed
+        // load per frame while nothing is intercepted; see
+        // `dispatcher::x2_outbound`.
+        for frame in message.frames() {
+            crate::dispatcher::x2_outbound::li_tap_outbound(
+                frame,
+                message.destination,
+                message.source_local_addr,
+                message.relayed,
+            );
         }
 
         match message.transport {
@@ -1558,6 +1579,7 @@ mod tests {
     #[test]
     fn outbound_message_construction() {
         let message = OutboundMessage {
+            relayed: false,
             connection_id: ConnectionId(99),
             transport: Transport::Udp,
             destination: "10.0.0.1:5060".parse().unwrap(),
@@ -1574,6 +1596,7 @@ mod tests {
 
     fn message_with_followups(followups: Option<Vec<Bytes>>) -> OutboundMessage {
         OutboundMessage {
+            relayed: false,
             connection_id: ConnectionId(1),
             transport: Transport::Udp,
             destination: "10.0.0.1:5060".parse().unwrap(),
@@ -1848,6 +1871,7 @@ mod tests {
         };
 
         let make = |source: Option<SocketAddr>| OutboundMessage {
+            relayed: false,
             connection_id: ConnectionId(0),
             transport: Transport::Udp,
             destination: addr("203.0.113.1:5060"),
@@ -1930,6 +1954,7 @@ mod tests {
         let pcscf = addr("192.0.2.20:5066");
         router
             .send(OutboundMessage {
+                relayed: false,
                 connection_id: ConnectionId(0),
                 transport: Transport::Udp,
                 destination: pcscf,
@@ -1975,6 +2000,7 @@ mod tests {
 
         router
             .send(OutboundMessage {
+                relayed: false,
                 connection_id: ConnectionId(0),
                 transport: Transport::Udp,
                 destination: addr("192.0.2.20:5060"),
@@ -2008,6 +2034,7 @@ mod tests {
         let receiver = receiver.expect("and the receiver that serves it");
         sender
             .send(OutboundMessage {
+                relayed: false,
                 connection_id: ConnectionId(1),
                 transport: Transport::Sctp,
                 destination: addr("198.51.100.20:5060"),
@@ -2073,6 +2100,7 @@ mod tests {
         let destination = addr("198.51.100.20:5060");
         let error = router
             .send(OutboundMessage {
+                relayed: false,
                 connection_id: ConnectionId(0),
                 transport: Transport::Sctp,
                 destination,
@@ -2125,6 +2153,7 @@ mod tests {
 
         router
             .send(OutboundMessage {
+                relayed: false,
                 connection_id: ConnectionId(7),
                 transport: Transport::Sctp,
                 destination: addr("198.51.100.20:5060"),

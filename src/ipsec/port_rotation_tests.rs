@@ -422,6 +422,7 @@ async fn egress_paths_send_from_the_pairs_own_client_port() {
             &manager,
             5066,
             OutboundMessage {
+                relayed: false,
                 connection_id: ConnectionId(7),
                 transport: Transport::Tcp,
                 destination: socket("192.0.2.77:6102"),

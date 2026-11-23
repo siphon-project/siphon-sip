@@ -30,6 +30,7 @@ fn set(addrs: &[SocketAddr]) -> HashSet<SocketAddr> {
 
 fn datagram(source: SocketAddr, destination: SocketAddr, body: &'static [u8]) -> OutboundMessage {
     OutboundMessage {
+        relayed: false,
         connection_id: ConnectionId::default(),
         transport: Transport::Udp,
         destination,

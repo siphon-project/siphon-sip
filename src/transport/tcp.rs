@@ -1217,6 +1217,7 @@ mod tests {
         listener
             .outbound_tx
             .send(OutboundMessage {
+                relayed: false,
                 followups: None,
                 connection_id: flow_connection,
                 transport: Transport::Tcp,

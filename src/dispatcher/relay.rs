@@ -686,6 +686,7 @@ pub(super) fn relay_request(
         let (destination, local) =
             captured_flow_egress(outbound_transport, destination, local, &data, state);
         let outbound_message = OutboundMessage {
+            relayed: true,
             followups: None,
             connection_id: ConnectionId(flow.map(|f| f.connection_id).unwrap_or(0)),
             transport: outbound_transport,
@@ -720,7 +721,7 @@ pub(super) fn relay_request(
             server_name: tls_peer.0,
             verify_server: tls_peer.1,
         };
-        send_to_target(
+        send_relayed_to_target(
             data,
             &target,
             inbound.transport,
@@ -1297,6 +1298,7 @@ pub(super) fn relay_fork_branch(
             state,
         );
         let outbound_message = OutboundMessage {
+            relayed: true,
             followups: None,
             connection_id: ConnectionId(flow.connection_id),
             transport: outbound_transport,
@@ -1320,7 +1322,7 @@ pub(super) fn relay_fork_branch(
             server_name: tls_server_name,
             verify_server,
         };
-        send_to_target(
+        send_relayed_to_target(
             data,
             &relay_target,
             inbound.transport,

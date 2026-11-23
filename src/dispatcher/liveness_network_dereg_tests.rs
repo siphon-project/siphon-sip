@@ -133,6 +133,7 @@ async fn the_de_registration_notify_rides_the_pair_and_nothing_follows_in_clear(
     let before = crate::metrics::ipsec::unprotected_sends_refused().expect("initialised");
     let port_us = SocketAddr::new(ue.ip(), ue.port() + 1);
     let late = OutboundMessage {
+        relayed: false,
         connection_id: ConnectionId::default(),
         transport: Transport::Udp,
         destination: port_us,

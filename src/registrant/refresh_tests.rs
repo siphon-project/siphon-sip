@@ -648,6 +648,7 @@ async fn tcp_ues_register_from_their_own_address_and_take_the_pcscf_connection()
         .context
         .outbound
         .send(OutboundMessage {
+            relayed: false,
             connection_id: inbound.connection_id,
             transport: Transport::Tcp,
             destination: inbound.remote_addr,

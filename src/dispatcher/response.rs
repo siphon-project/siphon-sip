@@ -1092,12 +1092,13 @@ pub(super) fn handle_response(
                         // request arrived on.  Pass the session's captured
                         // inbound_local_addr so the OutboundRouter hits the
                         // right per-listener UDP channel.
-                        send_message_from(
+                        send_message_marked(
                             outcome.response,
                             transport,
                             source_addr,
                             connection_id,
                             Some(inbound_local_addr),
+                            outcome.script_reply.is_none(), // not the script's own
                             state,
                         );
 
@@ -1261,7 +1262,7 @@ pub(super) fn handle_response(
                 {
                     sent_by_transaction =
                         actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
-                    process_timer_actions(
+                    process_relayed_timer_actions(
                         &actions,
                         &server_key,
                         Some(source_addr),
@@ -1284,7 +1285,7 @@ pub(super) fn handle_response(
                     branch = %branch,
                     "forwarding response via session"
                 );
-                send_message_from(
+                send_relayed_message_from(
                     message,
                     transport,
                     source_addr,

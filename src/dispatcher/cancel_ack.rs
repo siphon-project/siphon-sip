@@ -143,7 +143,9 @@ pub(super) fn send_proxy_branch_cancel(
         transport = %cancel.hop.transport,
         "proxy: sending a branch its CANCEL"
     );
-    send_outbound_from(
+    // Relayed: the proxy passes on the CANCEL it received, which interception
+    // recorded as it arrived.
+    send_relayed_from(
         cancel.frame.clone(),
         cancel.hop.transport,
         cancel.hop.destination,
@@ -953,7 +955,7 @@ pub(super) fn relay_ack_via_session(
                 server_name: None,
                 verify_server: None,
             };
-            send_to_target(
+            send_relayed_to_target(
                 data,
                 &target,
                 client_branch.transport,

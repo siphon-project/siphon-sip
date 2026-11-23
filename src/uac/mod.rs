@@ -683,6 +683,7 @@ impl UacSender {
         }
 
         let outbound_message = OutboundMessage {
+            relayed: false,
             followups: None,
             connection_id,
             transport,
@@ -878,6 +879,7 @@ impl UacSender {
         }
 
         let outbound_message = OutboundMessage {
+            relayed: false,
             followups: None,
             connection_id: ConnectionId::default(),
             transport,

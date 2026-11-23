@@ -113,6 +113,7 @@ impl Node {
     fn answer(&self, request: &InboundMessage, response: &SipMessage) {
         self.outbound
             .send(OutboundMessage {
+                relayed: false,
                 connection_id: request.connection_id,
                 transport: Transport::Tcp,
                 destination: request.remote_addr,
@@ -410,6 +411,7 @@ impl Fallback {
     fn send(&self, connection_id: ConnectionId, data: Vec<u8>) {
         self.outbound
             .send(OutboundMessage {
+                relayed: false,
                 connection_id,
                 transport: Transport::Tcp,
                 destination: self.source.local_addr().expect("a bound address"),

@@ -442,6 +442,7 @@ fn outbound_message(egress: &RegistrantEgress, built: &BuiltRegister) -> Outboun
     }
 
     OutboundMessage {
+        relayed: false,
         followups: None,
         connection_id: ConnectionId::default(),
         transport: built.transport,

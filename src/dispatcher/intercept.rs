@@ -124,7 +124,18 @@ pub(super) fn intercept_message(
 
     for matched in &session.matches {
         let x_id = matched.task.details.x_id;
-        let event = li.build_iri_event(
+        // X2 carries what is sent to and received from the target. On a B2BUA
+        // call the other party's leg is neither: what arrives there is not
+        // recorded for a warrant whose target is on the other leg, and what
+        // siphon sends the target on its own leg is ([`super::x2_outbound`]).
+        // The session still lives by every message that arrives.
+        if !li.is_on_target_leg(&session.session_id, call_id, x_id) {
+            if event_type == crate::li::IriEventType::End {
+                super::x3_delivery::detach_x3(&session, state);
+            }
+            continue;
+        }
+        let mut event = li.build_iri_event(
             matched,
             event_type,
             call_id,
@@ -137,6 +148,7 @@ pub(super) fn intercept_message(
             source_ip,
             Some(inbound.data.to_vec()),
         );
+        event.destination_ip = Some(inbound.local_addr.ip());
         li.emit_iri(event);
         li.tasks().mark_intercept(x_id);
 
@@ -475,7 +487,7 @@ pub(super) fn live_call(
             .iter()
             .map(|leg| leg.dialog.call_id.clone())
             .collect();
-        let owner = call_owner(state, internal_id, replacement_target)?;
+        let owner = call_owner(&state.call_actors, internal_id, replacement_target)?;
         return Some(LiveCall {
             owner: Some(owner),
             answered: call_state == crate::b2bua::actor::CallState::Answered,
@@ -848,22 +860,24 @@ fn b2bua_owner(
         None => true,
     };
     let internal_id = held.or_else(|| replaced_call(state, message))?;
-    call_owner(state, internal_id, replacement_target)
+    call_owner(&state.call_actors, internal_id, replacement_target)
+}
+
+/// The owner of the call `call_id` is a leg of, in `store`, with no message to
+/// ask about a dialog it replaces: for a frame siphon sends on a leg it holds.
+pub(crate) fn owner_of_leg(store: &CallActorStore, call_id: &str) -> Option<crate::li::CallOwner> {
+    let internal_id = store.find_by_sip_call_id(call_id)?;
+    let replacement_target = store.is_replacement_target_leg(&internal_id, call_id);
+    call_owner(store, internal_id, replacement_target)
 }
 
 /// The owner of a leg of the call `internal_id`.
 fn call_owner(
-    state: &DispatcherState,
+    store: &CallActorStore,
     internal_id: String,
     replacement_target: bool,
 ) -> Option<crate::li::CallOwner> {
-    let a_leg_call_id = state
-        .call_actors
-        .get_call(&internal_id)?
-        .a_leg
-        .dialog
-        .call_id
-        .clone();
+    let a_leg_call_id = store.get_call(&internal_id)?.a_leg.dialog.call_id.clone();
     Some(crate::li::CallOwner {
         internal_id,
         a_leg_call_id,

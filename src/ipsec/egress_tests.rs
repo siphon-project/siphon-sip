@@ -97,6 +97,7 @@ fn mt_request(ue: IpAddr, call_id: &str) -> OutboundMessage {
         call_id = call_id,
     );
     OutboundMessage {
+        relayed: false,
         connection_id: ConnectionId(9_000),
         transport: Transport::Tcp,
         destination: SocketAddr::new(ue, UE_PORT_C),

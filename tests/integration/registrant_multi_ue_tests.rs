@@ -110,6 +110,7 @@ fn every_ue_from_yaml_registers_from_its_own_address() {
             .expect("built");
         router
             .send(OutboundMessage {
+                relayed: false,
                 connection_id: ConnectionId::default(),
                 transport: built.transport,
                 destination: built.destination,

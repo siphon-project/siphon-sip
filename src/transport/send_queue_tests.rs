@@ -91,6 +91,7 @@ impl Listener {
     fn send(&self, on: &InboundMessage, data: Bytes) {
         self.outbound
             .send(OutboundMessage {
+                relayed: false,
                 followups: None,
                 connection_id: on.connection_id,
                 transport: Transport::Tcp,
