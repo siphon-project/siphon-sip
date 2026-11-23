@@ -1132,3 +1132,97 @@ async fn the_group_store_drains_after_complete_races() {
 fn b2bua_drop_or_bye(state: &DispatcherState, internal_call_id: &str) -> bool {
     b2bua_terminate_call_inner(internal_call_id, None, "b2bua", state)
 }
+
+/// A sink that reads, at the moment the group reports an answer, the state the
+/// answering leg's call is in. A bridge started from `answered` reads that same
+/// state and refuses a leg that is not answered yet.
+struct StateProbe {
+    calls: Arc<crate::b2bua::actor::CallActorStore>,
+    seen: Mutex<Vec<Option<crate::b2bua::actor::CallState>>>,
+}
+
+impl OriginateGroupSink for StateProbe {
+    fn branch_created(&self, _: &str, _: &DialBranch) {}
+    fn branch_progress(&self, _: &str, _: &DialBranch, _: &OriginateLegProgress) {}
+    fn branch_ended(&self, _: &str, _: &DialBranch) {}
+    fn answered(&self, winner: &OriginateGroupWinner) {
+        let call_state = self
+            .calls
+            .get_call(&winner.internal_call_id)
+            .map(|call| call.state.clone());
+        self.seen.lock().expect("the probe log").push(call_state);
+    }
+    fn failed(&self, _: &OriginateGroupFailure) {}
+}
+
+/// A phone that answers the moment it is rung, a 180 trailing its 200 as it
+/// does when the two are handled side by side: the sink is told of the answer
+/// only once the leg is answered, and the straggling 180 does not take the
+/// answer back (RFC 3261 §17.2.1: nothing follows a final response).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_answer_is_reported_once_the_leg_is_answered_and_a_late_180_cannot_undo_it() {
+    const DESK: &str = "198.51.100.201:5060";
+    let aor = "sip:3201@siphon.example.com";
+    register(aor, &format!("sip:3201@{DESK}"), 1.0);
+    let engine = NativeTestEngine::start().await;
+    let dispatcher = anchored_dispatcher(&engine);
+    let probe = Arc::new(StateProbe {
+        calls: Arc::clone(&dispatcher.state.call_actors),
+        seen: Mutex::default(),
+    });
+    let group_id = create_originate_group(
+        &dispatcher.state,
+        OriginateGroupSpec {
+            params: anchored_params(aor),
+            targets: dial_targets_for_aor(aor).expect("the AoR has contacts"),
+            strategy: OriginateGroupStrategy::Parallel,
+            total_timeout_secs: 30,
+            answers: OriginateGroupAnswers::First,
+            early_offer: None,
+            media_flags: None,
+        },
+        Arc::clone(&probe) as Arc<dyn OriginateGroupSink>,
+    )
+    .expect("the group is created");
+    start_originate_group(&dispatcher.state, &group_id).expect("the group starts");
+    let invite = invite_to(&drain(&dispatcher.udp), DESK);
+    let contact = format!("sip:3201@{DESK}");
+    phone_sends(
+        &dispatcher.state,
+        socket(DESK),
+        &phone_response(
+            &invite,
+            200,
+            "OK",
+            "desk-tag",
+            &contact,
+            Some(&phone_offer("198.51.100.201")),
+        ),
+    );
+    phone_sends(
+        &dispatcher.state,
+        socket(DESK),
+        &phone_response(&invite, 180, "Ringing", "desk-tag", &contact, None),
+    );
+    assert_eq!(
+        *probe.seen.lock().expect("the probe log"),
+        vec![Some(crate::b2bua::actor::CallState::Answered)],
+        "answered is reported with the leg answered, once"
+    );
+    let winner = dispatcher
+        .state
+        .call_actors
+        .find_by_sip_call_id(invite.headers.call_id().expect("a Call-ID"))
+        .and_then(|id| {
+            dispatcher
+                .state
+                .call_actors
+                .get_call(&id)
+                .map(|c| c.state.clone())
+        });
+    assert_eq!(
+        winner,
+        Some(crate::b2bua::actor::CallState::Answered),
+        "a straggling 180 leaves the leg answered"
+    );
+}
