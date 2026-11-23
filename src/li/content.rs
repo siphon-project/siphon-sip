@@ -302,6 +302,20 @@ impl CallContent {
             .collect()
     }
 
+    /// Whether any delivery on this record, live or ended and not yet
+    /// reported, belongs to a session other than `session_id`.
+    fn held_for_another(&self, session_id: &str) -> bool {
+        self.attachments
+            .iter()
+            .chain(
+                self.legs
+                    .iter()
+                    .flat_map(|leg| &leg.ended)
+                    .flat_map(|ended| &ended.attachments),
+            )
+            .any(|attachment| &*attachment.session_id != session_id)
+    }
+
     /// Whether a delivery is asked for, live, or ended by siphon and not yet
     /// reported ended.
     fn delivering(&self) -> bool {
@@ -713,6 +727,152 @@ impl LiManager {
         detached
     }
 
+    /// Whether siphon ended or withdrew a delivery that was asked for while
+    /// the attach was out: it is on its leg's ended deliveries, siphon's end
+    /// of it not yet reported ended by the engine (its warrant was deactivated
+    /// or changed, its destination removed, its session ended). An engine that
+    /// answers such an attach `Ok` is delivering content nothing warrants, and
+    /// it is detached. A delivery the engine itself ended, or one asked for
+    /// again since (live), is not this one's to detach.
+    pub fn x3_delivery_withdrawn(
+        &self,
+        call_id: &str,
+        scope: Option<&CallScope>,
+        (x_id, d_id, correlation_id): (XId, DId, u64),
+    ) -> bool {
+        self.x3_attachments.get(call_id).is_some_and(|content| {
+            let live = content.attachments.iter().any(|attachment| {
+                attachment.scope.as_ref() == scope
+                    && asked(attachment) == (x_id, d_id, correlation_id)
+            });
+            !live
+                && content
+                    .legs
+                    .iter()
+                    .filter(|leg| leg.scope.as_ref() == scope)
+                    .flat_map(|leg| &leg.ended)
+                    .flat_map(|ended| &ended.attachments)
+                    .any(|attachment| asked(attachment) == (x_id, d_id, correlation_id))
+        })
+    }
+
+    /// Whether siphon has ended the engine call of a leg, or is ending it
+    /// (a `delete`, an `offer` replacing it) and has offered nothing since: a
+    /// delivery siphon detached and the engine does not know the call of
+    /// ended with the call, as siphon asked.
+    pub fn x3_engine_call_ended_by_siphon(&self, call_id: &str, scope: Option<&CallScope>) -> bool {
+        self.x3_attachments.get(call_id).is_some_and(|content| {
+            content
+                .legs
+                .iter()
+                .filter(|leg| leg.scope.as_ref() == scope)
+                .any(|leg| {
+                    (leg.attempt > 0 && !leg.offered)
+                        || leg
+                            .ended
+                            .iter()
+                            .any(|ended| ended.engine_call != EngineCallEnd::No)
+                })
+        })
+    }
+
+    /// Every live delivery on record, each with the record it is on. A copy,
+    /// so what is asked of other stores for each is asked with no guard held.
+    pub fn x3_live_attachments(&self) -> Vec<(String, ActiveIntercept)> {
+        self.x3_attachments
+            .iter()
+            .flat_map(|content| {
+                let record = content.key().clone();
+                content
+                    .value()
+                    .attachments
+                    .iter()
+                    .map(|attachment| (record.clone(), attachment.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Whether a delivery is still provisioned: its warrant exists and asks
+    /// for content, it still names the delivery's destination at the same
+    /// address, and the call it is on is still one the warrant names. A
+    /// delivery whose session has no decision left to say is taken to be.
+    pub fn x3_still_warranted(&self, attachment: &ActiveIntercept) -> bool {
+        let Some(task) = self.tasks.get(attachment.x_id) else {
+            return false;
+        };
+        if !task.details.delivery_type.includes_content() {
+            return false;
+        }
+        let named = self
+            .tasks
+            .destinations_for_interface(attachment.x_id, true)
+            .iter()
+            .any(|destination| {
+                destination.details.d_id == attachment.d_id
+                    && destination
+                        .details
+                        .delivery_address
+                        .socket_addr()
+                        .is_some_and(|address| address.to_string() == attachment.delivery)
+            });
+        named
+            && self
+                .session_names_warrant(&attachment.session_id, attachment.x_id)
+                .unwrap_or(true)
+    }
+
+    /// siphon is detaching these deliveries of a record, and no others
+    /// (their warrant, destination or target is no longer provisioned): they
+    /// stop being live and stay on record until the engine reports each
+    /// ended, as a detach siphon asked for, which is not a fault. Returns the
+    /// ones that were live, so one that ended meanwhile, or that another scan
+    /// took, is not detached twice. The session is not ended: the call goes
+    /// on, and its other deliveries with it.
+    pub fn x3_detach_deliveries(
+        &self,
+        call_id: &str,
+        deliveries: &[ActiveIntercept],
+    ) -> Vec<ActiveIntercept> {
+        let Some(mut content) = self.x3_attachments.get_mut(call_id) else {
+            return Vec::new();
+        };
+        let (detached, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut content.attachments)
+            .into_iter()
+            .partition(|attachment| {
+                deliveries.iter().any(|wanted| {
+                    asked(wanted) == asked(attachment)
+                        && wanted.scope == attachment.scope
+                        && wanted.session_id == attachment.session_id
+                })
+            });
+        content.attachments = kept;
+        let mut scopes: Vec<Option<CallScope>> = Vec::new();
+        for attachment in &detached {
+            if !scopes.contains(&attachment.scope) {
+                scopes.push(attachment.scope.clone());
+            }
+        }
+        for scope in scopes {
+            let attachments = detached
+                .iter()
+                .filter(|attachment| attachment.scope == scope)
+                .cloned()
+                .collect();
+            let leg = content.leg(scope.as_ref());
+            leg.ended.push_back(Ended {
+                attempt: leg.attempt,
+                detached: true,
+                engine_call: EngineCallEnd::No,
+                attachments,
+                held: Vec::new(),
+                refused: Vec::new(),
+                offered: false,
+            });
+        }
+        detached
+    }
+
     /// A message shows the session `session_id` live on a call it had ended
     /// on: its Call-ID opens a new dialog, or the answer to its INVITE beat
     /// the CANCEL that was taken for its end. It is owed its content again.
@@ -917,8 +1077,26 @@ impl LiManager {
     /// whether siphon ended that delivery, and warranted content going
     /// unaccounted for is not something to lose with a map entry. It is kept
     /// for [`Self::take_unanswered_x3_ends`].
+    #[cfg(test)]
     pub(super) fn forget_x3_call(&self, call_id: &str) {
-        let Some((_, content)) = self.x3_attachments.remove(call_id) else {
+        self.forget_x3_call_if(call_id, |_| true);
+    }
+
+    /// [`Self::forget_x3_call`] for the session `session_id` that is
+    /// releasing it: a record that holds a delivery of any other session is
+    /// that session's, and stays. A stale decision released for a call that
+    /// another session now owns (a decision made before the warrant, found
+    /// again by a leg's next message) must not take the interception of the
+    /// live session away with it.
+    pub(super) fn forget_x3_call_of(&self, call_id: &str, session_id: &str) {
+        self.forget_x3_call_if(call_id, |content| !content.held_for_another(session_id));
+    }
+
+    fn forget_x3_call_if(&self, call_id: &str, release: impl Fn(&CallContent) -> bool) {
+        let Some((_, content)) = self
+            .x3_attachments
+            .remove_if(call_id, |_, content| release(content))
+        else {
             return;
         };
         let orphaned = content.orphaned();
@@ -1242,6 +1420,25 @@ mod tests {
         assert!(manager.x3_attempt_in_progress(CALL, None, attempt + 1));
         manager.forget_x3_call(CALL);
         assert!(!manager.x3_attempt_in_progress(CALL, None, attempt + 1));
+    }
+
+    /// Whether siphon ended an engine call is what tells a detach the engine
+    /// answers "unknown call" for apart from a call the engine lost.
+    #[test]
+    fn the_end_of_an_engine_call_is_told_from_one_the_engine_lost() {
+        let manager = manager().0;
+        assert!(
+            !manager.x3_engine_call_ended_by_siphon(CALL, None),
+            "no record"
+        );
+        let attempt = attempt_offered(&manager);
+        manager.register_x3_attachment(CALL, attachment(DId::generate(), None), attempt);
+        assert!(
+            !manager.x3_engine_call_ended_by_siphon(CALL, None),
+            "an engine call siphon did not end"
+        );
+        manager.x3_media_ended_by_siphon(CALL, None);
+        assert!(manager.x3_engine_call_ended_by_siphon(CALL, None), "ended");
     }
 
     #[test]

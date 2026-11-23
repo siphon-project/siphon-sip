@@ -257,6 +257,10 @@ mod lcr_route_bookkeeping_tests;
 #[cfg(test)]
 mod li_conference_tests;
 #[cfg(test)]
+mod li_mid_call_relay_tests;
+#[cfg(test)]
+mod li_mid_call_tests;
+#[cfg(test)]
 mod li_multi_delivery_tests;
 #[cfg(test)]
 mod li_session_tests;
@@ -944,6 +948,7 @@ pub async fn run(
 
     spawn_rtpengine_events(&state, rtpengine_events_rx);
     intercept::watch_engine_calls(&state);
+    intercept::watch_warrants(&state);
 
     spawn_conference_change_events(Arc::new(RunningDispatcher));
 
