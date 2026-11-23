@@ -1173,7 +1173,7 @@ async fn a_bye_ends_every_warrants_delivery_in_one_detach() {
     assert_eq!(engine_reports_its_ends(&rig).await, 2);
     let rendered = log.rendered();
     assert!(
-        !rendered.contains(" WARN ") && !rendered.contains(" ERROR "),
+        super::li_session_tests::own_warnings(&log).is_empty(),
         "{rendered}"
     );
     assert_eq!(faults_reported(&log), 0, "{rendered}");
@@ -1208,7 +1208,7 @@ async fn a_detach_that_finds_the_call_ended_by_siphon_is_not_a_fault() {
     assert_eq!(engine_reports_its_ends(&rig).await, 2);
     let rendered = log.rendered();
     assert!(
-        !rendered.contains(" WARN ") && !rendered.contains(" ERROR "),
+        super::li_session_tests::own_warnings(&log).is_empty(),
         "{rendered}"
     );
     assert_eq!(faults_reported(&log), 0, "{rendered}");
