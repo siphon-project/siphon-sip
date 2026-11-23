@@ -682,6 +682,26 @@ impl RegistrantEntry {
         self
     }
 
+    /// Whether the registrar may still hold a binding granted to this entry:
+    /// it is `Registered`, or the grant has not run out (a refresh in flight
+    /// or due leaves the state elsewhere while the binding stays).
+    pub fn holds_binding(&self) -> bool {
+        self.state == RegistrantState::Registered
+            || self.expires_at.is_some_and(|at| at > Instant::now())
+    }
+
+    /// Whether a REGISTER of `other` would bind the same contact on the same
+    /// registrar as this entry's does, so replacing this entry with it is a
+    /// refresh of the binding rather than a second one.
+    fn same_binding_target(&self, other: &RegistrantEntry) -> bool {
+        self.registrar_uri == other.registrar_uri
+            && self.destination == other.destination
+            && self.transport == other.transport
+            && self.contact_uri == other.contact_uri
+            && self.local_addr == other.local_addr
+            && self.credentials.username == other.credentials.username
+    }
+
     /// Returns seconds until expiry, or 0 if expired/not registered.
     pub fn expires_in(&self) -> u64 {
         self.expires_at
@@ -1009,15 +1029,31 @@ impl RegistrantManager {
                 (
                     existing.call_id.clone(),
                     existing.cseq.load(Ordering::Relaxed),
+                    existing.expires_at,
+                    existing.same_binding_target(&entry),
                 )
             })
         });
-        let Some((call_id, cseq)) = carried else {
+        let Some((call_id, cseq, expires_at, same_target)) = carried else {
             return false;
         };
 
-        entry.call_id = call_id;
-        entry.cseq = AtomicU32::new(cseq);
+        if same_target {
+            // A refresh of the binding the registrar holds: keep what it
+            // holds, so a removal before the refresh is answered still clears
+            // it (see `build_deregistration`).
+            entry.call_id = call_id;
+            entry.cseq = AtomicU32::new(cseq);
+            entry.expires_at = expires_at;
+        } else if let Some(message) = self.build_deregistration(&entry.aor) {
+            // The binding is on the registrar (or contact) being replaced, and
+            // no REGISTER of the new entry would reach it: clear it there, on
+            // its own Call-ID, and let the new entry register afresh.
+            match self.pending_deregistrations.lock() {
+                Ok(mut pending) => pending.push(message),
+                Err(poisoned) => poisoned.into_inner().push(message),
+            }
+        }
         entry.state = RegistrantState::Unregistered;
         entry.next_attempt = Instant::now();
 
@@ -2050,6 +2086,178 @@ mod tests {
         let bytes = dereg[0].message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
         assert!(raw.contains("Expires: 0"));
+    }
+
+    // --- De-registration of a trunk removed after its settings changed ---
+
+    const SOURCED_AOR: &str = "sip:a@carrier.example";
+
+    fn raw_of(built: &BuiltRegister) -> String {
+        String::from_utf8_lossy(&built.message.to_bytes()).into_owned()
+    }
+
+    fn cseq_of(raw: &str) -> u32 {
+        raw.lines()
+            .find_map(|line| line.strip_prefix("CSeq: "))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|number| number.parse().ok())
+            .expect("a CSeq header")
+    }
+
+    fn call_id_of(manager: &RegistrantManager, aor: &str) -> String {
+        manager
+            .entries
+            .get(aor)
+            .map(|entry| entry.call_id.clone())
+            .expect("entry present")
+    }
+
+    /// A registered source trunk whose last REGISTER used `cseq`.
+    fn registered_source_trunk(manager: &RegistrantManager) -> u32 {
+        install_test_egress(manager);
+        manager.add(source_entry(SOURCED_AOR, 1));
+        let no_listeners = HashMap::new();
+        let defaults = EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &no_listeners);
+        let built = manager
+            .build_register(SOURCED_AOR, defaults, 600)
+            .expect("a REGISTER");
+        manager.handle_success(SOURCED_AOR, 600);
+        cseq_of(&raw_of(&built))
+    }
+
+    #[test]
+    fn a_trunk_removed_right_after_an_update_is_deregistered() {
+        let manager = make_manager();
+        let last_cseq = registered_source_trunk(&manager);
+        let call_id = call_id_of(&manager, SOURCED_AOR);
+
+        assert!(manager.update_from_source(source_entry(SOURCED_AOR, 2)));
+        // Before the next tick: nothing has refreshed the binding yet.
+        assert!(manager.remove(SOURCED_AOR).is_some());
+
+        let pending = manager.take_pending_deregistrations();
+        assert_eq!(pending.len(), 1, "the binding on the registrar was left");
+        let raw = raw_of(&pending[0]);
+        assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+        assert!(raw.contains(&call_id), "Call-ID {call_id} not in: {raw}");
+        assert!(cseq_of(&raw) > last_cseq, "CSeq must rise: {raw}");
+    }
+
+    #[test]
+    fn a_trunk_removed_during_the_challenge_after_an_update_is_deregistered() {
+        let manager = make_manager();
+        let last_cseq = registered_source_trunk(&manager);
+        let call_id = call_id_of(&manager, SOURCED_AOR);
+        assert!(manager.update_from_source(source_entry(SOURCED_AOR, 2)));
+
+        // The refresh went out and was challenged; its answer is in flight.
+        let no_listeners = HashMap::new();
+        let defaults = EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &no_listeners);
+        let challenge = DigestChallenge {
+            realm: "carrier.example".to_string(),
+            nonce: "abc123".to_string(),
+            opaque: None,
+            qop: Some("auth".to_string()),
+            algorithm: auth::DigestAlgorithm::Md5,
+            stale: false,
+        };
+        let refresh = manager
+            .build_register(SOURCED_AOR, defaults, 600)
+            .expect("the refresh");
+        let answer = manager
+            .build_register_with_auth(SOURCED_AOR, defaults, &challenge, false, 600)
+            .expect("the answer to the challenge");
+        assert_eq!(
+            manager.state(SOURCED_AOR),
+            Some(RegistrantState::Challenging)
+        );
+        let answer_cseq = cseq_of(&raw_of(&answer));
+        assert!(cseq_of(&raw_of(&refresh)) > last_cseq);
+
+        assert!(manager.remove(SOURCED_AOR).is_some());
+
+        let pending = manager.take_pending_deregistrations();
+        assert_eq!(pending.len(), 1, "the binding on the registrar was left");
+        let raw = raw_of(&pending[0]);
+        assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+        assert!(raw.contains(&call_id), "Call-ID {call_id} not in: {raw}");
+        // Above the REGISTER already in flight, so the registrar never
+        // applies that one after this.
+        assert!(cseq_of(&raw) > answer_cseq, "CSeq must rise: {raw}");
+        // Nothing left to re-create the binding or to answer.
+        assert!(manager.state(SOURCED_AOR).is_none());
+    }
+
+    #[test]
+    fn an_update_to_another_registrar_clears_the_binding_on_the_old_one() {
+        let manager = make_manager();
+        registered_source_trunk(&manager);
+        let old_call_id = call_id_of(&manager, SOURCED_AOR);
+        let mut moved = source_entry(SOURCED_AOR, 2);
+        moved.registrar_uri = "sip:registrar.other.example:5060".to_string();
+        moved.destination = "10.0.0.2:5060".parse().unwrap();
+
+        assert!(manager.update_from_source(moved));
+
+        // The binding is on the old registrar: cleared there, at once.
+        let pending = manager.take_pending_deregistrations();
+        assert_eq!(pending.len(), 1);
+        let raw = raw_of(&pending[0]);
+        assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+        assert!(raw.contains(&old_call_id), "wrong Call-ID: {raw}");
+        assert!(
+            raw.contains("registrar.carrier.com"),
+            "wrong registrar: {raw}"
+        );
+        assert_eq!(pending[0].destination, "10.0.0.1:5060".parse().unwrap());
+
+        // The new registrar holds nothing yet, so removing sends nothing.
+        assert!(manager.remove(SOURCED_AOR).is_some());
+        assert!(manager.take_pending_deregistrations().is_empty());
+    }
+
+    #[test]
+    fn an_updated_trunk_that_never_registered_sends_nothing_on_removal() {
+        let manager = make_manager();
+        install_test_egress(&manager);
+        manager.add(source_entry(SOURCED_AOR, 1));
+
+        assert!(manager.update_from_source(source_entry(SOURCED_AOR, 2)));
+        assert!(manager.remove(SOURCED_AOR).is_some());
+
+        assert!(manager.take_pending_deregistrations().is_empty());
+    }
+
+    #[test]
+    fn an_update_that_leaves_the_target_alone_sends_nothing_by_itself() {
+        let manager = make_manager();
+        registered_source_trunk(&manager);
+
+        assert!(manager.update_from_source(source_entry(SOURCED_AOR, 2)));
+
+        assert!(manager.take_pending_deregistrations().is_empty());
+    }
+
+    #[test]
+    fn update_and_remove_cycles_leave_no_entry_or_queued_message() {
+        let manager = make_manager();
+        install_test_egress(&manager);
+        let baseline = manager.len();
+        for cycle in 0..200u64 {
+            let aor = format!("sip:trunk{cycle}@carrier.example");
+            manager.add(source_entry(&aor, cycle));
+            manager.handle_success(&aor, 600);
+            let mut next = source_entry(&aor, cycle + 1000);
+            if cycle % 2 == 0 {
+                next.destination = "10.0.0.2:5060".parse().unwrap();
+            }
+            assert!(manager.update_from_source(next));
+            manager.remove(&aor);
+            assert!(!manager.take_pending_deregistrations().is_empty());
+        }
+
+        assert_eq!(manager.len(), baseline);
+        assert!(manager.take_pending_deregistrations().is_empty());
     }
 
     // --- De-registration on removal ---

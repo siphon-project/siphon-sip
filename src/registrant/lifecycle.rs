@@ -100,16 +100,24 @@ impl RegistrantManager {
 
     /// Build the `Expires: 0` REGISTER that clears one entry's binding.
     ///
-    /// `None` when the entry is unknown, was never registered (nothing to
-    /// clear), or the loop has not started yet, so there is no egress to build
-    /// a Via and Contact from.
+    /// A binding is held upstream when the entry is `Registered`, or when the
+    /// registrar's grant has not run out yet although the state has moved on:
+    /// a refresh, a forced one or one after a source update, resets the state
+    /// to unregistered and then to registering or challenging while the
+    /// binding it replaces stays.
+    ///
+    /// `None` when the entry is unknown, holds no binding (never registered,
+    /// or its grant ran out or was refused), or the loop has not started yet,
+    /// so there is no egress to build a Via and Contact from.
+    ///
+    /// The Call-ID is the entry's, with the next CSeq (RFC 3261 §10.2.2), so
+    /// it also outranks a REGISTER still in flight: the registrar refuses the
+    /// older one if it arrives after this.
     pub(super) fn build_deregistration(&self, aor: &str) -> Option<super::BuiltRegister> {
         let egress = self.egress.get()?;
         let entry = self.entries.get(aor)?;
         // A shutdown de-registration already covers (or covered) it.
-        if entry.state != RegistrantState::Registered
-            || entry.deregistration != Deregistration::NotStarted
-        {
+        if !entry.holds_binding() || entry.deregistration != Deregistration::NotStarted {
             return None;
         }
         drop(entry);

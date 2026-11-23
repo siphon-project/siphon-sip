@@ -551,7 +551,7 @@ async fn an_unanswered_de_register_still_deletes_the_set() {
 }
 
 #[tokio::test]
-async fn a_removed_ue_mid_authentication_deletes_both_sets_at_once() {
+async fn a_removed_ue_mid_authentication_deregisters_then_deletes_both_sets() {
     let mut harness = Harness::new();
     harness.add(1, UE_ADDR);
     harness.register_initially(1, UE_ADDR).await;
@@ -560,9 +560,13 @@ async fn a_removed_ue_mid_authentication_deletes_both_sets_at_once() {
     harness.sent().await;
     assert_eq!(harness.ports(UE_ADDR), vec![6100, 6102]);
 
-    // Not registered right now, so no de-REGISTER: the sets go at once.
+    // The refresh in flight replaces a binding the registrar still holds, so
+    // removing the UE de-registers it; the sets go once that is answered.
     harness.registrant.remove(&impu(1));
-    assert!(test_support::take_deregistrations(&harness.registrant).is_empty());
+    let deregistration = test_support::take_deregistrations(&harness.registrant)
+        .pop()
+        .expect("a de-REGISTER for the binding the refresh was replacing");
+    harness.answer("200 OK", &harness.call_id(&deregistration), "");
     harness
         .registrant
         .spawn_sa_deletions(&harness.ipsec, ip("192.0.2.1"));
