@@ -313,7 +313,7 @@ pub(super) fn originate_on(
         bus.remove_channel(channel_id);
         return ControlResult::error(
             ControlErrorCode::Unavailable,
-            "the originated call vanished before its INVITE could be sent",
+            "the INVITE could not be sent: the call vanished or the transport refused it",
         );
     }
 

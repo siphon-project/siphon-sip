@@ -177,6 +177,8 @@ mod control_dial_bridge_args_tests;
 #[cfg(test)]
 mod control_dial_bridge_fallback_tests;
 #[cfg(test)]
+mod control_dial_bridge_fast_answer_tests;
+#[cfg(test)]
 mod control_dial_bridge_from_host_tests;
 #[cfg(test)]
 mod control_dial_bridge_hunt_progress_tests;

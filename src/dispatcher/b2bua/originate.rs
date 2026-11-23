@@ -253,7 +253,8 @@ fn dial_in_process(prepared: PreparedOriginate) -> Result<PreparedOriginate, Ori
     }
     if !b2bua_originate_dial(&prepared) {
         return Err(OriginateError::Unavailable(
-            "originate was staged but the call vanished before dialling".to_string(),
+            "originate was staged but the call vanished or the transport refused its INVITE"
+                .to_string(),
         ));
     }
     Ok(prepared)
@@ -826,37 +827,17 @@ pub fn dial_originate(state: &DispatcherState, prepared: &PreparedOriginate) -> 
         ),
         state,
     );
-    match pinned {
-        Some(flow) => {
-            if let Err(error) = send_over_flow(
-                &prepared.internal_call_id,
-                data,
-                flow,
-                prepared.transport,
-                prepared.destination,
-                state,
-            ) {
-                // Nothing will answer an INVITE that never left: say so now,
-                // rather than at the ring timeout.
-                error!(
-                    call_id = %prepared.internal_call_id,
-                    destination = %prepared.destination,
-                    transport = %prepared.transport,
-                    "originate: the flow would not take the INVITE: {error}"
-                );
-                // The call exists only for this INVITE; it goes with it, the
-                // way a call torn down before dialling is gone, so a `false`
-                // here leaves nothing behind for the caller to clean up.
-                state.b2bua_retransmits.disarm_branch(&branch);
-                state.call_actors.remove_call(&prepared.internal_call_id);
-                state
-                    .call_event_receivers
-                    .remove(&prepared.internal_call_id);
-                // An early offer's allocation goes with it.
-                originate_delete_media(&prepared.sip_call_id, state);
-                return false;
-            }
-        }
+    let refused = match pinned {
+        Some(flow) => send_over_flow(
+            &prepared.internal_call_id,
+            data,
+            flow,
+            prepared.transport,
+            prepared.destination,
+            state,
+        )
+        .err()
+        .map(|error| format!("the flow would not take the INVITE: {error}")),
         None => {
             let relay_target = RelayTarget {
                 address: prepared.destination,
@@ -864,6 +845,11 @@ pub fn dial_originate(state: &DispatcherState, prepared: &PreparedOriginate) -> 
                 server_name: prepared.tls_server_name.clone(),
                 verify_server: prepared.verify_server,
             };
+            // RFC 3261 §8.1.3.1: a transport error is treated as a 503 received
+            // for the INVITE. A connect that is refused, a TLS handshake or
+            // certificate verification that fails, a send the transport will
+            // not take: none of them is ever answered, so waiting for the ring
+            // timeout would only delay the caller's next step.
             send_to_target(
                 data,
                 &relay_target,
@@ -871,8 +857,31 @@ pub fn dial_originate(state: &DispatcherState, prepared: &PreparedOriginate) -> 
                 ConnectionId::default(),
                 None,
                 state,
-            );
+            )
+            .delivery_failed
+            .then(|| "the transport would not take the INVITE".to_string())
         }
+    };
+    if let Some(reason) = refused {
+        // Nothing will answer an INVITE that never left: say so now, rather
+        // than at the ring timeout.
+        error!(
+            call_id = %prepared.internal_call_id,
+            destination = %prepared.destination,
+            transport = %prepared.transport,
+            "originate: {reason}"
+        );
+        // The call exists only for this INVITE; it goes with it, the way a
+        // call torn down before dialling is gone, so a `false` here leaves
+        // nothing behind for the caller to clean up.
+        state.b2bua_retransmits.disarm_branch(&branch);
+        state.call_actors.remove_call(&prepared.internal_call_id);
+        state
+            .call_event_receivers
+            .remove(&prepared.internal_call_id);
+        // An early offer's allocation goes with it.
+        originate_delete_media(&prepared.sip_call_id, state);
+        return false;
     }
     set_b2bua_answer_deadline(&prepared.internal_call_id, prepared.timeout_secs, state);
     debug!(
