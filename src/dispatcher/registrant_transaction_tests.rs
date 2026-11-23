@@ -535,3 +535,199 @@ async fn shutdown_de_registers_every_binding_and_registers_nothing() {
         );
     }
 }
+
+// --- the de-REGISTER of a removed entry, challenged ----------------------------
+
+const DIGEST_CHALLENGE: &str =
+    "Digest realm=\"carrier.example\", nonce=\"n1\", algorithm=MD5, qop=\"auth\"";
+
+fn parse_sent(sent: &OutboundMessage) -> SipMessage {
+    crate::sip::parser::parse_sip_message_bytes(&sent.data).expect("a request that parses")
+}
+
+fn header(message: &SipMessage, name: &str) -> String {
+    message.headers.get(name).cloned().unwrap_or_default()
+}
+
+impl Setup {
+    /// A registered trunk, removed: the de-REGISTER the loop would send, sent.
+    fn removed_trunk_deregistration(&self) -> SipMessage {
+        self.registrant.add(trunk(TRUNK));
+        let (register, _) = self.send(TRUNK, 3600);
+        self.answer(&register.message, "200 OK", "Expires: 3600\r\n");
+        self.registrant.remove(TRUNK);
+        self.send_queued_deregistration()
+    }
+
+    fn send_queued_deregistration(&self) -> SipMessage {
+        let built = test_support::take_deregistrations(&self.registrant)
+            .pop()
+            .expect("a queued de-REGISTER");
+        send_registrant_request(&self.registrant, TRUNK, &built, &self.dispatcher.state);
+        parse_sent(&self.dispatcher.udp.try_recv().expect("the de-REGISTER"))
+    }
+
+    fn challenge(&self, request: &SipMessage, status: &str, header_name: &str) {
+        self.answer(
+            request,
+            status,
+            &format!("{header_name}: {DIGEST_CHALLENGE}\r\n"),
+        );
+    }
+}
+
+fn cseq(message: &SipMessage) -> u32 {
+    crate::registrant::cseq_number(message).expect("a CSeq")
+}
+
+#[tokio::test]
+async fn a_challenged_de_register_is_answered_once_and_ended_by_the_200() {
+    let setup = Setup::new();
+    let deregister = setup.removed_trunk_deregistration();
+    assert_eq!(header(&deregister, "Expires"), "0");
+    assert!(header(&deregister, "Authorization").is_empty());
+
+    setup.challenge(&deregister, "401 Unauthorized", "WWW-Authenticate");
+
+    let answer = parse_sent(&setup.dispatcher.udp.try_recv().expect("the answer"));
+    assert_eq!(header(&answer, "Expires"), "0");
+    assert!(header(&answer, "Authorization").contains("username=\"trunk\""));
+    assert_eq!(header(&answer, "Call-ID"), header(&deregister, "Call-ID"));
+    assert_eq!(cseq(&answer), cseq(&deregister) + 1);
+    assert!(setup.registrant.is_empty(), "a removed trunk reads as live");
+    assert_eq!(setup.registrant.removed_deregistrations_pending(), 1);
+
+    setup.answer(&answer, "200 OK", "Expires: 0\r\n");
+
+    assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
+    assert!(
+        setup.dispatcher.udp.try_recv().is_err(),
+        "nothing else sent"
+    );
+}
+
+#[tokio::test]
+async fn a_proxy_challenge_to_a_de_register_is_answered_with_proxy_authorization() {
+    let setup = Setup::new();
+    let deregister = setup.removed_trunk_deregistration();
+
+    setup.challenge(
+        &deregister,
+        "407 Proxy Authentication Required",
+        "Proxy-Authenticate",
+    );
+
+    let answer = parse_sent(&setup.dispatcher.udp.try_recv().expect("the answer"));
+    assert_eq!(header(&answer, "Expires"), "0");
+    assert!(header(&answer, "Proxy-Authorization").contains("username=\"trunk\""));
+}
+
+#[tokio::test]
+async fn a_second_challenge_gives_up() {
+    let setup = Setup::new();
+    let deregister = setup.removed_trunk_deregistration();
+    setup.challenge(&deregister, "401 Unauthorized", "WWW-Authenticate");
+    let answer = parse_sent(&setup.dispatcher.udp.try_recv().expect("the answer"));
+
+    setup.challenge(&answer, "401 Unauthorized", "WWW-Authenticate");
+
+    assert!(setup.dispatcher.udp.try_recv().is_err(), "answered twice");
+    assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
+}
+
+#[tokio::test]
+async fn a_refused_de_register_is_given_up_on() {
+    let setup = Setup::new();
+    let deregister = setup.removed_trunk_deregistration();
+
+    setup.answer(&deregister, "503 Service Unavailable", "");
+
+    assert!(setup.dispatcher.udp.try_recv().is_err());
+    assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
+}
+
+#[tokio::test]
+async fn an_unanswered_de_register_times_out_and_is_forgotten() {
+    let setup = Setup::new();
+    let deregister = setup.removed_trunk_deregistration();
+    let timer_f = setup.timer(&deregister, TimerName::F).expect("Timer F");
+
+    setup.fire(timer_f);
+    // The failure is posted off the sweep.
+    wait_until_pending_is(&setup.registrant, 0).await;
+}
+
+async fn wait_until_pending_is(registrant: &RegistrantManager, expected: usize) {
+    for _ in 0..100 {
+        if registrant.removed_deregistrations_pending() == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "{} removed de-REGISTER(s) still tracked, expected {expected}",
+        registrant.removed_deregistrations_pending()
+    );
+}
+
+#[tokio::test]
+async fn a_late_answer_to_the_first_register_does_not_end_the_de_register() {
+    let setup = Setup::new();
+    setup.registrant.add(trunk(TRUNK));
+    let (first, _) = setup.send(TRUNK, 3600);
+    setup.registrant.remove(TRUNK);
+    let deregister = setup.send_queued_deregistration();
+    assert!(cseq(&deregister) > cseq(&first.message));
+
+    // The first REGISTER's own 200 arrives late: no entry, no new binding, and
+    // the de-REGISTER, still in flight, is not taken as answered.
+    setup.answer(&first.message, "200 OK", "Expires: 3600\r\n");
+    assert!(setup.registrant.is_empty());
+    assert_eq!(setup.registrant.removed_deregistrations_pending(), 1);
+
+    setup.answer(&deregister, "200 OK", "Expires: 0\r\n");
+    assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
+}
+
+/// Project leak gate: whichever way a removed trunk's de-REGISTER ends, the
+/// store, the transactions and the timers are back where they started.
+#[tokio::test]
+async fn removed_de_registers_leave_nothing_behind_whichever_way_they_end() {
+    let setup = Setup::new();
+    let baseline_transactions = setup.transactions();
+    let baseline_timers = setup.dispatcher.state.timer_wheel.len();
+
+    for cycle in 0..60 {
+        let deregister = setup.removed_trunk_deregistration();
+        match cycle % 6 {
+            0 => setup.answer(&deregister, "200 OK", "Expires: 0\r\n"),
+            1 | 2 => {
+                setup.challenge(&deregister, "401 Unauthorized", "WWW-Authenticate");
+                let answer = parse_sent(&setup.dispatcher.udp.try_recv().expect("answer"));
+                if cycle % 6 == 1 {
+                    setup.answer(&answer, "200 OK", "Expires: 0\r\n");
+                } else {
+                    setup.challenge(&answer, "401 Unauthorized", "WWW-Authenticate");
+                }
+            }
+            3 => setup.answer(&deregister, "500 Server Error", ""),
+            4 => {
+                let timer_f = setup.timer(&deregister, TimerName::F).expect("Timer F");
+                setup.fire(timer_f);
+            }
+            _ => {
+                // Never answered, never timed out: the sweep bound ends it.
+                setup
+                    .registrant
+                    .expire_removed_deregistrations(Instant::now() + Duration::from_secs(120));
+            }
+        }
+        let _ = setup.dispatcher.udp.try_iter().count();
+    }
+    setup.fire(Instant::now() + 64 * T1);
+    wait_until_pending_is(&setup.registrant, 0).await;
+
+    assert_eq!(setup.transactions(), baseline_transactions);
+    assert_eq!(setup.dispatcher.state.timer_wheel.len(), baseline_timers);
+    assert!(setup.registrant.is_empty());
+}

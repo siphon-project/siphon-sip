@@ -29,6 +29,7 @@ pub mod protected;
 mod protected_tcp;
 mod refresh;
 pub mod register_extras;
+mod removed;
 pub mod source;
 mod status;
 #[cfg(test)]
@@ -47,6 +48,7 @@ pub use refresh::{
     await_deregistrations, deregister_all, registration_loop, retire_ue_security_associations,
     RegistrationLoopContext, SHUTDOWN_ANSWER_WAIT,
 };
+pub use removed::{cseq_number, RemovedAnswer};
 pub use status::RegistrantStatus;
 
 use std::collections::{HashMap, HashSet};
@@ -484,6 +486,15 @@ pub struct RegistrantEntry {
     pub state: RegistrantState,
     /// When the current registration expires.
     pub expires_at: Option<Instant>,
+    /// Until when the registrar may hold the binding it last granted. Set on
+    /// each 2xx from the granted `Expires` and left alone by a failure, so a
+    /// refresh that fails does not make a removal forget the earlier grant
+    /// (`expires_at`, which status reports, is cleared by a failure).
+    pub binding_until: Option<Instant>,
+    /// A REGISTER of this entry ended without an answer (Timer F), or was in
+    /// flight when a source update replaced the entry: the registrar may have
+    /// accepted it all the same. Cleared by any answer.
+    pub register_unanswered: bool,
     /// When to next attempt registration.
     pub next_attempt: Instant,
     /// Current backoff duration for retries after failure.
@@ -586,6 +597,8 @@ impl RegistrantEntry {
             contact_uri,
             state: RegistrantState::Unregistered,
             expires_at: None,
+            binding_until: None,
+            register_unanswered: false,
             next_attempt: Instant::now(),
             backoff: Duration::from_secs(5),
             cseq: AtomicU32::new(1),
@@ -734,6 +747,9 @@ pub struct RegistrantManager {
     /// them. Holds finished messages rather than live entries, so a removed
     /// trunk is gone from `entries` immediately.
     pending_deregistrations: std::sync::Mutex<Vec<BuiltRegister>>,
+    /// The de-REGISTERs of removed entries in flight, by Call-ID, kept to
+    /// answer a challenge (see [`removed`]).
+    draining_deregistrations: DashMap<String, removed::DrainingDeregistration>,
     /// UE SA pairs to tear down: an entry moved off an address (see
     /// [`address`]), a superseded or abandoned SA set (see [`protected`]), a
     /// removed entry's sets. The manager has no kernel access; the loop and the
@@ -803,6 +819,7 @@ impl RegistrantManager {
             egress: std::sync::OnceLock::new(),
             stream_reconcile: std::sync::OnceLock::new(),
             pending_deregistrations: std::sync::Mutex::new(Vec::new()),
+            draining_deregistrations: DashMap::new(),
             pending_sa_deletions: std::sync::Mutex::new(Vec::new()),
             teardowns: std::sync::Mutex::new(Vec::new()),
             ipsec: std::sync::OnceLock::new(),
@@ -953,10 +970,7 @@ impl RegistrantManager {
         if let Some(entry) = removed.as_ref() {
             self.retire_sa_sets(entry, deregistration.as_ref());
             if let Some(message) = deregistration {
-                match self.pending_deregistrations.lock() {
-                    Ok(mut pending) => pending.push(message),
-                    Err(poisoned) => poisoned.into_inner().push(message),
-                }
+                self.queue_removed_deregistration(entry, message);
             }
             self.emit_event(RegistrantEvent::Deregistered {
                 aor: aor.to_string(),
@@ -1005,19 +1019,17 @@ impl RegistrantManager {
             return false;
         }
         let carried = self.entries.get(&entry.aor).and_then(|existing| {
-            (existing.origin == EntryOrigin::Source).then(|| {
-                (
-                    existing.call_id.clone(),
-                    existing.cseq.load(Ordering::Relaxed),
-                )
-            })
+            (existing.origin == EntryOrigin::Source).then(|| entry.carry_binding_from(&existing))
         });
-        let Some((call_id, cseq)) = carried else {
+        let Some(same_target) = carried else {
             return false;
         };
-
-        entry.call_id = call_id;
-        entry.cseq = AtomicU32::new(cseq);
+        // A binding on the registrar (or contact) being replaced is one no
+        // REGISTER of the new entry reaches: clear it there, on its own
+        // Call-ID, and let the new entry register afresh.
+        let deregistration = (!same_target)
+            .then(|| self.build_deregistration(&entry.aor))
+            .flatten();
         entry.state = RegistrantState::Unregistered;
         entry.next_attempt = Instant::now();
 
@@ -1025,6 +1037,9 @@ impl RegistrantManager {
         if let Some(replaced) = self.entries.insert(entry.aor.clone(), entry) {
             // The replacement starts a fresh handshake; the old one's SAs go.
             self.retire_sa_sets(&replaced, None);
+            if let Some(message) = deregistration {
+                self.queue_removed_deregistration(&replaced, message);
+            }
         }
         true
     }
@@ -1192,6 +1207,8 @@ impl RegistrantManager {
             let refresh_at = window.delay(granted_expires, unit);
             entry.state = RegistrantState::Registered;
             entry.expires_at = Some(Instant::now() + Duration::from_secs(granted_expires as u64));
+            entry.binding_until = entry.expires_at;
+            entry.register_unanswered = false;
             entry.next_attempt = Instant::now() + refresh_at;
             entry.failure_count = 0;
             entry.last_failure_status = None;
@@ -1240,6 +1257,7 @@ impl RegistrantManager {
             entry.state = RegistrantState::Failed;
             entry.failure_count += 1;
             entry.last_failure_status = Some(status_code);
+            entry.register_unanswered = status_code == 0;
             entry.expires_at = None;
 
             // Exponential backoff capped at max_retry_interval.
@@ -2050,6 +2068,295 @@ mod tests {
         let bytes = dereg[0].message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
         assert!(raw.contains("Expires: 0"));
+    }
+
+    // --- De-registration of a trunk removed after its settings changed ---
+
+    const SOURCED_AOR: &str = "sip:a@carrier.example";
+
+    fn raw_of(built: &BuiltRegister) -> String {
+        String::from_utf8_lossy(&built.message.to_bytes()).into_owned()
+    }
+
+    fn cseq_of(raw: &str) -> u32 {
+        raw.lines()
+            .find_map(|line| line.strip_prefix("CSeq: "))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|number| number.parse().ok())
+            .expect("a CSeq header")
+    }
+
+    fn call_id_of(manager: &RegistrantManager, aor: &str) -> String {
+        manager
+            .entries
+            .get(aor)
+            .map(|entry| entry.call_id.clone())
+            .expect("entry present")
+    }
+
+    /// A registered source trunk whose last REGISTER used `cseq`.
+    fn registered_source_trunk(manager: &RegistrantManager) -> u32 {
+        install_test_egress(manager);
+        manager.add(source_entry(SOURCED_AOR, 1));
+        let no_listeners = HashMap::new();
+        let defaults = EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &no_listeners);
+        let built = manager
+            .build_register(SOURCED_AOR, defaults, 600)
+            .expect("a REGISTER");
+        manager.handle_success(SOURCED_AOR, 600);
+        cseq_of(&raw_of(&built))
+    }
+
+    #[test]
+    fn a_trunk_removed_right_after_an_update_is_deregistered() {
+        let manager = make_manager();
+        let last_cseq = registered_source_trunk(&manager);
+        let call_id = call_id_of(&manager, SOURCED_AOR);
+
+        assert!(manager.update_from_source(source_entry(SOURCED_AOR, 2)));
+        // Before the next tick: nothing has refreshed the binding yet.
+        assert!(manager.remove(SOURCED_AOR).is_some());
+
+        let pending = manager.take_pending_deregistrations();
+        assert_eq!(pending.len(), 1, "the binding on the registrar was left");
+        let raw = raw_of(&pending[0]);
+        assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+        assert!(raw.contains(&call_id), "Call-ID {call_id} not in: {raw}");
+        assert!(cseq_of(&raw) > last_cseq, "CSeq must rise: {raw}");
+    }
+
+    #[test]
+    fn a_trunk_removed_during_the_challenge_after_an_update_is_deregistered() {
+        let manager = make_manager();
+        let last_cseq = registered_source_trunk(&manager);
+        let call_id = call_id_of(&manager, SOURCED_AOR);
+        assert!(manager.update_from_source(source_entry(SOURCED_AOR, 2)));
+
+        // The refresh went out and was challenged; its answer is in flight.
+        let no_listeners = HashMap::new();
+        let defaults = EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &no_listeners);
+        let challenge = DigestChallenge {
+            realm: "carrier.example".to_string(),
+            nonce: "abc123".to_string(),
+            opaque: None,
+            qop: Some("auth".to_string()),
+            algorithm: auth::DigestAlgorithm::Md5,
+            stale: false,
+        };
+        let refresh = manager
+            .build_register(SOURCED_AOR, defaults, 600)
+            .expect("the refresh");
+        let answer = manager
+            .build_register_with_auth(SOURCED_AOR, defaults, &challenge, false, 600)
+            .expect("the answer to the challenge");
+        assert_eq!(
+            manager.state(SOURCED_AOR),
+            Some(RegistrantState::Challenging)
+        );
+        let answer_cseq = cseq_of(&raw_of(&answer));
+        assert!(cseq_of(&raw_of(&refresh)) > last_cseq);
+
+        assert!(manager.remove(SOURCED_AOR).is_some());
+
+        let pending = manager.take_pending_deregistrations();
+        assert_eq!(pending.len(), 1, "the binding on the registrar was left");
+        let raw = raw_of(&pending[0]);
+        assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+        assert!(raw.contains(&call_id), "Call-ID {call_id} not in: {raw}");
+        // Above the REGISTER already in flight, so the registrar never
+        // applies that one after this.
+        assert!(cseq_of(&raw) > answer_cseq, "CSeq must rise: {raw}");
+        // Nothing left to re-create the binding or to answer.
+        assert!(manager.state(SOURCED_AOR).is_none());
+    }
+
+    #[test]
+    fn an_update_to_another_registrar_clears_the_binding_on_the_old_one() {
+        let manager = make_manager();
+        registered_source_trunk(&manager);
+        let old_call_id = call_id_of(&manager, SOURCED_AOR);
+        let mut moved = source_entry(SOURCED_AOR, 2);
+        moved.registrar_uri = "sip:registrar.other.example:5060".to_string();
+        moved.destination = "198.51.100.2:5060".parse().unwrap();
+
+        assert!(manager.update_from_source(moved));
+
+        // The binding is on the old registrar: cleared there, at once.
+        let pending = manager.take_pending_deregistrations();
+        assert_eq!(pending.len(), 1);
+        let raw = raw_of(&pending[0]);
+        assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+        assert!(raw.contains(&old_call_id), "wrong Call-ID: {raw}");
+        assert!(
+            raw.contains("registrar.carrier.com"),
+            "wrong registrar: {raw}"
+        );
+        assert_eq!(pending[0].destination, "10.0.0.1:5060".parse().unwrap());
+
+        // The new registrar holds nothing yet, so removing sends nothing.
+        assert!(manager.remove(SOURCED_AOR).is_some());
+        assert!(manager.take_pending_deregistrations().is_empty());
+    }
+
+    #[test]
+    fn an_updated_trunk_that_never_registered_sends_nothing_on_removal() {
+        let manager = make_manager();
+        install_test_egress(&manager);
+        manager.add(source_entry(SOURCED_AOR, 1));
+
+        assert!(manager.update_from_source(source_entry(SOURCED_AOR, 2)));
+        assert!(manager.remove(SOURCED_AOR).is_some());
+
+        assert!(manager.take_pending_deregistrations().is_empty());
+    }
+
+    #[test]
+    fn an_update_that_leaves_the_target_alone_sends_nothing_by_itself() {
+        let manager = make_manager();
+        registered_source_trunk(&manager);
+
+        assert!(manager.update_from_source(source_entry(SOURCED_AOR, 2)));
+
+        assert!(manager.take_pending_deregistrations().is_empty());
+    }
+
+    #[test]
+    fn update_and_remove_cycles_leave_no_entry_or_queued_message() {
+        let manager = make_manager();
+        install_test_egress(&manager);
+        let baseline = manager.len();
+        for cycle in 0..200u64 {
+            let aor = format!("sip:trunk{cycle}@carrier.example");
+            manager.add(source_entry(&aor, cycle));
+            manager.handle_success(&aor, 600);
+            let mut next = source_entry(&aor, cycle + 1000);
+            if cycle % 2 == 0 {
+                next.destination = "198.51.100.2:5060".parse().unwrap();
+            }
+            assert!(manager.update_from_source(next));
+            manager.remove(&aor);
+            assert!(!manager.take_pending_deregistrations().is_empty());
+        }
+
+        assert_eq!(manager.len(), baseline);
+        assert!(manager.take_pending_deregistrations().is_empty());
+    }
+
+    // --- A binding the registrar may hold without a granted `Registered` ---
+
+    fn no_listeners_defaults() -> HashMap<Transport, SocketAddr> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn a_trunk_removed_after_a_failed_refresh_is_deregistered_while_the_grant_lasts() {
+        let manager = make_manager();
+        let last_cseq = registered_source_trunk(&manager);
+        // A refresh goes out and ends in a final failure: the entry reports no
+        // expiry, but the registrar still holds the earlier grant.
+        let listeners = no_listeners_defaults();
+        let defaults = EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &listeners);
+        manager.build_register(SOURCED_AOR, defaults, 600);
+        manager.handle_failure(SOURCED_AOR, 503, None);
+        assert_eq!(manager.state(SOURCED_AOR), Some(RegistrantState::Failed));
+
+        assert!(manager.remove(SOURCED_AOR).is_some());
+
+        let pending = manager.take_pending_deregistrations();
+        assert_eq!(pending.len(), 1, "the earlier grant was forgotten");
+        let raw = raw_of(&pending[0]);
+        assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+        assert!(cseq_of(&raw) > last_cseq + 1, "CSeq must rise: {raw}");
+    }
+
+    #[test]
+    fn a_trunk_removed_after_its_failed_refresh_s_old_grant_ran_out_sends_nothing() {
+        let manager = make_manager();
+        registered_source_trunk(&manager);
+        let listeners = no_listeners_defaults();
+        let defaults = EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &listeners);
+        manager.build_register(SOURCED_AOR, defaults, 600);
+        manager.handle_failure(SOURCED_AOR, 503, None);
+        if let Some(mut entry) = manager.entries.get_mut(SOURCED_AOR) {
+            entry.binding_until = Instant::now().checked_sub(Duration::from_secs(1));
+        }
+
+        assert!(manager.remove(SOURCED_AOR).is_some());
+
+        assert!(manager.take_pending_deregistrations().is_empty());
+    }
+
+    #[test]
+    fn a_trunk_removed_with_its_first_register_unanswered_is_deregistered() {
+        let manager = make_manager();
+        install_test_egress(&manager);
+        manager.add(source_entry(SOURCED_AOR, 1));
+        let listeners = no_listeners_defaults();
+        let defaults = EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &listeners);
+        let first = manager
+            .build_register(SOURCED_AOR, defaults, 600)
+            .expect("the first REGISTER");
+        let first_cseq = cseq_of(&raw_of(&first));
+        let call_id = call_id_of(&manager, SOURCED_AOR);
+
+        assert!(manager.remove(SOURCED_AOR).is_some());
+
+        let pending = manager.take_pending_deregistrations();
+        assert_eq!(pending.len(), 1, "an in-flight REGISTER may bind later");
+        let raw = raw_of(&pending[0]);
+        assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+        assert!(raw.contains(&call_id), "wrong Call-ID: {raw}");
+        assert!(cseq_of(&raw) > first_cseq, "must outrank the first: {raw}");
+
+        // The late 200 to the first REGISTER finds no entry and makes none.
+        manager.handle_success(SOURCED_AOR, 600);
+        assert!(manager.state(SOURCED_AOR).is_none());
+        assert!(manager.is_empty());
+    }
+
+    #[test]
+    fn a_trunk_whose_register_timed_out_is_deregistered_on_removal() {
+        let manager = make_manager();
+        install_test_egress(&manager);
+        manager.add(source_entry(SOURCED_AOR, 1));
+        let listeners = no_listeners_defaults();
+        let defaults = EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &listeners);
+        manager.build_register(SOURCED_AOR, defaults, 600);
+        manager.handle_failure(SOURCED_AOR, 0, None);
+
+        manager.remove(SOURCED_AOR);
+
+        assert_eq!(manager.take_pending_deregistrations().len(), 1);
+    }
+
+    #[test]
+    fn a_trunk_whose_register_was_refused_leaves_nothing_to_clear() {
+        let manager = make_manager();
+        install_test_egress(&manager);
+        manager.add(source_entry(SOURCED_AOR, 1));
+        let listeners = no_listeners_defaults();
+        let defaults = EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &listeners);
+        manager.build_register(SOURCED_AOR, defaults, 600);
+        manager.handle_failure(SOURCED_AOR, 403, None);
+
+        manager.remove(SOURCED_AOR);
+
+        assert!(manager.take_pending_deregistrations().is_empty());
+    }
+
+    #[test]
+    fn an_update_with_a_register_in_flight_still_clears_it_on_removal() {
+        let manager = make_manager();
+        install_test_egress(&manager);
+        manager.add(source_entry(SOURCED_AOR, 1));
+        let listeners = no_listeners_defaults();
+        let defaults = EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &listeners);
+        manager.build_register(SOURCED_AOR, defaults, 600);
+
+        assert!(manager.update_from_source(source_entry(SOURCED_AOR, 2)));
+        manager.remove(SOURCED_AOR);
+
+        assert_eq!(manager.take_pending_deregistrations().len(), 1);
     }
 
     // --- De-registration on removal ---

@@ -78,13 +78,7 @@ fn handle_answer(
     let aor = match registrant.find_by_call_id(&call_id) {
         Some(aor) => aor,
         None => {
-            // The answer to the de-REGISTER of a removed entry: its SA sets
-            // go now (TS 24.229 5.1.1.6.1). Any final answer ends it.
-            if status_code >= 200 && registrant.finish_teardown(&call_id) {
-                debug!(call_id = %call_id, "removed registrant's de-REGISTER answered, SA sets deleted");
-            } else {
-                debug!(call_id = %call_id, "registrant response: no matching entry");
-            }
+            handle_removed_entry_answer(registrant, message, status_code, &call_id, state);
             return;
         }
     };
@@ -465,6 +459,18 @@ fn send_registrant_request(
     built: &crate::registrant::BuiltRegister,
     state: &DispatcherState,
 ) {
+    if let Err(error) = try_send_registrant_request(registrant, built, state) {
+        warn!(aor = %aor, %error, "registrant: REGISTER not sent");
+        registrant.handle_failure(aor, 0, None);
+    }
+}
+
+/// [`send_registrant_request`] without failing an entry when it cannot go.
+fn try_send_registrant_request(
+    registrant: &crate::registrant::RegistrantManager,
+    built: &crate::registrant::BuiltRegister,
+    state: &DispatcherState,
+) -> Result<(), String> {
     let data = bytes::Bytes::from(built.message.to_bytes());
     let message = crate::transport::OutboundMessage {
         followups: None,
@@ -476,11 +482,7 @@ fn send_registrant_request(
         server_name: None,
         verify_server: None,
     };
-    if let Err(error) = registrant.open_transaction(&built.message, &message) {
-        warn!(aor = %aor, %error, "registrant: REGISTER not sent");
-        registrant.handle_failure(aor, 0, None);
-        return;
-    }
+    registrant.open_transaction(&built.message, &message)?;
     send_outbound_from(
         data,
         built.transport,
@@ -489,6 +491,58 @@ fn send_registrant_request(
         built.source_local_addr,
         state,
     );
+    Ok(())
+}
+
+/// The answer to a REGISTER no live entry owns: the de-REGISTER of a removed
+/// entry. A challenge to it is answered once, with `Expires: 0` (RFC 3261
+/// §22, §10.2.2); any other final answer ends it. The answer to a removed IMS
+/// entry's protected de-REGISTER releases its SA sets (TS 24.229 5.1.1.6.1).
+fn handle_removed_entry_answer(
+    registrant: &crate::registrant::RegistrantManager,
+    message: &SipMessage,
+    status_code: u16,
+    call_id: &str,
+    state: &DispatcherState,
+) {
+    use crate::registrant::RemovedAnswer;
+
+    let header_name = if status_code == 407 {
+        "Proxy-Authenticate"
+    } else {
+        "WWW-Authenticate"
+    };
+    let challenge = matches!(status_code, 401 | 407)
+        .then(|| message.headers.get(header_name))
+        .flatten()
+        .and_then(|raw| crate::auth::parse_challenge(raw));
+    let defaults = crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs);
+    let answer = registrant.answer_removed_deregistration(
+        call_id,
+        crate::registrant::cseq_number(message),
+        status_code,
+        challenge
+            .as_ref()
+            .map(|challenge| (challenge, status_code == 407)),
+        defaults,
+    );
+    match answer {
+        RemovedAnswer::Retry(built) => {
+            if let Err(error) = try_send_registrant_request(registrant, &built, state) {
+                registrant
+                    .removed_deregistration_ended(&built.branch, &format!("not sent: {error}"));
+            }
+        }
+        RemovedAnswer::Finished | RemovedAnswer::Stale => {}
+        RemovedAnswer::NotTracked => {
+            // Any final answer ends the protected de-REGISTER of a removed UE.
+            if status_code >= 200 && registrant.finish_teardown(call_id) {
+                debug!(call_id = %call_id, "removed registrant's de-REGISTER answered, SA sets deleted");
+            } else {
+                debug!(call_id = %call_id, "registrant response: no matching entry");
+            }
+        }
+    }
 }
 
 /// The dispatcher's transaction layer as the registrant sends under it: a
@@ -530,6 +584,10 @@ pub(super) fn registrant_transaction_timed_out(key: &TransactionKey, state: &Dis
     };
     let branch = key.branch.clone();
     super::tasks::post_expiry(state, move |state| {
+        // A removed entry's de-REGISTER got no answer: give up on it.
+        if registrant.removed_deregistration_ended(&branch, "unanswered") {
+            return;
+        }
         if registrant.transaction_timed_out(&branch).is_some() {
             // The temporary SA set the failure abandoned.
             if let Some(ipsec) = state.ipsec_manager.as_ref() {

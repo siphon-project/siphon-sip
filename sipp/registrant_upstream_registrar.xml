@@ -54,6 +54,34 @@
     </action>
   </recv>
 
+  <!-- Most carrier registrars challenge every REGISTER, a de-registration
+       included (RFC 3261 §22). The removed trunk has to answer it, still with
+       `Expires: 0`, or the binding stays until it expires. -->
+  <send>
+    <![CDATA[
+
+      SIP/2.0 401 Unauthorized
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      WWW-Authenticate: Digest realm="registrar.test", nonce="0123456789abcdef", algorithm=MD5, qop="auth"
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv request="REGISTER">
+    <action>
+      <ereg regexp="Expires: 0" search_in="msg" check_it="true"
+            assign_to="challenged_dereg_expires" />
+      <ereg regexp="Authorization: Digest" search_in="msg" check_it="true"
+            assign_to="challenged_dereg_auth" />
+      <log message="challenged de-REGISTER carried Expires [$challenged_dereg_expires] and [$challenged_dereg_auth]" />
+    </action>
+  </recv>
+
   <send>
     <![CDATA[
 

@@ -280,7 +280,21 @@ impl RegistrantManager {
             return None;
         }
         let mut entry = self.entries.get_mut(aor)?;
-        let egress = EntryEgress::of(&entry, defaults);
+        self.build_register_with_auth_for(&mut entry, defaults, challenge, is_proxy_auth, expires)
+    }
+
+    /// [`build_register_with_auth`](Self::build_register_with_auth) for an
+    /// entry the caller holds: a live one, or a removed one answering the
+    /// challenge to its de-REGISTER.
+    pub(super) fn build_register_with_auth_for(
+        &self,
+        entry: &mut RegistrantEntry,
+        defaults: EgressDefaults<'_>,
+        challenge: &DigestChallenge,
+        is_proxy_auth: bool,
+        expires: u32,
+    ) -> Option<BuiltRegister> {
+        let egress = EntryEgress::of(entry, defaults);
         let effective_addr = egress.sent_by;
         let cseq = entry.next_cseq();
         let branch = format!("z9hG4bK-reg-{}", uuid::Uuid::new_v4());
