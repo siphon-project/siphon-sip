@@ -107,6 +107,7 @@ impl LiManager {
     /// is released by [`sweep_sessions`](Self::sweep_sessions) after its grace.
     pub fn forget_session(&self, session_id: &str) {
         if let Some((_, decision)) = self.decisions.remove(session_id) {
+            self.release_warranted_count(&decision);
             for leg in &decision.legs {
                 self.aliases.remove(&**leg);
             }

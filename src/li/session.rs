@@ -34,6 +34,7 @@ use super::{IriEventType, LiManager};
 
 mod engine_calls;
 mod live_dialog;
+mod outbound;
 use engine_calls::MintedEngineCall;
 pub use engine_calls::{DialogMedia, EngineCallSide};
 
@@ -100,6 +101,7 @@ pub(super) struct SessionDecision {
     caller_tag: Option<Box<str>>,
     /// The legs a B2BUA call dialled for its called party.
     called_party_legs: Vec<Arc<str>>,
+    counted: bool, // in `warranted_sessions`: it named a warrant when inserted
     /// A BYE has ended the session. Nothing that arrives on its dialogs
     /// afterwards makes it live again: not the answer to a request that
     /// crossed the BYE, and not a request a party still sends. Only an INVITE
@@ -856,7 +858,7 @@ impl LiManager {
     /// Clear the session cache, as it is when it reaches its cap. Content
     /// records with a delivery on them stay: the engine is still delivering.
     pub(crate) fn clear_session_cache(&self) {
-        self.decisions.clear();
+        self.clear_decisions();
         self.aliases.clear();
         self.minted_engine_calls.clear();
         self.forget_idle_x3_calls();
@@ -1213,7 +1215,7 @@ impl LiManager {
     /// reaches this subsystem any more, so everything is released.
     pub fn sweep_sessions(&self, now: Instant, call_is_live: impl Fn(&str) -> bool) {
         if !self.is_intercepting() {
-            self.decisions.clear();
+            self.clear_decisions();
             self.aliases.clear();
             self.minted_engine_calls.clear();
             self.forget_idle_x3_calls();
@@ -1402,6 +1404,7 @@ impl LiManager {
                 // What it knew of minted engine calls was handed on already;
                 // the bindings under its own id go with it.
                 if let Some((_, replaced)) = self.decisions.remove(&**leg) {
+                    self.release_warranted_count(&replaced);
                     self.release_engine_calls(leg, &replaced.engine_calls);
                 }
             }
@@ -1417,6 +1420,7 @@ impl LiManager {
         };
         vacant.insert(SessionDecision {
             generation,
+            counted: self.count_warranted(&matched),
             matched,
             seen: HashSet::new(),
             primary_call_id: Arc::clone(primary_call_id),
