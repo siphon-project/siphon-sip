@@ -48,6 +48,7 @@ impl Drop for RelayingInvite {
                     &self.key,
                     session,
                     &entry.cancel_reasons,
+                    true,
                     487,
                     "Request Terminated",
                     &self.state,

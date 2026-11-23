@@ -1199,6 +1199,7 @@ mod tests {
         );
         outbound_tx
             .send(OutboundMessage {
+                relayed: false,
                 connection_id: ConnectionId::default(),
                 transport: Transport::Tcp,
                 destination: server,
@@ -1276,6 +1277,7 @@ mod tests {
     /// A send with no live connection, bound for `destination`.
     fn fallback_message(destination: SocketAddr) -> OutboundMessage {
         OutboundMessage {
+            relayed: false,
             connection_id: ConnectionId::default(),
             transport: Transport::Tcp,
             destination,
@@ -1321,6 +1323,7 @@ mod tests {
         outbound_tx.send(fallback_message(hung)).unwrap();
         outbound_tx
             .send(OutboundMessage {
+                relayed: false,
                 connection_id: live,
                 ..fallback_message(other)
             })
@@ -1358,6 +1361,7 @@ mod tests {
 
     fn message_with_body(destination: SocketAddr, body: &'static [u8]) -> OutboundMessage {
         OutboundMessage {
+            relayed: false,
             data: Bytes::from_static(body),
             ..fallback_message(destination)
         }

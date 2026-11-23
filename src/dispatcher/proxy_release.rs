@@ -312,6 +312,7 @@ fn release_pending_invite(
         &server_key,
         session_arc,
         &reasons,
+        false,
         status,
         best_error_reason(status),
         state,

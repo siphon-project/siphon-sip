@@ -267,6 +267,7 @@ mod tests {
 
     fn tcp_message(data: &'static [u8], destination: &str, local: Option<&str>) -> OutboundMessage {
         OutboundMessage {
+            relayed: false,
             connection_id: ConnectionId(7),
             transport: Transport::Tcp,
             destination: sock(destination),

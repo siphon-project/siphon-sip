@@ -476,6 +476,7 @@ pub(super) fn send_over_flow(
     state
         .outbound
         .send(OutboundMessage {
+            relayed: false,
             followups: None,
             connection_id: flow.connection_id,
             transport,
@@ -688,6 +689,47 @@ pub(super) fn send_to_target(
     send_source: Option<SocketAddr>,
     state: &DispatcherState,
 ) -> SendOutcome {
+    send_to_target_marked(
+        data,
+        target,
+        fallback_transport,
+        fallback_connection_id,
+        send_source,
+        false,
+        state,
+    )
+}
+
+/// [`send_to_target`] for a request a proxy passes on as it received it.
+/// Lawful intercept has recorded it on arrival and skips this copy.
+pub(super) fn send_relayed_to_target(
+    data: Bytes,
+    target: &RelayTarget,
+    fallback_transport: Transport,
+    fallback_connection_id: ConnectionId,
+    send_source: Option<SocketAddr>,
+    state: &DispatcherState,
+) -> SendOutcome {
+    send_to_target_marked(
+        data,
+        target,
+        fallback_transport,
+        fallback_connection_id,
+        send_source,
+        true,
+        state,
+    )
+}
+
+fn send_to_target_marked(
+    data: Bytes,
+    target: &RelayTarget,
+    fallback_transport: Transport,
+    fallback_connection_id: ConnectionId,
+    send_source: Option<SocketAddr>,
+    relayed: bool,
+    state: &DispatcherState,
+) -> SendOutcome {
     let transport = target.transport.unwrap_or(fallback_transport);
     let destination = target.address;
     // A script `send_socket=` egress pin translated to a bind address:
@@ -714,6 +756,11 @@ pub(super) fn send_to_target(
         );
     }
 
+    // The pool branches below open their own connection and never reach
+    // `OutboundRouter::deliver`, where lawful intercept taps what leaves, so
+    // they tap it themselves, once the send has succeeded.
+    let tapped = super::x2_outbound::li_tap_wanted().then(|| data.clone());
+
     match transport {
         Transport::Tcp => {
             // Use connection pool for outbound TCP.  For ESP-over-TCP
@@ -738,6 +785,9 @@ pub(super) fn send_to_target(
             });
             match connect_result {
                 Ok(connection_id) => {
+                    if let Some(frame) = tapped.as_ref() {
+                        super::x2_outbound::li_tap_outbound(frame, destination, source, relayed);
+                    }
                     debug!(
                         destination = %destination,
                         connection_id = ?connection_id,
@@ -779,6 +829,14 @@ pub(super) fn send_to_target(
                     data_clone,
                 )) {
                     Ok(connection_id) => {
+                        if let Some(frame) = tapped.as_ref() {
+                            super::x2_outbound::li_tap_outbound(
+                                frame,
+                                destination,
+                                Some(listener),
+                                relayed,
+                            );
+                        }
                         debug!(
                             destination = %destination,
                             connection_id = ?connection_id,
@@ -818,6 +876,7 @@ pub(super) fn send_to_target(
 
             if let Some(connection_id) = connection_id {
                 let outbound_message = OutboundMessage {
+                    relayed,
                     followups: None,
                     connection_id,
                     transport: Transport::Tls,
@@ -850,6 +909,9 @@ pub(super) fn send_to_target(
                     data_clone,
                 )) {
                     Ok(connection_id) => {
+                        if let Some(frame) = tapped.as_ref() {
+                            super::x2_outbound::li_tap_outbound(frame, destination, None, relayed);
+                        }
                         debug!(
                             destination = %destination,
                             connection_id = ?connection_id,
@@ -885,6 +947,7 @@ pub(super) fn send_to_target(
             match state.stream_connections.reuse(destination, transport) {
                 Some(connection_id) => {
                     let outbound_message = OutboundMessage {
+                        relayed,
                         followups: None,
                         connection_id,
                         transport,
@@ -940,6 +1003,7 @@ pub(super) fn send_to_target(
             let (destination, source_local_addr) =
                 protected_udp_egress(&data, transport, destination, source_local_addr, state);
             let outbound_message = OutboundMessage {
+                relayed,
                 followups: None,
                 connection_id: fallback_connection_id,
                 transport,

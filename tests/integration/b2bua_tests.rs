@@ -3115,6 +3115,7 @@ fn route(router: &siphon::transport::OutboundRouter, event: &siphon::b2bua::retr
     if let siphon::b2bua::retransmit::Due::Send { data, target, .. } = event {
         router
             .send(siphon::transport::OutboundMessage {
+                relayed: false,
                 followups: None,
                 connection_id: target.connection_id,
                 transport: target.transport,

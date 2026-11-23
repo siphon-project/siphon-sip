@@ -420,6 +420,7 @@ pub(super) fn handle_registrant_ipsec_challenge(
         }
         let data = bytes::Bytes::from(retry_message.to_bytes());
         let outbound_message = crate::transport::OutboundMessage {
+            relayed: false,
             followups: None,
             connection_id: crate::transport::ConnectionId::default(),
             transport,
@@ -473,6 +474,7 @@ fn try_send_registrant_request(
 ) -> Result<(), String> {
     let data = bytes::Bytes::from(built.message.to_bytes());
     let message = crate::transport::OutboundMessage {
+        relayed: false,
         followups: None,
         connection_id: crate::transport::ConnectionId::default(),
         transport: built.transport,

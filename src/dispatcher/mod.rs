@@ -104,6 +104,7 @@ mod timers;
 mod uac_transactions;
 #[cfg(test)]
 mod unprotected_response_tests;
+pub(crate) mod x2_outbound;
 mod x3_delivery;
 
 #[cfg(test)]
@@ -264,6 +265,8 @@ mod li_mid_call_relay_tests;
 mod li_mid_call_tests;
 #[cfg(test)]
 mod li_multi_delivery_tests;
+#[cfg(test)]
+mod li_outbound_tests;
 #[cfg(test)]
 mod li_session_tests;
 #[cfg(test)]

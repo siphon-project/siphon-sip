@@ -134,7 +134,20 @@ fn intercepting() -> (
 
 /// [`intercepting`] on a dispatcher the test prepared (a media engine, say).
 pub(super) fn intercepting_on(
+    dispatcher: super::test_dispatcher::TestDispatcher,
+) -> (
+    Arc<DispatcherState>,
+    LiManager,
+    mpsc::Receiver<IriEvent>,
+    mpsc::Receiver<AuditEntry>,
+) {
+    intercepting_for(dispatcher, "sip:alice@example.com")
+}
+
+/// [`intercepting_on`] with the warrant on the target `identifier`.
+pub(super) fn intercepting_for(
     mut dispatcher: super::test_dispatcher::TestDispatcher,
+    identifier: &str,
 ) -> (
     Arc<DispatcherState>,
     LiManager,
@@ -168,9 +181,7 @@ pub(super) fn intercepting_on(
     li.tasks()
         .activate(TaskDetails {
             x_id: XId::generate(),
-            target_identifiers: vec![TargetIdentifier::SipUri(
-                "sip:alice@example.com".to_string(),
-            )],
+            target_identifiers: vec![TargetIdentifier::SipUri(identifier.to_string())],
             delivery_type: DeliveryType::X2AndX3,
             list_of_dids: vec![d_id],
             list_of_dsids: Vec::new(),
@@ -260,9 +271,9 @@ async fn every_leg_of_a_warranted_b2bua_call_carries_one_correlation() {
     let events = drain_iri(&mut iri);
     assert_eq!(
         events.len(),
-        8,
-        "every message on both legs is intercepted, the callee leg included \
-         although none of its identities name the target"
+        3,
+        "the target's own leg is intercepted, whatever happens on the far \
+         leg, which is not to or from the target"
     );
     let expected = correlation_from_call_id(&internal_id);
     for event in &events {
@@ -273,9 +284,8 @@ async fn every_leg_of_a_warranted_b2bua_call_carries_one_correlation() {
         );
     }
     assert!(
-        events.iter().any(|event| event.call_id == CALLEE_CALL_ID)
-            && events.iter().any(|event| event.call_id == CALLER_CALL_ID),
-        "each record still carries its own leg's Call-ID"
+        events.iter().all(|event| event.call_id == CALLER_CALL_ID),
+        "each record carries its own leg's Call-ID, the caller's here"
     );
     assert_eq!(
         li.correlation_for(&li.tasks().list()[0], &internal_id),
@@ -287,22 +297,15 @@ async fn every_leg_of_a_warranted_b2bua_call_carries_one_correlation() {
         Some(crate::li::IriEventType::Continue),
         "the 200 to the BYE closes the session it belongs to"
     );
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.event_type == crate::li::IriEventType::End)
-            .count(),
-        1,
-        "the far end's BYE is the one end"
-    );
 }
 
 /// TS 103 221-2 clause 5.2.6 is asked of each message: the caller is the
-/// target here, so what the callee leg carries travels to the target, the far
-/// end's re-INVITE and BYE included, and only what the caller sends is from it.
+/// target here, so only its own leg is recorded and what it sends is from it.
+/// What the far end sends on the callee leg (a re-INVITE, a BYE) is not to or
+/// from the target; what siphon sends the target is recorded where it leaves.
 #[tokio::test]
 async fn each_record_of_a_b2bua_call_carries_its_own_direction() {
-    use crate::li::pdu::PayloadDirection::{SentFromTarget, SentToTarget};
+    use crate::li::pdu::PayloadDirection::SentFromTarget;
 
     let (state, _li, mut iri, _audit) = intercepting();
     let internal_id = caller_calls(&state);
@@ -337,11 +340,7 @@ async fn each_record_of_a_b2bua_call_carries_its_own_direction() {
         directions,
         [
             ("INVITE", None, SentFromTarget),
-            ("INVITE", Some(180), SentToTarget),
-            ("INVITE", Some(200), SentToTarget),
             ("ACK", None, SentFromTarget),
-            ("INVITE", None, SentToTarget),
-            ("BYE", None, SentToTarget),
             ("BYE", Some(200), SentFromTarget),
         ]
     );

@@ -126,6 +126,7 @@ fn options_to(destination: SocketAddr) -> OutboundMessage {
 
 fn message_to(destination: SocketAddr, text: String) -> OutboundMessage {
     OutboundMessage {
+        relayed: false,
         connection_id: ConnectionId::default(),
         transport: Transport::Udp,
         destination,

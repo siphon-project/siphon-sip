@@ -668,6 +668,11 @@ pub fn li_manager() -> Option<crate::li::LiManager> {
     LI_MANAGER.get().cloned()
 }
 
+/// [`li_manager`] without the clone, for the per-frame outbound tap.
+pub fn li_manager_ref() -> Option<&'static crate::li::LiManager> {
+    LI_MANAGER.get()
+}
+
 pub(super) fn init_li(config: &Config) -> Option<LiState> {
     let li_config = config.lawful_intercept.as_ref()?;
     if !li_config.enabled {

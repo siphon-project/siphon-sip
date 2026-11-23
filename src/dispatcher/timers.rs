@@ -358,7 +358,57 @@ pub(super) fn process_timer_actions_with_followups(
     transport: Option<Transport>,
     connection_id: Option<ConnectionId>,
     source_local_addr: Option<SocketAddr>,
+    followups: Vec<Bytes>,
+    state: &DispatcherState,
+) {
+    process_timer_actions_marked(
+        actions,
+        key,
+        destination,
+        transport,
+        connection_id,
+        source_local_addr,
+        followups,
+        false,
+        state,
+    );
+}
+
+/// [`process_timer_actions`] for the response a proxy passes upstream: the
+/// message the transaction sends is one lawful intercept recorded when it
+/// arrived from the downstream branch.
+pub(super) fn process_relayed_timer_actions(
+    actions: &[Action],
+    key: &TransactionKey,
+    destination: Option<SocketAddr>,
+    transport: Option<Transport>,
+    connection_id: Option<ConnectionId>,
+    source_local_addr: Option<SocketAddr>,
+    state: &DispatcherState,
+) {
+    process_timer_actions_marked(
+        actions,
+        key,
+        destination,
+        transport,
+        connection_id,
+        source_local_addr,
+        Vec::new(),
+        true,
+        state,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_timer_actions_marked(
+    actions: &[Action],
+    key: &TransactionKey,
+    destination: Option<SocketAddr>,
+    transport: Option<Transport>,
+    connection_id: Option<ConnectionId>,
+    source_local_addr: Option<SocketAddr>,
     mut followups: Vec<Bytes>,
+    relayed: bool,
     state: &DispatcherState,
 ) {
     for action in actions {
@@ -367,12 +417,13 @@ pub(super) fn process_timer_actions_with_followups(
                 if let (Some(dest), Some(trans)) = (destination, transport) {
                     let conn_id = connection_id.unwrap_or_default();
                     if followups.is_empty() {
-                        send_message_from(
+                        send_message_marked(
                             message.clone(),
                             trans,
                             dest,
                             conn_id,
                             source_local_addr,
+                            relayed,
                             state,
                         );
                     } else {

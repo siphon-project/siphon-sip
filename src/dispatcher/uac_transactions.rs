@@ -169,6 +169,7 @@ pub(super) fn track_reply_followup(
     state.uac_sender.track_request(
         request,
         &OutboundMessage {
+            relayed: false,
             followups: None,
             connection_id: inbound.connection_id,
             transport: inbound.transport,

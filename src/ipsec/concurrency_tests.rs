@@ -69,6 +69,7 @@ fn router() -> (OutboundRouter, flume::Receiver<OutboundMessage>) {
 
 fn message(destination: SocketAddr, data: &'static [u8]) -> OutboundMessage {
     OutboundMessage {
+        relayed: false,
         connection_id: ConnectionId(0),
         transport: Transport::Udp,
         destination,

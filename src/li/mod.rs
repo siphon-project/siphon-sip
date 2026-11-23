@@ -264,6 +264,10 @@ pub struct LiManager {
     /// Leg Call-ID to the session it belongs to, for every leg whose session
     /// is not keyed on its own Call-ID.
     aliases: Arc<DashMap<Arc<str>, Arc<str>>>,
+    /// How many remembered decisions name at least one warrant: the gate of
+    /// the outbound X2 tap, one relaxed load on every frame siphon sends.
+    /// See [`LiManager::any_warranted_session`].
+    warranted_sessions: Arc<std::sync::atomic::AtomicUsize>,
     /// The sessions with media on each engine call siphon made under an id of
     /// its own minting, by that id.
     ///
@@ -302,6 +306,7 @@ impl LiManager {
             unanswered_x3_ends: Arc::default(),
             decisions: Arc::new(DashMap::new()),
             aliases: Arc::new(DashMap::new()),
+            warranted_sessions: Arc::default(),
             minted_engine_calls: Arc::new(DashMap::new()),
             live_dialogs: Arc::default(),
         };

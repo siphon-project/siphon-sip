@@ -599,13 +599,24 @@ async fn a_seated_call_keeps_its_one_interception_across_seat_leave_and_reseat()
     );
     assert_eq!(li.x3_attachments_for(CALL).len(), 1);
 
-    // The far party's signalling still belongs to the session.
+    // The session goes on. What the far party sends on its own leg is not to
+    // or from the target (the caller), so it is not recorded; the target's own
+    // signalling still is.
     drain_iri(&mut iri);
     arrives(
         &state,
         CALLEE,
         &callee_request("INFO", 2, "z9hG4bK-far-info").replace(CALLEE_CALL_ID, FAR),
     );
+    assert!(
+        drain_iri(&mut iri).is_empty(),
+        "the far leg is not the target's"
+    );
+    let info = on_call(CALLER_ACK, CALL)
+        .replace("ACK sip:", "INFO sip:")
+        .replace("CSeq: 1 ACK", "CSeq: 3 INFO")
+        .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-info");
+    arrives(&state, CALLER, &info);
     let late = drain_iri(&mut iri);
     assert_eq!(late.len(), 1, "X2 goes on");
     assert_eq!(late[0].correlation_id, correlation, "under the one CID");
@@ -2085,7 +2096,7 @@ fn directions(events: &[IriEvent]) -> Vec<(String, Option<u16>, PayloadDirection
 /// transfer's third leg send is to the target.
 #[tokio::test]
 async fn x2_direction_follows_who_sent_each_message_on_every_leg() {
-    use PayloadDirection::{SentFromTarget, SentToTarget};
+    use PayloadDirection::SentFromTarget;
     let (state, _engine, _li, mut iri, _audit) =
         intercepting_on_the_engine(NativeTestEngine::start().await).await;
     let internal_id = caller_calls(&state);
@@ -2135,14 +2146,12 @@ async fn x2_direction_follows_who_sent_each_message_on_every_leg() {
 
     assert_eq!(
         directions(&drain_iri(&mut iri)),
+        // Only the target's own leg: what the called party and the transfer
+        // target send on theirs is not to or from the target (the caller).
         vec![
             ("INVITE".to_string(), None, SentFromTarget),
-            ("INVITE".to_string(), Some(200), SentToTarget),
             ("ACK".to_string(), None, SentFromTarget),
             ("REFER".to_string(), None, SentFromTarget),
-            ("INVITE".to_string(), Some(180), SentToTarget),
-            ("INVITE".to_string(), Some(200), SentToTarget),
-            ("BYE".to_string(), None, SentToTarget),
             ("BYE".to_string(), Some(200), SentFromTarget),
             ("INVITE".to_string(), None, SentFromTarget),
         ]
@@ -2250,23 +2259,26 @@ async fn a_transfers_third_leg_is_never_from_a_called_target() {
     );
 
     let seen = directions(&drain_iri(&mut iri));
+    // The warrant names the called party. This fixture's script has no B2BUA
+    // handler, so the caller's INVITE is one a proxy relays to the target and
+    // is recorded (a B2BUA's is withheld, `li_outbound_tests`); the caller's
+    // ACK after it is on a leg that is not the target's, and is not.
     assert_eq!(
-        seen[..3],
+        seen[..2],
         [
             ("INVITE".to_string(), None, SentToTarget),
             ("INVITE".to_string(), Some(200), SentFromTarget),
-            ("ACK".to_string(), None, SentToTarget),
         ],
-        "the caller's and the called party's own"
+        "the caller's opening INVITE and the called party's own"
     );
-    for third in &seen[3..5] {
+    for third in &seen[2..4] {
         assert!(
             matches!(third.2, SentToTarget | Unknown),
             "the third party's {third:?} is not the target's"
         );
     }
     assert_eq!(
-        seen[5],
+        seen[4],
         ("INFO".to_string(), None, SentFromTarget),
         "and the called party is still told from it"
     );

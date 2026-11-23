@@ -430,11 +430,22 @@ impl TransactionManager {
     /// ended: a 2xx, Timer B or Timer D) and for one that is not an INVITE
     /// client transaction (§9.1: a CANCEL is for an INVITE).
     pub fn cancel_invite_client(&self, key: &TransactionKey, reasons: &[String]) -> CancelOutcome {
+        self.cancel_invite_client_marked(key, reasons, false)
+    }
+
+    /// [`cancel_invite_client`](Self::cancel_invite_client), saying whether the
+    /// CANCEL passes on one the proxy received (`passed_on`).
+    pub fn cancel_invite_client_marked(
+        &self,
+        key: &TransactionKey,
+        reasons: &[String],
+        passed_on: bool,
+    ) -> CancelOutcome {
         let Some(mut entry) = self.transactions.get_mut(key) else {
             return CancelOutcome::NothingToSend;
         };
         match &mut **entry {
-            Transaction::Ict(ict) => ict.request_cancel(reasons),
+            Transaction::Ict(ict) => ict.request_cancel_marked(reasons, passed_on),
             _ => CancelOutcome::NothingToSend,
         }
     }

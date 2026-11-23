@@ -27,7 +27,7 @@ mod tests;
 
 // `li_manager` is reached as `crate::server::li_manager` by the dispatcher, so
 // its path has to survive the move out of this file.
-pub use bootstrap::li_manager;
+pub use bootstrap::{li_manager, li_manager_ref};
 
 use bootstrap::*;
 pub use python_thread::build_runtime;

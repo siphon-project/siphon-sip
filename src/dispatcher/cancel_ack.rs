@@ -61,7 +61,7 @@ pub(super) fn cancel_fork_branches(
         if Some(client_key) == exclude {
             continue;
         }
-        cancel_proxy_branch(client_key, &[], state);
+        cancel_proxy_branch(client_key, &[], false, state);
     }
     // The branches that had already ended when the request got its final
     // response (they failed while the fork was still open) go now; `exclude`,
@@ -95,7 +95,12 @@ pub(super) fn cancel_fork_branches(
 ///
 /// The waiting CANCEL does not depend on the proxy session, which the caller's
 /// CANCEL removes at once.
-fn cancel_proxy_branch(client_key: &TransactionKey, reasons: &[String], state: &DispatcherState) {
+fn cancel_proxy_branch(
+    client_key: &TransactionKey,
+    reasons: &[String],
+    passed_on: bool,
+    state: &DispatcherState,
+) {
     use crate::transaction::state::CancelOutcome;
 
     // The branch is being given up on anyway: a no-response timer on it would
@@ -108,7 +113,7 @@ fn cancel_proxy_branch(client_key: &TransactionKey, reasons: &[String], state: &
 
     match state
         .transaction_manager
-        .cancel_invite_client(client_key, reasons)
+        .cancel_invite_client_marked(client_key, reasons, passed_on)
     {
         CancelOutcome::SendNow(cancel) => send_proxy_branch_cancel(&cancel, state),
         CancelOutcome::Deferred => debug!(
@@ -143,7 +148,14 @@ pub(super) fn send_proxy_branch_cancel(
         transport = %cancel.hop.transport,
         "proxy: sending a branch its CANCEL"
     );
-    send_outbound_from(
+    // The proxy passing on the CANCEL it received was recorded as it arrived;
+    // one it decided on itself (a fork settled, a reject, Timer C) was not.
+    let send = if cancel.passed_on {
+        send_relayed_from
+    } else {
+        send_outbound_from
+    };
+    send(
         cancel.frame.clone(),
         cancel.hop.transport,
         cancel.hop.destination,
@@ -953,7 +965,7 @@ pub(super) fn relay_ack_via_session(
                 server_name: None,
                 verify_server: None,
             };
-            send_to_target(
+            send_relayed_to_target(
                 data,
                 &target,
                 client_branch.transport,
@@ -1035,6 +1047,7 @@ pub(super) fn handle_cancel_via_session(
         invite_server_key,
         session_arc,
         &reasons,
+        true,
         487,
         "Request Terminated",
         state,
@@ -1051,6 +1064,7 @@ pub(super) fn abandon_pending_invite(
     invite_server_key: &TransactionKey,
     session_arc: Arc<RwLock<ProxySession>>,
     reasons: &[String],
+    passed_on: bool,
     status: u16,
     reason_phrase: &str,
     state: &DispatcherState,
@@ -1111,7 +1125,7 @@ pub(super) fn abandon_pending_invite(
         // Sent now to a branch that has answered with a provisional, kept for
         // one that has answered nothing, dropped for one that already has its
         // final response (RFC 3261 §9.1).
-        cancel_proxy_branch(client_key, reasons, state);
+        cancel_proxy_branch(client_key, reasons, passed_on, state);
     }
 
     // The final response upstream, built from the original INVITE of the
