@@ -650,3 +650,179 @@ async fn an_originated_invite_no_warrant_names_is_not_remembered() {
     assert!(drain_iri(&mut iri).is_empty());
     assert_eq!(li.remembered_session_count(), 0);
 }
+/// A call siphon originates makes the dialled UA the call's A-leg, so the
+/// session decided on the outbound INVITE is anchored on siphon's own tag. What
+/// the target sends on that leg is still the target's.
+#[tokio::test]
+async fn what_an_originated_target_sends_is_recorded_when_its_leg_is_the_a_leg() {
+    use crate::li::pdu::PayloadDirection::SentFromTarget;
+    let (state, li, mut iri, _audit) = intercepting_for(test_dispatcher(), ORIGINATED_TARGET);
+    let _tap = tests_support::install(&li, Some(Arc::clone(&state.call_actors)));
+    let leg = Leg::new_a_leg(
+        CALLEE_CALL_ID.to_string(),
+        "siphon-leg".to_string(),
+        "z9hG4bK-originated".to_string(),
+        LegTransport {
+            remote_addr: CALLEE.parse().expect("a literal address"),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+            local_addr: None,
+        },
+    );
+    create_b2bua_call(&state, leg);
+
+    leaves(
+        &state,
+        CALLEE,
+        &on_the_dialled_leg("INVITE", 1, "", "originated"),
+    );
+    arrives(
+        &state,
+        CALLEE,
+        &super::li_session_tests::callee_response(CALLEE_CALL_ID, "180 Ringing"),
+    );
+    arrives(
+        &state,
+        CALLEE,
+        &super::li_session_tests::callee_response(CALLEE_CALL_ID, "200 OK"),
+    );
+    arrives(
+        &state,
+        CALLEE,
+        &super::li_session_tests::callee_request("BYE", 2, "z9hG4bK-far-bye"),
+    );
+
+    let events = drain_iri(&mut iri);
+    let stream: Vec<_> = events
+        .iter()
+        .map(|event| {
+            (
+                event.sip_method.as_str(),
+                event.status_code,
+                event.direction,
+            )
+        })
+        .collect();
+    assert_eq!(
+        stream,
+        [
+            ("INVITE", None, SentToTarget),
+            ("INVITE", Some(180), SentFromTarget),
+            ("INVITE", Some(200), SentFromTarget),
+            ("BYE", None, SentFromTarget),
+        ]
+    );
+}
+
+/// Two reliable provisionals of one transaction differ by their RSeq
+/// (RFC 3262 §3); a resend of either is the same bytes.
+#[tokio::test]
+async fn reliable_provisionals_that_differ_by_rseq_are_each_recorded_once() {
+    let (state, _li, mut iri, _internal_id, _tap) = rig("sip:alice@example.com");
+    let reliable = |rseq: u32| {
+        answer("183 Session Progress").replace("CSeq:", &format!("RSeq: {rseq}\r\nCSeq:"))
+    };
+
+    leaves(&state, CALLER, &reliable(1));
+    leaves(&state, CALLER, &reliable(1));
+    leaves(&state, CALLER, &reliable(2));
+    leaves(&state, CALLER, &reliable(2));
+
+    assert_eq!(drain_iri(&mut iri).len(), 2, "one record per RSeq");
+}
+
+/// The proxy that relays every INVITE to the target, for a warrant on it.
+fn li_proxy(
+    handlers: &str,
+) -> (
+    super::proxy_dialog_state_tests::Proxy,
+    crate::li::LiManager,
+    mpsc::Receiver<IriEvent>,
+    tests_support::TapGuard,
+) {
+    let script = format!(
+        concat!(
+            "from siphon import proxy\n",
+            "\n",
+            "@proxy.on_request\n",
+            "def route(request):\n",
+            "    request.relay(\"sip:callee@198.51.100.11:5060\")\n",
+            "\n",
+            "{handlers}",
+        ),
+        handlers = handlers,
+    );
+    let dispatcher = super::test_dispatcher::test_dispatcher_with_script(&script);
+    let udp = dispatcher.udp.clone();
+    let (state, li, iri, _audit) = intercepting_for(dispatcher, "sip:callee@example.com");
+    let tap = tests_support::install(&li, Some(Arc::clone(&state.call_actors)));
+    (
+        super::proxy_dialog_state_tests::Proxy { state, udp },
+        li,
+        iri,
+        tap,
+    )
+}
+
+/// The target `target` answers the INVITE siphon relayed to it.
+fn target_answers(proxy: &super::proxy_dialog_state_tests::Proxy, status: u16, reason: &str) {
+    let relayed = super::proxy_dialog_state_tests::invites_by_destination(&proxy.wire());
+    let (_, invite) = relayed
+        .iter()
+        .find(|(destination, _)| destination == "198.51.100.11:5060")
+        .expect("the INVITE was relayed to the target");
+    let response = super::proxy_dialog_state_tests::response_to(
+        invite,
+        status,
+        reason,
+        "tag-target",
+        "sip:callee@198.51.100.11:5060",
+        "",
+    );
+    let raw = String::from_utf8(response.to_bytes()).expect("UTF-8");
+    arrives(&proxy.state, "198.51.100.11:5060", &raw);
+    proxy.response("198.51.100.11:5060", response);
+}
+
+/// A CANCEL siphon makes up itself (a `reply.reject()` abandoning the INVITE)
+/// is a message to the target no arrival stands for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_siphon_generates_itself_is_recorded() {
+    let (proxy, _li, mut iri, _tap) =
+        li_proxy(super::proxy_cancel_awaits_provisional_tests::REJECT_ON_183);
+    let raw = super::proxy_cancel_awaits_provisional_tests::caller_invite("cid-rejected");
+    arrives(&proxy.state, "192.0.2.50:5060", &raw);
+    proxy.request("192.0.2.50:5060", &raw);
+    target_answers(&proxy, 183, "Session Progress");
+
+    let events = drain_iri(&mut iri);
+    let cancels = events
+        .iter()
+        .filter(|event| event.sip_method == "CANCEL")
+        .count();
+    assert_eq!(cancels, 1, "{:?}", summary(&events));
+}
+
+/// The CANCEL a proxy passes on from the caller's own CANCEL is the record its
+/// arrival made.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_passed_on_from_the_caller_is_one_record() {
+    let (proxy, _li, mut iri, _tap) = li_proxy("");
+    let raw = super::proxy_cancel_awaits_provisional_tests::caller_invite("cid-cancelled");
+    arrives(&proxy.state, "192.0.2.50:5060", &raw);
+    proxy.request("192.0.2.50:5060", &raw);
+    target_answers(&proxy, 180, "Ringing");
+    let cancel = raw
+        .replacen("INVITE", "CANCEL", 1)
+        .replace("CSeq: 5 INVITE", "CSeq: 5 CANCEL")
+        .replace("Contact: <sip:phone@192.0.2.50:5060>\r\n", "");
+    arrives(&proxy.state, "192.0.2.50:5060", &cancel);
+    proxy.request("192.0.2.50:5060", &cancel);
+
+    let events = drain_iri(&mut iri);
+    let cancels = events
+        .iter()
+        .filter(|event| event.sip_method == "CANCEL")
+        .count();
+    assert_eq!(cancels, 1, "{:?}", summary(&events));
+}

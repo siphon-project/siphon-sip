@@ -105,7 +105,7 @@ impl Ict {
         self.no_response = NoResponseProgress::GaveUp;
         let mut actions = vec![Action::CancelTimer(TimerName::A)];
         if matches!(self.cancel, CancelProgress::NotRequested) {
-            match self.build_cancel(&[]) {
+            match self.build_cancel(&[], false) {
                 Ok(cancel) => self.cancel = CancelProgress::Waiting(Box::new(cancel)),
                 Err(error) => actions.push(Action::ProtocolError(format!(
                     "no response before the no-response timer, and the INVITE's CANCEL could not be built for a late provisional: {error}"

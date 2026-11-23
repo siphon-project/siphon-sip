@@ -805,6 +805,9 @@ pub struct BranchCancel {
     pub frame: Bytes,
     /// Where the INVITE went, and so where this goes.
     pub hop: BranchHop,
+    /// Whether a CANCEL the proxy received is what this passes on, rather
+    /// than one the proxy decided on itself.
+    pub passed_on: bool,
 }
 
 /// What [`Ict::request_cancel`] did with a request to cancel the INVITE.
@@ -1061,18 +1064,26 @@ impl Ict {
     /// * `Completed` / `Terminated`: the final response has arrived, and there
     ///   is nothing to cancel.
     pub fn request_cancel(&mut self, reasons: &[String]) -> CancelOutcome {
+        self.request_cancel_marked(reasons, false)
+    }
+
+    /// [`request_cancel`](Self::request_cancel), saying whether the CANCEL
+    /// passes on one the proxy received (`passed_on`).
+    pub fn request_cancel_marked(&mut self, reasons: &[String], passed_on: bool) -> CancelOutcome {
         match (self.state, &self.cancel) {
-            (IctState::Calling, CancelProgress::NotRequested) => match self.build_cancel(reasons) {
-                Ok(cancel) => {
-                    self.cancel = CancelProgress::Waiting(Box::new(cancel));
-                    CancelOutcome::Deferred
+            (IctState::Calling, CancelProgress::NotRequested) => {
+                match self.build_cancel(reasons, passed_on) {
+                    Ok(cancel) => {
+                        self.cancel = CancelProgress::Waiting(Box::new(cancel));
+                        CancelOutcome::Deferred
+                    }
+                    Err(error) => CancelOutcome::Unbuildable(error),
                 }
-                Err(error) => CancelOutcome::Unbuildable(error),
-            },
+            }
             // The first request's CANCEL is the one that waits.
             (IctState::Calling, _) => CancelOutcome::Deferred,
             (IctState::Proceeding, CancelProgress::NotRequested) => {
-                match self.build_cancel(reasons) {
+                match self.build_cancel(reasons, passed_on) {
                     Ok(cancel) => {
                         self.cancel = CancelProgress::Sent;
                         CancelOutcome::SendNow(cancel)
@@ -1085,7 +1096,7 @@ impl Ict {
     }
 
     /// The CANCEL of the INVITE this transaction sent, for the hop it went to.
-    fn build_cancel(&self, reasons: &[String]) -> Result<BranchCancel, String> {
+    fn build_cancel(&self, reasons: &[String], passed_on: bool) -> Result<BranchCancel, String> {
         let hop = self
             .hop
             .ok_or_else(|| "no hop was recorded for the INVITE".to_string())?;
@@ -1096,6 +1107,7 @@ impl Ict {
         Ok(BranchCancel {
             frame: Bytes::from(cancel.to_bytes()),
             hop,
+            passed_on,
         })
     }
 
@@ -1152,7 +1164,7 @@ impl Ict {
                 self.timer_c = TimerCProgress::Expired;
                 let mut actions = Vec::new();
                 if matches!(self.cancel, CancelProgress::NotRequested) {
-                    match self.build_cancel(&[]) {
+                    match self.build_cancel(&[], false) {
                         Ok(cancel) => {
                             self.cancel = CancelProgress::Sent;
                             actions.push(Action::SendCancel(Box::new(cancel)));

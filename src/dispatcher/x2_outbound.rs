@@ -25,18 +25,33 @@ use super::inbound::{message_instance_key, top_via_branch};
 use super::request::to_has_tag;
 use crate::b2bua::actor::CallActorStore;
 use crate::li::{AuditOperation, Identities, IriEventType, LiManager, MessageFacts};
-use crate::sip::message::StartLine;
+use crate::sip::message::{SipMessage, StartLine};
 use crate::sip::parser::parse_sip_message_bytes;
 
-/// Whether the outbound tap has anything to do: some session is warranted.
-/// For a caller that would copy a frame only to tap it.
-pub(crate) fn li_tap_wanted() -> bool {
+/// The manager and call store the tap works against: the process's, or in a
+/// test the ones it installed ([`tests_support::install`]). Everything else
+/// the tap does, its gate included, is the same code.
+fn with_tap<R>(work: impl FnOnce(&LiManager, Option<&CallActorStore>) -> R) -> Option<R> {
     #[cfg(test)]
-    if let Some(wanted) = tests_support::wanted() {
-        return wanted;
-    }
-    crate::server::li_manager_ref()
-        .is_some_and(|li| li.any_warranted_session() || li.any_active_task())
+    let work = match tests_support::with_installed(work) {
+        Ok(result) => return Some(result),
+        Err(work) => work,
+    };
+    let li = crate::server::li_manager_ref()?;
+    let store = crate::b2bua::actor::global_call_store();
+    Some(work(li, store.map(|store| &**store)))
+}
+
+/// Whether the tap has anything to do on `li`: some session is warranted, or
+/// a warrant exists that an initial INVITE siphon originates may open one for.
+fn tap_is_wanted(li: &LiManager) -> bool {
+    li.any_warranted_session() || li.any_active_task()
+}
+
+/// Whether the outbound tap has anything to do. For a caller that would copy a
+/// frame only to tap it.
+pub(crate) fn li_tap_wanted() -> bool {
+    with_tap(|li, _| tap_is_wanted(li)).unwrap_or(false)
 }
 
 /// Record one frame that is about to leave, if it goes to the target of a
@@ -52,25 +67,11 @@ pub(crate) fn li_tap_outbound(
     source_local_addr: Option<SocketAddr>,
     relayed: bool,
 ) {
-    #[cfg(test)]
-    if let Some(done) = tests_support::tap(frame, destination, source_local_addr, relayed) {
-        return done;
-    }
-    let Some(li) = crate::server::li_manager_ref() else {
-        return;
-    };
-    if !li.any_warranted_session() {
-        return;
-    }
-    let store = crate::b2bua::actor::global_call_store();
-    tap_frame(
-        li,
-        store.map(|store| &**store),
-        frame,
-        destination,
-        source_local_addr,
-        relayed,
-    );
+    with_tap(|li, store| {
+        if tap_is_wanted(li) {
+            tap_frame(li, store, frame, destination, source_local_addr, relayed);
+        }
+    });
 }
 
 /// [`li_tap_outbound`] against a given manager and call store.
@@ -151,7 +152,7 @@ pub(crate) fn tap_frame(
         return;
     }
     // A retransmission is the same frame again, not another message.
-    if !li.record_message_once(&session.session_id, message_instance_key(&message)) {
+    if !li.record_message_once(&session.session_id, outbound_instance_key(&message)) {
         return;
     }
     if relayed {
@@ -189,6 +190,29 @@ pub(crate) fn tap_frame(
             ),
         );
     }
+}
+
+/// What tells one message siphon generates from a resend of it: the inbound
+/// key (top Via branch, CSeq, method or status) and, for the provisionals of
+/// one transaction that differ only there, the RSeq of a reliable one
+/// (RFC 3262 §3) and the tag of the dialog it answers on. Retransmissions are
+/// the same bytes, so they keep the key.
+fn outbound_instance_key(message: &SipMessage) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut key = message_instance_key(message);
+    for name in ["RSeq", "To"] {
+        for byte in message
+            .headers
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or_default()
+            .bytes()
+        {
+            key = (key ^ u64::from(byte)).wrapping_mul(PRIME);
+        }
+        key = (key ^ 0xff).wrapping_mul(PRIME);
+    }
+    key
 }
 
 /// The event type of a frame siphon sends, from its shape alone: the
@@ -232,34 +256,15 @@ pub(crate) mod tests_support {
         TapGuard
     }
 
-    /// `Some(())` when a test manager is installed and took the frame.
-    pub(super) fn tap(
-        frame: &Bytes,
-        destination: SocketAddr,
-        source_local_addr: Option<SocketAddr>,
-        relayed: bool,
-    ) -> Option<()> {
-        TAP.with(|slot| {
-            let slot = slot.borrow();
-            let (li, store) = slot.as_ref()?;
-            tap_frame(
-                li,
-                store.as_deref(),
-                frame,
-                destination,
-                source_local_addr,
-                relayed,
-            );
-            Some(())
-        })
-    }
-
-    /// Whether the installed test manager has a warranted session.
-    pub(super) fn wanted() -> Option<bool> {
-        TAP.with(|slot| {
-            slot.borrow()
-                .as_ref()
-                .map(|(li, _)| li.any_warranted_session() || li.any_active_task())
+    /// Run `work` on the installed manager, or hand it back when a test
+    /// installed none.
+    pub(super) fn with_installed<R, F>(work: F) -> Result<R, F>
+    where
+        F: FnOnce(&LiManager, Option<&CallActorStore>) -> R,
+    {
+        TAP.with(|slot| match slot.borrow().as_ref() {
+            Some((li, store)) => Ok(work(li, store.as_deref())),
+            None => Err(work),
         })
     }
 }

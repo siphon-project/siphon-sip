@@ -93,8 +93,15 @@ impl LiManager {
 
     /// Forget every decision, and the count that went with them.
     pub(super) fn clear_decisions(&self) {
-        self.decisions.clear();
-        self.warranted_sessions.store(0, Ordering::Relaxed);
+        // Each decision is uncounted as it leaves the map, under its shard's
+        // lock, so a session decided meanwhile keeps its count: resetting to
+        // zero afterwards would erase it.
+        self.decisions.retain(|_, decision| {
+            self.release_warranted_count(decision);
+            false
+        });
+        #[cfg(test)]
+        pause::after_clear();
     }
 
     /// Whether any warrant is provisioned on a node with lawful intercept on:
@@ -137,6 +144,10 @@ impl LiManager {
         if view.matches.is_empty() {
             return None;
         }
+        // However the call numbers its legs (a call siphon originates has the
+        // dialled party for its A-leg), this INVITE is dialled for the party
+        // it names, so the leg is the called party's.
+        self.note_called_party_leg(&view.session_id, call_id);
         if let Some(mut decision) = self.decisions.get_mut(&*view.session_id) {
             decision.invite_session = true;
             if let Some(branch) = facts.branch {
@@ -290,6 +301,31 @@ impl LiManager {
         true
     }
 }
+/// A place for a test to act between the decisions being cleared and the count
+/// being reset.
+#[cfg(test)]
+pub(super) mod pause {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` once, at the next clear on this thread.
+    pub(super) fn once_after_clear(hook: impl FnOnce() + 'static) {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn after_clear() {
+        let taken = HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = taken {
+            hook();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,6 +747,70 @@ mod tests {
         provision_targets(&manager, DeliveryType::X2Only, None, bob());
         manager.tasks().deactivate_all();
         assert!(!manager.any_active_task());
+    }
+
+    /// The count is the gate of the tap, so a cache clear racing the sessions
+    /// being decided must neither erase a new session's count nor leave one
+    /// behind.
+    #[test]
+    fn the_warranted_count_is_exact_while_the_cache_is_cleared_under_it() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2Only, None);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let clearer = {
+            let manager = manager.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    manager.clear_session_cache();
+                }
+            })
+        };
+        let deciders: Vec<_> = (0..8)
+            .map(|thread| {
+                let manager = manager.clone();
+                std::thread::spawn(move || {
+                    for index in 0..20_000 {
+                        let call_id = format!("raced-{thread}-{index}@example.com");
+                        manager.resolve_session(&call_id, &invite(), &caller_invite(), || None);
+                    }
+                })
+            })
+            .collect();
+        for decider in deciders {
+            decider.join().expect("a deciding thread finishes");
+        }
+        stop.store(true, Ordering::Relaxed);
+        clearer.join().expect("the clearing thread finishes");
+
+        assert_eq!(
+            manager.warranted_sessions.load(Ordering::Relaxed),
+            manager.remembered_session_count(),
+            "every remembered session is warranted and counted once"
+        );
+        manager.clear_session_cache();
+        assert_eq!(manager.warranted_sessions.load(Ordering::Relaxed), 0);
+    }
+
+    /// A session decided between the decisions being cleared and the count
+    /// being reset is still there, and still counted.
+    #[test]
+    fn a_session_decided_while_the_cache_is_clearing_keeps_its_count() {
+        let (manager, _iri, _audit) = manager();
+        provision(&manager, DeliveryType::X2Only, None);
+        manager.resolve_session(DIALOG, &invite(), &caller_invite(), || None);
+        let racing = manager.clone();
+        super::pause::once_after_clear(move || {
+            racing.resolve_session("raced@example.com", &invite(), &caller_invite(), || None);
+        });
+        manager.clear_session_cache();
+        assert_eq!(manager.remembered_session_count(), 1);
+        assert_eq!(
+            manager.warranted_sessions.load(Ordering::Relaxed),
+            1,
+            "the session decided during the clear is counted"
+        );
+        assert!(manager.any_warranted_session());
     }
 
     #[test]

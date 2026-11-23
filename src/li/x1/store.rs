@@ -407,18 +407,33 @@ impl TaskStore {
         self.active.load(Ordering::Relaxed) > 0
     }
 
+    /// Store a task, counting it when it is new. The count moves with the map
+    /// entry itself, one for one, so it is exact however the threads that
+    /// provision interleave.
+    fn insert_task(&self, x_id: XId, task: StoredTask) {
+        if self.tasks.insert(x_id, task).is_none() {
+            self.active.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Remove every task, uncounting each as it goes. How many were removed.
+    fn clear_tasks(&self) -> usize {
+        let mut removed = 0;
+        self.tasks.retain(|_, _| {
+            self.active.fetch_sub(1, Ordering::Relaxed);
+            removed += 1;
+            false
+        });
+        removed
+    }
+
     /// Invalidate every cached matching decision.
     ///
     /// Called from each mutation that can change what matches. It is
     /// deliberately coarse: a warrant provisioned or withdrawn is rare and a
     /// missed interception is not survivable, so every session is re-decided
     /// rather than reasoning about which ones could have been affected.
-    fn sync_active(&self) {
-        self.active.store(self.tasks.len(), Ordering::Relaxed);
-    }
-
     fn bump_generation(&self) {
-        self.sync_active();
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         // `send_replace` stores the value with no receiver listening too, so
         // a subscriber that arrives later still reads the current one.
@@ -611,7 +626,7 @@ impl TaskStore {
         }
         self.validate(&details)?;
         self.index.index(x_id, &details.target_identifiers);
-        self.tasks.insert(
+        self.insert_task(
             x_id,
             StoredTask {
                 details,
@@ -664,7 +679,9 @@ impl TaskStore {
         self.index.remove(x_id);
         self.bump_generation();
         let removed = self.tasks.remove(&x_id);
-        self.sync_active();
+        if removed.is_some() {
+            self.active.fetch_sub(1, Ordering::Relaxed);
+        }
         removed.map(|(_, task)| task).ok_or_else(|| {
             X1Error::new(
                 ErrorCode::XidDoesNotExist,
@@ -675,9 +692,8 @@ impl TaskStore {
 
     /// Deactivate every task, returning how many were removed.
     pub fn deactivate_all(&self) -> usize {
-        let count = self.tasks.len();
         self.index.clear();
-        self.tasks.clear();
+        let count = self.clear_tasks();
         self.bump_generation();
         count
     }
@@ -777,11 +793,11 @@ impl TaskStore {
     /// Replace the whole task set — used when reloading provisioned state.
     pub fn replace_all(&self, tasks: Vec<TaskDetails>) {
         self.index.clear();
-        self.tasks.clear();
+        self.clear_tasks();
         for details in tasks {
             let x_id = details.x_id;
             self.index.index(x_id, &details.target_identifiers);
-            self.tasks.insert(
+            self.insert_task(
                 x_id,
                 StoredTask {
                     details,
@@ -852,6 +868,45 @@ mod tests {
 
     fn stores_with_content() -> (DestinationStore, TaskStore) {
         stores(ContentCapability::Available)
+    }
+
+    // -- the active-task gate -------------------------------------------
+
+    /// The gate is read without a lock, so it has to be exact however the
+    /// provisioning threads interleave: a stale zero is a warrant that is not
+    /// looked for.
+    #[test]
+    fn the_active_count_is_exact_under_concurrent_provisioning() {
+        let (destinations, tasks) = stores_with_content();
+        let details = destination(DeliveryType::X2AndX3);
+        let d_id = details.d_id;
+        destinations.create(details).unwrap();
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let tasks = tasks.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..5_000 {
+                        let provisioned = task(DeliveryType::X2AndX3, vec![d_id]);
+                        let x_id = provisioned.x_id;
+                        tasks.activate(provisioned).unwrap();
+                        tasks.deactivate(x_id).unwrap();
+                    }
+                    // One stays.
+                    tasks
+                        .activate(task(DeliveryType::X2AndX3, vec![d_id]))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(tasks.len(), 16);
+        assert_eq!(tasks.active.load(Ordering::Relaxed), 16);
+        assert!(tasks.any_active());
+        assert_eq!(tasks.deactivate_all(), 16);
+        assert_eq!(tasks.active.load(Ordering::Relaxed), 0);
+        assert!(!tasks.any_active());
     }
 
     // -- generation changes ---------------------------------------------
