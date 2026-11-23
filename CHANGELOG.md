@@ -13,6 +13,10 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A SIP message whose body is not valid UTF-8 now goes out over WebSocket and WSS as a binary frame.** The write task converted every outbound message with a lossy UTF-8 conversion and sent it as a text frame, so binary payloads (for example the 3GPP mission-critical data signalling and payload types, whose encoding is binary) had their octets replaced by U+FFFD while `Content-Length` still counted the original length. RFC 7118 §5 allows both text and binary frames and RFC 6455 §5.6 requires a text frame to be valid UTF-8, so a message that is valid UTF-8 still goes as a text frame and anything else goes as a binary frame, byte for byte. Inbound binary frames were already accepted unchanged.
+
 ## [1.17.0] — 2026-11-23
 
 ### Security
