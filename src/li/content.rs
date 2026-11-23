@@ -776,6 +776,24 @@ impl LiManager {
         })
     }
 
+    /// Whether the engine took the end siphon asked for on a leg (a `delete`,
+    /// a seat's leave) and has answered it: unlike
+    /// [`Self::x3_engine_call_ended_by_siphon`] this is never true while the
+    /// command is still out, which the engine may yet refuse.
+    pub fn x3_engine_call_end_committed(&self, call_id: &str, scope: Option<&CallScope>) -> bool {
+        self.x3_attachments.get(call_id).is_some_and(|content| {
+            content
+                .legs
+                .iter()
+                .filter(|leg| leg.scope.as_ref() == scope)
+                .any(|leg| {
+                    leg.ended
+                        .iter()
+                        .any(|ended| ended.engine_call == EngineCallEnd::Yes)
+                })
+        })
+    }
+
     /// Every live delivery on record, each with the record it is on. A copy,
     /// so what is asked of other stores for each is asked with no guard held.
     pub fn x3_live_attachments(&self) -> Vec<(String, ActiveIntercept)> {
@@ -1699,6 +1717,31 @@ mod tests {
         manager.x3_media_end_committed(CALL, None);
         let next = attempt_offered(&manager);
         assert!(manager.register_x3_attachment(CALL, attachment(d_id, None), next));
+    }
+
+    /// An end siphon asked for counts as committed only once the engine has
+    /// answered it: not while it is out, and not after it was refused.
+    #[test]
+    fn an_end_is_committed_only_when_the_engine_took_it() {
+        let (manager, _iri, _audit) = manager();
+        let d_id = DId::generate();
+        let attempt = attempt_offered(&manager);
+        manager.register_x3_attachment(CALL, attachment(d_id, None), attempt);
+        assert!(!manager.x3_engine_call_end_committed(CALL, None));
+
+        manager.x3_media_ending(CALL, None);
+        assert!(manager.x3_engine_call_ended_by_siphon(CALL, None));
+        assert!(
+            !manager.x3_engine_call_end_committed(CALL, None),
+            "asked, not yet answered"
+        );
+        manager.x3_media_end_failed(CALL, None);
+        assert!(!manager.x3_engine_call_end_committed(CALL, None));
+
+        manager.x3_media_ending(CALL, None);
+        manager.x3_media_end_committed(CALL, None);
+        assert!(manager.x3_engine_call_end_committed(CALL, None));
+        assert!(!manager.x3_engine_call_end_committed("other-call", None));
     }
 
     /// The same warrant and destination under another session's Correlation

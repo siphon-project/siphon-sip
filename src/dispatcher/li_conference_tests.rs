@@ -158,6 +158,134 @@ async fn a_bye_detaches_a_seats_delivery_on_the_seat() {
         .expect("the seat is freed");
 }
 
+/// The BYE of a seated, intercepted caller, on the dialog `call_id`.
+fn seated_bye(call_id: &str) -> String {
+    on_call(CALLER_ACK, call_id)
+        .replace("ACK sip:", "BYE sip:")
+        .replace("CSeq: 1 ACK", "CSeq: 2 BYE")
+        .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-bye")
+}
+
+/// The session's end and the script's `rtpengine.conference_leave` race for
+/// the seat. When siphon's own leave is out first the engine ends the seat's
+/// delivery with it and answers the seat detach `unknown call`: the delivery
+/// ended as siphon asked, so that is no warning, and the stop is still
+/// audited and no fault reaches the ADMF.
+#[tokio::test]
+async fn a_seat_detach_that_finds_siphons_own_leave_done_is_not_a_warning() {
+    const CALL: &str = "factory-seat-leave-race@192.0.2.10";
+    const ROOM: &str = "room-factory-seat-leave-race";
+    let (log, _guard) = capture_log();
+    let (state, engine, li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    let events = engine_events(&state);
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    script_joins(&state, CALL, ROOM).await;
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+
+    // The session ends and takes the seat's delivery; its detach is not sent
+    // yet. The script's leave goes out before it, and the engine, having
+    // ended the seat with the leave, answers the detach `unknown call`.
+    engine.refuse_next("detach_x3");
+    arrives(&state, CALLER, &seated_bye(CALL));
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("the seat is freed");
+    engine_reports(&events, ended(ROOM, "caller-tag", "CallEnded")).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    assert_eq!(engine.commands("conference_leave").len(), 1);
+    assert_eq!(
+        engine.commands("detach_x3").len(),
+        1,
+        "the detach was asked for and answered unknown call"
+    );
+    assert!(
+        super::li_session_tests::own_warnings(&log).is_empty(),
+        "{}",
+        log.rendered()
+    );
+    assert_eq!(faults_reported(&log), 0, "{}", log.rendered());
+    assert_eq!(li.x3_attachment_count(), 0);
+    let mut stops = 0;
+    while let Ok(entry) = audit.try_recv() {
+        if entry.operation == crate::li::AuditOperation::MediaCaptureStopped {
+            stops += 1;
+        }
+    }
+    assert_eq!(stops, 1, "the stop is still audited");
+}
+
+/// A leave the engine refuses takes nothing out: the seat still delivers, so
+/// the session's end must still detach it, and cleanly.
+#[tokio::test]
+async fn a_refused_leave_does_not_spare_the_seat_its_detach() {
+    const CALL: &str = "factory-seat-leave-refused@192.0.2.10";
+    const ROOM: &str = "room-factory-seat-leave-refused";
+    let (log, _guard) = capture_log();
+    let (state, engine, _li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    script_joins(&state, CALL, ROOM).await;
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+
+    engine.refuse_next("conference_leave");
+    arrives(&state, CALLER, &seated_bye(CALL));
+    assert!(backend_of(&state).delete(CALL, "caller-tag").await.is_err());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    assert_eq!(
+        engine.commands("detach_x3").len(),
+        1,
+        "the seat is still delivering: it is detached"
+    );
+    assert!(
+        super::li_session_tests::own_warnings(&log).is_empty(),
+        "{}",
+        log.rendered()
+    );
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("the seat is freed");
+}
+
+/// A seat the engine dropped on its own, not by siphon's leave, and whose
+/// detach is answered `unknown call`, is still a warning: siphon asked for
+/// nothing that ends the seat there.
+#[tokio::test]
+async fn a_seat_detach_the_engine_answers_unknown_call_on_its_own_is_a_warning() {
+    const CALL: &str = "factory-seat-dropped@192.0.2.10";
+    const ROOM: &str = "room-factory-seat-dropped";
+    let (log, _guard) = capture_log();
+    let (state, engine, _li, _iri, mut audit) =
+        intercepting_on_the_engine(NativeTestEngine::start_with_x3().await).await;
+    arrives(&state, CALLER, &on_call(CALLER_INVITE, CALL));
+    script_joins(&state, CALL, ROOM).await;
+    arrives(&state, CALLER, &on_call(CALLER_ACK, CALL));
+    assert_eq!(attach_outcomes(&mut audit).await, (1, 0));
+
+    engine.refuse_next("detach_x3");
+    arrives(&state, CALLER, &seated_bye(CALL));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let warnings = super::li_session_tests::own_warnings(&log);
+    assert!(
+        warnings.iter().any(|line| {
+            line.contains("could not detach X3 content delivery from a conference seat")
+        }),
+        "{}",
+        log.rendered()
+    );
+    backend_of(&state)
+        .delete(CALL, "caller-tag")
+        .await
+        .expect("the seat is freed");
+}
+
 /// A detach that the engine reports as having dropped content, or that a
 /// transport failure beat, is content the agency did not get. The delivery is
 /// kept on record from the detach to that report, so the fault is raised, and
