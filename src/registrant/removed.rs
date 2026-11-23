@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
-use super::{AuthMode, BuiltRegister, EgressDefaults, RegistrantEntry, RegistrantManager};
+use super::{
+    AuthMode, BuiltRegister, EgressDefaults, RegistrantEntry, RegistrantManager, RegistrantState,
+};
 use crate::auth::DigestChallenge;
 use crate::sip::message::SipMessage;
 
@@ -69,6 +71,57 @@ pub fn cseq_number(message: &SipMessage) -> Option<u32> {
 }
 
 impl RegistrantEntry {
+    /// Whether the registrar may hold a binding from this entry, so removing
+    /// it has to clear one: a grant that has not run out (a refresh, forced or
+    /// after a source update, moves the state on while the binding stays, and
+    /// a refresh that failed leaves the earlier grant in place), or a REGISTER
+    /// that may have reached the registrar without an answer (in flight, or
+    /// timed out: RFC 3261 §10.3 answers 200 to removing a contact it does not
+    /// hold, so clearing it is harmless).
+    pub fn holds_binding(&self) -> bool {
+        self.binding_until.is_some_and(|at| at > Instant::now())
+            || self.register_in_flight()
+            || self.register_unanswered
+    }
+
+    fn register_in_flight(&self) -> bool {
+        matches!(
+            self.state,
+            RegistrantState::Registering | RegistrantState::Challenging
+        )
+    }
+
+    /// Whether a REGISTER of `other` would bind the same contact on the same
+    /// registrar as this entry's does, so replacing this entry with it is a
+    /// refresh of the binding rather than a second one.
+    fn same_binding_target(&self, other: &RegistrantEntry) -> bool {
+        self.registrar_uri == other.registrar_uri
+            && self.destination == other.destination
+            && self.transport == other.transport
+            && self.contact_uri == other.contact_uri
+            && self.local_addr == other.local_addr
+            && self.credentials.username == other.credentials.username
+    }
+
+    /// Take over the binding `existing` holds when this entry, replacing it,
+    /// targets the same one: a refresh of it, so the Call-ID carries over, the
+    /// CSeq continues (RFC 3261 §10.2.4 / §8.1.1.5) and a removal before the
+    /// refresh is answered still clears it. Returns `false` when the binding is
+    /// elsewhere and has to be cleared there.
+    pub(super) fn carry_binding_from(&mut self, existing: &RegistrantEntry) -> bool {
+        if !existing.same_binding_target(self) {
+            return false;
+        }
+        self.call_id = existing.call_id.clone();
+        self.cseq = std::sync::atomic::AtomicU32::new(
+            existing.cseq.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        self.expires_at = existing.expires_at;
+        self.binding_until = existing.binding_until;
+        self.register_unanswered = existing.register_unanswered || existing.register_in_flight();
+        true
+    }
+
     /// What a challenge to this entry's de-REGISTER is answered from.
     fn copy_for_draining(&self) -> RegistrantEntry {
         let mut copy = RegistrantEntry::new(
@@ -91,13 +144,23 @@ impl RegistrantEntry {
 }
 
 impl RegistrantManager {
-    /// Track the de-REGISTER `built` of the removed (or replaced) `entry`, so
-    /// the challenge to it is answered. Not for an AKA entry (see the module).
-    pub(super) fn track_removed_deregistration(
+    /// Queue the de-REGISTER `built` of the removed (or replaced) `entry` for
+    /// the loop to send, and track it so the challenge to it is answered.
+    pub(super) fn queue_removed_deregistration(
         &self,
         entry: &RegistrantEntry,
-        built: &BuiltRegister,
+        built: BuiltRegister,
     ) {
+        self.track_removed_deregistration(entry, &built);
+        match self.pending_deregistrations.lock() {
+            Ok(mut pending) => pending.push(built),
+            Err(poisoned) => poisoned.into_inner().push(built),
+        }
+    }
+
+    /// Track the de-REGISTER `built` of the removed (or replaced) `entry`, so
+    /// the challenge to it is answered. Not for an AKA entry (see the module).
+    fn track_removed_deregistration(&self, entry: &RegistrantEntry, built: &BuiltRegister) {
         if entry.auth_mode != AuthMode::Digest || entry.ue_ipsec.is_some() {
             return;
         }

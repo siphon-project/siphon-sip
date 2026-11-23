@@ -695,34 +695,6 @@ impl RegistrantEntry {
         self
     }
 
-    /// Whether the registrar may hold a binding from this entry, so removing
-    /// it has to clear one: a grant that has not run out (a refresh, forced or
-    /// after a source update, moves the state on while the binding stays, and
-    /// a refresh that failed leaves the earlier grant in place), or a REGISTER
-    /// that may have reached the registrar without an answer (in flight, or
-    /// timed out: RFC 3261 §10.3 answers 200 to removing a contact it does not
-    /// hold, so clearing it is harmless).
-    pub fn holds_binding(&self) -> bool {
-        self.binding_until.is_some_and(|at| at > Instant::now())
-            || matches!(
-                self.state,
-                RegistrantState::Registering | RegistrantState::Challenging
-            )
-            || self.register_unanswered
-    }
-
-    /// Whether a REGISTER of `other` would bind the same contact on the same
-    /// registrar as this entry's does, so replacing this entry with it is a
-    /// refresh of the binding rather than a second one.
-    fn same_binding_target(&self, other: &RegistrantEntry) -> bool {
-        self.registrar_uri == other.registrar_uri
-            && self.destination == other.destination
-            && self.transport == other.transport
-            && self.contact_uri == other.contact_uri
-            && self.local_addr == other.local_addr
-            && self.credentials.username == other.credentials.username
-    }
-
     /// Returns seconds until expiry, or 0 if expired/not registered.
     pub fn expires_in(&self) -> u64 {
         self.expires_at
@@ -998,11 +970,7 @@ impl RegistrantManager {
         if let Some(entry) = removed.as_ref() {
             self.retire_sa_sets(entry, deregistration.as_ref());
             if let Some(message) = deregistration {
-                self.track_removed_deregistration(entry, &message);
-                match self.pending_deregistrations.lock() {
-                    Ok(mut pending) => pending.push(message),
-                    Err(poisoned) => poisoned.into_inner().push(message),
-                }
+                self.queue_removed_deregistration(entry, message);
             }
             self.emit_event(RegistrantEvent::Deregistered {
                 aor: aor.to_string(),
@@ -1051,43 +1019,17 @@ impl RegistrantManager {
             return false;
         }
         let carried = self.entries.get(&entry.aor).and_then(|existing| {
-            (existing.origin == EntryOrigin::Source).then(|| {
-                (
-                    existing.call_id.clone(),
-                    existing.cseq.load(Ordering::Relaxed),
-                    existing.expires_at,
-                    existing.binding_until,
-                    existing.register_unanswered
-                        || matches!(
-                            existing.state,
-                            RegistrantState::Registering | RegistrantState::Challenging
-                        ),
-                    existing.same_binding_target(&entry),
-                )
-            })
+            (existing.origin == EntryOrigin::Source).then(|| entry.carry_binding_from(&existing))
         });
-        let Some((call_id, cseq, expires_at, binding_until, register_unanswered, same_target)) =
-            carried
-        else {
+        let Some(same_target) = carried else {
             return false;
         };
-
-        let mut deregistration = None;
-        if same_target {
-            // A refresh of the binding the registrar holds: keep what it
-            // holds, so a removal before the refresh is answered still clears
-            // it (see `build_deregistration`).
-            entry.call_id = call_id;
-            entry.cseq = AtomicU32::new(cseq);
-            entry.expires_at = expires_at;
-            entry.binding_until = binding_until;
-            entry.register_unanswered = register_unanswered;
-        } else {
-            // The binding is on the registrar (or contact) being replaced, and
-            // no REGISTER of the new entry would reach it: clear it there, on
-            // its own Call-ID, and let the new entry register afresh.
-            deregistration = self.build_deregistration(&entry.aor);
-        }
+        // A binding on the registrar (or contact) being replaced is one no
+        // REGISTER of the new entry reaches: clear it there, on its own
+        // Call-ID, and let the new entry register afresh.
+        let deregistration = (!same_target)
+            .then(|| self.build_deregistration(&entry.aor))
+            .flatten();
         entry.state = RegistrantState::Unregistered;
         entry.next_attempt = Instant::now();
 
@@ -1096,11 +1038,7 @@ impl RegistrantManager {
             // The replacement starts a fresh handshake; the old one's SAs go.
             self.retire_sa_sets(&replaced, None);
             if let Some(message) = deregistration {
-                self.track_removed_deregistration(&replaced, &message);
-                match self.pending_deregistrations.lock() {
-                    Ok(mut pending) => pending.push(message),
-                    Err(poisoned) => poisoned.into_inner().push(message),
-                }
+                self.queue_removed_deregistration(&replaced, message);
             }
         }
         true
