@@ -119,6 +119,7 @@ fn run_tick(
     // handshake installs fresh ones), superseded or abandoned SA sets, and
     // those of removed entries whose de-REGISTER went unanswered.
     manager.expire_teardowns(std::time::Instant::now());
+    manager.expire_removed_deregistrations(std::time::Instant::now());
     delete_queued_sas(manager, context, egress);
 
     // Shutting down: nothing is started, and the sockets and connections stay
@@ -525,6 +526,7 @@ fn send_registrant_message(
 ) {
     if let Err(error) = send_register(manager, outbound, egress, &built) {
         warn!(destination = %built.destination, %error, "failed to send de-REGISTER");
+        manager.removed_deregistration_ended(&built.branch, "not sent");
     }
 }
 

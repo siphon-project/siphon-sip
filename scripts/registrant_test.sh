@@ -57,4 +57,4 @@ else
   fail "siphon never logged sending a de-REGISTER — the scenario passed for the wrong reason"
 fi
 
-echo "PASS: removing a trunk cleared its binding upstream with Expires: 0"
+echo "PASS: removing a trunk cleared its binding upstream with Expires: 0, challenge answered"

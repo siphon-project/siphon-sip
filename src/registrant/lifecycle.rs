@@ -240,6 +240,8 @@ impl RegistrantManager {
         entry.deregistration = Deregistration::Done;
         entry.state = RegistrantState::Unregistered;
         entry.expires_at = None;
+        entry.binding_until = None;
+        entry.register_unanswered = false;
         entry.in_flight_branch = None;
         let address = entry.local_addr;
         let deletions: Vec<super::SaDeletion> = entry
