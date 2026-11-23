@@ -2239,7 +2239,7 @@ mod tests {
         let old_call_id = call_id_of(&manager, SOURCED_AOR);
         let mut moved = source_entry(SOURCED_AOR, 2);
         moved.registrar_uri = "sip:registrar.other.example:5060".to_string();
-        moved.destination = "10.0.0.2:5060".parse().unwrap();
+        moved.destination = "198.51.100.2:5060".parse().unwrap();
 
         assert!(manager.update_from_source(moved));
 
@@ -2293,7 +2293,7 @@ mod tests {
             manager.handle_success(&aor, 600);
             let mut next = source_entry(&aor, cycle + 1000);
             if cycle % 2 == 0 {
-                next.destination = "10.0.0.2:5060".parse().unwrap();
+                next.destination = "198.51.100.2:5060".parse().unwrap();
             }
             assert!(manager.update_from_source(next));
             manager.remove(&aor);
