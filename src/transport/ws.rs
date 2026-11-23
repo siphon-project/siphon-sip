@@ -211,12 +211,17 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
     let write_timeout = crate::transport::send_queue::write_timeout();
     let mut write_task = tokio::spawn(async move {
         while let Some(data) = outbound_rx.recv().await {
-            // SIP messages are text — send as text frame
-            let text = String::from_utf8_lossy(&data).into_owned();
+            // RFC 6455 §5.6: a text frame must be valid UTF-8. A SIP body may be
+            // binary (RFC 7118 §5 allows both frame types), so a message that is
+            // not valid UTF-8 goes out as a binary frame, never lossy-converted.
+            let frame = match std::str::from_utf8(&data) {
+                Ok(text) => Message::text(text),
+                Err(_) => Message::Binary(data),
+            };
             // Bounded: a browser or gateway that stops reading its socket leaves
             // this send blocked forever, pinning the connection and its
             // `connection_map` entry for the life of the process.
-            match tokio::time::timeout(write_timeout, ws_sink.send(Message::text(text))).await {
+            match tokio::time::timeout(write_timeout, ws_sink.send(frame)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     warn!("WS write error on {:?}: {}", connection_id, error);
@@ -991,6 +996,127 @@ mod tests {
         assert_eq!(message.transport, Transport::WebSocket);
         let data_str = String::from_utf8_lossy(&message.data);
         assert!(data_str.contains("OPTIONS"));
+    }
+
+    /// Connects a client, sends one inbound frame so the server registers the
+    /// connection, and returns the client plus the server's send queue for it.
+    async fn connected_client_with_queue() -> (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        SendQueue,
+        flume::Receiver<InboundMessage>,
+    ) {
+        let (inbound_tx, inbound_rx) = flume::unbounded();
+        let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
+        let addr = listen(
+            any_loopback_port(),
+            inbound_tx,
+            outbound_rx,
+            Arc::clone(&connection_map),
+            test_acl(),
+            StreamConnections::new(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("ws listener must bind");
+        let url = format!("ws://127.0.0.1:{}", addr.port());
+        let (mut ws_stream, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws_stream
+            .send(Message::text("REGISTER sip:test SIP/2.0\r\n\r\n"))
+            .await
+            .unwrap();
+        let message =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .unwrap()
+                .unwrap();
+        let queue = connection_map
+            .get(&message.connection_id)
+            .expect("connection registered")
+            .value()
+            .clone();
+        (ws_stream, queue, inbound_rx)
+    }
+
+    fn message_with_body(body: &[u8]) -> Vec<u8> {
+        let mut wire = format!(
+            concat!(
+                "MESSAGE sip:bob@example.com SIP/2.0\r\n",
+                "Via: SIP/2.0/WS 192.0.2.1:5060;branch=z9hG4bK1\r\n",
+                "From: <sip:alice@example.com>;tag=a\r\n",
+                "To: <sip:bob@example.com>\r\n",
+                "Call-ID: binary-body@example.com\r\n",
+                "CSeq: 1 MESSAGE\r\n",
+                "Content-Type: application/octet-stream\r\n",
+                "Content-Length: {}\r\n",
+                "\r\n",
+            ),
+            body.len()
+        )
+        .into_bytes();
+        wire.extend_from_slice(body);
+        wire
+    }
+
+    #[tokio::test]
+    async fn ws_non_utf8_body_is_sent_as_binary_frame_unchanged() {
+        // RFC 7118 §5 allows text or binary frames; RFC 6455 §5.6 requires a
+        // text frame to be valid UTF-8, so octets like 0xC0 0xFF must go in a
+        // binary frame, never lossy-converted to U+FFFD.
+        let (mut client, queue, _inbound_rx) = connected_client_with_queue().await;
+        let body = [0x01, 0xC0, 0xFF, 0x80, 0x00, 0x7F];
+        let wire = message_with_body(&body);
+        queue.try_send(Bytes::from(wire.clone())).unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match frame {
+            Message::Binary(data) => {
+                assert_eq!(data.as_ref(), wire.as_slice());
+                assert!(data.ends_with(&body));
+                let head = String::from_utf8_lossy(&data[..data.len() - body.len()]).into_owned();
+                assert!(head.contains("Content-Length: 6\r\n"));
+            }
+            other => panic!("expected a binary frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_utf8_message_is_still_sent_as_text_frame() {
+        let (mut client, queue, _inbound_rx) = connected_client_with_queue().await;
+        let wire = message_with_body("h\u{e9}llo".as_bytes());
+        queue.try_send(Bytes::from(wire.clone())).unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match frame {
+            Message::Text(text) => assert_eq!(text.as_bytes(), wire.as_slice()),
+            other => panic!("expected a text frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_inbound_binary_frame_with_non_utf8_body_is_delivered_unchanged() {
+        let (mut client, _queue, inbound_rx) = connected_client_with_queue().await;
+        let wire = message_with_body(&[0xC0, 0xFF, 0xFE, 0x00]);
+        client
+            .send(Message::binary(Bytes::from(wire.clone())))
+            .await
+            .unwrap();
+        let message =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(message.data.as_ref(), wire.as_slice());
     }
 
     #[tokio::test]

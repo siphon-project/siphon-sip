@@ -1014,6 +1014,35 @@ mod tests {
     }
 
     #[test]
+    fn non_utf8_body_survives_parse_and_serialize_byte_identical() {
+        // The relay path parses and re-serialises every message; a body that is
+        // not valid UTF-8 (a 3GPP binary payload) must come out octet for octet.
+        let body_bytes: [u8; 6] = [0x01, 0xC0, 0xFF, 0x80, 0x00, 0x7F];
+        let mut raw = Vec::from(
+            concat!(
+                "MESSAGE sip:bob@example.com SIP/2.0\r\n",
+                "Via: SIP/2.0/WS 192.0.2.1:5060;branch=z9hG4bK1\r\n",
+                "From: <sip:alice@example.com>;tag=a\r\n",
+                "To: <sip:bob@example.com>\r\n",
+                "Call-ID: binary-relay@example.com\r\n",
+                "CSeq: 1 MESSAGE\r\n",
+                "Content-Type: application/octet-stream\r\n",
+                "Content-Length: 6\r\n",
+                "\r\n",
+            )
+            .as_bytes(),
+        );
+        raw.extend_from_slice(&body_bytes);
+
+        let message = parse_sip_message_bytes(&raw).expect("should parse");
+        assert_eq!(message.body, body_bytes);
+        let wire = message.to_bytes();
+        assert!(wire.ends_with(&body_bytes));
+        let reparsed = parse_sip_message_bytes(&wire).expect("serialised form reparses");
+        assert_eq!(reparsed.body, body_bytes);
+    }
+
+    #[test]
     fn parse_bytes_empty_body() {
         let raw = concat!(
             "SIP/2.0 200 OK\r\n",
