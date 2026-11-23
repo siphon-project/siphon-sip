@@ -13,6 +13,15 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **LI: X2 now carries every SIP message siphon sends to a target, not only what it receives.** Interception tapped inbound bytes only, so everything siphon generated toward the target never reached the mediation function: its 100 Trying and local answers (`answer_local`, a conference factory's 200, a script reply), the 200 to the target's BYE, the 202 and sipfrag NOTIFYs of a REFER, teardown BYEs (`max_call_duration`, `b2bua.terminate`, session timer), session refresh, PRACK, ACK and CANCEL on a leg siphon dialled, and the copy a B2BUA builds for the target's leg. They are now recorded where they leave (the transport send path, and the TCP/TLS connections the pool opens), payload direction 2, under the call's Correlation ID. A resent frame is one record, a proxy's relayed copy stays the record its arrival made, and a frame siphon sends does not begin or end a session. A node with no warranted session pays one relaxed load per frame.
+- LI: X2 records now carry `destination_ip` (the local address for what arrives, the peer for what siphon sends). It was always absent.
+
+### Changed
+
+- **LI, B2BUA calls: X2 records the target's leg only.** What the other party sends and receives on its own leg is not to or from the target, so it is no longer recorded for a warrant whose target is on the other leg; the target-leg messages in both directions replace it. A call whose two parties are targets of different warrants records each leg under its own warrant. The call's opening INVITE, which arrives before the call exists, is still recorded as before.
+
 ## [1.17.0] — 2026-11-23
 
 ### Security
