@@ -418,6 +418,8 @@ mod session_timer_tests;
 #[cfg(test)]
 mod shutdown_teardown_tests;
 #[cfg(test)]
+mod single_leg_warning_tests;
+#[cfg(test)]
 mod single_listener_snapshot_tests;
 #[cfg(test)]
 mod spiral_invite_tests;
