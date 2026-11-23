@@ -167,6 +167,32 @@ fn bench(criterion: &mut Criterion) {
         });
     });
 
+    // An initial INVITE siphon sends on a Call-ID nothing has resolved, which no
+    // warrant names: the match is the whole cost, and nothing is remembered.
+    let originated = Identities {
+        request_uri: Some("sip:dave@example.com"),
+        from_uri: Some("<sip:15550100001@192.0.2.1>;tag=s"),
+        to_uri: Some("<sip:dave@example.com>"),
+        source_ip: None,
+    };
+    let initial_invite = MessageFacts {
+        request: true,
+        method: "INVITE",
+        status_code: None,
+        to_tagged: false,
+        branch: Some("z9hG4bK-originated"),
+    };
+    criterion.bench_function("li_outbound_tap/originated_invite_unnamed", |bencher| {
+        bencher.iter(|| {
+            black_box(manager.decide_outbound_invite(
+                black_box("originated-call@192.0.2.1"),
+                &initial_invite,
+                &originated,
+                || None,
+            ));
+        });
+    });
+
     let hit = Bytes::from_static(ANSWER.as_bytes());
     criterion.bench_function("li_outbound_tap/gate_on_hit", |bencher| {
         bencher.iter(|| {

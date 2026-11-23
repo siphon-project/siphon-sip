@@ -20,7 +20,7 @@ entry, but a working config keeps working.
 
 ### Changed
 
-- **LI, B2BUA calls: X2 records the target's leg only.** What the other party sends and receives on its own leg is not to or from the target, so it is no longer recorded for a warrant whose target is on the other leg; the target-leg messages in both directions replace it. A call whose two parties are targets of different warrants records each leg under its own warrant. The call's opening INVITE, which arrives before the call exists, is still recorded as before.
+- **LI, B2BUA calls: X2 records the target's leg only.** What the other party sends and receives on its own leg is not to or from the target, so it is no longer recorded for a warrant whose target is on the other leg; the target-leg messages in both directions replace it. A call whose two parties are targets of different warrants records each leg under its own warrant. The caller's INVITE of a call B2BUA mode takes is not recorded for a warrant on the called party either (it is not sent to the target; siphon's own INVITE is, and opens the stream); a proxied INVITE is relayed to the target and stays. A call siphon originates or dials to a target no earlier message of the session names is now decided on its own initial INVITE, so that INVITE, a CANCEL, the ACK and the rest are recorded.
 
 ## [1.17.0] — 2026-11-23
 
