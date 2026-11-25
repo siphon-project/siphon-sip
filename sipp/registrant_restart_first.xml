@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- The upstream registrar, before the node is killed: it accepts the trunk's
+     REGISTER and grants a binding. scripts/registrant_restart_test.sh then
+     kills siphon without a shutdown and restarts it with the trunk no longer
+     listed; sipp/registrant_restart_second.xml is what answers that. -->
+<scenario name="Upstream registrar: the registration a node later leaves behind">
+
+  <recv request="REGISTER">
+    <action>
+      <!-- A registration, not a de-registration. No `^` anchor: the sipp in CI
+           does not match one against a header value. -->
+      <ereg regexp="Expires: [1-9]" search_in="msg" check_it="true"
+            assign_to="initial_expires" />
+      <log message="REGISTER carried Expires [$initial_expires]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:edge@127.0.0.1:25060>;expires=600
+      Expires: 600
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <ResponseTimeRepartition value="100, 500, 1000, 2000"/>
+  <CallLengthRepartition value="1000, 5000, 10000, 20000"/>
+
+</scenario>

@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- The upstream registrar after the node was killed and restarted without the
+     trunk in its list. The binding the dead process held is still here; the
+     restarted siphon must clear it (RFC 3261 §10.2.2) on the Contact and the
+     Call-ID it was made with. The registrar challenges every REGISTER (§22),
+     the de-registration included, so the credential has to come from the
+     source's lookup: nothing persisted it. -->
+<scenario name="Upstream registrar: clearing the binding a killed node left">
+
+  <recv request="REGISTER">
+    <action>
+      <ereg regexp="Expires: 0" search_in="msg" check_it="true"
+            assign_to="dereg_expires" />
+      <ereg regexp="sip:edge@127.0.0.1:25060" search_in="hdr" header="Contact:"
+            check_it="true" assign_to="dereg_contact" />
+      <log message="de-REGISTER carried Expires [$dereg_expires] on Contact [$dereg_contact]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+
+      SIP/2.0 401 Unauthorized
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      WWW-Authenticate: Digest realm="registrar.test", nonce="0123456789abcdef", algorithm=MD5, qop="auth"
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv request="REGISTER">
+    <action>
+      <ereg regexp="Expires: 0" search_in="msg" check_it="true"
+            assign_to="retry_expires" />
+      <ereg regexp="username=.line-user-7." search_in="hdr" header="Authorization:"
+            check_it="true" assign_to="retry_auth" />
+      <log message="authorised de-REGISTER carried Expires [$retry_expires] and [$retry_auth]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Expires: 0
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <ResponseTimeRepartition value="100, 500, 1000, 2000"/>
+  <CallLengthRepartition value="1000, 5000, 10000, 20000"/>
+
+</scenario>
