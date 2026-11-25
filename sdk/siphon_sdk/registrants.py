@@ -34,6 +34,17 @@ This HTTP source exists for the deployment that seals its trunk secrets at rest:
 the controller unseals in-process and serves the credential over a trusted local
 channel, so siphon never sees the sealed form.
 
+**Lookup by AoR (optional).** With ``registrant.http.lookup_url`` set (a template
+with an ``{aor}`` placeholder, replaced by the percent-encoded AoR), siphon also
+``GET``s one trunk, with the same ``Authorization`` header as the list, to answer
+the registrar's challenge to the de-REGISTER that clears a binding a killed
+process left behind. The answer is one :class:`RegistrantRow` exactly as a
+``registrants`` element, returned **even when the trunk is not listed for that
+node or is ``enabled=False``**; ``404`` means the AoR is unknown, and any other
+non-2xx, a timeout or an unparsable body is treated the same (the challenge is
+not answered). Only ``username``, ``password`` / ``ha1`` + ``ha1_algorithm`` and
+``realm`` are read. Build it with :func:`lookup_response`.
+
 Zero-dependency dataclasses (matching the rest of ``siphon_sdk``). ``to_dict()``
 omits ``None`` fields to match the Rust ``skip_serializing_if``.
 """
@@ -160,4 +171,24 @@ class RegistrantListResponse:
         )
 
 
-__all__ = ["CONTRACT_VERSION", "RegistrantRow", "RegistrantListResponse"]
+def lookup_response(row: Optional[RegistrantRow]) -> Optional[Dict[str, Any]]:
+    """The JSON body of a ``lookup_url`` answer, or ``None`` for an unknown AoR.
+
+    ``None`` means the endpoint answers ``404``. A known trunk is answered with
+    its row whether or not it is enabled or listed for the asking node::
+
+        row = find_trunk(aor)              # your store
+        body = lookup_response(row)
+        if body is None:
+            return 404, ""
+        return 200, json.dumps(body)
+    """
+    return None if row is None else row.to_dict()
+
+
+__all__ = [
+    "CONTRACT_VERSION",
+    "RegistrantRow",
+    "RegistrantListResponse",
+    "lookup_response",
+]

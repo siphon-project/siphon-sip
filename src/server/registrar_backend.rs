@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use tracing::{error, info, warn};
 
-use super::bootstrap::{init_ifc_redis_backend, init_presence_redis_backend};
+use super::bootstrap::{
+    init_ifc_redis_backend, init_presence_redis_backend, init_registrant_bindings, instance_id,
+};
 use super::restored_stream_eviction::evict_restored_stream_bindings;
 use crate::config::{Config, RegistrarBackendType};
 use crate::registrar::backend::{self, RegistrarBackend};
@@ -22,7 +24,7 @@ use crate::registrar::backend_status::BackendStatus;
 use crate::registrar::Registrar;
 
 /// How long to wait between attempts to reach a backend that is down.
-const RETRY_INTERVAL: Duration = Duration::from_secs(1);
+pub(super) const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// One failed attempt in this many is logged at `warn`, the rest at `debug`:
 /// the first one was an `error`, and a backend down for an hour is not 3600
@@ -188,6 +190,29 @@ where
     }
 }
 
+/// Connect once, then keep trying every `interval` as the registrar's own
+/// backend does, and hand the connection back. For a connection nothing else
+/// retries for us.
+#[cfg(feature = "redis-backend")]
+pub(super) async fn connect_and_hand_on<C, E, Connect, ConnectFuture>(
+    label: &'static str,
+    interval: Duration,
+    connect: Connect,
+) -> C
+where
+    E: std::fmt::Display,
+    Connect: Fn() -> ConnectFuture,
+    ConnectFuture: std::future::Future<Output = Result<C, E>>,
+{
+    match connect().await {
+        Ok(connected) => connected,
+        Err(error) => {
+            error!(%error, "failed to connect for {label}: retrying every {}s", interval.as_secs());
+            connect_until(label, interval, connect).await
+        }
+    }
+}
+
 /// The IPsec ports a late restore drops protected bindings on, when IPsec is
 /// configured. A boot restore leaves it to `reconcile_ipsec_restart`.
 fn config_ipsec_ports(config: Option<&Config>) -> Option<(Vec<u16>, u16)> {
@@ -234,6 +259,11 @@ async fn attach_redis(
 
     // --- presence subscriptions (the same Redis, its own prefix) ---
     init_presence_redis_backend(redis_cfg).await;
+
+    // --- the registrant's bindings (the same Redis, its own prefix) ---
+    if config.registrant.is_some() {
+        init_registrant_bindings(redis_cfg, instance_id(config)).await;
+    }
 }
 
 /// Restore the registrar from `backend`, install its writer, and mark the
@@ -362,6 +392,28 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&attempts);
         let connected = connect_until("Test", Duration::from_millis(1), move || {
+            let attempt = counted.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt < 3 {
+                    Err("connection refused")
+                } else {
+                    Ok(attempt)
+                }
+            }
+        })
+        .await;
+        assert_eq!(connected, 3);
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    }
+
+    /// The registrant's own Redis connection is retried as the registrar's is,
+    /// not given up on after one failure.
+    #[cfg(feature = "redis-backend")]
+    #[tokio::test]
+    async fn the_registrant_connection_is_retried_until_it_answers() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&attempts);
+        let connected = connect_and_hand_on("Test", Duration::from_millis(1), move || {
             let attempt = counted.fetch_add(1, Ordering::SeqCst);
             async move {
                 if attempt < 3 {

@@ -255,7 +255,10 @@ impl RegistrantManager {
                     .collect()
             })
             .unwrap_or_default();
+        let call_id = entry.call_id.clone();
         drop(entry);
+        // Cleared, or given up on: either way a restart has nothing to clear.
+        self.forget_binding_record(aor, &call_id);
         self.queue_sa_deletions(deletions);
         if status_code == 200 {
             info!(aor = %aor, "de-registered for shutdown");

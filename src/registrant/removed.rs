@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use super::{
-    AuthMode, BuiltRegister, EgressDefaults, RegistrantEntry, RegistrantManager, RegistrantState,
+    AuthMode, BuiltRegister, EgressDefaults, RegistrantCredentials, RegistrantEntry,
+    RegistrantManager, RegistrantState,
 };
 use crate::auth::DigestChallenge;
 use crate::sip::message::SipMessage;
@@ -34,7 +35,7 @@ pub(super) const DRAINING_LIFETIME: Duration = Duration::from_secs(70);
 /// A removed entry's de-REGISTER in flight.
 pub(super) struct DrainingDeregistration {
     /// A copy of what answering a challenge needs.
-    entry: RegistrantEntry,
+    pub(super) entry: RegistrantEntry,
     /// Via branch of the request in flight (its Timer F names it).
     branch: String,
     /// CSeq of the request in flight: an answer carrying another one belongs
@@ -42,7 +43,23 @@ pub(super) struct DrainingDeregistration {
     cseq: u32,
     /// Whether the challenge was answered already.
     challenged: bool,
+    /// The entry holds no credentials (a binding the last process left, found
+    /// at start-up): a challenge is answered from the source's lookup.
+    needs_lookup: bool,
     deadline: Instant,
+}
+
+/// What the lookup of the credentials for a challenged de-REGISTER needs.
+#[derive(Debug, Clone)]
+pub struct CredentialRequest {
+    /// Call-ID of the de-REGISTER the challenge answered.
+    pub call_id: String,
+    pub aor: String,
+    pub registrar_uri: String,
+    /// The challenge to answer once the credentials are in.
+    pub challenge: DigestChallenge,
+    /// `true` for a 407.
+    pub is_proxy_auth: bool,
 }
 
 /// What an answer to a removed entry's REGISTER came to.
@@ -57,6 +74,9 @@ pub enum RemovedAnswer {
     Finished,
     /// The challenge, answered: send this.
     Retry(Box<BuiltRegister>),
+    /// The challenge needs credentials the manager does not hold: look them up
+    /// and hand them to [`RegistrantManager::answer_after_lookup`].
+    Lookup(Box<CredentialRequest>),
 }
 
 /// The CSeq number of `message`.
@@ -152,6 +172,30 @@ impl RegistrantManager {
         built: BuiltRegister,
     ) {
         self.track_removed_deregistration(entry, &built);
+        self.push_pending_deregistration(built);
+    }
+
+    /// Queue the de-REGISTER `built` of a binding the last process left, from
+    /// `copy`, an entry without credentials (see [`super::startup`]).
+    pub(super) fn queue_startup_deregistration(&self, copy: RegistrantEntry, built: BuiltRegister) {
+        if let Some(cseq) = cseq_number(&built.message) {
+            self.draining_deregistrations.insert(
+                copy.call_id.clone(),
+                DrainingDeregistration {
+                    entry: copy,
+                    branch: built.branch.clone(),
+                    cseq,
+                    challenged: false,
+                    needs_lookup: true,
+                    deadline: Instant::now() + DRAINING_LIFETIME,
+                },
+            );
+        }
+        // Held for the checks made just before it goes.
+        self.stage_startup_deregistration(built);
+    }
+
+    pub(super) fn push_pending_deregistration(&self, built: BuiltRegister) {
         match self.pending_deregistrations.lock() {
             Ok(mut pending) => pending.push(built),
             Err(poisoned) => poisoned.into_inner().push(built),
@@ -174,9 +218,67 @@ impl RegistrantManager {
                 branch: built.branch.clone(),
                 cseq,
                 challenged: false,
+                needs_lookup: false,
                 deadline: Instant::now() + DRAINING_LIFETIME,
             },
         );
+    }
+
+    /// Take the de-registrations queued by [`Self::remove`] and the restart
+    /// clean-up, leaving none. A restart's is checked again here, just before it
+    /// would leave: see [`Self::startup_deregistration_superseded`].
+    pub(super) fn take_pending_deregistrations(&self) -> Vec<BuiltRegister> {
+        let taken = match self.pending_deregistrations.lock() {
+            Ok(mut pending) => std::mem::take(&mut *pending),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        taken
+            .into_iter()
+            .filter(|built| {
+                !built
+                    .message
+                    .headers
+                    .get("Call-ID")
+                    .is_some_and(|call_id| self.startup_deregistration_superseded(call_id))
+            })
+            .collect()
+    }
+
+    /// Whether the restart de-REGISTER on `call_id` must not go: a live entry
+    /// now holds the AoR on the same Contact, so an `Expires: 0` on that Contact
+    /// would delete its binding (RFC 3261 §10.3). It is forgotten, record
+    /// included.
+    pub(super) fn startup_deregistration_superseded(&self, call_id: &str) -> bool {
+        let superseded = self
+            .draining_deregistrations
+            .get(call_id)
+            .filter(|draining| draining.needs_lookup)
+            .is_some_and(|draining| {
+                let Some(contact) = draining.entry.contact_uri.as_deref() else {
+                    return false;
+                };
+                self.entries.get(&draining.entry.aor).is_some_and(|live| {
+                    // The same registrar: one moved to another is a binding the
+                    // old registrar still holds.
+                    live.registrar_uri == draining.entry.registrar_uri
+                        && live.transport == draining.entry.transport
+                        && (live.sent_contact.as_deref() == Some(contact)
+                            || self.egress.get().is_some_and(|egress| {
+                                Self::predicted_contact(&live, egress.defaults()) == contact
+                            }))
+                })
+            });
+        if superseded {
+            if let Some((_, draining)) = self.draining_deregistrations.remove(call_id) {
+                info!(
+                    aor = %draining.entry.aor,
+                    registrar = %draining.entry.registrar_uri,
+                    "restart clean-up: a live entry holds the binding now, its de-REGISTER is not sent"
+                );
+                self.forget_binding_record(&draining.entry.aor, call_id);
+            }
+        }
+        superseded
     }
 
     /// How many removed entries' de-REGISTERs are still tracked.
@@ -211,7 +313,31 @@ impl RegistrantManager {
         if (200..300).contains(&status_code) {
             info!(aor = %draining.entry.aor, "removed registrant de-registered");
         } else if matches!(status_code, 401 | 407) && !draining.challenged {
-            if let Some((challenge, is_proxy_auth)) = challenge {
+            if let (true, Some((challenge, is_proxy_auth))) = (draining.needs_lookup, challenge) {
+                let configured = self
+                    .restart
+                    .credential_lookup
+                    .get()
+                    .is_some_and(|lookup| lookup.is_configured());
+                if configured {
+                    draining.challenged = true;
+                    draining.deadline = Instant::now() + DRAINING_LIFETIME;
+                    return RemovedAnswer::Lookup(Box::new(CredentialRequest {
+                        call_id: call_id.to_string(),
+                        aor: draining.entry.aor.clone(),
+                        registrar_uri: draining.entry.registrar_uri.clone(),
+                        challenge: challenge.clone(),
+                        is_proxy_auth,
+                    }));
+                }
+                warn!(
+                    aor = %draining.entry.aor,
+                    registrar = %draining.entry.registrar_uri,
+                    "removed registrant: the registrar challenged the de-REGISTER and no credential lookup is configured, binding left to expire"
+                );
+            } else if let (false, Some((challenge, is_proxy_auth))) =
+                (draining.needs_lookup, challenge)
+            {
                 let built = self.build_register_with_auth_for(
                     &mut draining.entry,
                     defaults,
@@ -242,8 +368,79 @@ impl RegistrantManager {
                 "removed registrant: de-REGISTER not accepted, binding left to expire"
             );
         }
+        let aor = draining.entry.aor.clone();
         drop(draining);
         self.draining_deregistrations.remove(call_id);
+        self.forget_binding_record(&aor, call_id);
+        RemovedAnswer::Finished
+    }
+
+    /// The credentials for `request`'s challenge, looked up: `Ok(Some(..))` a
+    /// row, `Ok(None)` the source does not know the AoR, `Err` it could not be
+    /// asked. Answers the challenge with them, once; without them the binding
+    /// is left to expire (logged with the AoR and registrar) and the
+    /// de-registration ends.
+    pub fn answer_after_lookup(
+        &self,
+        request: &CredentialRequest,
+        credentials: Result<Option<RegistrantCredentials>, String>,
+        defaults: EgressDefaults<'_>,
+    ) -> RemovedAnswer {
+        // The lookup may have taken a while: the trunk may be live on that
+        // Contact by now.
+        if self.startup_deregistration_superseded(&request.call_id) {
+            return RemovedAnswer::Finished;
+        }
+        let Some(mut draining) = self.draining_deregistrations.get_mut(&request.call_id) else {
+            // Ended meanwhile (Timer F, the sweep): nothing to answer.
+            return RemovedAnswer::NotTracked;
+        };
+        let credentials = match credentials {
+            Ok(Some(credentials)) => Some(credentials),
+            Ok(None) => {
+                warn!(
+                    aor = %request.aor,
+                    registrar = %request.registrar_uri,
+                    "removed registrant: the source does not know the AoR, the challenge to its de-REGISTER is not answered, binding left to expire"
+                );
+                None
+            }
+            Err(error) => {
+                warn!(
+                    aor = %request.aor,
+                    registrar = %request.registrar_uri,
+                    %error,
+                    "removed registrant: the credential lookup failed, the challenge to its de-REGISTER is not answered, binding left to expire"
+                );
+                None
+            }
+        };
+        if let Some(credentials) = credentials {
+            draining.entry.credentials = credentials;
+            let built = self.build_register_with_auth_for(
+                &mut draining.entry,
+                defaults,
+                &request.challenge,
+                request.is_proxy_auth,
+                0,
+            );
+            if let Some(built) = built {
+                if let Some(cseq) = cseq_number(&built.message) {
+                    draining.cseq = cseq;
+                    draining.branch = built.branch.clone();
+                    draining.deadline = Instant::now() + DRAINING_LIFETIME;
+                    return RemovedAnswer::Retry(Box::new(built));
+                }
+            }
+            warn!(
+                aor = %request.aor,
+                registrar = %request.registrar_uri,
+                "removed registrant: cannot answer the challenge with the looked-up credentials, binding left to expire"
+            );
+        }
+        drop(draining);
+        self.draining_deregistrations.remove(&request.call_id);
+        self.forget_binding_record(&request.aor, &request.call_id);
         RemovedAnswer::Finished
     }
 
@@ -264,13 +461,23 @@ impl RegistrantManager {
                 registrar = %draining.entry.registrar_uri,
                 "removed registrant: de-REGISTER {why}, binding left to expire"
             );
+            self.forget_binding_record(&draining.entry.aor, &call_id);
         }
         true
     }
 
     /// Drop the tracked de-REGISTERs past [`DRAINING_LIFETIME`].
     pub fn expire_removed_deregistrations(&self, now: Instant) {
-        self.draining_deregistrations
-            .retain(|_, draining| draining.deadline > now);
+        let expired: Vec<(String, String)> = self
+            .draining_deregistrations
+            .iter()
+            .filter(|draining| draining.deadline <= now)
+            .map(|draining| (draining.key().clone(), draining.entry.aor.clone()))
+            .collect();
+        for (call_id, aor) in expired {
+            if self.draining_deregistrations.remove(&call_id).is_some() {
+                self.forget_binding_record(&aor, &call_id);
+            }
+        }
     }
 }

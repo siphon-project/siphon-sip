@@ -25,12 +25,14 @@ pub mod ipsec_offer;
 mod lifecycle;
 pub mod messages;
 pub mod pacing;
+pub mod persist;
 pub mod protected;
 mod protected_tcp;
 mod refresh;
 pub mod register_extras;
 mod removed;
 pub mod source;
+pub mod startup;
 mod status;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -48,7 +50,7 @@ pub use refresh::{
     await_deregistrations, deregister_all, registration_loop, retire_ue_security_associations,
     RegistrationLoopContext, SHUTDOWN_ANSWER_WAIT,
 };
-pub use removed::{cseq_number, RemovedAnswer};
+pub use removed::{cseq_number, CredentialRequest, RemovedAnswer};
 pub use status::RegistrantStatus;
 
 use std::collections::{HashMap, HashSet};
@@ -499,6 +501,7 @@ pub struct RegistrantEntry {
     pub next_attempt: Instant,
     /// Current backoff duration for retries after failure.
     pub backoff: Duration,
+    pub sent_contact: Option<String>, // the Contact of the last REGISTER, for [`persist`]
     /// Per-entry CSeq counter.
     pub cseq: AtomicU32,
     /// Nonce counter for digest auth.
@@ -601,6 +604,7 @@ impl RegistrantEntry {
             register_unanswered: false,
             next_attempt: Instant::now(),
             backoff: Duration::from_secs(5),
+            sent_contact: None,
             cseq: AtomicU32::new(1),
             nonce_counter: NonceCounter::new(),
             call_id: format!("reg-{}", uuid::Uuid::new_v4()),
@@ -779,6 +783,7 @@ pub struct RegistrantManager {
     /// The client transaction layer every REGISTER is sent under, attached by
     /// the dispatcher (see [`lifecycle`]).
     transactions: std::sync::OnceLock<Arc<dyn RegisterTransactions>>,
+    restart: startup::RestartState, // clearing a killed process's bindings (see [`startup`])
 }
 
 /// Everything [`registration_loop`] needs to put a REGISTER on the wire.
@@ -830,6 +835,7 @@ impl RegistrantManager {
             max_registers_per_sec: None,
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             transactions: std::sync::OnceLock::new(),
+            restart: startup::RestartState::default(),
         }
     }
 
@@ -868,14 +874,6 @@ impl RegistrantManager {
     /// Record how REGISTERs egress. Called once by [`registration_loop`].
     fn set_egress(&self, egress: RegistrantEgress) {
         let _ = self.egress.set(egress);
-    }
-
-    /// Take the de-registrations queued by [`Self::remove`], leaving none.
-    fn take_pending_deregistrations(&self) -> Vec<BuiltRegister> {
-        match self.pending_deregistrations.lock() {
-            Ok(mut pending) => std::mem::take(&mut *pending),
-            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-        }
     }
 
     /// Base for UE IPsec SPI allocation, well clear of the RFC 4303 §2.1
@@ -972,6 +970,7 @@ impl RegistrantManager {
             if let Some(message) = deregistration {
                 self.queue_removed_deregistration(entry, message);
             }
+            self.forget_untracked_binding_record(entry);
             self.emit_event(RegistrantEvent::Deregistered {
                 aor: aor.to_string(),
             });
@@ -1225,6 +1224,7 @@ impl RegistrantManager {
             // During shutdown a binding the registrar just granted is cleared
             // straight away (see `lifecycle`); nothing acts on it meanwhile.
             let shutting_down = entry.deregistration != Deregistration::NotStarted;
+            self.persist_granted(&entry, u64::from(granted_expires));
             drop(entry);
             if shutting_down {
                 return;

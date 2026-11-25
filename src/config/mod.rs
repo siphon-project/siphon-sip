@@ -1144,7 +1144,7 @@ impl Config {
                             .to_string(),
                     ));
                 }
-                Ok(())
+                database.check_lookup().map_err(SiphonError::Config)
             }
             RegistrantBackendType::Http => {
                 let Some(http) = &registrant.http else {
@@ -1163,7 +1163,7 @@ impl Config {
                             .to_string(),
                     ));
                 }
-                Ok(())
+                http.check_lookup().map_err(SiphonError::Config)
             }
         }
     }

@@ -169,6 +169,7 @@ impl RegistrantManager {
         let contact = entry.contact_uri.clone().unwrap_or_else(|| {
             default_contact_uri(&entry.credentials.username, effective_addr, entry.transport)
         });
+        entry.sent_contact = Some(contact.clone());
 
         let via = format!(
             "SIP/2.0/{} {};branch={};rport",
@@ -309,6 +310,7 @@ impl RegistrantManager {
         let contact = entry.contact_uri.clone().unwrap_or_else(|| {
             default_contact_uri(&entry.credentials.username, effective_addr, entry.transport)
         });
+        entry.sent_contact = Some(contact.clone());
 
         let via = format!(
             "SIP/2.0/{} {};branch={};rport",

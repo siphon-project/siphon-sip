@@ -304,6 +304,62 @@ pub fn entry_from_desired(
 // Sources
 // ---------------------------------------------------------------------------
 
+/// What a challenge to a restart's de-REGISTER is answered from: the source,
+/// asked for one trunk by AoR.
+///
+/// Nothing persists a credential (see [`super::persist`]), so the binding a
+/// killed process left behind can be cleared against a registrar that
+/// challenges every REGISTER only by asking the source again. The row it
+/// returns need not be listed for this node or enabled: the trunk may have
+/// moved to another node or been switched off, which is why its binding is
+/// being cleared.
+pub trait CredentialLookup: Send + Sync {
+    /// Whether the source has a lookup configured.
+    fn is_configured(&self) -> bool;
+
+    /// The row of `aor`: `Ok(None)` when the source does not know it, `Err`
+    /// when it could not be asked.
+    fn lookup<'a>(
+        &'a self,
+        aor: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<RegistrantRow>, String>> + Send + 'a>,
+    >;
+}
+
+/// The credentials a looked-up `row` registers with. Unlike
+/// [`DesiredRegistrant::from_row`] a disabled row is fine: it only has to
+/// answer a challenge.
+pub fn credentials_from_row(row: &RegistrantRow) -> Result<super::RegistrantCredentials, String> {
+    if row.username.trim().is_empty() {
+        return Err("`username` is empty".to_string());
+    }
+    let secret = StoredSecret::from_config(
+        row.password.as_deref(),
+        row.ha1.as_deref(),
+        &row.ha1_algorithm,
+    )?;
+    Ok(super::RegistrantCredentials {
+        username: row.username.clone(),
+        secret,
+        realm: row.realm.clone(),
+    })
+}
+
+/// `aor` as a URL query component: everything but the unreserved characters
+/// of RFC 3986 §2.3 is percent-encoded.
+pub(crate) fn encode_query_component(aor: &str) -> String {
+    let mut encoded = String::with_capacity(aor.len());
+    for byte in aor.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 /// The configured source of registering trunks.
 ///
 /// An enum rather than a trait object: an async method behind `dyn` needs a
@@ -328,6 +384,22 @@ impl RegistrantSource {
         }
     }
 
+    /// Whether a lookup by AoR is configured.
+    pub fn lookup_configured(&self) -> bool {
+        match self {
+            RegistrantSource::Database(source) => source.config.lookup_query.is_some(),
+            RegistrantSource::Http(source) => source.config.lookup_url.is_some(),
+        }
+    }
+
+    /// The row of `aor` (see [`CredentialLookup::lookup`]).
+    pub async fn lookup_row(&self, aor: &str) -> Result<Option<RegistrantRow>, String> {
+        match self {
+            RegistrantSource::Database(source) => source.lookup(aor).await,
+            RegistrantSource::Http(source) => source.lookup(aor).await,
+        }
+    }
+
     /// How often to re-read and reconcile.
     pub fn refresh_interval(&self) -> std::time::Duration {
         let seconds = match self {
@@ -335,6 +407,21 @@ impl RegistrantSource {
             RegistrantSource::Http(source) => source.config.refresh_secs,
         };
         std::time::Duration::from_secs(seconds.max(1))
+    }
+}
+
+impl CredentialLookup for RegistrantSource {
+    fn is_configured(&self) -> bool {
+        self.lookup_configured()
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        aor: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<RegistrantRow>, String>> + Send + 'a>,
+    > {
+        Box::pin(self.lookup_row(aor))
     }
 }
 
@@ -352,6 +439,36 @@ impl HttpSource {
             .build()
             .map_err(|error| format!("cannot build the HTTP client: {error}"))?;
         Ok(Self { config, client })
+    }
+
+    /// `GET lookup_url` with `{aor}` replaced: one row as a list element is.
+    /// `404` is "unknown"; any other non-2xx, a timeout or an unreadable body
+    /// is an error.
+    async fn lookup(&self, aor: &str) -> Result<Option<RegistrantRow>, String> {
+        let Some(template) = self.config.lookup_url.as_deref() else {
+            return Err("no `registrant.http.lookup_url` is configured".to_string());
+        };
+        let url = template.replace("{aor}", &encode_query_component(aor));
+        let mut request = self.client.get(&url);
+        if let Some(ref header) = self.config.auth_header {
+            request = request.header(reqwest::header::AUTHORIZATION, header);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| format!("GET {template} failed: {error}"))?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(format!("GET {template} answered {status}"));
+        }
+        response
+            .json::<RegistrantRow>()
+            .await
+            .map(Some)
+            .map_err(|error| format!("GET {template} returned an invalid trunk: {error}"))
     }
 
     async fn fetch(&self) -> Result<Vec<RegistrantRow>, String> {
@@ -432,6 +549,34 @@ mod postgres {
                     self.drop_client().await;
                     Err(format!(
                         "the trunk query did not answer within {}ms",
+                        self.config.timeout_ms
+                    ))
+                }
+            }
+        }
+
+        /// Run `lookup_query` with `$1` = `aor`: its first row, `None` for no row.
+        pub(super) async fn lookup(&self, aor: &str) -> Result<Option<RegistrantRow>, String> {
+            let Some(statement) = self.config.lookup_query.as_deref() else {
+                return Err("no `registrant.database.lookup_query` is configured".to_string());
+            };
+            let timeout = Duration::from_millis(self.config.timeout_ms);
+            let run = async {
+                let client = self.client().await?;
+                match client.query(statement, &[&aor]).await {
+                    Ok(rows) => Ok(rows.first().map(row_from_sql)),
+                    Err(error) => {
+                        self.drop_client().await;
+                        Err(format!("the trunk lookup failed: {error}"))
+                    }
+                }
+            };
+            match tokio::time::timeout(timeout, run).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    self.drop_client().await;
+                    Err(format!(
+                        "the trunk lookup did not answer within {}ms",
                         self.config.timeout_ms
                     ))
                 }
@@ -574,12 +719,15 @@ pub async fn reconcile_once(
 
     let mut desired = Vec::with_capacity(rows.len());
     let mut report = ReconcileReport::default();
+    let mut unusable = std::collections::HashSet::new();
     for row in &rows {
         match DesiredRegistrant::from_row(row) {
             Ok(Some(entry)) => desired.push(entry),
             // Disabled: not wanted, and not an error.
             Ok(None) => {}
             Err(error) => {
+                // Still listed, so a binding of it is not cleared at restart.
+                unusable.insert(row.aor.trim().to_string());
                 report.rejected += 1;
                 warn!(aor = %row.aor, %error, "registrant source: skipping an unusable row");
             }
@@ -605,6 +753,7 @@ pub async fn reconcile_once(
     let live = manager.source_fingerprints();
     let actions = reconcile(&desired, &live);
     if actions.is_empty() {
+        manager.set_source_unusable(unusable);
         return Ok(report);
     }
 
@@ -612,6 +761,7 @@ pub async fn reconcile_once(
     for action in actions {
         match action {
             ReconcileAction::Add(entry) => {
+                let aor = entry.aor.clone();
                 match build_entry_off_thread(entry, default_interval).await {
                     Ok(built) => {
                         manager.add(built);
@@ -619,11 +769,13 @@ pub async fn reconcile_once(
                     }
                     Err(error) => {
                         report.rejected += 1;
+                        unusable.insert(aor);
                         warn!(%error, "registrant source: cannot add a trunk");
                     }
                 }
             }
             ReconcileAction::Update(entry) => {
+                let aor = entry.aor.clone();
                 match build_entry_off_thread(entry, default_interval).await {
                     Ok(built) => {
                         if manager.update_from_source(built) {
@@ -632,6 +784,7 @@ pub async fn reconcile_once(
                     }
                     Err(error) => {
                         report.rejected += 1;
+                        unusable.insert(aor);
                         warn!(%error, "registrant source: cannot update a trunk");
                     }
                 }
@@ -646,17 +799,36 @@ pub async fn reconcile_once(
         }
     }
 
+    // Swapped in whole, once every entry has been tried: the earlier set protects
+    // a row whose entry could not be built until this one says the same.
+    manager.set_source_unusable(unusable);
     Ok(report)
 }
+
+#[cfg(test)]
+pub(crate) type BuildHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+/// A test's view into the middle of a reconcile pass, called with the AoR of
+/// each entry about to be built.
+#[cfg(test)]
+pub(crate) static BUILD_HOOK: std::sync::Mutex<Option<BuildHook>> = std::sync::Mutex::new(None);
 
 /// [`entry_from_desired`] off the runtime: it resolves DNS, which blocks.
 async fn build_entry_off_thread(
     desired: DesiredRegistrant,
     default_interval: u32,
 ) -> Result<super::RegistrantEntry, String> {
-    tokio::task::spawn_blocking(move || entry_from_desired(&desired, default_interval))
-        .await
-        .map_err(|error| format!("the entry builder panicked: {error}"))?
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Ok(hook) = BUILD_HOOK.lock() {
+            if let Some(hook) = hook.clone() {
+                hook(&desired.aor);
+            }
+        }
+        entry_from_desired(&desired, default_interval)
+    })
+    .await
+    .map_err(|error| format!("the entry builder panicked: {error}"))?
 }
 
 /// The configured source, so an out-of-band refresh can reach it.
@@ -697,6 +869,8 @@ pub async fn reconcile_loop(
             Ok(report) => {
                 health.record_success();
                 backoff.reset();
+                // From here "not listed" is a fact, not an outage (see `startup`).
+                manager.mark_source_loaded();
                 if report.added + report.updated + report.removed + report.rejected > 0 {
                     info!(
                         added = report.added,
@@ -747,6 +921,10 @@ pub struct DatabaseSource {
 impl DatabaseSource {
     pub fn new(config: crate::config::RegistrantDatabaseConfig, _instance_id: String) -> Self {
         Self { config }
+    }
+
+    pub(super) async fn lookup(&self, _aor: &str) -> Result<Option<RegistrantRow>, String> {
+        Err("registrant.backend: database needs the postgres-backend feature".to_string())
     }
 
     pub(super) async fn fetch(&self) -> Result<Vec<RegistrantRow>, String> {
@@ -1012,3 +1190,7 @@ mod tests {
         assert!(!json.contains("null"), "{json}");
     }
 }
+
+#[cfg(test)]
+#[path = "source_lookup_tests.rs"]
+mod lookup_tests;

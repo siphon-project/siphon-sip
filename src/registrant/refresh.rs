@@ -96,6 +96,8 @@ pub async fn registration_loop(manager: Arc<RegistrantManager>, context: Registr
 
     loop {
         tokio::time::sleep(tick_interval).await;
+        // A restart's de-REGISTER is checked once more right before it can go.
+        manager.release_startup_deregistrations().await;
         run_tick(&manager, &context, egress, limiter.as_mut());
     }
 }
@@ -588,13 +590,20 @@ pub async fn await_deregistrations(
     manager: &RegistrantManager,
     deadline: tokio::time::Instant,
 ) -> bool {
+    let mut ended = true;
     while manager.deregistrations_pending() {
         if tokio::time::Instant::now() >= deadline {
-            return false;
+            ended = false;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    true
+    // The records of the bindings just cleared go before the process does, or
+    // the next start would clear them again.
+    if let Some(store) = manager.restart.bindings.get() {
+        store.flush(Duration::from_secs(2)).await;
+    }
+    ended
 }
 
 /// The most shutdown spends deleting the SA sets left after that wait.

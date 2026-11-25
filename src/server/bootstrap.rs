@@ -127,7 +127,11 @@ fn init_registrant_source(
     use crate::registrant::source::{DatabaseSource, HttpSource, RegistrantSource};
 
     let source = match registrant_config.backend {
-        RegistrantBackendType::Static => return,
+        // No source to wait for: what is configured is all there is.
+        RegistrantBackendType::Static => {
+            manager.mark_source_loaded();
+            return;
+        }
         RegistrantBackendType::Database => {
             // Config load refuses `database` without the block, so this is
             // unreachable; log rather than panic if it ever is not.
@@ -154,6 +158,9 @@ fn init_registrant_source(
 
     let source = Arc::new(source);
     crate::registrant::source::set_source(Arc::clone(&source));
+    manager.set_credential_lookup(
+        Arc::clone(&source) as Arc<dyn crate::registrant::source::CredentialLookup>
+    );
     let loop_manager = Arc::clone(manager);
     tokio::spawn(async move {
         crate::registrant::source::reconcile_loop(loop_manager, source).await;
@@ -306,6 +313,44 @@ pub(super) async fn init_presence_redis_backend(redis: &crate::config::RedisBack
     if let Some(shared) = shared {
         store.set_shared(shared);
     }
+}
+
+/// Keep the registrant's granted bindings in the registrar's Redis, so a
+/// restart can de-register what a killed process left (own key prefix, no
+/// credential in any record). The registrant picks the store up when it is
+/// ready for it.
+#[cfg(feature = "redis-backend")]
+pub(super) async fn init_registrant_bindings(
+    redis: &crate::config::RedisBackendConfig,
+    instance_id: String,
+) {
+    let target = redis.target.clone();
+    let key_prefix = redis.registrant_key_prefix.clone();
+    let ttl_slack_secs = u64::from(redis.ttl_slack_secs);
+    // Its own connection, retried until it answers as the registrar's is: a
+    // Redis in a maintenance window at boot must not mean no clean-up ever.
+    tokio::spawn(async move {
+        let connection = super::registrar_backend::connect_and_hand_on(
+            "the registrant's bindings",
+            super::registrar_backend::RETRY_INTERVAL,
+            || crate::redis_target::RedisConnection::connect(target.clone()),
+        )
+        .await;
+        crate::registrant::persist::publish_store(crate::registrant::persist::BindingStore::redis(
+            connection,
+            instance_id,
+            key_prefix,
+            ttl_slack_secs,
+        ));
+    });
+}
+
+/// Stand-in when the `redis-backend` feature is off: the bindings are not kept.
+#[cfg(not(feature = "redis-backend"))]
+pub(super) async fn init_registrant_bindings(
+    _redis: &crate::config::RedisBackendConfig,
+    _instance_id: String,
+) {
 }
 
 /// Stand-in when the `redis-backend` feature is off.
@@ -991,6 +1036,14 @@ pub(super) fn init_registrant(
     );
 
     init_registrant_source(manager, config, registrant_config);
+
+    // With the registrar on Redis, the bindings this process holds are kept
+    // there, and a restart clears the ones it left (see `registrant::startup`).
+    if config.registrar.backend == crate::config::RegistrarBackendType::Redis {
+        tokio::spawn(crate::registrant::startup::run_startup_cleanup(Arc::clone(
+            manager,
+        )));
+    }
 
     // Spawn background registration loop
     let loop_manager = Arc::clone(manager);

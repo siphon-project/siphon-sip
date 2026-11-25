@@ -26,6 +26,15 @@ entry, but a working config keeps working.
   to `ringing` on a provisional and `answered` on the callee's 200.
 - Docs: `@b2bua.on_info` and `b2bua.send_info` reference, and an Info-Package
   (RFC 6086) cookbook recipe.
+- `registrant.http.lookup_url` (a template with `{aor}`, percent-encoded as a
+  query component, same `Authorization` as the list; one trunk row as answer,
+  `enabled: false` still answered, `404` = unknown) and
+  `registrant.database.lookup_query` (`$1` = AoR): the credential for the
+  challenge to a restart's de-REGISTER, read once by AoR since none is stored.
+  No lookup, an unknown AoR or a failing source leaves the binding to expire,
+  logged with the AoR and registrar. `registrar.redis.registrant_key_prefix`
+  (default `siphon:registrant:`) names where the bindings are kept. SDK:
+  `siphon_sdk.registrants.lookup_response`.
 
 ### Fixed
 
@@ -35,6 +44,18 @@ entry, but a working config keeps working.
   `answer`) no longer logs `B2BUA: no winning B-leg for BYE` at WARN. Such a
   call has no B-leg and the 200 is all the BYE is owed, so it is logged at
   debug. A call with B-legs none of which won still warns.
+- A node killed without a graceful shutdown no longer leaves its trunk bindings
+  on the registrar. A trunk whose lease moved to another node meanwhile stayed
+  registered from the dead node, as a second contact, until the old binding
+  expired (up to one interval). With `registrar.backend: redis` each granted
+  binding is now recorded (AoR, registrar, Contact, Call-ID, next CSeq, no
+  credential) under `registrar.redis.registrant_key_prefix`, expiring with the
+  grant. After a restart, once the source has been read, every recorded binding
+  no live entry owns gets an `Expires: 0` REGISTER on its Contact and Call-ID
+  with a higher CSeq (RFC 3261 §10.2.2, §10.2.4), and a live entry on the same
+  contact takes the binding over instead. At most 3 start-ups try one binding.
+  A challenge to that de-REGISTER is answered from the new source lookup below
+  (closes #954).
 - `call.state` in the hooks that run on an existing call (`@b2bua.on_info`,
   `@b2bua.on_reoffer`, `@b2bua.on_reoffer_answered`) is the call's own
   (`calling`, `ringing`, `answered`, `terminated`). It was always `calling`, so

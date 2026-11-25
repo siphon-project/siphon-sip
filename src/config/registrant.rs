@@ -118,6 +118,14 @@ pub struct RegistrantDatabaseConfig {
     /// Per-query deadline in milliseconds, connection included.
     #[serde(default = "default_registrant_source_timeout_ms")]
     pub timeout_ms: u64,
+    /// Statement returning the one row of the trunk whose AoR is `$1`, in the
+    /// same columns as `query`, whether or not the trunk is listed for this
+    /// node or enabled. Optional. Used when a registrar challenges the
+    /// de-REGISTER that clears a binding a killed process left behind: nothing
+    /// persists a credential, so the credential is read from here, once, by
+    /// AoR. No row, an error, or no statement leaves the challenge unanswered
+    /// and the binding to expire.
+    pub lookup_query: Option<String>,
 }
 
 /// JSON source for `registrant.backend: http`.
@@ -142,6 +150,44 @@ pub struct RegistrantHttpConfig {
     /// Full `Authorization` header value sent with each request (e.g.
     /// `"Bearer …"`). Supports `${VAR}` expansion.
     pub auth_header: Option<String>,
+    /// URL siphon `GET`s the one trunk of an AoR from, with `{aor}` replaced by
+    /// the AoR, percent-encoded as a URL query component. Optional. It answers
+    /// with one trunk row as a `url` list element is (same JSON, same
+    /// `Authorization` header), whether or not the trunk is listed for this
+    /// node or enabled; `404` means the AoR is unknown. Used when a registrar
+    /// challenges the de-REGISTER that clears a binding a killed process left
+    /// behind: nothing persists a credential, so it is read from here, once,
+    /// by AoR. Any other failure, or none configured, leaves the challenge
+    /// unanswered and the binding to expire.
+    pub lookup_url: Option<String>,
+}
+
+impl RegistrantDatabaseConfig {
+    /// The lookup statement must be able to select a trunk.
+    pub fn check_lookup(&self) -> Result<(), String> {
+        match self.lookup_query.as_deref() {
+            Some(query) if !query.contains("$1") => Err(
+                "registrant.database.lookup_query must reference `$1`, the AoR of the trunk to \
+                 look up. Without it the statement cannot select a trunk."
+                    .to_string(),
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl RegistrantHttpConfig {
+    /// The lookup URL must be able to name a trunk.
+    pub fn check_lookup(&self) -> Result<(), String> {
+        match self.lookup_url.as_deref() {
+            Some(url) if !url.contains("{aor}") => Err(
+                "registrant.http.lookup_url must contain `{aor}`, replaced by the AoR of the \
+                 trunk to look up. Without it every lookup would ask for the same trunk."
+                    .to_string(),
+            ),
+            _ => Ok(()),
+        }
+    }
 }
 
 fn default_registrant_backend() -> RegistrantBackendType {

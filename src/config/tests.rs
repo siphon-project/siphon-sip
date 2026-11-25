@@ -6916,3 +6916,118 @@ fn accepts_srs_app_naming_a_control_app() {
         Some("recorder")
     );
 }
+/// The registrant's persisted bindings ride the registrar's Redis under a
+/// prefix of their own, defaulted apart from the registrar's keyspace.
+#[test]
+fn registrar_redis_registrant_key_prefix_defaults_and_overrides() {
+    let config = Config::from_str(&backend_yaml(
+        "registrar:\n  backend: redis\n  redis:\n    url: \"redis://127.0.0.1:6379\"\n",
+    ))
+    .expect("config");
+    let redis = config.registrar.redis.expect("redis");
+    assert_eq!(redis.registrant_key_prefix, "siphon:registrant:");
+    assert!(!redis.registrant_key_prefix.starts_with(&redis.key_prefix));
+
+    let config = Config::from_str(&backend_yaml(
+        "registrar:\n  backend: redis\n  redis:\n    url: \"redis://127.0.0.1:6379\"\n    \
+         registrant_key_prefix: \"edge-a:registrant:\"\n",
+    ))
+    .expect("config");
+    assert_eq!(
+        config.registrar.redis.expect("redis").registrant_key_prefix,
+        "edge-a:registrant:"
+    );
+}
+
+/// The registrar builds its index by scanning `{key_prefix}*`: a registrant
+/// prefix under it (or one it sits under) would be read as bindings.
+#[test]
+fn registrar_redis_registrant_key_prefix_may_not_overlap_the_registrars() {
+    for prefix in ["siphon:reg:registrant:", "siphon:", ""] {
+        let result = Config::from_str(&backend_yaml(&format!(
+            "registrar:\n  backend: redis\n  redis:\n    url: \"redis://127.0.0.1:6379\"\n    \
+             registrant_key_prefix: \"{prefix}\"\n"
+        )));
+        assert!(result.is_err(), "{prefix:?} was accepted");
+    }
+}
+
+fn http_registrant_yaml(extra: &str) -> String {
+    backend_yaml(&format!(
+        "registrant:\n  backend: http\n  http:\n    url: \"https://controller.example/trunks\"\n{extra}"
+    ))
+}
+
+#[test]
+fn registrant_http_lookup_url_is_optional_and_read() {
+    let config = Config::from_str(&http_registrant_yaml("")).expect("config");
+    assert!(config
+        .registrant
+        .expect("registrant")
+        .http
+        .expect("http")
+        .lookup_url
+        .is_none());
+
+    let config = Config::from_str(&http_registrant_yaml(
+        "    lookup_url: \"https://controller.example/trunks?aor={aor}\"\n",
+    ))
+    .expect("config");
+    assert_eq!(
+        config
+            .registrant
+            .expect("registrant")
+            .http
+            .expect("http")
+            .lookup_url
+            .as_deref(),
+        Some("https://controller.example/trunks?aor={aor}")
+    );
+}
+
+#[test]
+fn registrant_http_lookup_url_without_the_aor_placeholder_is_refused() {
+    let error = Config::from_str(&http_registrant_yaml(
+        "    lookup_url: \"https://controller.example/trunk\"\n",
+    ))
+    .expect_err("a lookup that cannot name the trunk");
+    assert!(error.to_string().contains("{aor}"), "{error}");
+}
+
+#[test]
+fn registrant_database_lookup_query_is_optional_and_needs_its_parameter() {
+    let database = |extra: &str| {
+        backend_yaml(&format!(
+            "registrant:\n  backend: database\n  database:\n    url: \"postgresql://siphon@db.example/siphon\"\n{extra}"
+        ))
+    };
+    if !cfg!(feature = "postgres-backend") {
+        return;
+    }
+    let config = Config::from_str(&database("")).expect("config");
+    assert!(config
+        .registrant
+        .expect("registrant")
+        .database
+        .expect("database")
+        .lookup_query
+        .is_none());
+
+    let config = Config::from_str(&database(
+        "    lookup_query: \"SELECT aor, registrar, username, password FROM trunks WHERE aor = $1\"\n",
+    ))
+    .expect("config");
+    assert!(config
+        .registrant
+        .expect("registrant")
+        .database
+        .expect("database")
+        .lookup_query
+        .is_some());
+
+    let error = Config::from_str(&database(
+        "    lookup_query: \"SELECT aor, registrar, username FROM trunks\"\n",
+    ))
+    .expect_err("a lookup that cannot select a trunk");
+    assert!(error.to_string().contains("$1"), "{error}");
+}

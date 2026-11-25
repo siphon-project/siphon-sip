@@ -61,7 +61,7 @@ nodes and **(b)** whether it survives a process restart.
 | **Presence subscriptions** (`presence.subscribe_dialog`) | in-memory + Redis when the registrar is on Redis | Snapshot at boot | Yes, with the Redis registrar backend |
 | **Presence documents** (PIDF) | local in-memory | No | No |
 | **Gateway health** | local atomics, per-node probing | No (each node probes independently) | No (resets to healthy) |
-| **Outbound registrations** (`registrant`) | local in-memory | No | No |
+| **Outbound registrations** (`registrant`) | local in-memory; with the Redis registrar backend each granted binding is also recorded (no credential) so a restart de-registers what a killed process left | No | No |
 
 Two clean categories fall out of that table:
 
