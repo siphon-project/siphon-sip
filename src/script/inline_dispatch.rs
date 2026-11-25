@@ -89,6 +89,22 @@ fn coroutine_cannot_suspend(python: Python<'_>, coroutine: &Bound<'_, PyAny>) ->
 
 /// `Ok(true)` when neither `code` nor any code object nested in it yields.
 fn analyse_code_for_suspension(python: Python<'_>, code: &Bound<'_, PyAny>) -> PyResult<bool> {
+    // A handler that starts a task (`asyncio.create_task`, `ensure_future`) or
+    // asks for the loop needs a running event loop, which the inline path does
+    // not have: `create_task` would raise `RuntimeError: no running event loop`
+    // and the handler's reply would be lost. It need not contain an `await` to
+    // need one (reply, then start the follow-up work, is the usual shape), so
+    // the names count as suspending too. A false negative only costs the
+    // driver path.
+    for name in code.getattr("co_names")?.try_iter()? {
+        let name: String = name?.extract()?;
+        if matches!(
+            name.as_str(),
+            "create_task" | "ensure_future" | "get_running_loop" | "get_event_loop"
+        ) {
+            return Ok(false);
+        }
+    }
     let dis = python.import("dis")?;
     let instructions = dis.call_method1("get_instructions", (code,))?;
     for instruction in instructions.try_iter()? {
@@ -567,6 +583,16 @@ mod tests {
         (
             "await inside a comprehension",
             "import asyncio\nasync def one():\n    await asyncio.sleep(0)\n    return 1\nasync def handler():\n    return [await one() for _ in range(1)]\n",
+        ),
+        // No `await` at all, but `create_task` needs the running loop the
+        // inline path does not have (reply, then start follow-up work).
+        (
+            "create_task without an await",
+            "import asyncio\nasync def work():\n    pass\nasync def handler():\n    asyncio.create_task(work())\n",
+        ),
+        (
+            "ensure_future without an await",
+            "import asyncio\nasync def work():\n    pass\nasync def handler():\n    asyncio.ensure_future(work())\n",
         ),
         (
             "await inside a nested async def",
