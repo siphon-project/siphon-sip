@@ -16,6 +16,16 @@ entry, but a working config keeps working.
 ### Added
 
 - `lawful_intercept.x2.network_function_id`: the Network Function ID (TS 103 221-2 clause 5.3.7, attribute 6) that every X2 PDU carries. It defaults to `lawful_intercept.x1.ne_identifier`, and with neither set PDUs carry no NFID. It must equal the media engine's `x3_network_function_id` so a mediation function files the signalling and the content of one call under one network element. A value that is empty, over 255 octets or holds a control character is refused at config load.
+- `@b2bua.on_info` handlers may declare a `leg` keyword: `"caller"` for an INFO
+  from the A-leg party, `"callee"` from the B-leg party (the names
+  `b2bua.send_info(leg=)` takes). It is passed only to a handler that declares
+  it, so `(call, request)` handlers are unchanged, and it holds under
+  `call.keep_call_id()`.
+- SDK: `SipTestHarness.send_info()` delivers an INFO to `@b2bua.on_info`
+  handlers and returns the answer (`InfoResult`); the mock's `call.state` moves
+  to `ringing` on a provisional and `answered` on the callee's 200.
+- Docs: `@b2bua.on_info` and `b2bua.send_info` reference, and an Info-Package
+  (RFC 6086) cookbook recipe.
 
 ### Fixed
 
@@ -35,19 +45,6 @@ entry, but a working config keeps working.
   reply was lost and the INFO relayed. Handlers naming `create_task`,
   `ensure_future`, `get_running_loop` or `get_event_loop` now run on the async
   driver.
-
-### Added
-
-- `@b2bua.on_info` handlers may declare a `leg` keyword: `"caller"` for an INFO
-  from the A-leg party, `"callee"` from the B-leg party (the names
-  `b2bua.send_info(leg=)` takes). It is passed only to a handler that declares
-  it, so `(call, request)` handlers are unchanged, and it holds under
-  `call.keep_call_id()`.
-- SDK: `SipTestHarness.send_info()` delivers an INFO to `@b2bua.on_info`
-  handlers and returns the answer (`InfoResult`); the mock's `call.state` moves
-  to `ringing` on a provisional and `answered` on the callee's 200.
-- Docs: `@b2bua.on_info` and `b2bua.send_info` reference, and an Info-Package
-  (RFC 6086) cookbook recipe.
 
 ## [1.17.1] — 2026-11-23
 
