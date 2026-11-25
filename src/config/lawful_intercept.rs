@@ -49,6 +49,17 @@ pub struct LawfulInterceptConfig {
     pub siprec: Option<LiSiprecConfig>,
 }
 
+impl LawfulInterceptConfig {
+    /// The NFID X2 PDUs carry: `x2.network_function_id`, else
+    /// `x1.ne_identifier`, else none.
+    pub fn x2_network_function_id(&self) -> Option<&str> {
+        self.x2
+            .as_ref()
+            .and_then(|x2| x2.network_function_id.as_deref())
+            .or_else(|| self.x1.as_ref().map(|x1| x1.ne_identifier.as_str()))
+    }
+}
+
 /// X1 admin interface — separate HTTPS listener with mTLS.
 #[derive(Debug, Deserialize, Clone)]
 pub struct LiX1Config {
@@ -185,6 +196,17 @@ pub struct LiX2Config {
     pub channel_size: usize,
     /// TLS settings for X2 delivery (when transport = "tls").
     pub tls: Option<LiTlsConfig>,
+    /// The Network Function ID (TS 103 221-2 clause 5.3.7, attribute 6) every
+    /// X2 PDU carries. Absent: `lawful_intercept.x1.ne_identifier`; with
+    /// neither set, PDUs carry no NFID.
+    ///
+    /// It must be the same string as the media engine's
+    /// `x3_network_function_id`, so a mediation function files the signalling
+    /// and the content of one call under one network element. 1 to 255 octets
+    /// of UTF-8, no control characters; checked at load. The bound is
+    /// siphon's own: clause 5.3.7 leaves the format to the architecture.
+    #[serde(default)]
+    pub network_function_id: Option<String>,
 }
 
 /// X3 content delivery.

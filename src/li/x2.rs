@@ -11,7 +11,8 @@
 //! interface into the MDF, and TS 103 221-2 is what an MDF reads there.
 
 use super::pdu::{Attribute, PayloadFormat, Pdu, PduType};
-use super::IriEvent;
+use super::x2_context::{ContextKey, ContextSequences, ContextTimings};
+use super::{IriEvent, IriEventType};
 use crate::config::{LiTlsConfig, LiX2Config};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -121,10 +122,22 @@ struct Delivery {
     connector: Option<TlsConnector>,
     server_name: String,
     connection: Option<Connection>,
-    /// Per-connection PDU counter for the sequence-number attribute.
-    sequence: u32,
+    /// Sequence numbers per (XID, CID) context (clause 5.3.9).
+    ///
+    /// Owned here, not by the connection, so each context keeps counting across
+    /// a reconnect. Per destination, because each mediation function receives
+    /// its own copy of a context's PDUs and checks that copy for gaps.
+    contexts: ContextSequences,
+    /// Counter for keepalives, which are no context's PDUs. It belongs to the
+    /// connection and restarts with it.
+    keepalive_sequence: u32,
     /// When the connection last carried a PDU, IRI or keepalive.
     last_sent: Instant,
+    /// When a data record last reached this destination. Keepalives do not
+    /// count: a destination only they keep alive is one nothing is routed to.
+    last_record: Instant,
+    /// The Network Function ID every PDU carries (clause 5.3.7), if any.
+    network_function_id: Option<String>,
 }
 
 impl Delivery {
@@ -220,13 +233,150 @@ impl Delivery {
 
     /// Adopt a freshly opened connection.
     ///
-    /// The sequence number is per connection, so it restarts here whichever
-    /// path opened it: a record's reconnect, or the first record after a
-    /// keepalive found the peer gone.
+    /// Only the keepalive count restarts here, whichever path opened the
+    /// connection (a record's reconnect, or the first record after a keepalive
+    /// found the peer gone). The contexts' numbering does not: it is the
+    /// context that is numbered, not the connection.
     fn connected(&mut self, connection: Connection) {
         self.connection = Some(connection);
-        self.sequence = 0;
+        self.keepalive_sequence = 0;
         self.last_sent = Instant::now();
+    }
+
+    /// Deliver one event to this destination, reconnecting once on a failed
+    /// write.
+    ///
+    /// Settles the event's context afterwards: an End record ends its session
+    /// whether or not it reached the peer, but the context is only marked, not
+    /// deleted. The BYE's 200 and a retransmitted BYE still belong to it and
+    /// number on from it; the loop's sweep releases it once it has been silent
+    /// for the linger.
+    async fn deliver(&mut self, event: &IriEvent, reconnect_interval: Duration) {
+        let key = ContextKey::new(event.x_id.as_bytes(), event.correlation_id);
+        if event.event_type == IriEventType::Begin {
+            self.contexts.reopen(key);
+        }
+        self.write_event(event, key, reconnect_interval).await;
+        if event.event_type == IriEventType::End {
+            self.contexts.finish(key, Instant::now().into_std());
+        }
+    }
+
+    /// Frame and write one event, with one retry on a fresh connection.
+    async fn write_event(
+        &mut self,
+        event: &IriEvent,
+        key: ContextKey,
+        reconnect_interval: Duration,
+    ) {
+        if self.connection.is_none() && !self.connect_with_retries(reconnect_interval).await {
+            error!(
+                address = %self.address,
+                xid = %event.x_id,
+                liid = %event.liid,
+                "X2 no connection to mediation function, IRI record dropped"
+            );
+            return;
+        }
+
+        let encoded = match encode_iri_event(
+            event,
+            self.contexts.peek(key),
+            self.network_function_id.as_deref(),
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                // A PDU we cannot frame is a defect in this element, not a
+                // transport fault, so it is not worth a reconnect.
+                error!(
+                    error = %error,
+                    xid = %event.x_id,
+                    liid = %event.liid,
+                    "X2 record could not be framed, dropped"
+                );
+                return;
+            }
+        };
+
+        let Some(connection) = self.connection.as_mut() else {
+            return;
+        };
+        match connection.write_all(&encoded).await {
+            Ok(()) => {
+                self.contexts.commit(key, Instant::now().into_std());
+                self.last_sent = Instant::now();
+                self.last_record = Instant::now();
+                debug!(
+                    address = %self.address,
+                    xid = %event.x_id,
+                    liid = %event.liid,
+                    event_type = ?event.event_type,
+                    "X2 IRI record delivered"
+                );
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    address = %self.address,
+                    error = %error,
+                    xid = %event.x_id,
+                    liid = %event.liid,
+                    "X2 delivery failed, reconnecting"
+                );
+                self.connection = None;
+            }
+        }
+
+        // One retry on a fresh connection. A half-open socket only reveals
+        // itself on write, so the first record after the peer went away is
+        // otherwise always lost. The record was not delivered, so it carries
+        // the same number again.
+        tokio::time::sleep(reconnect_interval).await;
+        if !self.connect_with_retries(reconnect_interval).await {
+            error!(
+                address = %self.address,
+                xid = %event.x_id,
+                liid = %event.liid,
+                "X2 reconnect failed, IRI record dropped"
+            );
+            return;
+        }
+        let retry = match encode_iri_event(
+            event,
+            self.contexts.peek(key),
+            self.network_function_id.as_deref(),
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                error!(error = %error, liid = %event.liid, "X2 record could not be framed on retry");
+                return;
+            }
+        };
+        let Some(connection) = self.connection.as_mut() else {
+            return;
+        };
+        match connection.write_all(&retry).await {
+            Ok(()) => {
+                self.contexts.commit(key, Instant::now().into_std());
+                self.last_sent = Instant::now();
+                self.last_record = Instant::now();
+                info!(
+                    address = %self.address,
+                    liid = %event.liid,
+                    "X2 IRI record delivered after reconnect"
+                );
+            }
+            Err(error) => {
+                error!(
+                    address = %self.address,
+                    error = %error,
+                    xid = %event.x_id,
+                    liid = %event.liid,
+                    "X2 delivery failed after reconnect, IRI record dropped"
+                );
+                self.connection = None;
+            }
+        }
     }
 
     /// Send a keepalive if the connection has been quiet for a whole period.
@@ -259,7 +409,7 @@ impl Delivery {
             return;
         }
 
-        let encoded = match Pdu::keepalive(self.sequence).encode() {
+        let encoded = match Pdu::keepalive(self.keepalive_sequence).encode() {
             Ok(bytes) => bytes,
             Err(error) => {
                 // As with a record that cannot be framed: a defect in this
@@ -270,7 +420,7 @@ impl Delivery {
         };
         match connection.write_all(&encoded).await {
             Ok(()) => {
-                self.sequence = self.sequence.wrapping_add(1);
+                self.keepalive_sequence = self.keepalive_sequence.wrapping_add(1);
                 self.last_sent = Instant::now();
                 debug!(address = %self.address, "X2 keepalive sent");
             }
@@ -294,17 +444,49 @@ fn keepalive_period(seconds: u64) -> Option<Duration> {
 /// Background task that drains the IRI channel and delivers to the MDF.
 ///
 /// Runs for the lifetime of the LI subsystem.
-pub async fn delivery_task(receiver: mpsc::Receiver<IriEvent>, config: Arc<LiX2Config>) {
+///
+/// `network_function_id` is the NFID every PDU carries (clause 5.3.7), from
+/// [`crate::config::LawfulInterceptConfig::x2_network_function_id`].
+pub async fn delivery_task(
+    receiver: mpsc::Receiver<IriEvent>,
+    config: Arc<LiX2Config>,
+    network_function_id: Option<String>,
+) {
     let keepalive = keepalive_period(config.keepalive_secs);
-    run_delivery(receiver, config, keepalive).await;
+    run_delivery(
+        receiver,
+        config,
+        keepalive,
+        network_function_id,
+        ContextTimings::DEFAULT,
+    )
+    .await;
 }
 
-/// The delivery loop, with the keepalive period passed in rather than read as
-/// whole seconds, so a test can run it at a fraction of one.
+/// Wait for the next keepalive tick; never, when keepalives are off.
+async fn next_keepalive_tick(timer: &mut Option<(Duration, tokio::time::Interval)>) {
+    match timer {
+        Some((_, timer)) => {
+            timer.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// The delivery loop, with the keepalive period and the sequence-state bounds
+/// passed in rather than read as constants, so a test can run it at a fraction
+/// of them.
+///
+/// Two timers run beside the event channel, independent of one another and of
+/// traffic: the keepalive tick (when enabled) and the sweep of the sequence
+/// state, which must run on a quiet interface too, since a context's lifetime
+/// is measured in silence.
 async fn run_delivery(
     mut receiver: mpsc::Receiver<IriEvent>,
     config: Arc<LiX2Config>,
     keepalive: Option<Duration>,
+    network_function_id: Option<String>,
+    timings: ContextTimings,
 ) {
     let use_tls = config.transport.eq_ignore_ascii_case("tls");
     info!(
@@ -351,19 +533,26 @@ async fn run_delivery(
         timer.tick().await;
     }
 
+    let mut sweep_timer = tokio::time::interval(timings.sweep_interval);
+    sweep_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    sweep_timer.tick().await;
+
     loop {
-        let received = match keepalive_timer.as_mut() {
-            // `recv` is cancel-safe, so a tick that wins the race loses no event.
-            Some((period, timer)) => tokio::select! {
-                received = receiver.recv() => received,
-                _ = timer.tick() => {
+        // `recv` is cancel-safe, so a tick that wins the race loses no event.
+        let received = tokio::select! {
+            received = receiver.recv() => received,
+            _ = sweep_timer.tick() => {
+                sweep_deliveries(&mut deliveries, &timings);
+                continue;
+            }
+            _ = next_keepalive_tick(&mut keepalive_timer) => {
+                if let Some(period) = keepalive {
                     for delivery in deliveries.values_mut() {
-                        delivery.keepalive_if_idle(*period).await;
+                        delivery.keepalive_if_idle(period).await;
                     }
-                    continue;
                 }
-            },
-            None => receiver.recv().await,
+                continue;
+            }
         };
         let Some(event) = received else {
             break;
@@ -388,115 +577,37 @@ async fn run_delivery(
                     connector: connector.clone(),
                     server_name,
                     connection: None,
-                    sequence: 0,
+                    contexts: ContextSequences::new(timings),
+                    keepalive_sequence: 0,
                     last_sent: Instant::now(),
+                    last_record: Instant::now(),
+                    network_function_id: network_function_id.clone(),
                 });
-
-            if delivery.connection.is_none()
-                && !delivery.connect_with_retries(reconnect_interval).await
-            {
-                error!(
-                    address = %address,
-                    xid = %event.x_id,
-                    liid = %event.liid,
-                    "X2 no connection to mediation function, IRI record dropped"
-                );
-                continue;
-            }
-
-            let encoded = match encode_iri_event(&event, delivery.sequence) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    // A PDU we cannot frame is a defect in this element, not a
-                    // transport fault, so it is not worth a reconnect.
-                    error!(
-                        error = %error,
-                        xid = %event.x_id,
-                        liid = %event.liid,
-                        "X2 record could not be framed, dropped"
-                    );
-                    continue;
-                }
-            };
-
-            let Some(connection) = delivery.connection.as_mut() else {
-                continue;
-            };
-            match connection.write_all(&encoded).await {
-                Ok(()) => {
-                    delivery.sequence = delivery.sequence.wrapping_add(1);
-                    delivery.last_sent = Instant::now();
-                    debug!(
-                        address = %address,
-                        xid = %event.x_id,
-                        liid = %event.liid,
-                        event_type = ?event.event_type,
-                        "X2 IRI record delivered"
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    warn!(
-                        address = %address,
-                        error = %error,
-                        xid = %event.x_id,
-                        liid = %event.liid,
-                        "X2 delivery failed, reconnecting"
-                    );
-                    delivery.connection = None;
-                }
-            }
-
-            // One retry on a fresh connection. A half-open socket only reveals
-            // itself on write, so the first record after the peer went away is
-            // otherwise always lost.
-            tokio::time::sleep(reconnect_interval).await;
-            if !delivery.connect_with_retries(reconnect_interval).await {
-                error!(
-                    address = %address,
-                    xid = %event.x_id,
-                    liid = %event.liid,
-                    "X2 reconnect failed, IRI record dropped"
-                );
-                continue;
-            }
-            // The sequence number is per connection, so adopting the new one
-            // restarted it.
-            let retry = match encode_iri_event(&event, delivery.sequence) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    error!(error = %error, liid = %event.liid, "X2 record could not be framed on retry");
-                    continue;
-                }
-            };
-            let Some(connection) = delivery.connection.as_mut() else {
-                continue;
-            };
-            match connection.write_all(&retry).await {
-                Ok(()) => {
-                    delivery.sequence = delivery.sequence.wrapping_add(1);
-                    delivery.last_sent = Instant::now();
-                    info!(
-                        address = %address,
-                        liid = %event.liid,
-                        "X2 IRI record delivered after reconnect"
-                    );
-                }
-                Err(error) => {
-                    error!(
-                        address = %address,
-                        error = %error,
-                        xid = %event.x_id,
-                        liid = %event.liid,
-                        "X2 delivery failed after reconnect, IRI record dropped"
-                    );
-                    delivery.connection = None;
-                }
-            }
+            delivery.deliver(&event, reconnect_interval).await;
         }
     }
 
     info!("X2 IRI delivery task stopped (channel closed)");
+}
+
+/// Release what no longer needs holding: contexts past their bounds, then any
+/// destination left with none that has had no record for the idle bound, so
+/// destinations that come and go do not accumulate. Dropping one closes its
+/// connection; the next record for it reconnects.
+fn sweep_deliveries(deliveries: &mut HashMap<String, Delivery>, timings: &ContextTimings) {
+    let now = Instant::now().into_std();
+    deliveries.retain(|address, delivery| {
+        let swept = delivery.contexts.sweep(now);
+        if swept > 0 {
+            debug!(address = %address, swept, "X2 sequence state of finished contexts released");
+        }
+        let idle =
+            delivery.contexts.is_empty() && delivery.last_record.elapsed() > timings.max_idle;
+        if idle {
+            debug!(address = %address, "X2 destination idle, released");
+        }
+        !idle
+    });
 }
 
 /// Where one event has to go.
@@ -612,11 +723,22 @@ fn build_tls_connector(tls: Option<&LiTlsConfig>) -> Result<TlsConnector, String
 /// `PayloadFormat::Sip` means, and it is also what makes the record useful:
 /// the MDF re-derives whatever its handover format needs, rather than
 /// inheriting whichever subset of headers this element thought to copy.
-fn encode_iri_event(event: &IriEvent, sequence: u32) -> Result<Vec<u8>, super::pdu::PduError> {
+///
+/// `sequence` is the number of this PDU within its (XID, CID) context, and
+/// `network_function_id` the NFID of every PDU this node sends; absent, there
+/// is no attribute 6.
+fn encode_iri_event(
+    event: &IriEvent,
+    sequence: u32,
+    network_function_id: Option<&str>,
+) -> Result<Vec<u8>, super::pdu::PduError> {
     let mut attributes = vec![
         Attribute::timestamp(event.timestamp),
         Attribute::sequence_number(sequence),
     ];
+    if let Some(identifier) = network_function_id {
+        attributes.push(Attribute::network_function_id(identifier));
+    }
     if let Some(source) = event.source_ip {
         attributes.push(Attribute::source_address(source));
     }
@@ -677,6 +799,7 @@ fn summarise(event: &IriEvent) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::x1::types::{DeliveryType, TargetIdentifier, XId};
+    use super::super::x2_context::{CONTEXT_END_LINGER, CONTEXT_MAX_IDLE};
     use super::*;
     use crate::li::pdu::{attribute_type, PayloadDirection};
     use crate::li::target::MatchedParty;
@@ -770,7 +893,7 @@ mod tests {
     #[test]
     fn iri_event_frames_as_a_ts_103_221_2_x2_pdu() {
         let event = test_iri_event();
-        let encoded = encode_iri_event(&event, 0).expect("event must frame");
+        let encoded = encode_iri_event(&event, 0, None).expect("event must frame");
 
         assert_eq!(&encoded[0..2], &[0x00, 0x05], "version 0.5");
         assert_eq!(&encoded[2..4], &[0x00, 0x01], "X2");
@@ -802,7 +925,7 @@ mod tests {
         let odd = b"INVITE sip:b@e.com SIP/2.0\r\nf: <sip:a@e.com>;tag=1\r\ni: xyz\r\n\r\n";
         event.raw_message = Some(odd.to_vec());
 
-        let encoded = encode_iri_event(&event, 0).expect("event must frame");
+        let encoded = encode_iri_event(&event, 0, None).expect("event must frame");
         let header_length =
             u32::from_be_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
         assert_eq!(&encoded[header_length..], odd);
@@ -817,19 +940,19 @@ mod tests {
         event.party = MatchedParty::Originating;
 
         event.direction = PayloadDirection::SentToTarget;
-        let to_target = encode_iri_event(&event, 0).expect("event must frame");
+        let to_target = encode_iri_event(&event, 0, None).expect("event must frame");
         assert_eq!(&to_target[14..16], &[0x00, 0x02], "sent to target");
 
         event.direction = PayloadDirection::SentFromTarget;
-        let from_target = encode_iri_event(&event, 0).expect("event must frame");
+        let from_target = encode_iri_event(&event, 0, None).expect("event must frame");
         assert_eq!(&from_target[14..16], &[0x00, 0x03], "sent from target");
 
         event.party = MatchedParty::Terminating;
-        let still_from_target = encode_iri_event(&event, 0).expect("event must frame");
+        let still_from_target = encode_iri_event(&event, 0, None).expect("event must frame");
         assert_eq!(&still_from_target[14..16], &[0x00, 0x03]);
 
         event.direction = PayloadDirection::Unknown;
-        let unknown = encode_iri_event(&event, 0).expect("event must frame");
+        let unknown = encode_iri_event(&event, 0, None).expect("event must frame");
         assert_eq!(&unknown[14..16], &[0x00, 0x01], "not known to the POI");
     }
 
@@ -850,7 +973,7 @@ mod tests {
     /// `<imsi>204081234567890</imsi>` as the shape).
     #[test]
     fn the_x2_pdu_is_the_known_answer_for_a_matched_e164_number() {
-        let encoded = encode_iri_event(&known_answer_event(), 1).expect("event must frame");
+        let encoded = encode_iri_event(&known_answer_event(), 1, None).expect("event must frame");
 
         let mut expected: Vec<u8> = vec![
             0x00, 0x05, // version 0.5
@@ -892,7 +1015,7 @@ mod tests {
     }
 
     fn matched_target_identifier_of(event: &IriEvent) -> Vec<String> {
-        let encoded = encode_iri_event(event, 0).expect("event must frame");
+        let encoded = encode_iri_event(event, 0, None).expect("event must frame");
         attributes_of(&encoded)
             .into_iter()
             .filter(|(kind, _)| *kind == 17)
@@ -912,7 +1035,7 @@ mod tests {
             ["<e164Number>999000000001</e164Number>"]
         );
 
-        let encoded = encode_iri_event(&event, 0).expect("event must frame");
+        let encoded = encode_iri_event(&event, 0, None).expect("event must frame");
         let header_length =
             u32::from_be_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
         assert!(
@@ -978,52 +1101,53 @@ mod tests {
         );
     }
 
-    /// Wireshark's own `li5g` dissector reading the PDU back. It shares none
-    /// of our reading of the specification, which a test of ours cannot say.
+    /// Run PDUs through Wireshark's `li5g` dissector and return what it read
+    /// back, or `None` (after saying why) where `tshark`/`text2pcap` is absent
+    /// or too old to know the protocol.
     ///
-    /// Skips when `tshark` or `text2pcap` is not installed, or is too old to
-    /// know the protocol.
-    #[test]
-    fn wireshark_reads_back_the_matched_target_and_the_direction() {
+    /// Each PDU is one TCP segment to a fabricated port that is declared to be
+    /// `li5g`. Returns the `-T fields` rows for `fields` (first occurrence of
+    /// each, `|`-separated) and the full `-V` tree.
+    fn dissect_with_li5g(pdus: &[Vec<u8>], fields: &[&str]) -> Option<(Vec<String>, String)> {
         use std::process::Command;
 
-        let fields = match Command::new("tshark").args(["-G", "fields"]).output() {
-            Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+        match Command::new("tshark").args(["-G", "fields"]).output() {
+            Ok(output) if String::from_utf8_lossy(&output.stdout).contains("li5g.mti") => {}
+            Ok(_) => {
+                eprintln!("skipped: this tshark has no li5g dissector");
+                return None;
+            }
             Err(_) => {
                 eprintln!("skipped: tshark is not installed");
-                return;
+                return None;
             }
-        };
-        if !fields.contains("li5g.mti") {
-            eprintln!("skipped: this tshark has no li5g dissector");
-            return;
         }
 
         // tshark is commonly confined to a short list of readable paths, and
         // the system temporary directory is on it where a checkout is not.
-        let directory = std::env::temp_dir().join(format!("siphon-x2-li5g-{}", std::process::id()));
+        // The name carries the call site's thread so parallel tests do not
+        // share a directory.
+        let directory = std::env::temp_dir().join(format!(
+            "siphon-x2-li5g-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::create_dir_all(&directory).expect("a scratch directory");
         let hex_path = directory.join("x2.hex");
         let capture_path = directory.join("x2.pcap");
 
-        let mut frames = String::new();
-        for direction in [
-            PayloadDirection::SentToTarget,
-            PayloadDirection::SentFromTarget,
-        ] {
-            let mut event = known_answer_event();
-            event.direction = direction;
-            let encoded = encode_iri_event(&event, 1).expect("event must frame");
+        let mut dump = String::new();
+        for encoded in pdus {
             // `text2pcap`'s hex-dump form; an offset of zero starts a packet.
             for (index, chunk) in encoded.chunks(16).enumerate() {
-                frames.push_str(&format!("{:06x}", index * 16));
+                dump.push_str(&format!("{:06x}", index * 16));
                 for byte in chunk {
-                    frames.push_str(&format!(" {byte:02x}"));
+                    dump.push_str(&format!(" {byte:02x}"));
                 }
-                frames.push('\n');
+                dump.push('\n');
             }
         }
-        std::fs::write(&hex_path, frames).expect("the hex dump is writable");
+        std::fs::write(&hex_path, dump).expect("the hex dump is writable");
 
         let converted = Command::new("text2pcap")
             .args(["-q", "-T", "1234,42069"])
@@ -1032,7 +1156,7 @@ mod tests {
             .status();
         let Ok(converted) = converted else {
             eprintln!("skipped: text2pcap is not installed");
-            return;
+            return None;
         };
         assert!(converted.success(), "text2pcap must accept the dump");
 
@@ -1047,7 +1171,7 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).into_owned()
         };
 
-        let read_back = dissect(&[
+        let mut field_arguments: Vec<&str> = vec![
             "-T",
             "fields",
             "-E",
@@ -1056,46 +1180,83 @@ mod tests {
             // subtree's label and as the value under it.
             "-E",
             "occurrence=f",
-            "-e",
-            "li5g.pd",
-            "-e",
-            "li5g.mti",
-            "-e",
-            "li5g.xid",
-            "-e",
-            "li5g.cid",
-            "-e",
-            "li5g.sq",
-            "-e",
-            "sip.Method",
-        ]);
+        ];
+        for field in fields {
+            field_arguments.extend(["-e", field]);
+        }
+        let rows = dissect(&field_arguments)
+            .lines()
+            .map(str::to_string)
+            .collect();
         let tree = dissect(&["-V"]);
         let _ = std::fs::remove_dir_all(&directory);
+        Some((rows, tree))
+    }
 
-        let lines: Vec<&str> = read_back.lines().collect();
-        assert_eq!(
-            lines,
-            [
-                "2|<e164Number>999000000001</e164Number>|11111111-2222-3333-4444-555555555555|4242|1|INVITE",
-                "3|<e164Number>999000000001</e164Number>|11111111-2222-3333-4444-555555555555|4242|1|INVITE",
-            ],
-            "Wireshark must read back what was meant:\n{tree}"
-        );
-        // Only what the dissector said of the PDU and the SIP inside it; the
-        // fabricated TCP header above it has unknowns of its own.
-        let dissected: Vec<String> = tree
-            .split("Lawful Interception 5G")
+    /// The dissector's account of each PDU, lower-cased, with the fabricated
+    /// TCP header above it left out (it has unknowns of its own).
+    fn li5g_trees(tree: &str) -> Vec<String> {
+        tree.split("Lawful Interception 5G")
             .skip(1)
             .map(|pdu| pdu.split("\nFrame ").next().unwrap_or(pdu).to_lowercase())
-            .collect();
-        assert_eq!(dissected.len(), 2, "both PDUs dissect as li5g:\n{tree}");
-        for pdu in &dissected {
+            .collect()
+    }
+
+    fn assert_dissected_cleanly(trees: &[String]) {
+        for pdu in trees {
             for rejected in ["malformed", "unknown", "expert info"] {
                 assert!(
                     !pdu.contains(rejected),
                     "Wireshark flagged the PDU as {rejected}:\n{pdu}"
                 );
             }
+        }
+    }
+
+    /// Wireshark's own `li5g` dissector reading the PDU back. It shares none
+    /// of our reading of the specification, which a test of ours cannot say.
+    ///
+    /// Skips when `tshark` or `text2pcap` is not installed, or is too old to
+    /// know the protocol.
+    #[test]
+    fn wireshark_reads_back_the_matched_target_and_the_direction() {
+        let pdus: Vec<Vec<u8>> = [
+            PayloadDirection::SentToTarget,
+            PayloadDirection::SentFromTarget,
+        ]
+        .into_iter()
+        .map(|direction| {
+            let mut event = known_answer_event();
+            event.direction = direction;
+            encode_iri_event(&event, 1, None).expect("event must frame")
+        })
+        .collect();
+        let Some((rows, tree)) = dissect_with_li5g(
+            &pdus,
+            &[
+                "li5g.pd",
+                "li5g.mti",
+                "li5g.xid",
+                "li5g.cid",
+                "li5g.sq",
+                "sip.Method",
+            ],
+        ) else {
+            return;
+        };
+
+        assert_eq!(
+            rows,
+            [
+                "2|<e164Number>999000000001</e164Number>|11111111-2222-3333-4444-555555555555|4242|1|INVITE",
+                "3|<e164Number>999000000001</e164Number>|11111111-2222-3333-4444-555555555555|4242|1|INVITE",
+            ],
+            "Wireshark must read back what was meant:\n{tree}"
+        );
+        let trees = li5g_trees(&tree);
+        assert_eq!(trees.len(), 2, "both PDUs dissect as li5g:\n{tree}");
+        assert_dissected_cleanly(&trees);
+        for pdu in &trees {
             assert!(
                 pdu.contains("attribute type: matched target identifier (17)"),
                 "{pdu}"
@@ -1103,12 +1264,61 @@ mod tests {
         }
     }
 
+    /// The three things a mediation function checks on X2: attribute 6 on
+    /// every data PDU, a gapless sequence per (XID, CID), and a keepalive in
+    /// payload format 0 with a count of its own. Read back by the dissector,
+    /// not by us.
+    #[test]
+    fn wireshark_reads_back_nfid_per_context_sequence_and_keepalive() {
+        let mut pdus: Vec<Vec<u8>> = Vec::new();
+        for sequence in 0..3u32 {
+            for correlation_id in [10u64, 20] {
+                let event = event_in_context(correlation_id);
+                pdus.push(
+                    encode_iri_event(&event, sequence, Some("siphon-ne-1"))
+                        .expect("event must frame"),
+                );
+            }
+        }
+        for sequence in 0..2u32 {
+            pdus.push(Pdu::keepalive(sequence).encode().expect("keepalive frames"));
+        }
+
+        let Some((rows, tree)) = dissect_with_li5g(
+            &pdus,
+            &["li5g.type", "li5g.pf", "li5g.cid", "li5g.sq", "li5g.nfid"],
+        ) else {
+            return;
+        };
+
+        // "siphon-ne-1", as the hex a byte field prints.
+        let nfid = "736970686f6e2d6e652d31";
+        let normalised: Vec<String> = rows.iter().map(|row| row.to_lowercase()).collect();
+        assert_eq!(
+            normalised,
+            [
+                format!("1|9|10|0|{nfid}"),
+                format!("1|9|20|0|{nfid}"),
+                format!("1|9|10|1|{nfid}"),
+                format!("1|9|20|1|{nfid}"),
+                format!("1|9|10|2|{nfid}"),
+                format!("1|9|20|2|{nfid}"),
+                "3|0|0|0|".to_string(),
+                "3|0|0|1|".to_string(),
+            ],
+            "Wireshark must read back NFID, per-context sequence and keepalive:\n{tree}"
+        );
+        let trees = li5g_trees(&tree);
+        assert_eq!(trees.len(), 8, "every PDU dissects as li5g:\n{tree}");
+        assert_dissected_cleanly(&trees);
+    }
+
     #[test]
     fn an_event_without_raw_bytes_is_not_framed_as_sip() {
         let mut event = test_iri_event();
         event.raw_message = None;
 
-        let encoded = encode_iri_event(&event, 0).expect("event must frame");
+        let encoded = encode_iri_event(&event, 0, None).expect("event must frame");
         assert_eq!(
             &encoded[12..14],
             &[0x00, 0x04],
@@ -1127,7 +1337,7 @@ mod tests {
         event.source_ip = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
         event.destination_ip = Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)));
 
-        let encoded = encode_iri_event(&event, 0).expect("event must frame");
+        let encoded = encode_iri_event(&event, 0, None).expect("event must frame");
         let header_length =
             u32::from_be_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
         let attributes = &encoded[40..header_length];
@@ -1161,7 +1371,7 @@ mod tests {
     fn sequence_number_is_carried_and_advances() {
         let event = test_iri_event();
         for sequence in [0u32, 1, 7] {
-            let encoded = encode_iri_event(&event, sequence).expect("event must frame");
+            let encoded = encode_iri_event(&event, sequence, None).expect("event must frame");
             let header_length =
                 u32::from_be_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
             assert_eq!(
@@ -1275,10 +1485,11 @@ mod tests {
             keepalive_secs: 30,
             channel_size: 100,
             tls: None,
+            network_function_id: None,
         });
 
         let (sender, receiver) = mpsc::channel(100);
-        tokio::spawn(delivery_task(receiver, config));
+        tokio::spawn(delivery_task(receiver, config, None));
 
         let accept_handle = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
@@ -1333,10 +1544,11 @@ mod tests {
             keepalive_secs: 30,
             channel_size: 100,
             tls: None,
+            network_function_id: None,
         });
 
         let (sender, receiver) = mpsc::channel(100);
-        tokio::spawn(delivery_task(receiver, config));
+        tokio::spawn(delivery_task(receiver, config, None));
         sender.send(test_iri_event()).await.expect("send");
 
         // Bring the collector up after the first attempt has already failed.
@@ -1374,10 +1586,11 @@ mod tests {
             keepalive_secs: 30,
             channel_size: 100,
             tls: None,
+            network_function_id: None,
         });
 
         let (sender, receiver) = mpsc::channel(100);
-        tokio::spawn(delivery_task(receiver, config));
+        tokio::spawn(delivery_task(receiver, config, None));
 
         let read_one = |listener: TcpListener| async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
@@ -1416,6 +1629,7 @@ mod tests {
             keepalive_secs: 30,
             channel_size: 100,
             tls: None,
+            network_function_id: None,
         })
     }
 
@@ -1473,15 +1687,17 @@ mod tests {
             receiver,
             keepalive_test_config(address, 1),
             Some(TEST_KEEPALIVE),
+            Some("siphon-ne-1".to_string()),
+            ContextTimings::DEFAULT,
         ));
 
         sender.send(test_iri_event()).await.expect("send");
         let mut stream = accept(&listener).await;
         let (header, attributes, _) = read_pdu(&mut stream).await;
         assert_eq!(&header[2..4], &[0x00, 0x01], "the record comes first");
-        let record_sequence = sequence_of(&attributes);
+        assert_eq!(sequence_of(&attributes), 0);
 
-        for expected in 1..=2u32 {
+        for expected in 0..=1u32 {
             let (header, attributes, payload) = read_pdu(&mut stream).await;
             assert_eq!(&header[0..2], &[0x00, 0x05], "version 0.5");
             assert_eq!(&header[2..4], &[0x00, 0x03], "PDU type keepalive");
@@ -1492,12 +1708,14 @@ mod tests {
             );
             assert_eq!(&header[8..12], &[0, 0, 0, 0], "no payload");
             assert!(payload.is_empty());
+            assert_eq!(&header[12..14], &[0x00, 0x00], "payload format 0");
             assert_eq!(&header[14..16], &[0x00, 0x00], "direction reserved");
+            assert_eq!(&header[16..32], &[0u8; 16], "all-zero XID");
             assert_eq!(&header[32..40], &[0u8; 8], "all-zero correlation");
             assert_eq!(
                 sequence_of(&attributes),
-                record_sequence + expected,
-                "keepalives share the connection's sequence with its records"
+                expected,
+                "keepalives count on their own, from 0, apart from every context"
             );
         }
     }
@@ -1511,6 +1729,8 @@ mod tests {
             receiver,
             keepalive_test_config(address, 1),
             None,
+            Some("siphon-ne-1".to_string()),
+            ContextTimings::DEFAULT,
         ));
 
         sender.send(test_iri_event()).await.expect("send");
@@ -1538,6 +1758,8 @@ mod tests {
             receiver,
             keepalive_test_config(address, 1),
             Some(TEST_KEEPALIVE),
+            Some("siphon-ne-1".to_string()),
+            ContextTimings::DEFAULT,
         ));
 
         sender.send(test_iri_event()).await.expect("send");
@@ -1562,9 +1784,9 @@ mod tests {
             }
         };
         assert_eq!(record, RAW_INVITE, "the later record arrives intact");
-        assert!(
-            record_sequence > 3,
-            "on the same connection, after the record and three keepalives: {record_sequence}"
+        assert_eq!(
+            record_sequence, 1,
+            "the second record of its context; the keepalives did not consume numbers"
         );
         assert!(
             tokio::time::timeout(TEST_KEEPALIVE, listener.accept())
@@ -1590,6 +1812,8 @@ mod tests {
             receiver,
             keepalive_test_config(address, reconnect_interval_secs),
             Some(TEST_KEEPALIVE),
+            Some("siphon-ne-1".to_string()),
+            ContextTimings::DEFAULT,
         ));
 
         sender.send(test_iri_event()).await.expect("send");
@@ -1609,9 +1833,434 @@ mod tests {
         assert_eq!(payload, RAW_INVITE);
         assert_eq!(
             sequence_of(&attributes),
-            0,
-            "the sequence restarts on the new connection"
+            1,
+            "the context, not the connection, is what is numbered"
         );
+    }
+
+    /// A data PDU's (XID, CID, sequence, NFID), read off the wire; keepalives
+    /// are returned separately by their own counter.
+    enum Received {
+        Record {
+            correlation_id: u64,
+            sequence: u32,
+            network_function_id: Option<Vec<u8>>,
+        },
+        Keepalive {
+            payload_format: u16,
+            sequence: u32,
+        },
+    }
+
+    async fn read_received(stream: &mut TcpStream) -> Received {
+        let (header, attributes, _) = read_pdu(stream).await;
+        let sequence = sequence_of(&attributes);
+        if header[2..4] == [0x00, 0x03] {
+            return Received::Keepalive {
+                payload_format: u16::from_be_bytes([header[12], header[13]]),
+                sequence,
+            };
+        }
+        let mut correlation = [0u8; 8];
+        correlation.copy_from_slice(&header[32..40]);
+        Received::Record {
+            correlation_id: u64::from_be_bytes(correlation),
+            sequence,
+            network_function_id: find_attribute(&attributes, attribute_type::NETWORK_FUNCTION_ID),
+        }
+    }
+
+    /// Read until `count` records have arrived, returning them with every
+    /// keepalive seen on the way.
+    async fn read_records(
+        stream: &mut TcpStream,
+        count: usize,
+    ) -> (Vec<(u64, u32, Option<Vec<u8>>)>, Vec<(u16, u32)>) {
+        let mut records = Vec::new();
+        let mut keepalives = Vec::new();
+        while records.len() < count {
+            match read_received(stream).await {
+                Received::Record {
+                    correlation_id,
+                    sequence,
+                    network_function_id,
+                    ..
+                } => records.push((correlation_id, sequence, network_function_id)),
+                Received::Keepalive {
+                    payload_format,
+                    sequence,
+                } => keepalives.push((payload_format, sequence)),
+            }
+        }
+        (records, keepalives)
+    }
+
+    fn event_in_context(correlation_id: u64) -> IriEvent {
+        let mut event = test_iri_event();
+        event.correlation_id = correlation_id;
+        event
+    }
+
+    /// Two contexts interleaved on one connection each number 0, 1, 2, every
+    /// PDU carries the NFID, and the keepalives between them keep their own
+    /// count.
+    #[tokio::test]
+    async fn interleaved_contexts_are_numbered_apart_and_carry_the_nfid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr").to_string();
+        let (sender, receiver) = mpsc::channel(100);
+        tokio::spawn(run_delivery(
+            receiver,
+            keepalive_test_config(address, 1),
+            Some(TEST_KEEPALIVE),
+            Some("siphon-ne-1".to_string()),
+            ContextTimings::DEFAULT,
+        ));
+
+        for correlation_id in [10, 20, 10, 20, 10, 20] {
+            sender
+                .send(event_in_context(correlation_id))
+                .await
+                .expect("send");
+        }
+        let mut stream = accept(&listener).await;
+        let (records, _) = read_records(&mut stream, 6).await;
+        let of = |wanted: u64| -> Vec<u32> {
+            records
+                .iter()
+                .filter(|(correlation_id, _, _)| *correlation_id == wanted)
+                .map(|(_, sequence, _)| *sequence)
+                .collect()
+        };
+        assert_eq!(of(10), [0, 1, 2]);
+        assert_eq!(of(20), [0, 1, 2]);
+        for (_, _, network_function_id) in &records {
+            assert_eq!(
+                network_function_id.as_deref(),
+                Some(b"siphon-ne-1".as_slice())
+            );
+        }
+
+        // Quiet now: the keepalives follow, format 0, from 0, undisturbed by
+        // the six records before them.
+        let mut keepalives = Vec::new();
+        while keepalives.len() < 2 {
+            if let Received::Keepalive {
+                payload_format,
+                sequence,
+            } = read_received(&mut stream).await
+            {
+                keepalives.push((payload_format, sequence));
+            }
+        }
+        assert_eq!(keepalives, [(0, 0), (0, 1)]);
+    }
+
+    /// A reconnect continues each context where it was, and restarts only the
+    /// keepalive counter, which belongs to the connection.
+    #[tokio::test]
+    async fn a_reconnect_continues_each_context_and_restarts_the_keepalive_count() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr").to_string();
+        let (sender, receiver) = mpsc::channel(100);
+        tokio::spawn(run_delivery(
+            receiver,
+            keepalive_test_config(address, 5),
+            Some(TEST_KEEPALIVE),
+            Some("siphon-ne-1".to_string()),
+            ContextTimings::DEFAULT,
+        ));
+
+        for correlation_id in [10, 20, 10, 20] {
+            sender
+                .send(event_in_context(correlation_id))
+                .await
+                .expect("send");
+        }
+        let mut first = accept(&listener).await;
+        let (records, _) = read_records(&mut first, 4).await;
+        assert_eq!(
+            records
+                .iter()
+                .map(|(correlation_id, sequence, _)| (*correlation_id, *sequence))
+                .collect::<Vec<_>>(),
+            [(10, 0), (20, 0), (10, 1), (20, 1)]
+        );
+        drop(first);
+
+        // The tick notices the closed peer; the next records reconnect.
+        tokio::time::sleep(TEST_KEEPALIVE * 3).await;
+        for correlation_id in [20, 10] {
+            sender
+                .send(event_in_context(correlation_id))
+                .await
+                .expect("send");
+        }
+        let (mut second, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("the closed connection was not dropped at the tick")
+            .expect("accept");
+        let (records, _) = read_records(&mut second, 2).await;
+        assert_eq!(
+            records
+                .iter()
+                .map(|(correlation_id, sequence, _)| (*correlation_id, *sequence))
+                .collect::<Vec<_>>(),
+            [(20, 2), (10, 2)],
+            "each context continues across the reconnect"
+        );
+
+        let mut keepalives = Vec::new();
+        while keepalives.is_empty() {
+            if let Received::Keepalive {
+                payload_format,
+                sequence,
+            } = read_received(&mut second).await
+            {
+                keepalives.push((payload_format, sequence));
+            }
+        }
+        assert_eq!(
+            keepalives,
+            [(0, 0)],
+            "a new connection's keepalives count from 0"
+        );
+    }
+
+    fn delivery_to(address: String) -> Delivery {
+        Delivery {
+            address,
+            connector: None,
+            server_name: String::new(),
+            connection: None,
+            contexts: ContextSequences::new(ContextTimings::DEFAULT),
+            keepalive_sequence: 0,
+            last_sent: Instant::now(),
+            last_record: Instant::now(),
+            network_function_id: None,
+        }
+    }
+
+    fn event_of(correlation_id: u64, event_type: IriEventType) -> IriEvent {
+        let mut event = event_in_context(correlation_id);
+        event.event_type = event_type;
+        event
+    }
+
+    /// The leak rule for the per-context numbering: after N sessions that
+    /// ended and N whose End never came, nothing is left once each one's bound
+    /// has passed.
+    #[tokio::test]
+    async fn per_context_state_drains_after_completed_and_abandoned_sessions() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let mut delivery = delivery_to(listener.local_addr().expect("addr").to_string());
+        let sessions = 25u64;
+        for session in 0..sessions {
+            for event_type in [IriEventType::Begin, IriEventType::End] {
+                delivery
+                    .deliver(
+                        &event_of(1000 + session, event_type),
+                        Duration::from_millis(10),
+                    )
+                    .await;
+            }
+        }
+        let count = usize::try_from(sessions).unwrap_or(usize::MAX);
+        assert_eq!(delivery.contexts.len(), count, "ended, lingering");
+        for session in 0..sessions {
+            delivery
+                .deliver(
+                    &event_of(2000 + session, IriEventType::Begin),
+                    Duration::from_millis(10),
+                )
+                .await;
+        }
+        assert_eq!(delivery.contexts.len(), 2 * count);
+
+        let now = Instant::now().into_std();
+        assert_eq!(
+            delivery
+                .contexts
+                .sweep(now + CONTEXT_END_LINGER + Duration::from_secs(1)),
+            count
+        );
+        assert_eq!(delivery.contexts.len(), count, "only the abandoned remain");
+        assert_eq!(
+            delivery
+                .contexts
+                .sweep(now + CONTEXT_MAX_IDLE + Duration::from_secs(1)),
+            count
+        );
+        assert_eq!(delivery.contexts.len(), 0);
+    }
+
+    /// An End is the BYE; its 200 and a retransmitted BYE are PDUs of the same
+    /// context and number on from it, not from 0.
+    #[tokio::test]
+    async fn the_bye_its_200_and_a_retransmitted_bye_number_on() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let mut delivery = delivery_to(listener.local_addr().expect("addr").to_string());
+        for event_type in [
+            IriEventType::Begin,
+            IriEventType::End,
+            IriEventType::Continue,
+            IriEventType::End,
+        ] {
+            delivery
+                .deliver(&event_of(55, event_type), Duration::from_millis(10))
+                .await;
+        }
+        let mut stream = accept(&listener).await;
+        let (records, _) = read_records(&mut stream, 4).await;
+        assert_eq!(
+            records
+                .iter()
+                .map(|(_, sequence, _)| *sequence)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert_eq!(delivery.contexts.len(), 1, "held through the linger");
+    }
+
+    /// A session whose End cannot be delivered is still over: its context is
+    /// marked ended and drops after the linger, instead of waiting out the
+    /// idle bound.
+    #[tokio::test]
+    async fn an_end_record_that_cannot_be_delivered_still_ends_its_context() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let mut delivery = delivery_to(address.to_string());
+        delivery
+            .deliver(&event_of(77, IriEventType::Begin), Duration::from_millis(1))
+            .await;
+        assert_eq!(delivery.contexts.len(), 1, "the Begin was delivered");
+
+        // The collector goes away and the connection with it.
+        drop(accept(&listener).await);
+        drop(listener);
+        delivery.connection = None;
+        delivery
+            .deliver(&event_of(77, IriEventType::End), Duration::from_millis(1))
+            .await;
+        assert_eq!(delivery.contexts.len(), 1, "the End was not delivered");
+
+        let later = Instant::now().into_std() + CONTEXT_END_LINGER + Duration::from_secs(1);
+        assert_eq!(delivery.contexts.sweep(later), 1);
+        assert_eq!(delivery.contexts.len(), 0);
+    }
+
+    /// The sweep belongs to the delivery loop, not to traffic: with keepalives
+    /// off and no event arriving, an ended context, an abandoned one and then
+    /// the whole idle destination are released. Read off the wire, because the
+    /// map is the task's own: a released context numbers from 0 again, and a
+    /// released destination is reconnected.
+    ///
+    /// Real time at millisecond bounds rather than a paused clock: a paused
+    /// clock auto-advances whenever the runtime waits on the socket, which
+    /// fires the read timeouts of the very sockets this test depends on.
+    #[tokio::test]
+    async fn the_loop_sweeps_on_its_own_interval_with_no_traffic() {
+        let timings = ContextTimings {
+            max_idle: Duration::from_millis(600),
+            end_linger: Duration::from_millis(100),
+            sweep_interval: Duration::from_millis(20),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr").to_string();
+        let (sender, receiver) = mpsc::channel(100);
+        tokio::spawn(run_delivery(
+            receiver,
+            keepalive_test_config(address, 1),
+            None,
+            None,
+            timings,
+        ));
+        let sequences = |records: Vec<(u64, u32, Option<Vec<u8>>)>| -> Vec<(u64, u32)> {
+            records
+                .into_iter()
+                .map(|(correlation_id, sequence, _)| (correlation_id, sequence))
+                .collect()
+        };
+
+        for (correlation_id, event_type) in [
+            (1, IriEventType::Begin),
+            (1, IriEventType::End),
+            (2, IriEventType::Begin),
+        ] {
+            sender
+                .send(event_of(correlation_id, event_type))
+                .await
+                .expect("send");
+        }
+        let mut first = accept(&listener).await;
+        let (records, _) = read_records(&mut first, 3).await;
+        assert_eq!(sequences(records), [(1, 0), (1, 1), (2, 0)]);
+
+        // Past the linger, well inside the idle bound, and nothing sent.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for (correlation_id, event_type) in [(1, IriEventType::Begin), (2, IriEventType::Continue)]
+        {
+            sender
+                .send(event_of(correlation_id, event_type))
+                .await
+                .expect("send");
+        }
+        let (records, _) = read_records(&mut first, 2).await;
+        assert_eq!(
+            sequences(records),
+            [(1, 0), (2, 1)],
+            "the ended context was released; the live one carried on"
+        );
+
+        // Past the idle bound with nothing sent: the contexts, then the
+        // destination, go.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        sender
+            .send(event_of(2, IriEventType::Continue))
+            .await
+            .expect("send");
+        let mut second = accept(&listener).await;
+        let (records, _) = read_records(&mut second, 1).await;
+        assert_eq!(
+            sequences(records),
+            [(2, 0)],
+            "an idle context restarts, on a new connection to the dropped destination"
+        );
+    }
+
+    /// Clause 5.3 layout, octet by octet, for a PDU that carries the NFID.
+    #[test]
+    fn the_x2_pdu_with_a_network_function_id_is_the_known_answer() {
+        let encoded = encode_iri_event(&known_answer_event(), 1, Some("siphon-ne-1"))
+            .expect("event must frame");
+
+        let mut expected: Vec<u8> = vec![
+            0x00, 0x05, 0x00, 0x01, // version 0.5, X2
+            0x00, 0x00, 0x00, 0x74, // header length: 40 + 12 + 8 + 15 + 41
+            0x00, 0x00, 0x00, 0x39, // payload length 57
+            0x00, 0x09, 0x00, 0x02, // SIP, sent to target
+            0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55, // XID
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x92, // correlation 4242
+            0x00, 0x09, 0x00, 0x08, 0x65, 0x53, 0xf1, 0x00, 0x07, 0x5b, 0xcd,
+            0x15, // timestamp
+            0x00, 0x08, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, // sequence number 1
+            0x00, 0x06, 0x00, 0x0b, // NFID, 11 octets
+        ];
+        expected.extend_from_slice(b"siphon-ne-1");
+        expected.extend_from_slice(&[0x00, 0x11, 0x00, 0x25]);
+        expected.extend_from_slice(b"<e164Number>999000000001</e164Number>");
+        expected.extend_from_slice(RAW_INVITE);
+
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn no_network_function_id_means_no_attribute_6() {
+        let encoded = encode_iri_event(&test_iri_event(), 0, None).expect("event must frame");
+        assert!(attributes_of(&encoded)
+            .iter()
+            .all(|(kind, _)| *kind != attribute_type::NETWORK_FUNCTION_ID));
     }
 
     #[tokio::test]

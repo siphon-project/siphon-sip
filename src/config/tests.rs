@@ -3973,6 +3973,120 @@ fn parses_lawful_intercept_defaults() {
     assert!(li.x3.unwrap().enabled);
 }
 
+/// A config with X2, and an X1 block only when `ne_identifier` is given.
+fn x2_nfid_yaml(enabled: bool, ne_identifier: Option<&str>, x2_nfid: Option<&str>) -> String {
+    let mut yaml = format!(
+        concat!(
+            "listen:\n",
+            "  udp:\n",
+            "    - \"0.0.0.0:5060\"\n",
+            "domain:\n",
+            "  local:\n",
+            "    - \"example.com\"\n",
+            "script:\n",
+            "  path: \"scripts/proxy_default.py\"\n",
+            "lawful_intercept:\n",
+            "  enabled: {}\n",
+        ),
+        enabled
+    );
+    if let Some(identifier) = ne_identifier {
+        yaml.push_str(&format!(
+            concat!(
+                "  x1:\n",
+                "    listen: \"127.0.0.1:8443\"\n",
+                "    ne_identifier: \"{}\"\n",
+                "    tls:\n",
+                "      certificate: \"/etc/siphon/li/x1.crt\"\n",
+                "      private_key: \"/etc/siphon/li/x1.key\"\n",
+                "      client_ca: \"/etc/siphon/li/admf-ca.pem\"\n",
+            ),
+            identifier
+        ));
+    }
+    yaml.push_str("  x2:\n    delivery_address: \"192.0.2.50:6543\"\n");
+    if let Some(identifier) = x2_nfid {
+        yaml.push_str(&format!("    network_function_id: \"{identifier}\"\n"));
+    }
+    yaml
+}
+
+#[test]
+fn x2_network_function_id_is_its_own_key() {
+    let config = Config::from_str(&x2_nfid_yaml(
+        true,
+        Some("siphon-ne-1"),
+        Some("siphon-nf-9"),
+    ))
+    .expect("a valid NFID loads");
+    let li = config.lawful_intercept.expect("lawful_intercept");
+    assert_eq!(
+        li.x2
+            .as_ref()
+            .and_then(|x2| x2.network_function_id.as_deref()),
+        Some("siphon-nf-9")
+    );
+    assert_eq!(
+        li.x2_network_function_id(),
+        Some("siphon-nf-9"),
+        "the explicit key wins over x1.ne_identifier"
+    );
+}
+
+#[test]
+fn x2_network_function_id_defaults_to_the_x1_ne_identifier() {
+    let config = Config::from_str(&x2_nfid_yaml(true, Some("siphon-ne-1"), None)).expect("loads");
+    let li = config.lawful_intercept.expect("lawful_intercept");
+    assert!(li
+        .x2
+        .as_ref()
+        .is_some_and(|x2| x2.network_function_id.is_none()));
+    assert_eq!(li.x2_network_function_id(), Some("siphon-ne-1"));
+}
+
+#[test]
+fn x2_network_function_id_is_absent_when_neither_is_set() {
+    let config = Config::from_str(&x2_nfid_yaml(true, None, None)).expect("loads");
+    let li = config.lawful_intercept.expect("lawful_intercept");
+    assert_eq!(li.x2_network_function_id(), None);
+}
+
+#[test]
+fn an_unusable_x2_network_function_id_is_refused_at_load() {
+    let too_long = "a".repeat(256);
+    for (nfid, reason) in [
+        ("", "it is empty"),
+        (too_long.as_str(), "over the 255 allowed"),
+        ("siphon\\nne", "control character"),
+    ] {
+        let error = Config::from_str(&x2_nfid_yaml(true, Some("siphon-ne-1"), Some(nfid)))
+            .expect_err("an unusable NFID must not load")
+            .to_string();
+        assert!(error.contains("Network Function ID"), "{error}");
+        assert!(error.contains(reason), "{reason}: {error}");
+        assert!(
+            error.contains("lawful_intercept.x2.network_function_id"),
+            "the error names the key to fix: {error}"
+        );
+    }
+}
+
+/// The value taken from `x1.ne_identifier` is held to the same limits, since
+/// it is what goes on the wire.
+#[test]
+fn an_unusable_ne_identifier_is_refused_when_it_becomes_the_nfid() {
+    let too_long = "a".repeat(300);
+    let error = Config::from_str(&x2_nfid_yaml(true, Some(&too_long), None))
+        .expect_err("an over-long defaulted NFID must not load")
+        .to_string();
+    assert!(error.contains("over the 255 allowed"), "{error}");
+
+    // An explicit NFID makes the X1 identifier irrelevant to X2.
+    assert!(Config::from_str(&x2_nfid_yaml(true, Some(&too_long), Some("siphon-ne-1"))).is_ok());
+    // And a disabled block is not validated at all.
+    assert!(Config::from_str(&x2_nfid_yaml(false, Some(&too_long), None)).is_ok());
+}
+
 #[test]
 fn lawful_intercept_absent_when_not_configured() {
     let config = Config::from_str(minimal_yaml()).unwrap();

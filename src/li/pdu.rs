@@ -71,6 +71,11 @@ pub enum PduType {
 /// as X2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadFormat {
+    /// Clause 5.2.5's "reserved for keepalive", the format of a keepalive PDU
+    /// and of nothing else. It describes no payload, so it is refused on X2 and
+    /// X3 ([`PayloadFormat::allowed_on`]) and [`Pdu::keepalive`] is the only
+    /// constructor that uses it.
+    ReservedForKeepalive = 0,
     /// ETSI TS 102 232-1 defined payload.
     Etsi102232 = 1,
     /// 3GPP TS 33.128 defined payload.
@@ -115,7 +120,8 @@ impl PayloadFormat {
         match pdu_type {
             PduType::X2 => !matches!(
                 self,
-                PayloadFormat::Ethernet
+                PayloadFormat::ReservedForKeepalive
+                    | PayloadFormat::Ethernet
                     | PayloadFormat::Rtp
                     | PayloadFormat::GtpU
                     | PayloadFormat::Msrp
@@ -123,13 +129,17 @@ impl PayloadFormat {
             ),
             PduType::X3 => !matches!(
                 self,
-                PayloadFormat::Sip
+                PayloadFormat::ReservedForKeepalive
+                    | PayloadFormat::Sip
                     | PayloadFormat::Dhcp
                     | PayloadFormat::Radius
                     | PayloadFormat::ThreeGpp33108EpsIri
             ),
-            // Keepalives carry no payload, so no format is meaningful.
-            PduType::Keepalive | PduType::KeepaliveAck => false,
+            // Keepalives carry no payload, so the one format that describes
+            // none is the only one they may use.
+            PduType::Keepalive | PduType::KeepaliveAck => {
+                self == PayloadFormat::ReservedForKeepalive
+            }
         }
     }
 }
@@ -220,6 +230,18 @@ impl Attribute {
         Self::raw(attribute_type, value.as_bytes().to_vec())
     }
 
+    /// The Network Function ID attribute (type 6).
+    ///
+    /// Clause 5.3.7: the identifier of the network function that produced the
+    /// PDU, as UTF-8 with no terminator. Carried on every X2 PDU so that the
+    /// mediation function files the IRI of a call under the same NE identifier
+    /// as its content, which the media engine frames with
+    /// `x3_network_function_id`. The two must be the same string. Limits are in
+    /// [`validate_network_function_id`].
+    pub fn network_function_id(identifier: &str) -> Self {
+        Self::text(attribute_type::NETWORK_FUNCTION_ID, identifier)
+    }
+
     /// The Matched Target Identifier attribute (type 17).
     ///
     /// ETSI TS 103 221-2 V1.10.1 clause 5.3.18: the target identifier the POI
@@ -303,6 +325,37 @@ impl Attribute {
     }
 }
 
+/// Most octets a Network Function ID may take.
+///
+/// Siphon's own bound, not the specification's: clause 5.3.7 leaves the format
+/// of the identifier to the architecture. The attribute's two-octet length
+/// field would allow 65 535; an identifier is a short name, and 255 is what
+/// this element enforces so that a runaway value is refused at configuration
+/// load rather than framed into every PDU.
+pub const MAX_NETWORK_FUNCTION_ID_OCTETS: usize = 255;
+
+/// Check a configured Network Function ID against what can be framed.
+///
+/// UTF-8 is a property of `&str`; what is left to refuse is the empty string
+/// (an attribute with no value identifies nothing), anything over
+/// [`MAX_NETWORK_FUNCTION_ID_OCTETS`], and control characters, which no
+/// identifier a person typed contains and which corrupt a log line.
+pub fn validate_network_function_id(identifier: &str) -> Result<(), String> {
+    if identifier.is_empty() {
+        return Err("it is empty".to_string());
+    }
+    if identifier.len() > MAX_NETWORK_FUNCTION_ID_OCTETS {
+        return Err(format!(
+            "it is {} octets, over the {MAX_NETWORK_FUNCTION_ID_OCTETS} allowed",
+            identifier.len()
+        ));
+    }
+    if identifier.chars().any(char::is_control) {
+        return Err("it contains a control character".to_string());
+    }
+    Ok(())
+}
+
 /// A PDU that could not be built as specified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PduError {
@@ -378,11 +431,7 @@ impl Pdu {
     /// not merely lose one record — the receiver reads the next PDU's header
     /// from the middle of this one and the connection never recovers.
     pub fn encode(&self) -> Result<Vec<u8>, PduError> {
-        // A keepalive carries no payload, so no format describes anything and
-        // clause 5.2.5's table has nothing to say about it. Only the two
-        // interfaces that carry data are checked against it.
-        let carries_payload = matches!(self.pdu_type, PduType::X2 | PduType::X3);
-        if carries_payload && !self.payload_format.allowed_on(self.pdu_type) {
+        if !self.payload_format.allowed_on(self.pdu_type) {
             return Err(PduError::FormatNotAllowed {
                 format: self.payload_format,
                 pdu_type: self.pdu_type,
@@ -432,10 +481,9 @@ impl Pdu {
     pub fn keepalive(sequence: u32) -> Self {
         Self {
             pdu_type: PduType::Keepalive,
-            // A keepalive has no payload to describe. The encoder never
-            // consults the format table for this PDU type, so the value is
-            // inert; it is here because the field exists.
-            payload_format: PayloadFormat::Etsi102232,
+            // Clause 5.2.5 reserves format 0 for the keepalive: it has no
+            // payload to describe.
+            payload_format: PayloadFormat::ReservedForKeepalive,
             payload_direction: PayloadDirection::ReservedForKeepalive,
             x_id: [0u8; 16],
             correlation_id: [0u8; 8],
@@ -628,6 +676,98 @@ mod tests {
         assert_eq!(attribute_type::SEQUENCE_NUMBER, 8);
         assert_eq!(attribute_type::TIMESTAMP, 9);
         assert_eq!(attribute_type::MATCHED_TARGET_IDENTIFIER, 17);
+    }
+
+    /// Clause 5.1's keepalive, octet by octet: every mandatory field other
+    /// than the version, the PDU type and the header length is zero, payload
+    /// format included (the value reserved for exactly this PDU), and the one
+    /// attribute is a sequence number.
+    #[test]
+    fn keepalive_is_the_known_answer_with_payload_format_zero() {
+        let encoded = Pdu::keepalive(42).encode().expect("keepalive must encode");
+
+        let mut expected: Vec<u8> = vec![
+            0x00, 0x05, // version 0.5
+            0x00, 0x03, // PDU type keepalive
+            0x00, 0x00, 0x00, 0x30, // header length 48
+            0x00, 0x00, 0x00, 0x00, // payload length 0
+            0x00, 0x00, // payload format 0, reserved for keepalive
+            0x00, 0x00, // payload direction 0
+        ];
+        expected.extend_from_slice(&[0u8; 16]); // XID zero
+        expected.extend_from_slice(&[0u8; 8]); // correlation ID zero
+        expected.extend_from_slice(&[0x00, 0x08, 0x00, 0x04, 0x00, 0x00, 0x00, 0x2a]);
+        assert_eq!(encoded, expected);
+    }
+
+    /// The value reserved for keepalives describes no payload, so a PDU that
+    /// carries one cannot use it, on either interface.
+    #[test]
+    fn the_keepalive_format_cannot_frame_x2_or_x3_data() {
+        for pdu_type in [PduType::X2, PduType::X3] {
+            let mut pdu = sip_pdu();
+            pdu.pdu_type = pdu_type;
+            pdu.payload_format = PayloadFormat::ReservedForKeepalive;
+            assert_eq!(
+                pdu.encode(),
+                Err(PduError::FormatNotAllowed {
+                    format: PayloadFormat::ReservedForKeepalive,
+                    pdu_type,
+                })
+            );
+        }
+        assert_eq!(PayloadFormat::ReservedForKeepalive as u16, 0);
+    }
+
+    /// And the converse: a keepalive or its acknowledgement is format 0 and
+    /// nothing else.
+    #[test]
+    fn a_keepalive_cannot_carry_a_data_format() {
+        for pdu_type in [PduType::Keepalive, PduType::KeepaliveAck] {
+            let mut pdu = Pdu::keepalive(0);
+            pdu.pdu_type = pdu_type;
+            assert!(pdu.encode().is_ok(), "{pdu_type:?} with format 0");
+            pdu.payload_format = PayloadFormat::Etsi102232;
+            assert!(pdu.encode().is_err(), "{pdu_type:?} with format 1");
+        }
+    }
+
+    /// Clause 5.3 layout for attribute 6 (clause 5.3.7): a two-octet type, a
+    /// two-octet length, then the identifier as UTF-8 with no terminator.
+    #[test]
+    fn network_function_id_is_attribute_6_with_a_utf8_value() {
+        let mut pdu = sip_pdu();
+        pdu.attributes = vec![Attribute::network_function_id("siphon-ne-1")];
+        let encoded = pdu.encode().expect("well-formed PDU must encode");
+
+        assert_eq!(
+            &encoded[40..55],
+            &[
+                0x00, 0x06, 0x00, 0x0b, // type 6, 11 octets
+                b's', b'i', b'p', b'h', b'o', b'n', b'-', b'n', b'e', b'-', b'1'
+            ]
+        );
+        assert_eq!(
+            u32::from_be_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]),
+            55,
+            "header length counts the attribute"
+        );
+    }
+
+    #[test]
+    fn network_function_id_limits() {
+        assert!(validate_network_function_id("siphon-ne-1").is_ok());
+        assert!(
+            validate_network_function_id("nf\u{e9}-1").is_ok(),
+            "UTF-8 is allowed"
+        );
+        assert!(validate_network_function_id("").is_err(), "empty");
+        assert!(
+            validate_network_function_id("a\nb").is_err(),
+            "control character"
+        );
+        assert!(validate_network_function_id(&"a".repeat(255)).is_ok());
+        assert!(validate_network_function_id(&"a".repeat(256)).is_err());
     }
 
     #[test]
