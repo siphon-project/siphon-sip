@@ -24,6 +24,10 @@
 //! and one task applies them, retrying what Redis refuses. Safe from a thread
 //! attached to the interpreter and from a tokio worker alike.
 
+// Without Redis nothing builds a store (the registrar's Redis backend does):
+// the module is then all unreachable by design, and compiles the same.
+#![cfg_attr(not(any(feature = "redis-backend", test)), allow(dead_code))]
+
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -31,7 +35,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Notify;
-use tracing::{debug, warn};
+#[cfg(feature = "redis-backend")]
+use tracing::debug;
+use tracing::warn;
 
 use super::EntryOrigin;
 use crate::transport::Transport;
@@ -46,6 +52,7 @@ pub const DEFAULT_REGISTRANT_KEY_PREFIX: &str = "siphon:registrant:";
 pub const MAX_STARTUP_ATTEMPTS: u32 = 3;
 
 /// How long a failed write waits before it is applied again.
+#[cfg(feature = "redis-backend")]
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Seconds since the Unix epoch.
@@ -211,8 +218,9 @@ enum Backend {
     /// Applied at once, no task: for tests that need no Redis.
     #[cfg(test)]
     Memory(Mutex<HashMap<String, (BindingRecord, u64)>>),
-    /// Queues and never applies: for a test of the queue itself.
-    #[cfg(test)]
+    /// Queues and never applies, and reads as unreadable: for a test of the
+    /// queue itself. Nothing builds it outside tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     Inert,
 }
 
@@ -263,6 +271,7 @@ impl Shared {
             .max(1)
     }
 
+    #[cfg(feature = "redis-backend")]
     fn take_pending(&self) -> Vec<(String, Write)> {
         let mut pending = match self.pending.lock() {
             Ok(pending) => pending,
@@ -277,6 +286,7 @@ impl Shared {
 
     /// Put back what could not be applied, unless a newer write for the AoR
     /// arrived meanwhile.
+    #[cfg(feature = "redis-backend")]
     fn requeue(&self, aor: String, write: Write) {
         let mut pending = match self.pending.lock() {
             Ok(pending) => pending,
@@ -285,6 +295,7 @@ impl Shared {
         pending.entry(aor).or_insert(write);
     }
 
+    #[cfg(feature = "redis-backend")]
     async fn apply(&self, aor: &str, write: &Write) -> Result<(), String> {
         match &self.backend {
             #[cfg(feature = "redis-backend")]
@@ -341,7 +352,6 @@ impl Shared {
                 self.apply_memory(aor, write);
                 Ok(())
             }
-            #[cfg(test)]
             Backend::Inert => Ok(()),
         }
     }
@@ -382,6 +392,7 @@ impl Shared {
     }
 
     /// Apply every pending write once; what fails is queued again.
+    #[cfg(feature = "redis-backend")]
     async fn drain_once(&self) -> usize {
         let mut failed = 0;
         let batch = self.take_pending();
@@ -586,9 +597,11 @@ impl BindingStore {
     /// by its Contact, so another node's record of the same AoR and Contact is
     /// a REGISTER that already replaced ours (RFC 3261 §10.3). Scans
     /// `{prefix}*:{aor}` for each (SCAN, never KEYS).
+    #[cfg_attr(not(any(feature = "redis-backend", test)), allow(clippy::never_loop))]
     pub async fn others_holding(&self, aors: &[String]) -> Result<Vec<BindingRecord>, String> {
-        let mut found = Vec::new();
+        let mut found: Vec<BindingRecord> = Vec::new();
         for aor in aors {
+            let _ = aor;
             match &self.shared.backend {
                 #[cfg(feature = "redis-backend")]
                 Backend::Redis(connection) => {
@@ -607,7 +620,6 @@ impl BindingStore {
                     }
                     found.extend(records);
                 }
-                #[cfg(test)]
                 Backend::Inert => return Err("the store cannot be read".to_string()),
                 #[cfg(test)]
                 Backend::Memory(records) => {
@@ -652,7 +664,6 @@ impl BindingStore {
                     .await
                     .map(|(records, _)| records)
             }
-            #[cfg(test)]
             Backend::Inert => Ok(Vec::new()),
             #[cfg(test)]
             Backend::Memory(records) => Ok(match records.lock() {

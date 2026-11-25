@@ -193,6 +193,7 @@ where
 /// Connect once, then keep trying every `interval` as the registrar's own
 /// backend does, and hand the connection back. For a connection nothing else
 /// retries for us.
+#[cfg(feature = "redis-backend")]
 pub(super) async fn connect_and_hand_on<C, E, Connect, ConnectFuture>(
     label: &'static str,
     interval: Duration,
@@ -407,6 +408,7 @@ mod tests {
 
     /// The registrant's own Redis connection is retried as the registrar's is,
     /// not given up on after one failure.
+    #[cfg(feature = "redis-backend")]
     #[tokio::test]
     async fn the_registrant_connection_is_retried_until_it_answers() {
         let attempts = Arc::new(AtomicUsize::new(0));
