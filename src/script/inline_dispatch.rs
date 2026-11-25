@@ -73,7 +73,12 @@ fn coroutine_cannot_suspend(python: Python<'_>, coroutine: &Bound<'_, PyAny>) ->
         return entry.1;
     }
 
-    let verdict = analyse_code_for_suspension(python, &code).unwrap_or(false);
+    // The names a handler uses are resolved against the globals it runs with.
+    let verdict = coroutine
+        .getattr("cr_frame")
+        .and_then(|frame| frame.getattr("f_globals"))
+        .and_then(|globals| analyse_code_for_suspension(python, &code, &globals))
+        .unwrap_or(false);
     inline_verdicts().insert(key, (code.clone().unbind(), verdict));
     if verdict {
         debug!(
@@ -87,23 +92,73 @@ fn coroutine_cannot_suspend(python: Python<'_>, coroutine: &Bound<'_, PyAny>) ->
     verdict
 }
 
-/// `Ok(true)` when neither `code` nor any code object nested in it yields.
-fn analyse_code_for_suspension(python: Python<'_>, code: &Bound<'_, PyAny>) -> PyResult<bool> {
+/// The `asyncio` functions that need a running event loop to be called.
+const LOOP_FUNCTIONS: [&str; 4] = [
+    "create_task",
+    "ensure_future",
+    "get_running_loop",
+    "get_event_loop",
+];
+
+/// Whether `code` reaches for the running event loop: a global it uses is bound
+/// to one of [`LOOP_FUNCTIONS`] (`from asyncio import create_task as spawn`), or
+/// to the `asyncio` module while one of their names is an attribute it uses
+/// (`asyncio.create_task(...)`, `import asyncio as aio`). An attribute of that
+/// name on anything else (`jobs.create_task()`) is not the loop.
+///
+/// The limit: this reads the names the handler's own code uses. An `await`-free
+/// handler that calls a plain helper which reaches for the loop is not seen; it
+/// needs an `await` of its own (see the handler documentation).
+fn needs_event_loop(
+    python: Python<'_>,
+    code: &Bound<'_, PyAny>,
+    globals: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    let asyncio = python.import("asyncio")?;
+    let names: Vec<String> = code
+        .getattr("co_names")?
+        .try_iter()?
+        .map(|name| name?.extract())
+        .collect::<PyResult<_>>()?;
+    let uses_loop_attribute = names
+        .iter()
+        .any(|name| LOOP_FUNCTIONS.contains(&name.as_str()));
+    for name in &names {
+        let Ok(value) = globals.get_item(name.as_str()) else {
+            // Not a global: `import asyncio` inside the handler.
+            if name == "asyncio" && uses_loop_attribute {
+                return Ok(true);
+            }
+            continue;
+        };
+        if value.is(&asyncio) && uses_loop_attribute {
+            return Ok(true);
+        }
+        for function in LOOP_FUNCTIONS {
+            if value.is(&asyncio.getattr(function)?) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// `Ok(true)` when neither `code` nor any code object nested in it yields or
+/// needs the event loop. Nested code is read whether or not it is called (a
+/// nested `def` that is never called still counts): a false negative only costs
+/// the driver path.
+fn analyse_code_for_suspension(
+    python: Python<'_>,
+    code: &Bound<'_, PyAny>,
+    globals: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
     // A handler that starts a task (`asyncio.create_task`, `ensure_future`) or
     // asks for the loop needs a running event loop, which the inline path does
     // not have: `create_task` would raise `RuntimeError: no running event loop`
     // and the handler's reply would be lost. It need not contain an `await` to
-    // need one (reply, then start the follow-up work, is the usual shape), so
-    // the names count as suspending too. A false negative only costs the
-    // driver path.
-    for name in code.getattr("co_names")?.try_iter()? {
-        let name: String = name?.extract()?;
-        if matches!(
-            name.as_str(),
-            "create_task" | "ensure_future" | "get_running_loop" | "get_event_loop"
-        ) {
-            return Ok(false);
-        }
+    // need one (reply, then start the follow-up work, is the usual shape).
+    if needs_event_loop(python, code, globals)? {
+        return Ok(false);
     }
     let dis = python.import("dis")?;
     let instructions = dis.call_method1("get_instructions", (code,))?;
@@ -119,7 +174,8 @@ fn analyse_code_for_suspension(python: Python<'_>, code: &Bound<'_, PyAny>) -> P
     for constant in code.getattr("co_consts")?.try_iter()? {
         let constant = constant?;
         // Nested function bodies, comprehensions and generator expressions.
-        if constant.hasattr("co_code")? && !analyse_code_for_suspension(python, &constant)? {
+        if constant.hasattr("co_code")? && !analyse_code_for_suspension(python, &constant, globals)?
+        {
             return Ok(false);
         }
     }
@@ -550,6 +606,64 @@ mod tests {
             let _ = coroutine.call_method0("close");
             verdict
         })
+    }
+
+    /// A name bound to `asyncio.create_task` under another name still needs the
+    /// loop, and `aio.create_task` through an aliased module does too.
+    #[test]
+    fn inline_analysis_resolves_the_names_against_the_handlers_globals() {
+        assert!(!inline_verdict_for(
+            "from asyncio import create_task as spawn\nasync def work():\n    pass\nasync def handler():\n    spawn(work())\n"
+        ));
+        assert!(!inline_verdict_for(
+            "import asyncio as aio\nasync def work():\n    pass\nasync def handler():\n    aio.create_task(work())\n"
+        ));
+        assert!(!inline_verdict_for(
+            "import asyncio\nasync def handler():\n    asyncio.get_running_loop()\n"
+        ));
+    }
+
+    /// `create_task` on something that is not asyncio is not the event loop: the
+    /// handler stays on the inline path.
+    #[test]
+    fn inline_analysis_leaves_another_create_task_inline() {
+        assert!(inline_verdict_for(
+            "class Jobs:\n    def create_task(self, job):\n        return job\njobs = Jobs()\nasync def handler():\n    jobs.create_task(1)\n"
+        ));
+        // A module that merely has the name is not asyncio's.
+        assert!(inline_verdict_for(
+            "import json\ncreate_task = json.dumps\nasync def handler():\n    create_task(1)\n"
+        ));
+    }
+
+    /// The verdict is made once per code object: a later change to the globals
+    /// it was read against does not redo the analysis.
+    #[test]
+    fn inline_analysis_is_made_once_per_code_object() {
+        Python::initialize();
+        Python::attach(|python| {
+            let module = PyModule::from_code(
+                python,
+                &std::ffi::CString::new(
+                    "class Jobs:\n    def create_task(self, job):\n        return job\ntarget = Jobs()\nasync def handler():\n    target.create_task(1)\n",
+                )
+                .unwrap(),
+                &std::ffi::CString::new("verdict_cache_probe.py").unwrap(),
+                &std::ffi::CString::new("verdict_cache_probe").unwrap(),
+            )
+            .unwrap();
+            let handler = module.getattr("handler").unwrap();
+            let first = handler.call0().unwrap();
+            assert!(coroutine_cannot_suspend(python, &first));
+            let _ = first.call_method0("close");
+            // Were the analysis redone, `target` being asyncio now would flip it.
+            module
+                .setattr("target", python.import("asyncio").unwrap())
+                .unwrap();
+            let second = handler.call0().unwrap();
+            assert!(coroutine_cannot_suspend(python, &second));
+            let _ = second.call_method0("close");
+        });
     }
 
     /// The analysis must say "cannot suspend" only when that is actually true.
