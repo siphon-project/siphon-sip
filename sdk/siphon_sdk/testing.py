@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import os
 import sys
 from dataclasses import dataclass, field
@@ -39,6 +40,45 @@ from siphon_sdk.reply import Reply
 from siphon_sdk.call import Call
 from siphon_sdk.reoffer import Reoffer
 from siphon_sdk import mock_module
+
+
+@dataclass
+class InfoResult:
+    """What ``@b2bua.on_info`` handlers made of an INFO.
+
+    ``answered`` is true when a handler answered with ``request.reply()``;
+    ``status_code``, ``reason``, ``body``, ``content_type`` and ``headers`` are
+    then the answer. When none did, siphon either relays the INFO to the far
+    leg (``relayed`` is true, ``status_code`` is ``None``) or, on a call with
+    no far leg, answers a bare ``200 OK`` itself.
+    """
+
+    request: Request
+    """The INFO the handlers were shown."""
+
+    leg: str
+    """Which party sent it: ``"caller"`` or ``"callee"``."""
+
+    answered: bool = False
+    """A handler answered with ``request.reply()``."""
+
+    relayed: bool = False
+    """No handler answered and the call has a far leg: siphon relays it."""
+
+    status_code: Optional[int] = None
+    """The status the sender gets, or ``None`` when the INFO is relayed."""
+
+    reason: Optional[str] = None
+    """The reason phrase that goes with ``status_code``."""
+
+    body: Optional[bytes] = None
+    """The answer's body (``request.set_reply_body``), if any."""
+
+    content_type: Optional[str] = None
+    """The answer's Content-Type, if it has a body."""
+
+    headers: list[tuple[str, str]] = field(default_factory=list)
+    """Headers the handler set on the answer (``request.set_reply_header``)."""
 
 
 @dataclass
@@ -802,6 +842,11 @@ class SipTestHarness:
             else:
                 fn(*args)
 
+        # The callee's 200 makes the call answered once the handlers have seen
+        # it, as siphon does; a later hook (an INFO handler) reads it.
+        if call.state in ("calling", "ringing"):
+            call._state = "answered"
+
         return CallResult(call=call, actions=list(call.actions))
 
     def send_provisional(
@@ -854,6 +899,11 @@ class SipTestHarness:
                     self._loop.run_until_complete(fn(call, reply))
                 else:
                     fn(call, reply)
+
+        # A provisional that goes on to the caller moves a calling call to
+        # ringing, as siphon does; a later hook (an INFO handler, say) reads it.
+        if call.state == "calling" and 180 <= reply.status_code <= 199:
+            call._state = "ringing"
 
         return CallResult(call=call, actions=list(call.actions))
 
@@ -1144,6 +1194,101 @@ class SipTestHarness:
             except Exception:
                 continue
         return offer
+
+    def send_info(
+        self,
+        call: Optional[Call] = None,
+        leg: str = "caller",
+        body: Optional[Union[str, bytes]] = None,
+        content_type: Optional[str] = None,
+        headers: Optional[dict[str, str]] = None,
+        bridged: bool = True,
+        request: Optional[Request] = None,
+        **kwargs: Any,
+    ) -> InfoResult:
+        """Deliver an in-dialog INFO (RFC 6086) to ``@b2bua.on_info`` handlers.
+
+        Builds the INFO from ``leg`` (``"caller"`` or ``"callee"``) carrying
+        ``body`` of ``content_type`` and ``headers`` (an ``Info-Package`` for an
+        Info Package, say), and calls every handler with ``(call, request)``,
+        plus ``leg=`` for a handler that declares it. Returns what siphon did
+        with it as an :class:`InfoResult`: the handler's answer, or the default
+        when none answered (relayed on a ``bridged`` call, a bare ``200 OK`` on
+        one with no far leg). A handler that raises leaves the default, as
+        siphon does.
+
+        Args:
+            call: The call (an answered one is built from ``**kwargs`` if
+                ``None``).
+            leg: Which party sends the INFO.
+            body: The INFO's body.
+            content_type: Its Content-Type.
+            headers: Its extra headers.
+            bridged: The call has a far leg to relay to.
+            request: A prepared INFO, instead of one built from the above.
+
+        Example::
+
+            result = harness.send_info(
+                headers={"Info-Package": "example-package"},
+                content_type="application/example+json", body=b"{}")
+            assert result.status_code == 200 and not result.relayed
+        """
+        if leg not in ("caller", "callee"):
+            raise ValueError(f'send_info(leg=...) is "caller" or "callee" (got {leg!r})')
+        if call is None:
+            call = Call(state="answered", **kwargs)
+        if request is None:
+            if isinstance(body, str):
+                body = body.encode()
+            request = Request(
+                method="INFO",
+                body=body,
+                content_type=content_type,
+                call_id=call.call_id,
+                headers=headers,
+            )
+        result = InfoResult(request=request, leg=leg)
+        def accepts_leg(fn: Any) -> bool:
+            try:
+                inspect.signature(fn).bind(None, None, leg=leg)
+            except (TypeError, ValueError):
+                return False
+            return True
+
+        registry = mock_module.get_registry()
+        raised = False
+        for fn, is_async in registry.get("b2bua.on_info"):
+            keywords = {"leg": leg} if accepts_leg(fn) else {}
+            try:
+                if is_async:
+                    self._loop.run_until_complete(fn(call, request, **keywords))
+                else:
+                    fn(call, request, **keywords)
+            except Exception:
+                raised = True
+                break
+        answer = None
+        if not raised:
+            for action in reversed(request.actions):
+                if action.kind == "reply" and action.status_code is not None:
+                    if 200 <= action.status_code <= 699:
+                        answer = action
+                    break
+        if answer is not None:
+            result.answered = True
+            result.status_code = answer.status_code
+            result.reason = answer.reason
+            reply_body = getattr(request, "_reply_body", None)
+            if reply_body is not None:
+                result.body, result.content_type = reply_body
+            result.headers = list(request.reply_headers)
+        elif bridged:
+            result.relayed = True
+        else:
+            result.status_code = 200
+            result.reason = "OK"
+        return result
 
     @property
     def diameter(self) -> mock_module.MockDiameter:

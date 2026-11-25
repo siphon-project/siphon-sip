@@ -155,7 +155,7 @@ pub fn handle_b2bua_info(inbound: InboundMessage, message: SipMessage, state: &D
     // The handler may answer it with a status and a body (RFC 6086 §4.2.2
     // lets a 200 to an INFO carry one, and an application package that
     // carries requests in INFO needs it for their results).
-    let response = match run_info_hook(&call_id, &inbound, &message, state) {
+    let response = match run_info_hook(&call_id, &inbound, &message, from_a_leg, state) {
         Some(response) => response,
         None if has_far_leg => {
             // Not the script's: relayed, and its retransmissions with it.
@@ -213,10 +213,16 @@ fn relay_info(
 /// response it asked for with `request.reply()` (and `set_reply_body()` /
 /// `set_reply_header()`). `None` when no handler ran, a handler raised, or
 /// none answered: the caller then sends the default 200.
+///
+/// A handler that declares a `leg` keyword is told which party sent the INFO,
+/// `"caller"` or `"callee"` (the names `b2bua.send_info(leg=)` takes). That is
+/// the dialog's answer, so it holds when `keep_call_id()` gives both legs one
+/// Call-ID.
 fn run_info_hook(
     call_id: &str,
     inbound: &InboundMessage,
     message: &SipMessage,
+    from_a_leg: bool,
     state: &DispatcherState,
 ) -> Option<SipMessage> {
     let engine_state = state.engine.state();
@@ -243,14 +249,21 @@ fn run_info_hook(
                 return None;
             }
         };
+        let leg = if from_a_leg { "caller" } else { "callee" };
         for handler in &handlers {
             let callable = handler.callable.bind(python);
-            let raised =
-                match callable.call1((call_object.bind(python), request_object.bind(python))) {
-                    Ok(returned) if handler.is_async => run_coroutine(python, &returned).err(),
-                    Ok(_) => None,
-                    Err(error) => Some(error),
-                };
+            let raised = match crate::script::handler_keyword::call_with_optional_keyword(
+                python,
+                callable,
+                (call_object.bind(python), request_object.bind(python)),
+                2,
+                "leg",
+                Some(leg),
+            ) {
+                Ok(returned) if handler.is_async => run_coroutine(python, &returned).err(),
+                Ok(_) => None,
+                Err(error) => Some(error),
+            };
             if let Some(error) = raised {
                 record_script_error("B2BUA on_info", &error);
                 return None;
