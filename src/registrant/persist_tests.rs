@@ -199,3 +199,49 @@ async fn other_instances_records_are_found_by_aor_and_never_our_own() {
 
     assert_eq!(found, vec![other]);
 }
+
+#[tokio::test]
+async fn the_attempt_counter_is_set_only_on_the_registration_it_names() {
+    let store = BindingStore::in_memory("node-a", 30);
+    let mut newer = record("sip:trunk@carrier.example");
+    newer.call_id = "reg-newer".to_string();
+    store.save(newer.clone());
+
+    store.set_attempts_if("sip:trunk@carrier.example", "reg-0001", 2);
+    assert_eq!(store.load().await.expect("loaded")[0].attempts, 1);
+
+    store.set_attempts_if("sip:trunk@carrier.example", "reg-newer", 2);
+    assert_eq!(store.load().await.expect("loaded")[0].attempts, 2);
+}
+
+/// A guarded write is never turned into an unguarded one, and never undoes a
+/// save of a newer registration that waits in the queue.
+#[test]
+fn the_queue_never_turns_a_guarded_write_into_an_unguarded_one() {
+    let aor = "sip:trunk@carrier.example";
+    let mut first = record(aor);
+    first.call_id = "reg-first".to_string();
+    let mut second = first.clone();
+    second.call_id = "reg-second".to_string();
+
+    // A save of the same registration, then its guarded removal: guarded.
+    let store = BindingStore::inert("node-a");
+    store.save(first.clone());
+    store.remove_if(aor, "reg-first");
+    assert_eq!(store.pending_kind(aor), Some("remove_if"));
+
+    // A save of a newer registration is not undone by an older one's removal
+    // or attempt update.
+    let store = BindingStore::inert("node-a");
+    store.save(second.clone());
+    store.remove_if(aor, "reg-first");
+    assert_eq!(store.pending_kind(aor), Some("save"));
+    store.set_attempts_if(aor, "reg-first", 3);
+    assert_eq!(store.pending_kind(aor), Some("save"));
+
+    // An unconditional removal stays unconditional.
+    let store = BindingStore::inert("node-a");
+    store.remove(aor);
+    store.remove_if(aor, "reg-first");
+    assert_eq!(store.pending_kind(aor), Some("remove"));
+}

@@ -96,6 +96,8 @@ pub async fn registration_loop(manager: Arc<RegistrantManager>, context: Registr
 
     loop {
         tokio::time::sleep(tick_interval).await;
+        // A restart's de-REGISTER is checked once more right before it can go.
+        manager.release_startup_deregistrations().await;
         run_tick(&manager, &context, egress, limiter.as_mut());
     }
 }

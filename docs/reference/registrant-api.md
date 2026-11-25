@@ -201,6 +201,16 @@ not answered, the binding expires as it would have, and the record is dropped
 - `lookup_query` is a statement returning the one row whose AoR is `$1`, in the
   columns of `query`.
 
+A de-REGISTER is sent only for a Contact that is exactly a socket this node
+registers from (an explicit IP and port equal to a specific listener or the
+egress address: wildcards, names, a missing port and per-entry addresses never
+qualify) and that no other node's record holds for the same AoR. Both are
+checked again right before every send, the authorised retry included; anything
+that cannot be established, Redis unreadable included, leaves the binding to
+expire. A registrar keys a binding by its Contact (RFC 3261 §10.3), so a wrong
+`Expires: 0` would delete a live binding. Records are only ever rewritten or
+removed by Call-ID, so a newer registration's record is never touched.
+
 Records hold the AoR, registrar, destination, transport, the Contact sent, the
 Call-ID, the next CSeq, the local address, the interval, the grant's end and an
 attempt counter (at most 3 start-ups try one binding). They expire by themselves

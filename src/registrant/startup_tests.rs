@@ -53,6 +53,12 @@ fn manager_with_store() -> (Arc<RegistrantManager>, Arc<BindingStore>) {
     (manager, store)
 }
 
+/// What the clean-up queued, after the checks made just before it would leave.
+async fn released(manager: &RegistrantManager) -> Vec<crate::registrant::BuiltRegister> {
+    manager.release_startup_deregistrations().await;
+    test_support::take_deregistrations(manager)
+}
+
 fn header(message: &crate::sip::message::SipMessage, name: &str) -> String {
     message.headers.get(name).cloned().unwrap_or_default()
 }
@@ -125,7 +131,8 @@ async fn an_orphan_is_de_registered_on_its_call_id_contact_and_next_cseq() {
             ..CleanupReport::default()
         }
     );
-    let built = test_support::take_deregistrations(&manager)
+    let built = released(&manager)
+        .await
         .pop()
         .expect("a queued de-REGISTER");
     assert_eq!(header(&built.message, "Expires"), "0");
@@ -152,7 +159,7 @@ async fn an_entry_that_has_not_registered_takes_over_the_stored_binding() {
     let report = manager.startup_cleanup(vec![stored.clone()], defaults(&listen));
 
     assert_eq!(report.carried, 1);
-    assert!(test_support::take_deregistrations(&manager).is_empty());
+    assert!(released(&manager).await.is_empty());
     assert_eq!(manager.removed_deregistrations_pending(), 0);
     // Its next REGISTER refreshes that binding (RFC 3261 §10.2.4).
     let refresh = manager
@@ -180,7 +187,7 @@ async fn an_entry_that_registered_since_on_the_same_contact_is_left_alone() {
     let report = manager.startup_cleanup(vec![stored], defaults(&listen));
 
     assert_eq!(report.left, 1);
-    assert!(test_support::take_deregistrations(&manager).is_empty());
+    assert!(released(&manager).await.is_empty());
     let after = manager
         .build_register(AOR, defaults(&listen), 600)
         .map(|built| header(&built.message, "Call-ID"))
@@ -203,9 +210,7 @@ async fn a_live_entry_on_another_contact_leaves_the_stored_one_to_be_cleared() {
     let report = manager.startup_cleanup(vec![stored.clone()], defaults(&listen));
 
     assert_eq!(report.deregistered, 1);
-    let built = test_support::take_deregistrations(&manager)
-        .pop()
-        .expect("a de-REGISTER");
+    let built = released(&manager).await.pop().expect("a de-REGISTER");
     assert!(header(&built.message, "Contact").contains(CONTACT));
     assert_eq!(manager.len(), 1);
     assert_eq!(manager.state(AOR), Some(RegistrantState::Unregistered));
@@ -223,7 +228,7 @@ async fn an_ims_ue_entry_is_neither_taken_over_nor_cleared() {
     let report = manager.startup_cleanup(vec![stored], defaults(&listen));
 
     assert_eq!(report.dropped, 1);
-    assert!(test_support::take_deregistrations(&manager).is_empty());
+    assert!(released(&manager).await.is_empty());
     assert!(store.load().await.expect("loaded").is_empty());
 }
 
@@ -238,7 +243,7 @@ async fn a_binding_that_used_up_its_attempts_is_dropped_not_tried_again() {
     let report = manager.startup_cleanup(vec![stored], defaults(&listen));
 
     assert_eq!(report.dropped, 1);
-    assert!(test_support::take_deregistrations(&manager).is_empty());
+    assert!(released(&manager).await.is_empty());
     assert!(store.load().await.expect("loaded").is_empty());
 }
 
@@ -279,7 +284,7 @@ async fn a_binding_of_a_row_the_source_rejected_is_left_alone() {
     let report = manager.startup_cleanup(vec![stored], defaults(&listen));
 
     assert_eq!(report.left, 1);
-    assert!(test_support::take_deregistrations(&manager).is_empty());
+    assert!(released(&manager).await.is_empty());
     assert_eq!(store.load().await.expect("loaded").len(), 1);
 }
 
@@ -344,7 +349,7 @@ async fn the_start_up_task_waits_for_a_late_store_then_clears_the_orphans() {
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!task.is_finished(), "ran without a store");
-    assert!(test_support::take_deregistrations(&manager).is_empty());
+    assert!(released(&manager).await.is_empty());
 
     // Redis came up after boot.
     let store = BindingStore::in_memory("node-a", 30);
@@ -355,12 +360,12 @@ async fn the_start_up_task_waits_for_a_late_store_then_clears_the_orphans() {
         .expect("the task ends once it has run")
         .expect("no panic");
 
-    assert_eq!(test_support::take_deregistrations(&manager).len(), 1);
+    assert_eq!(released(&manager).await.len(), 1);
 }
 
 // --- every way the de-REGISTER ends drops the record ---------------------------
 
-fn queued_orphan(
+async fn queued_orphan(
     manager: &RegistrantManager,
     store: &BindingStore,
 ) -> crate::registrant::BuiltRegister {
@@ -368,9 +373,7 @@ fn queued_orphan(
     let stored = record(AOR);
     store.save(stored.clone());
     manager.startup_cleanup(vec![stored], defaults(&listen));
-    test_support::take_deregistrations(manager)
-        .pop()
-        .expect("a de-REGISTER")
+    released(manager).await.pop().expect("a de-REGISTER")
 }
 
 async fn stored_count(store: &BindingStore) -> usize {
@@ -380,7 +383,7 @@ async fn stored_count(store: &BindingStore) -> usize {
 #[tokio::test]
 async fn a_final_answer_to_an_orphans_de_register_drops_its_record() {
     let (manager, store) = manager_with_store();
-    let built = queued_orphan(&manager, &store);
+    let built = queued_orphan(&manager, &store).await;
     let listen = listen();
     assert_eq!(stored_count(&store).await, 1);
 
@@ -400,7 +403,7 @@ async fn a_final_answer_to_an_orphans_de_register_drops_its_record() {
 #[tokio::test]
 async fn timer_f_of_an_orphans_de_register_drops_its_record() {
     let (manager, store) = manager_with_store();
-    let built = queued_orphan(&manager, &store);
+    let built = queued_orphan(&manager, &store).await;
     assert!(manager.removed_deregistration_ended(&built.branch, "unanswered"));
     assert_eq!(stored_count(&store).await, 0);
     assert_eq!(manager.removed_deregistrations_pending(), 0);
@@ -409,7 +412,7 @@ async fn timer_f_of_an_orphans_de_register_drops_its_record() {
 #[tokio::test]
 async fn the_sweep_of_an_orphans_de_register_drops_its_record() {
     let (manager, store) = manager_with_store();
-    let _built = queued_orphan(&manager, &store);
+    let _built = queued_orphan(&manager, &store).await;
     manager.expire_removed_deregistrations(Instant::now() + Duration::from_secs(120));
     assert_eq!(stored_count(&store).await, 0);
     assert_eq!(manager.removed_deregistrations_pending(), 0);
@@ -428,9 +431,7 @@ async fn removing_an_entry_drops_its_record_when_its_de_register_ends() {
 
     manager.remove(AOR);
     assert_eq!(stored_count(&store).await, 1, "kept until it is cleared");
-    let built = test_support::take_deregistrations(&manager)
-        .pop()
-        .expect("a de-REGISTER");
+    let built = released(&manager).await.pop().expect("a de-REGISTER");
     manager.answer_removed_deregistration(
         &header(&built.message, "Call-ID"),
         cseq_number(&built.message),
@@ -467,9 +468,7 @@ async fn an_old_de_register_ending_leaves_the_record_of_a_new_registration() {
     manager.build_register(AOR, defaults(&listen), 600);
     manager.handle_success(AOR, 600);
     manager.remove(AOR);
-    let old = test_support::take_deregistrations(&manager)
-        .pop()
-        .expect("a de-REGISTER");
+    let old = released(&manager).await.pop().expect("a de-REGISTER");
 
     manager.add(trunk(AOR));
     manager.build_register(AOR, defaults(&listen), 600);
@@ -492,7 +491,7 @@ async fn orphans_leave_no_tracked_de_register_and_no_record_whichever_way_they_e
     let (manager, store) = manager_with_store();
     let listen = listen();
     for cycle in 0..60u32 {
-        let built = queued_orphan(&manager, &store);
+        let built = queued_orphan(&manager, &store).await;
         let call_id = header(&built.message, "Call-ID");
         match cycle % 4 {
             0 => {
@@ -522,7 +521,7 @@ async fn orphans_leave_no_tracked_de_register_and_no_record_whichever_way_they_e
     assert_eq!(manager.removed_deregistrations_pending(), 0);
     assert_eq!(stored_count(&store).await, 0);
     assert_eq!(store.pending_writes(), 0);
-    assert!(test_support::take_deregistrations(&manager).is_empty());
+    assert!(released(&manager).await.is_empty());
     assert!(manager.is_empty());
 }
 
@@ -550,7 +549,7 @@ async fn a_binding_on_a_contact_that_is_not_this_nodes_is_not_de_registered() {
         assert_eq!(report.dropped, 1, "{contact}");
         assert_eq!(report.deregistered, 0, "{contact}");
         assert!(
-            test_support::take_deregistrations(&manager).is_empty(),
+            released(&manager).await.is_empty(),
             "{contact}: a de-REGISTER went out"
         );
         assert!(
@@ -575,21 +574,96 @@ async fn a_per_entry_address_that_moved_away_is_not_cleared() {
     let report = manager.startup_cleanup(vec![stored], defaults(&listen));
 
     assert_eq!(report.dropped, 1);
-    assert!(test_support::take_deregistrations(&manager).is_empty());
+    assert!(released(&manager).await.is_empty());
     assert!(store.load().await.expect("loaded").is_empty());
 }
 
-/// ...while an address this node does hold (a plain bind succeeds on it) is.
+/// Stricter: the Contact must carry an explicit IP and port equal to a
+/// specific listener or the egress socket, exactly. A bindable address, a
+/// wildcard, a hostname or a missing port never qualifies (the binding just
+/// expires, as before).
 #[tokio::test]
-async fn a_floating_address_this_node_holds_is_cleared() {
-    let (manager, store) = manager_with_store();
-    let listen = listen();
+async fn a_contact_that_is_not_exactly_a_listener_or_egress_socket_never_qualifies() {
+    for contact in [
+        // Bindable here, but not a socket this node registers from.
+        "sip:trunk@127.0.0.1:5060",
+        // Wildcards.
+        "sip:trunk@0.0.0.0:5060",
+        "sip:trunk@[::]:5060",
+        // No port.
+        "sip:trunk@192.0.2.1",
+        // A name.
+        "sip:trunk@sbc.example:5060",
+    ] {
+        let (manager, store) = manager_with_store();
+        let listen = listen();
+        let mut stored = record(AOR);
+        stored.contact = contact.to_string();
+        store.save(stored.clone());
+
+        let report = manager.startup_cleanup(vec![stored], defaults(&listen));
+
+        assert_eq!(report.dropped, 1, "{contact}");
+        assert!(
+            released(&manager).await.is_empty(),
+            "{contact}: a de-REGISTER went out"
+        );
+    }
+}
+
+/// A wildcard listener is no address to name in a Contact.
+#[tokio::test]
+async fn a_wildcard_listener_does_not_make_a_wildcard_contact_this_nodes() {
+    let manager = Arc::new(test_support::manager());
+    test_support::attach_untracked_transactions(&manager);
+    let wildcard: HashMap<Transport, std::net::SocketAddr> =
+        HashMap::from([(Transport::Udp, "0.0.0.0:5060".parse().expect("addr"))]);
+    manager.set_egress(crate::registrant::RegistrantEgress {
+        local_addr: "0.0.0.0:5060".parse().expect("addr"),
+        listen_addrs: wildcard.clone(),
+        advertised_addrs: HashMap::new(),
+        advertised_address: None,
+        hep_sender: None,
+    });
+    let store = BindingStore::in_memory("node-a", 30);
+    manager.attach_binding_store(Arc::clone(&store));
     let mut stored = record(AOR);
-    stored.contact = "sip:trunk@127.0.0.1:5060".to_string();
+    stored.contact = "sip:trunk@0.0.0.0:5060".to_string();
     store.save(stored.clone());
 
-    let report = manager.startup_cleanup(vec![stored], defaults(&listen));
+    let report = manager.startup_cleanup(
+        vec![stored],
+        EgressDefaults::new("0.0.0.0:5060".parse().expect("addr"), &wildcard),
+    );
 
+    assert_eq!(report.dropped, 1);
+}
+
+/// The default generated Contact is built from the listener's address and port,
+/// which is what qualifies it.
+#[tokio::test]
+async fn the_default_generated_contact_is_the_listeners_socket_and_qualifies() {
+    let (manager, _store) = manager_with_store();
+    let listen = listen();
+    manager.add(trunk(AOR));
+    manager.build_register(AOR, defaults(&listen), 600);
+    manager.handle_success(AOR, 600);
+    let stored = manager
+        .restart
+        .bindings
+        .get()
+        .expect("a store")
+        .load()
+        .await
+        .expect("loaded")
+        .pop()
+        .expect("a record");
+    assert_eq!(stored.contact, "sip:trunk@192.0.2.1:5060");
+
+    manager.remove(AOR);
+    let mut again = stored;
+    again.call_id = "reg-from-the-last-process".to_string();
+    let report = manager.startup_cleanup(vec![again], defaults(&listen));
     assert_eq!(report.deregistered, 1);
 }
 
@@ -615,7 +689,7 @@ async fn an_advertised_shared_host_does_not_make_a_contact_this_nodes() {
     let report = manager.startup_cleanup(vec![stored], defaults(&listen));
 
     assert_eq!(report.dropped, 1);
-    assert!(test_support::take_deregistrations(&manager).is_empty());
+    assert!(released(&manager).await.is_empty());
 }
 
 fn other_instance_record(contact: &str) -> BindingRecord {
@@ -627,22 +701,24 @@ fn other_instance_record(contact: &str) -> BindingRecord {
 }
 
 /// Another node's record of the same AoR on the same Contact: its REGISTER
-/// already replaced ours (RFC 3261 §10.3), and ours would delete it.
+/// already replaced ours (RFC 3261 §10.3), and ours would delete it. Checked
+/// again when the de-REGISTER is about to leave, so one that appears after the
+/// clean-up queued it stops it too.
 #[tokio::test]
 async fn another_instance_holding_the_same_contact_stops_the_de_register() {
     let (manager, store) = manager_with_store();
     let listen = listen();
     let stored = record(AOR);
     store.save(stored.clone());
+    manager.startup_cleanup(vec![stored], defaults(&listen));
+    // It registered after ours was queued.
+    store.save_as_instance(other_instance_record(CONTACT));
 
-    let report = manager.startup_cleanup_with(
-        vec![stored],
-        &[other_instance_record(CONTACT)],
-        defaults(&listen),
+    assert!(
+        released(&manager).await.is_empty(),
+        "the de-REGISTER left over another node's binding"
     );
-
-    assert_eq!(report.dropped, 1);
-    assert!(test_support::take_deregistrations(&manager).is_empty());
+    assert_eq!(manager.removed_deregistrations_pending(), 0);
     assert!(store.load().await.expect("loaded").is_empty());
 }
 
@@ -653,14 +729,49 @@ async fn another_instance_on_another_contact_does_not_stop_it() {
     let listen = listen();
     let stored = record(AOR);
     store.save(stored.clone());
+    store.save_as_instance(other_instance_record("sip:trunk@192.0.2.9:5060"));
+    manager.startup_cleanup(vec![stored], defaults(&listen));
 
-    let report = manager.startup_cleanup_with(
-        vec![stored],
-        &[other_instance_record("sip:trunk@192.0.2.9:5060")],
+    assert_eq!(released(&manager).await.len(), 1);
+}
+
+/// Fail closed: a store that cannot be read at send time abandons the
+/// de-REGISTER (the binding expires, as before) and drops our record.
+#[tokio::test]
+async fn a_store_that_cannot_be_read_abandons_the_de_register() {
+    let manager = Arc::new(test_support::manager());
+    test_support::install_egress(&manager);
+    test_support::attach_untracked_transactions(&manager);
+    let store = BindingStore::inert("node-a");
+    manager.attach_binding_store(Arc::clone(&store));
+    let listen = listen();
+    manager.startup_cleanup(vec![record(AOR)], defaults(&listen));
+
+    assert!(released(&manager).await.is_empty());
+    assert_eq!(manager.removed_deregistrations_pending(), 0);
+}
+
+/// A newer record (another Call-ID) written meanwhile is neither overwritten by
+/// the attempt counter nor deleted by the clean-up's completion.
+#[tokio::test]
+async fn a_newer_record_survives_the_attempt_update_and_the_completion() {
+    let (manager, store) = manager_with_store();
+    let listen = listen();
+    let mut newer = record(AOR);
+    newer.call_id = "reg-newer".to_string();
+    store.save(newer.clone());
+
+    manager.startup_cleanup(vec![record(AOR)], defaults(&listen));
+    let built = released(&manager).await.pop().expect("a de-REGISTER");
+    manager.answer_removed_deregistration(
+        &header(&built.message, "Call-ID"),
+        cseq_number(&built.message),
+        200,
+        None,
         defaults(&listen),
     );
 
-    assert_eq!(report.deregistered, 1);
+    assert_eq!(store.load().await.expect("loaded"), vec![newer]);
 }
 
 /// The registrar target is part of what a live entry replaces: a trunk moved
@@ -679,7 +790,7 @@ async fn a_trunk_moved_to_another_registrar_does_not_cancel_the_old_ones_clean_u
     manager.add(entry);
 
     assert_eq!(
-        test_support::take_deregistrations(&manager).len(),
+        released(&manager).await.len(),
         1,
         "the old registrar's binding was abandoned"
     );
@@ -708,7 +819,7 @@ async fn a_replacement_record_saved_at_late_attach_survives_the_clean_up() {
             .await
             .expect("read");
         manager.startup_cleanup(snapshot, defaults(&listen));
-        if let Some(built) = test_support::take_deregistrations(&manager).pop() {
+        if let Some(built) = released(&manager).await.pop() {
             manager.answer_removed_deregistration(
                 &header(&built.message, "Call-ID"),
                 cseq_number(&built.message),
@@ -738,7 +849,7 @@ async fn a_registrar_that_resolves_elsewhere_after_the_restart_is_the_same_targe
     let report = manager.startup_cleanup(vec![stored], defaults(&listen));
 
     assert_eq!(report.carried, 1);
-    assert!(test_support::take_deregistrations(&manager).is_empty());
+    assert!(released(&manager).await.is_empty());
 }
 
 /// Checked again when the de-REGISTER is about to leave: a live entry took the
@@ -754,7 +865,7 @@ async fn a_queued_restart_de_register_is_dropped_once_a_live_entry_holds_the_con
     manager.add(trunk(AOR));
 
     assert!(
-        test_support::take_deregistrations(&manager).is_empty(),
+        released(&manager).await.is_empty(),
         "the de-REGISTER left although the trunk is live on that Contact"
     );
     assert_eq!(manager.removed_deregistrations_pending(), 0);
@@ -773,7 +884,7 @@ async fn a_live_entry_on_another_contact_does_not_stop_the_de_register() {
     store.save(stored.clone());
     manager.startup_cleanup(vec![stored], defaults(&listen));
 
-    assert_eq!(test_support::take_deregistrations(&manager).len(), 1);
+    assert_eq!(released(&manager).await.len(), 1);
 }
 
 /// The record of a cleaned-up binding goes with its de-REGISTER unless a live
@@ -789,9 +900,7 @@ async fn a_cleaned_up_record_is_dropped_although_a_live_entry_holds_the_aor() {
     let stored = record(AOR);
     store.save(stored.clone());
     manager.startup_cleanup(vec![stored.clone()], defaults(&listen));
-    let built = test_support::take_deregistrations(&manager)
-        .pop()
-        .expect("a de-REGISTER");
+    let built = released(&manager).await.pop().expect("a de-REGISTER");
 
     manager.answer_removed_deregistration(
         &header(&built.message, "Call-ID"),
@@ -816,9 +925,7 @@ async fn a_record_a_live_entry_wrote_survives_the_clean_up_of_the_old_one() {
     let stored = record(AOR);
     store.save(stored.clone());
     manager.startup_cleanup(vec![stored], defaults(&listen));
-    let built = test_support::take_deregistrations(&manager)
-        .pop()
-        .expect("a de-REGISTER");
+    let built = released(&manager).await.pop().expect("a de-REGISTER");
     manager.build_register(AOR, defaults(&listen), 600);
     manager.handle_success(AOR, 600);
 

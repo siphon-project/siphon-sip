@@ -226,3 +226,69 @@ async fn other_instances_records_of_an_aor_are_found_by_scan() {
     assert_eq!(found[0].instance, "node-b");
     assert_eq!(found[0].aor, "sip:trunk@carrier.example");
 }
+
+#[tokio::test]
+async fn the_attempt_counter_is_guarded_by_call_id_in_redis() {
+    let Some(connection) = connection().await else {
+        return;
+    };
+    let store = BindingStore::redis(
+        connection,
+        "node-a".to_string(),
+        unique_prefix("attempts"),
+        30,
+    );
+    let mut first = record("node-a", "sip:trunk@carrier.example");
+    first.call_id = "reg-first".to_string();
+    let mut second = first.clone();
+    second.call_id = "reg-second".to_string();
+    store.save(second.clone());
+    store.flush(Duration::from_secs(5)).await;
+
+    store.set_attempts_if("sip:trunk@carrier.example", "reg-first", 3);
+    store.flush(Duration::from_secs(5)).await;
+    assert_eq!(store.load().await.expect("loaded"), vec![second.clone()]);
+
+    store.set_attempts_if("sip:trunk@carrier.example", "reg-second", 3);
+    store.flush(Duration::from_secs(5)).await;
+    assert_eq!(store.load().await.expect("loaded")[0].attempts, 3);
+}
+
+/// Fail closed: a hash of another instance for the AoR that cannot be read
+/// counts as held, not as absent.
+#[tokio::test]
+async fn an_unreadable_record_of_another_instance_is_an_error_not_an_absence() {
+    let Some(connection) = connection().await else {
+        return;
+    };
+    let prefix = unique_prefix("unreadable");
+    let node_a = BindingStore::redis(connection.clone(), "node-a".to_string(), prefix.clone(), 30);
+    let aor = "sip:trunk@carrier.example";
+    let mut raw = connection.clone();
+    let _: i64 = redis::cmd("HSET")
+        .arg(format!("{prefix}node-b:{aor}"))
+        .arg("aor")
+        .arg(aor)
+        .arg("call_id")
+        .arg("reg-garbled")
+        .query_async(&mut raw)
+        .await
+        .expect("HSET");
+
+    assert!(node_a.others_holding(&[aor.to_string()]).await.is_err());
+
+    // Our own unreadable record is ours to ignore.
+    let _: i64 = redis::cmd("DEL")
+        .arg(format!("{prefix}node-b:{aor}"))
+        .query_async(&mut raw)
+        .await
+        .expect("DEL");
+    let _: i64 = redis::cmd("HSET")
+        .arg(format!("{prefix}node-a:{aor}"))
+        .arg("aor")
+        .arg(aor)
+        .query_async(&mut raw)
+        .await
+        .expect("HSET");
+    assert!(node_a.others_holding(&[aor.to_string()]).await.is_ok());
+}

@@ -819,7 +819,10 @@ fn orphan_record() -> BindingRecord {
 
 impl Setup {
     /// A restart that finds one orphaned binding: its de-REGISTER, sent.
-    fn startup_orphan(&self, lookup: Option<Arc<StubLookup>>) -> (Arc<BindingStore>, SipMessage) {
+    async fn startup_orphan(
+        &self,
+        lookup: Option<Arc<StubLookup>>,
+    ) -> (Arc<BindingStore>, SipMessage) {
         let store = BindingStore::in_memory("node-a", 30);
         store.save(orphan_record());
         self.registrant.attach_binding_store(Arc::clone(&store));
@@ -830,12 +833,14 @@ impl Setup {
             .registrant
             .startup_cleanup(vec![orphan_record()], self.defaults());
         assert_eq!(report.deregistered, 1);
+        self.registrant.release_startup_deregistrations().await;
         (store, self.send_queued_deregistration())
     }
 
     /// The authenticated de-REGISTER the lookup task queued, once it has run.
     async fn queued_after_lookup(&self) -> Option<SipMessage> {
         for _ in 0..100 {
+            self.registrant.release_startup_deregistrations().await;
             if let Some(built) = test_support::take_deregistrations(&self.registrant).pop() {
                 send_registrant_request(&self.registrant, TRUNK, &built, &self.dispatcher.state);
                 return Some(parse_sent(&self.dispatcher.udp.try_recv().expect("sent")));
@@ -849,7 +854,7 @@ impl Setup {
 #[tokio::test]
 async fn a_restarts_de_register_is_sent_on_the_old_call_id_and_the_next_cseq() {
     let setup = Setup::new();
-    let (_store, deregister) = setup.startup_orphan(None);
+    let (_store, deregister) = setup.startup_orphan(None).await;
 
     assert_eq!(header(&deregister, "Expires"), "0");
     assert_eq!(header(&deregister, "Call-ID"), ORPHAN_CALL_ID);
@@ -862,7 +867,7 @@ async fn a_restarts_de_register_is_sent_on_the_old_call_id_and_the_next_cseq() {
 async fn a_challenge_to_a_restarts_de_register_is_answered_from_the_lookup() {
     let setup = Setup::new();
     let lookup = StubLookup::knowing("looked-up-user", "looked-up-password");
-    let (store, deregister) = setup.startup_orphan(Some(Arc::clone(&lookup)));
+    let (store, deregister) = setup.startup_orphan(Some(Arc::clone(&lookup))).await;
     setup.challenge(&deregister, "401 Unauthorized", "WWW-Authenticate");
 
     let answer = setup.queued_after_lookup().await.expect("the answer");
@@ -884,7 +889,9 @@ async fn a_challenge_to_a_restarts_de_register_is_answered_from_the_lookup() {
 #[tokio::test]
 async fn a_proxy_challenge_to_a_restarts_de_register_is_answered_with_proxy_authorization() {
     let setup = Setup::new();
-    let (_store, deregister) = setup.startup_orphan(Some(StubLookup::knowing("user-a", "pw")));
+    let (_store, deregister) = setup
+        .startup_orphan(Some(StubLookup::knowing("user-a", "pw")))
+        .await;
     setup.challenge(
         &deregister,
         "407 Proxy Authentication Required",
@@ -909,7 +916,7 @@ async fn a_challenge_nothing_can_answer_leaves_the_binding_to_expire_and_drops_t
     ];
     for (name, lookup) in cases {
         let setup = Setup::new();
-        let (store, deregister) = setup.startup_orphan(lookup);
+        let (store, deregister) = setup.startup_orphan(lookup).await;
         setup.challenge(&deregister, "401 Unauthorized", "WWW-Authenticate");
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -929,7 +936,9 @@ async fn a_challenge_nothing_can_answer_leaves_the_binding_to_expire_and_drops_t
 #[tokio::test]
 async fn a_second_challenge_after_the_lookup_gives_up_and_drops_the_record() {
     let setup = Setup::new();
-    let (store, deregister) = setup.startup_orphan(Some(StubLookup::knowing("user-a", "pw")));
+    let (store, deregister) = setup
+        .startup_orphan(Some(StubLookup::knowing("user-a", "pw")))
+        .await;
     setup.challenge(&deregister, "401 Unauthorized", "WWW-Authenticate");
     let answer = setup.queued_after_lookup().await.expect("the answer");
 
@@ -943,7 +952,7 @@ async fn a_second_challenge_after_the_lookup_gives_up_and_drops_the_record() {
 #[tokio::test]
 async fn timer_f_of_a_restarts_de_register_drops_the_record() {
     let setup = Setup::new();
-    let (store, deregister) = setup.startup_orphan(None);
+    let (store, deregister) = setup.startup_orphan(None).await;
     let timer_f = setup.timer(&deregister, TimerName::F).expect("Timer F");
 
     setup.fire(timer_f);
@@ -970,6 +979,7 @@ async fn restart_de_registers_leave_nothing_behind_whichever_way_they_end() {
         setup
             .registrant
             .startup_cleanup(vec![orphan_record()], setup.defaults());
+        setup.registrant.release_startup_deregistrations().await;
         let deregister = setup.send_queued_deregistration();
         match cycle % 3 {
             0 => setup.answer(&deregister, "200 OK", "Expires: 0\r\n"),
@@ -1003,7 +1013,7 @@ async fn restart_de_registers_leave_nothing_behind_whichever_way_they_end() {
 async fn a_slow_lookup_does_not_send_the_retry_once_the_trunk_registered_meanwhile() {
     let setup = Setup::new();
     let lookup = StubLookup::slow("user-a", "pw", Duration::from_millis(300));
-    let (store, deregister) = setup.startup_orphan(Some(Arc::clone(&lookup)));
+    let (store, deregister) = setup.startup_orphan(Some(Arc::clone(&lookup))).await;
     setup.challenge(&deregister, "401 Unauthorized", "WWW-Authenticate");
 
     // While the source thinks: the trunk is live here, on the same Contact.
@@ -1022,4 +1032,29 @@ async fn a_slow_lookup_does_not_send_the_retry_once_the_trunk_registered_meanwhi
     let left = store.load().await.expect("loaded");
     assert_eq!(left.len(), 1);
     assert_ne!(left[0].call_id, ORPHAN_CALL_ID);
+}
+
+/// Re-checked before the authorised retry as well: another node's record of the
+/// same Contact appeared while the source was thinking.
+#[tokio::test]
+async fn another_nodes_record_appearing_during_a_slow_lookup_stops_the_retry() {
+    let setup = Setup::new();
+    let lookup = StubLookup::slow("user-a", "pw", Duration::from_millis(300));
+    let (store, deregister) = setup.startup_orphan(Some(Arc::clone(&lookup))).await;
+    setup.challenge(&deregister, "401 Unauthorized", "WWW-Authenticate");
+
+    let mut other = orphan_record();
+    other.instance = "node-b".to_string();
+    other.call_id = "reg-on-the-other-node".to_string();
+    store.save_as_instance(other);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    setup.registrant.release_startup_deregistrations().await;
+
+    assert_eq!(lookup.asked.load(Ordering::SeqCst), 1);
+    assert!(
+        test_support::take_deregistrations(&setup.registrant).is_empty(),
+        "an authorised de-REGISTER left over another node's binding"
+    );
+    assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
+    assert!(store.load().await.expect("loaded").is_empty());
 }

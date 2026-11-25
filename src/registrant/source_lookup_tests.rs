@@ -286,3 +286,51 @@ async fn a_rejected_row_stays_protected_while_a_later_pass_is_still_resolving() 
     assert_eq!(seen.lock().expect("lock").as_slice(), [true]);
     assert!(manager.source_row_unusable(aor));
 }
+/// The AoR the lookup asks for is the one the list served, byte for byte
+/// (scheme, case, parameters), only percent-encoded for the query: nothing
+/// between the list row and the stored record rewrites it.
+#[tokio::test]
+async fn the_lookup_asks_for_the_aor_exactly_as_the_list_served_it() {
+    let served = "sip:Trunk-One@Carrier.Example;x=1";
+    let body = format!(
+        r#"{{"registrants":[{{"aor":"{served}","registrar":"sip:198.51.100.10:5060","username":"u","password":"p"}}]}}"#
+    );
+    let list = stub("200 OK", &body).await;
+    let manager = Arc::new(test_support::manager());
+    let list_source = source(&list.base, false);
+    reconcile_once(&manager, &list_source)
+        .await
+        .expect("a pass");
+    let aors: Vec<String> = manager.list().into_iter().map(|(aor, _, _)| aor).collect();
+    assert_eq!(aors, [served], "the entry is held under the served AoR");
+
+    let store = crate::registrant::persist::BindingStore::in_memory("node-a", 30);
+    manager.attach_binding_store(Arc::clone(&store));
+    test_support::install_egress(&manager);
+    let listen = std::collections::HashMap::from([(
+        crate::transport::Transport::Udp,
+        "192.0.2.1:5060".parse().expect("addr"),
+    )]);
+    manager.build_register(
+        served,
+        crate::registrant::EgressDefaults::new("192.0.2.1:5060".parse().expect("addr"), &listen),
+        600,
+    );
+    manager.handle_success(served, 600);
+    let record = store.load().await.expect("loaded").pop().expect("a record");
+    assert_eq!(record.aor, served);
+
+    let lookup = stub("200 OK", ROW).await;
+    source(&lookup.base, true)
+        .lookup_row(&record.aor)
+        .await
+        .expect("answered");
+    let requests = lookup.requests.lock().expect("lock");
+    assert!(
+        requests[0].starts_with(
+            "GET /trunks/lookup?aor=sip%3ATrunk-One%40Carrier.Example%3Bx%3D1 HTTP/1.1"
+        ),
+        "{}",
+        requests[0]
+    );
+}

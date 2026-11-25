@@ -35,7 +35,7 @@ pub(super) const DRAINING_LIFETIME: Duration = Duration::from_secs(70);
 /// A removed entry's de-REGISTER in flight.
 pub(super) struct DrainingDeregistration {
     /// A copy of what answering a challenge needs.
-    entry: RegistrantEntry,
+    pub(super) entry: RegistrantEntry,
     /// Via branch of the request in flight (its Timer F names it).
     branch: String,
     /// CSeq of the request in flight: an answer carrying another one belongs
@@ -191,7 +191,8 @@ impl RegistrantManager {
                 },
             );
         }
-        self.push_pending_deregistration(built);
+        // Held for the checks made just before it goes.
+        self.stage_startup_deregistration(built);
     }
 
     pub(super) fn push_pending_deregistration(&self, built: BuiltRegister) {

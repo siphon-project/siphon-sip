@@ -187,7 +187,16 @@ enum Write {
     Remove,
     /// Remove the stored record only if it is the registration `call_id`'s.
     RemoveIf(String),
+    /// Set the stored record's attempt counter, only if it is the registration
+    /// `call_id`'s.
+    SetAttemptsIf(String, u32),
 }
+
+/// Set the attempt counter of a record only when it is still the one being
+/// cleaned up. Atomic in Redis; the TTL is left as it is.
+#[cfg(feature = "redis-backend")]
+const SET_ATTEMPTS_IF_SCRIPT: &str = "if redis.call('HGET', KEYS[1], 'call_id') == ARGV[1] then \
+     redis.call('HSET', KEYS[1], 'attempts', ARGV[2]) return 1 else return 0 end";
 
 /// Delete a record only when it is still the one being cleaned up: another
 /// registration may have replaced it since. Atomic in Redis.
@@ -202,6 +211,9 @@ enum Backend {
     /// Applied at once, no task: for tests that need no Redis.
     #[cfg(test)]
     Memory(Mutex<HashMap<String, (BindingRecord, u64)>>),
+    /// Queues and never applies: for a test of the queue itself.
+    #[cfg(test)]
+    Inert,
 }
 
 struct Shared {
@@ -293,6 +305,16 @@ impl Shared {
                         .await
                         .map(|_| ())
                         .map_err(|error| error.to_string()),
+                    Write::SetAttemptsIf(call_id, attempts) => {
+                        redis::Script::new(SET_ATTEMPTS_IF_SCRIPT)
+                            .key(&key)
+                            .arg(call_id)
+                            .arg(*attempts)
+                            .invoke_async::<i64>(&mut connection)
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    }
                     Write::Save(record) => {
                         let mut pipeline = redis::pipe();
                         pipeline.atomic().cmd("DEL").arg(&key).ignore();
@@ -319,6 +341,8 @@ impl Shared {
                 self.apply_memory(aor, write);
                 Ok(())
             }
+            #[cfg(test)]
+            Backend::Inert => Ok(()),
         }
     }
 
@@ -337,6 +361,13 @@ impl Shared {
             }
             Write::Save(record) => {
                 records.insert(self.key(aor), ((**record).clone(), self.ttl_for(record)));
+            }
+            Write::SetAttemptsIf(call_id, attempts) => {
+                if let Some((stored, _)) = records.get_mut(&self.key(aor)) {
+                    if stored.call_id == *call_id {
+                        stored.attempts = *attempts;
+                    }
+                }
             }
             Write::RemoveIf(call_id) => {
                 let key = self.key(aor);
@@ -447,21 +478,59 @@ impl BindingStore {
             Ok(pending) => pending,
             Err(poisoned) => poisoned.into_inner(),
         };
-        // A guarded removal never undoes a save still waiting: a save of another
-        // registration is the newer record, and one of the same registration is
-        // simply removed.
+        // A guarded write is never made unguarded, and never undoes a save of a
+        // newer registration still waiting. Where two cannot both be kept the
+        // one that does less wins: the record is then left to expire, as before.
         let write = match (&write, pending.get(aor)) {
             (Write::RemoveIf(call_id), Some(Write::Save(queued))) => {
                 if queued.call_id != *call_id {
                     return;
                 }
-                Write::Remove
+                write
             }
+            (Write::SetAttemptsIf(call_id, _), Some(Write::Save(queued))) => {
+                if queued.call_id != *call_id {
+                    return;
+                }
+                write
+            }
+            // An unconditional removal, or a guarded one, stays as it is.
+            (Write::SetAttemptsIf(..), Some(Write::Remove | Write::RemoveIf(_))) => return,
+            (Write::RemoveIf(_), Some(Write::Remove)) => return,
             _ => write,
         };
         pending.insert(aor.to_string(), write);
         drop(pending);
         self.shared.notify.notify_one();
+    }
+
+    /// Set the attempt counter of `aor`'s record if it is still the
+    /// registration `call_id`'s.
+    pub fn set_attempts_if(&self, aor: &str, call_id: &str, attempts: u32) {
+        self.enqueue(aor, Write::SetAttemptsIf(call_id.to_string(), attempts));
+    }
+
+    /// What waits for `aor` in the queue.
+    #[cfg(test)]
+    pub(crate) fn pending_kind(&self, aor: &str) -> Option<&'static str> {
+        let pending = self.shared.pending.lock().ok()?;
+        pending.get(aor).map(|write| match write {
+            Write::Save(_) => "save",
+            Write::Remove => "remove",
+            Write::RemoveIf(_) => "remove_if",
+            Write::SetAttemptsIf(..) => "set_attempts_if",
+        })
+    }
+
+    /// A store that only queues, for a test of the queue.
+    #[cfg(test)]
+    pub(crate) fn inert(instance_id: &str) -> Arc<Self> {
+        Arc::new(Self::with_backend(
+            Backend::Inert,
+            instance_id.to_string(),
+            DEFAULT_REGISTRANT_KEY_PREFIX.to_string(),
+            30,
+        ))
     }
 
     /// Remove the record of `aor` if it is still the registration `call_id`'s.
@@ -528,8 +597,18 @@ impl BindingStore {
                         glob_escape(&self.shared.key_prefix),
                         glob_escape(aor)
                     );
-                    found.extend(scan_records(&mut connection.clone(), &pattern).await?);
+                    let (records, unreadable) =
+                        scan_records(&mut connection.clone(), &pattern).await?;
+                    // Another instance's hash that cannot be read may be exactly
+                    // the binding that matters: it counts as held.
+                    let own = format!("{}{}:", self.shared.key_prefix, self.shared.instance_id);
+                    if let Some(key) = unreadable.iter().find(|key| !key.starts_with(&own)) {
+                        return Err(format!("another instance's record {key} cannot be read"));
+                    }
+                    found.extend(records);
                 }
+                #[cfg(test)]
+                Backend::Inert => return Err("the store cannot be read".to_string()),
                 #[cfg(test)]
                 Backend::Memory(records) => {
                     let records = match records.lock() {
@@ -569,8 +648,12 @@ impl BindingStore {
                     glob_escape(&self.shared.key_prefix),
                     glob_escape(&self.shared.instance_id)
                 );
-                scan_records(&mut connection.clone(), &pattern).await
+                scan_records(&mut connection.clone(), &pattern)
+                    .await
+                    .map(|(records, _)| records)
             }
+            #[cfg(test)]
+            Backend::Inert => Ok(Vec::new()),
             #[cfg(test)]
             Backend::Memory(records) => Ok(match records.lock() {
                 Ok(records) => records.values().map(|(record, _)| record.clone()).collect(),
@@ -594,6 +677,7 @@ impl BindingStore {
                 .map(|(_, ttl)| *ttl),
             #[cfg(feature = "redis-backend")]
             Backend::Redis(_) => None,
+            Backend::Inert => None,
         }
     }
 
@@ -609,7 +693,7 @@ impl BindingStore {
 async fn scan_records(
     connection: &mut crate::redis_target::RedisConnection,
     pattern: &str,
-) -> Result<Vec<BindingRecord>, String> {
+) -> Result<(Vec<BindingRecord>, Vec<String>), String> {
     let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut cursor: u64 = 0;
     loop {
@@ -629,6 +713,7 @@ async fn scan_records(
         }
     }
     let mut records = Vec::new();
+    let mut unreadable = Vec::new();
     for key in keys {
         let fields: HashMap<String, String> = redis::cmd("HGETALL")
             .arg(&key)
@@ -641,10 +726,13 @@ async fn scan_records(
         }
         match BindingRecord::from_fields(&fields) {
             Some(record) => records.push(record),
-            None => debug!(%key, "registrant bindings: unreadable record skipped"),
+            None => {
+                debug!(%key, "registrant bindings: unreadable record skipped");
+                unreadable.push(key);
+            }
         }
     }
-    Ok(records)
+    Ok((records, unreadable))
 }
 
 /// Escape the glob characters of `text` for a `SCAN MATCH`.

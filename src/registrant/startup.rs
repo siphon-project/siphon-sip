@@ -73,6 +73,9 @@ pub(super) struct RestartState {
     /// The Call-ID of the latest record this process wrote for each AoR: a live
     /// registration's record, which a finished clean-up must not delete.
     pub(super) written: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Restart de-REGISTERs built and waiting for the checks made just before
+    /// they may go (see [`RegistrantManager::release_startup_deregistrations`]).
+    pub(super) staged: std::sync::Mutex<Vec<super::BuiltRegister>>,
 }
 
 /// What one start-up cleanup did.
@@ -117,13 +120,6 @@ impl RegistrantManager {
                 .insert(record.aor.clone(), record.call_id.clone()),
         };
         store.save(record);
-    }
-
-    fn written_call_id(&self, aor: &str) -> Option<String> {
-        match self.restart.written.lock() {
-            Ok(written) => written.get(aor).cloned(),
-            Err(poisoned) => poisoned.into_inner().get(aor).cloned(),
-        }
     }
 
     /// The persisted form of `entry`'s binding, granted for `granted_secs`.
@@ -235,19 +231,6 @@ impl RegistrantManager {
         records: Vec<BindingRecord>,
         defaults: EgressDefaults<'_>,
     ) -> CleanupReport {
-        self.startup_cleanup_with(records, &[], defaults)
-    }
-
-    /// [`startup_cleanup`](Self::startup_cleanup) knowing the records other
-    /// instances hold for the same AoRs: a binding one of them holds on the same
-    /// Contact was replaced by that node's REGISTER (RFC 3261 §10.3), and an
-    /// `Expires: 0` on it would delete that node's binding.
-    pub fn startup_cleanup_with(
-        &self,
-        records: Vec<BindingRecord>,
-        others: &[BindingRecord],
-        defaults: EgressDefaults<'_>,
-    ) -> CleanupReport {
         let mut report = CleanupReport::default();
         let Some(store) = self.restart.bindings.get() else {
             return report;
@@ -279,30 +262,21 @@ impl RegistrantManager {
                     store.remove_if(&record.aor, &record.call_id);
                     report.dropped += 1;
                 }
-                Outcome::Orphan
-                    if !self.contact_is_held_here(&record, defaults)
-                        || others.iter().any(|other| {
-                            other.aor == record.aor && other.contact == record.contact
-                        }) =>
-                {
+                Outcome::Orphan if !Self::contact_is_held_here(&record.contact, defaults) => {
                     info!(
                         aor = %record.aor,
                         registrar = %record.registrar_uri,
                         contact = %record.contact,
-                        "restart clean-up: the binding's Contact is not one only this node holds, so \
-                         it is another node's or was replaced by its REGISTER: left alone"
+                        "restart clean-up: the binding's Contact is not exactly a socket this node \
+                         registers from, so it may be another node's: left to expire"
                     );
                     store.remove_if(&record.aor, &record.call_id);
                     report.dropped += 1;
                 }
                 Outcome::Orphan => {
                     if self.deregister_orphan(&record, defaults) {
-                        // Not over a record a live registration has written since.
-                        if self.written_call_id(&record.aor).is_none() {
-                            let mut attempted = record.clone();
-                            attempted.attempts += 1;
-                            store.save(attempted);
-                        }
+                        // Guarded by Call-ID: never over a newer registration's record.
+                        store.set_attempts_if(&record.aor, &record.call_id, record.attempts + 1);
                         report.deregistered += 1;
                     } else {
                         store.remove_if(&record.aor, &record.call_id);
@@ -328,30 +302,24 @@ impl RegistrantManager {
         })
     }
 
-    /// Whether `record`'s Contact is an address this node holds right now, on a
-    /// port it registers from: a listener's or the egress IP, or an IP a plain
-    /// bind succeeds on. A floating address that moved away fails to bind
-    /// (EADDRNOTAVAIL), and a name advertised by every node, or the address a
-    /// record once used, proves nothing. A registrar keys a binding by its
-    /// Contact (RFC 3261 §10.3), so an `Expires: 0` on a Contact another node
-    /// holds would delete its binding.
-    fn contact_is_held_here(&self, record: &BindingRecord, defaults: EgressDefaults<'_>) -> bool {
-        let Some((host, port)) = contact_host_port(&record.contact) else {
+    /// Whether `contact` names exactly a socket this node registers from: an
+    /// explicit IP and port equal to a specific (non-wildcard) listener or the
+    /// egress address. A wildcard, a name, a missing port or an address the node
+    /// merely could bind never qualifies: those bindings just expire. A registrar
+    /// keys a binding by its Contact (RFC 3261 §10.3), so an `Expires: 0` on a
+    /// Contact another node holds would delete its binding.
+    fn contact_is_held_here(contact: &str, defaults: EgressDefaults<'_>) -> bool {
+        let Some((host, Some(port))) = contact_host_port(contact) else {
             return false;
         };
         let Ok(address) = host.parse::<std::net::IpAddr>() else {
             return false;
         };
-        let mut ports: Vec<u16> = defaults.listen_addrs.values().map(|a| a.port()).collect();
-        ports.push(defaults.local_addr.port());
-        ports.push(defaults.plain_port());
-        if port.is_some_and(|port| !ports.contains(&port)) {
+        if address.is_unspecified() {
             return false;
         }
-        defaults.local_addr.ip() == address
-            || defaults.listen_addrs.values().any(|listen| listen.ip() == address)
-            // No IP_FREEBIND / IP_TRANSPARENT: only an address on this host binds.
-            || std::net::UdpSocket::bind((address, 0)).is_ok()
+        let socket = std::net::SocketAddr::new(address, port);
+        defaults.local_addr == socket || defaults.listen_addrs.values().any(|l| *l == socket)
     }
 
     /// What a stored binding is to the live entries.
@@ -465,7 +433,87 @@ impl RegistrantManager {
         if let super::RemovedAnswer::Retry(built) =
             self.answer_after_lookup(&request, outcome, egress.defaults())
         {
-            self.push_pending_deregistration(*built);
+            self.stage_startup_deregistration(*built);
+        }
+    }
+}
+
+impl RegistrantManager {
+    /// Hold a restart's de-REGISTER back until the checks made just before it
+    /// goes (see [`Self::release_startup_deregistrations`]).
+    pub(super) fn stage_startup_deregistration(&self, built: super::BuiltRegister) {
+        match self.restart.staged.lock() {
+            Ok(mut staged) => staged.push(built),
+            Err(poisoned) => poisoned.into_inner().push(built),
+        }
+    }
+
+    /// Release the staged restart de-REGISTERs that still pass, to the queue the
+    /// loop sends from; abandon the rest (and drop their records). Called by the
+    /// loop right before it sends, so every one, the initial and the authorised
+    /// retry after the lookup, is checked at the moment it would leave: a live
+    /// entry holds the Contact now, the Contact is not exactly a socket of this
+    /// node's, or another node's record holds the AoR on it (RFC 3261 §10.3).
+    /// Anything that cannot be established, Redis unreadable included, abandons
+    /// it: the binding then expires as it would have.
+    pub async fn release_startup_deregistrations(&self) {
+        let staged = match self.restart.staged.lock() {
+            Ok(mut staged) => std::mem::take(&mut *staged),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        for built in staged {
+            let Some(call_id) = built.message.headers.get("Call-ID").cloned() else {
+                continue;
+            };
+            if self.startup_deregistration_may_go(&call_id).await {
+                self.push_pending_deregistration(built);
+            } else {
+                self.abandon_startup_deregistration(&call_id);
+            }
+        }
+    }
+
+    async fn startup_deregistration_may_go(&self, call_id: &str) -> bool {
+        if self.startup_deregistration_superseded(call_id) {
+            return false;
+        }
+        let Some((aor, contact)) =
+            self.draining_deregistrations
+                .get(call_id)
+                .and_then(|draining| {
+                    Some((
+                        draining.entry.aor.clone(),
+                        draining.entry.contact_uri.clone()?,
+                    ))
+                })
+        else {
+            return false;
+        };
+        let (Some(egress), Some(store)) = (self.egress.get(), self.restart.bindings.get()) else {
+            return false;
+        };
+        if !Self::contact_is_held_here(&contact, egress.defaults()) {
+            return false;
+        }
+        match store.others_holding(std::slice::from_ref(&aor)).await {
+            Ok(others) => !others
+                .iter()
+                .any(|other| other.aor == aor && other.contact == contact),
+            Err(error) => {
+                warn!(%aor, %error, "restart clean-up: the other nodes' bindings cannot be read, nothing is sent");
+                false
+            }
+        }
+    }
+
+    fn abandon_startup_deregistration(&self, call_id: &str) {
+        if let Some((_, draining)) = self.draining_deregistrations.remove(call_id) {
+            info!(
+                aor = %draining.entry.aor,
+                registrar = %draining.entry.registrar_uri,
+                "restart clean-up: the binding may be another node's now, its de-REGISTER is not sent"
+            );
+            self.forget_binding_record(&draining.entry.aor, call_id);
         }
     }
 }
@@ -551,17 +599,7 @@ pub(super) async fn run_startup_cleanup_from(
         return;
     };
     let stored = records.len();
-    let aors: Vec<String> = records.iter().map(|record| record.aor.clone()).collect();
-    // Without what the other nodes hold the clean-up could delete their
-    // bindings: when it cannot be read, nothing is de-registered.
-    let others = match store.others_holding(&aors).await {
-        Ok(others) => others,
-        Err(error) => {
-            error!(%error, "restart clean-up: the other nodes' bindings cannot be read, nothing is cleared");
-            return;
-        }
-    };
-    let report = manager.startup_cleanup_with(records, &others, egress.defaults());
+    let report = manager.startup_cleanup(records, egress.defaults());
     info!(
         stored,
         carried = report.carried,
