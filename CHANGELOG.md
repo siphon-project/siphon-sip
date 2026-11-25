@@ -13,8 +13,13 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- `lawful_intercept.x2.network_function_id`: the Network Function ID (TS 103 221-2 clause 5.3.7, attribute 6) that every X2 PDU carries. It defaults to `lawful_intercept.x1.ne_identifier`, and with neither set PDUs carry no NFID. It must equal the media engine's `x3_network_function_id` so a mediation function files the signalling and the content of one call under one network element. A value that is empty, over 255 octets or holds a control character is refused at config load.
+
 ### Fixed
 
+- LI X2 framing (TS 103 221-2): every X2 PDU now carries the NFID (attribute 6), where only X3 did. The sequence number (clause 5.3.9) is now counted per (XID, CID) context, each from 0, and survives a reconnect; it was one counter per connection, running across every task and session and restarting on reconnect. An End record marks its context ended without deleting it, so the BYE's 200 and a retransmitted BYE keep numbering on; a sweep on its own timer drops it after 32 seconds of silence (64 x T1), drops any context idle for 24 hours, and drops a destination left with no contexts and no records for 24 hours. A keepalive now uses payload format 0 (reserved for it) where it used 1, and counts on its own, per connection, from 0, so it no longer takes a number from the data PDUs.
 - The caller's BYE on a call siphon answered itself and never dialled (a bot
   hand-over, a conference factory seat, `answer_local`, a control-plane
   `answer`) no longer logs `B2BUA: no winning B-leg for BYE` at WARN. Such a
