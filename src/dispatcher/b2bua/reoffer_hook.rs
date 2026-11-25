@@ -121,6 +121,9 @@ pub(crate) fn py_call_for(
         (None, None) => return None,
     };
     let transport = &call.a_leg.transport;
+    // The call's own state: a handler on an existing call must not read the
+    // `calling` a freshly built `Call` starts at.
+    let call_state = call.state.as_str();
     Some(
         PyCall::new(
             call_id.to_string(),
@@ -128,7 +131,8 @@ pub(crate) fn py_call_for(
             transport.remote_addr.ip().to_string(),
             format!("{}", transport.transport).to_lowercase(),
         )
-        .with_flow(py_flow_from_leg(transport)),
+        .with_flow(py_flow_from_leg(transport))
+        .with_state(call_state),
     )
 }
 
