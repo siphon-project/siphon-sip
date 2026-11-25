@@ -40,6 +40,7 @@ available from [Real Time Telecom](../support.md).
 | [IMS multi-UE](ims-multi-ue.md) | One process registering many IMS UEs, each from its own address | `registration.add(local_addr=)`, `set_local_addr`, `find_by_local`, `refresh_window`, `max_registers_per_sec` |
 | [Conference focus](conference-focus.md) | An RFC 4579 focus mixing N parties in the media engine | `rtpengine.conference_join`/`leave`/`route`/`bridge`/`play`, `@rtpengine.on_active_speaker` |
 | [Recording awareness](recording-awareness.md) | Callers that ask for their own call to be recorded (RFC 7866) | `a=recordpref` / `a=record`, `offer.session_sdp`, `b2bua.reoffer`, Ogg Opus recordings |
+| [Info-Package over INFO](info-packages.md) | An RFC 6086 Info Package spoken inside a call | `Recv-Info`, `@b2bua.on_info(leg=)`, `b2bua.send_info`, `dial(strip=)`, 469 |
 | [Media & RTP profiles](media-rtp.md) | SRTP↔RTP, WebRTC, transcoding, hold | `rtpengine.offer`/`answer`, profiles, the `sdp` namespace |
 | [Online charging (OCS)](online-charging-ocs.md) | Prepaid voice + SMS/RCS over Diameter Ro | `ro:` config, `diameter.ro_ccr_*`, SCUR reserve/re-auth/disconnect, IEC, CGRateS |
 | [Hardening & security](security.md) | A locked-down edge | rate-limit, scanner/auth bans, TLS/mTLS, STIR/SHAKEN, IPsec |

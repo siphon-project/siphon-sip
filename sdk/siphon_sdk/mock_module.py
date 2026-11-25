@@ -3052,25 +3052,45 @@ class MockB2bua:
         """Register handler for an in-dialog INFO (RFC 6086) on a call siphon
         answered itself, or from either party of a bridged call.
 
-        Handler signature: ``(call, request) -> None``.
+        Handler signature: ``(call, request) -> None``, or
+        ``(call, request, leg) -> None``. ``leg`` is passed only to a handler
+        that declares it (a ``leg`` parameter or ``**kwargs``): ``"caller"``
+        for an INFO from the A-leg party, ``"callee"`` from the B-leg party,
+        the names ``b2bua.send_info(leg=)`` takes. Unlike comparing the INFO's
+        Call-ID with ``call.call_id`` it holds under ``call.keep_call_id()``.
 
-        Read ``request.body`` and ``request.content_type``; answer with
-        ``request.set_reply_body(body, content_type)`` (optional) and
+        Read ``request.body``, ``request.content_type`` and
+        ``request.get_header("Info-Package")``; answer with
+        ``request.set_reply_body(body, content_type)`` (optional),
+        ``request.set_reply_header(name, value)`` (optional) and
         ``request.reply(code, reason)``, a final status. Without a handler,
-        or when it answers nothing, siphon answers a bare ``200 OK``. A
+        or when it answers nothing, siphon answers a bare ``200 OK`` on a call
+        with no far leg and relays the INFO on one with a far leg. A
         retransmission gets the same response without running the handler
         again. On a call with a far leg the handler sees an INFO from either
-        party; one it answers is not relayed, one it leaves is relayed.
+        party; one it answers is not relayed, one it leaves is relayed. A DTMF
+        INFO is surfaced to ``@rtpengine.on_dtmf`` whichever way it goes.
+
+        ``call.state`` is the call's own: ``"calling"``, ``"ringing"`` or
+        ``"answered"`` (an INFO before the answer is possible on an early
+        dialog, and a script may refuse it).
+
+        An ``async def`` handler that starts follow-up work replies first and
+        then ``asyncio.create_task(...)``; the answer goes out when the
+        handler returns.
 
         Example::
 
             @b2bua.on_info
-            async def info(call, request):
+            async def info(call, request, leg):
                 if request.content_type == "application/example+xml":
                     request.set_reply_body(b"<ok/>", "application/example+xml")
                     request.reply(200, "OK")
                 else:
                     request.reply(415, "Unsupported Media Type")
+
+        In the SDK, ``SipTestHarness.send_info()`` delivers an INFO to the
+        handlers and returns the answer.
         """
         is_async = asyncio.iscoroutinefunction(fn)
         _registry.register("b2bua.on_info", None, fn, is_async)

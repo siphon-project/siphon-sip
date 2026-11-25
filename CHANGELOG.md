@@ -16,6 +16,16 @@ entry, but a working config keeps working.
 ### Added
 
 - `lawful_intercept.x2.network_function_id`: the Network Function ID (TS 103 221-2 clause 5.3.7, attribute 6) that every X2 PDU carries. It defaults to `lawful_intercept.x1.ne_identifier`, and with neither set PDUs carry no NFID. It must equal the media engine's `x3_network_function_id` so a mediation function files the signalling and the content of one call under one network element. A value that is empty, over 255 octets or holds a control character is refused at config load.
+- `@b2bua.on_info` handlers may declare a `leg` keyword: `"caller"` for an INFO
+  from the A-leg party, `"callee"` from the B-leg party (the names
+  `b2bua.send_info(leg=)` takes). It is passed only to a handler that declares
+  it, so `(call, request)` handlers are unchanged, and it holds under
+  `call.keep_call_id()`.
+- SDK: `SipTestHarness.send_info()` delivers an INFO to `@b2bua.on_info`
+  handlers and returns the answer (`InfoResult`); the mock's `call.state` moves
+  to `ringing` on a provisional and `answered` on the callee's 200.
+- Docs: `@b2bua.on_info` and `b2bua.send_info` reference, and an Info-Package
+  (RFC 6086) cookbook recipe.
 
 ### Fixed
 
@@ -25,6 +35,16 @@ entry, but a working config keeps working.
   `answer`) no longer logs `B2BUA: no winning B-leg for BYE` at WARN. Such a
   call has no B-leg and the 200 is all the BYE is owed, so it is logged at
   debug. A call with B-legs none of which won still warns.
+- `call.state` in the hooks that run on an existing call (`@b2bua.on_info`,
+  `@b2bua.on_reoffer`, `@b2bua.on_reoffer_answered`) is the call's own
+  (`calling`, `ringing`, `answered`, `terminated`). It was always `calling`, so
+  a script could not tell an answered call from one still ringing.
+- An `async def` handler that starts a task with `asyncio.create_task()` and
+  has no `await` of its own no longer fails with `no running event loop`. It was
+  run inline without a loop, so the handler raised and, for `@b2bua.on_info`, its
+  reply was lost and the INFO relayed. Handlers naming `create_task`,
+  `ensure_future`, `get_running_loop` or `get_event_loop` now run on the async
+  driver.
 
 ## [1.17.1] — 2026-11-23
 

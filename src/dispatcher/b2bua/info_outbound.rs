@@ -99,6 +99,37 @@ pub fn check_info_headers(headers: &[(String, String)]) -> Result<(), SendInfoRe
     Ok(())
 }
 
+/// The dispatcher and runtime a unit test registered for `sip_call_id`.
+///
+/// A unit test cannot publish its own dispatcher through [`B2BUA_CONTROL`],
+/// which is written once for the process, so it registers it here by Call-ID
+/// instead and never meets another test's. Compiled for tests only.
+#[cfg(test)]
+fn test_control_of(sip_call_id: &str) -> Option<(Arc<DispatcherState>, tokio::runtime::Handle)> {
+    test_controls()
+        .get(sip_call_id)
+        .map(|entry| (Arc::clone(&entry.0), entry.1.clone()))
+}
+
+#[cfg(test)]
+type TestControls = dashmap::DashMap<String, (Arc<DispatcherState>, tokio::runtime::Handle)>;
+
+#[cfg(test)]
+fn test_controls() -> &'static TestControls {
+    static CONTROLS: std::sync::OnceLock<TestControls> = std::sync::OnceLock::new();
+    CONTROLS.get_or_init(dashmap::DashMap::new)
+}
+
+/// Make `b2bua.send_info()` from a script reach `state` for the call
+/// `sip_call_id`, on the runtime the caller is in.
+#[cfg(test)]
+pub(crate) fn register_test_control(sip_call_id: &str, state: Arc<DispatcherState>) {
+    test_controls().insert(
+        sip_call_id.to_string(),
+        (state, tokio::runtime::Handle::current()),
+    );
+}
+
 /// Send an INFO in a dialog of the call `sip_call_id`: the caller's
 /// (`on_a_leg`; on a call siphon answered itself, its only dialog) or the
 /// answered callee's. Returns the INFO's branch and the receiver of its final
@@ -112,13 +143,46 @@ pub fn b2bua_send_info(
     headers: &[(String, String)],
 ) -> Result<SentInfo, SendInfoRefusal> {
     check_info_headers(headers)?;
+    // Only a unit test registers a dispatcher of its own (see
+    // `register_test_control`); the release build has just the running one.
+    #[cfg(test)]
+    if let Some((state, runtime)) = test_control_of(sip_call_id) {
+        return send_via(
+            &state,
+            &runtime,
+            sip_call_id,
+            on_a_leg,
+            content_type,
+            body,
+            headers,
+        );
+    }
     let control = B2BUA_CONTROL.get().ok_or(SendInfoRefusal::NotFound)?;
-    let state = &control.state;
+    send_via(
+        &control.state,
+        &control.runtime,
+        sip_call_id,
+        on_a_leg,
+        content_type,
+        body,
+        headers,
+    )
+}
+
+fn send_via(
+    state: &DispatcherState,
+    runtime: &tokio::runtime::Handle,
+    sip_call_id: &str,
+    on_a_leg: bool,
+    content_type: Option<&str>,
+    body: Vec<u8>,
+    headers: &[(String, String)],
+) -> Result<SentInfo, SendInfoRefusal> {
     let internal_call_id = state
         .call_actors
         .find_by_sip_call_id(sip_call_id)
         .ok_or(SendInfoRefusal::NotFound)?;
-    let _enter = control.runtime.enter();
+    let _enter = runtime.enter();
     send_info_on_leg(
         state,
         &internal_call_id,
