@@ -2258,7 +2258,8 @@ auth:
 #     # X2 PDU. Defaults to x1.ne_identifier; with neither set there is no
 #     # attribute. It MUST equal the media engine's x3_network_function_id, so
 #     # the mediation function files a call's signalling and content under one
-#     # network element. 1 to 255 octets of UTF-8, no control characters.
+#     # network element. 1 to 255 octets of UTF-8, no control characters
+#     # (the bound is siphon's own; clause 5.3.7 leaves the format open).
 #     network_function_id: "siphon-ne-1"
 #     # Sequence numbers (clause 5.3.9) are counted per (XID, CID) context from
 #     # 0 and continue across reconnects. Keepalives (payload format 0) count

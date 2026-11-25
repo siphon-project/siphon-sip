@@ -327,9 +327,11 @@ impl Attribute {
 
 /// Most octets a Network Function ID may take.
 ///
-/// The attribute's two-octet length field would allow 65 535; an identifier is
-/// a short name, and 255 is the bound this element enforces so that a runaway
-/// value is refused at configuration load rather than framed into every PDU.
+/// Siphon's own bound, not the specification's: clause 5.3.7 leaves the format
+/// of the identifier to the architecture. The attribute's two-octet length
+/// field would allow 65 535; an identifier is a short name, and 255 is what
+/// this element enforces so that a runaway value is refused at configuration
+/// load rather than framed into every PDU.
 pub const MAX_NETWORK_FUNCTION_ID_OCTETS: usize = 255;
 
 /// Check a configured Network Function ID against what can be framed.

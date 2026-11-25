@@ -11,7 +11,7 @@
 //! interface into the MDF, and TS 103 221-2 is what an MDF reads there.
 
 use super::pdu::{Attribute, PayloadFormat, Pdu, PduType};
-use super::x2_context::{ContextKey, ContextSequences};
+use super::x2_context::{ContextKey, ContextSequences, ContextTimings};
 use super::{IriEvent, IriEventType};
 use crate::config::{LiTlsConfig, LiX2Config};
 use std::collections::HashMap;
@@ -133,6 +133,9 @@ struct Delivery {
     keepalive_sequence: u32,
     /// When the connection last carried a PDU, IRI or keepalive.
     last_sent: Instant,
+    /// When a data record last reached this destination. Keepalives do not
+    /// count: a destination only they keep alive is one nothing is routed to.
+    last_record: Instant,
     /// The Network Function ID every PDU carries (clause 5.3.7), if any.
     network_function_id: Option<String>,
 }
@@ -243,22 +246,19 @@ impl Delivery {
     /// Deliver one event to this destination, reconnecting once on a failed
     /// write.
     ///
-    /// Settles the event's context afterwards: an End record closes its
-    /// session whether or not it reached the peer, so the counter is released
-    /// either way. Contexts whose End never arrives are the sweep's.
+    /// Settles the event's context afterwards: an End record ends its session
+    /// whether or not it reached the peer, but the context is only marked, not
+    /// deleted. The BYE's 200 and a retransmitted BYE still belong to it and
+    /// number on from it; the loop's sweep releases it once it has been silent
+    /// for the linger.
     async fn deliver(&mut self, event: &IriEvent, reconnect_interval: Duration) {
         let key = ContextKey::new(event.x_id.as_bytes(), event.correlation_id);
-        let swept = self.contexts.sweep_if_due(Instant::now().into_std());
-        if swept > 0 {
-            info!(
-                address = %self.address,
-                swept,
-                "X2 sequence state of sessions with no End record released"
-            );
+        if event.event_type == IriEventType::Begin {
+            self.contexts.reopen(key);
         }
         self.write_event(event, key, reconnect_interval).await;
         if event.event_type == IriEventType::End {
-            self.contexts.finish(key);
+            self.contexts.finish(key, Instant::now().into_std());
         }
     }
 
@@ -305,6 +305,7 @@ impl Delivery {
             Ok(()) => {
                 self.contexts.commit(key, Instant::now().into_std());
                 self.last_sent = Instant::now();
+                self.last_record = Instant::now();
                 debug!(
                     address = %self.address,
                     xid = %event.x_id,
@@ -358,6 +359,7 @@ impl Delivery {
             Ok(()) => {
                 self.contexts.commit(key, Instant::now().into_std());
                 self.last_sent = Instant::now();
+                self.last_record = Instant::now();
                 info!(
                     address = %self.address,
                     liid = %event.liid,
@@ -451,16 +453,40 @@ pub async fn delivery_task(
     network_function_id: Option<String>,
 ) {
     let keepalive = keepalive_period(config.keepalive_secs);
-    run_delivery(receiver, config, keepalive, network_function_id).await;
+    run_delivery(
+        receiver,
+        config,
+        keepalive,
+        network_function_id,
+        ContextTimings::DEFAULT,
+    )
+    .await;
 }
 
-/// The delivery loop, with the keepalive period passed in rather than read as
-/// whole seconds, so a test can run it at a fraction of one.
+/// Wait for the next keepalive tick; never, when keepalives are off.
+async fn next_keepalive_tick(timer: &mut Option<(Duration, tokio::time::Interval)>) {
+    match timer {
+        Some((_, timer)) => {
+            timer.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// The delivery loop, with the keepalive period and the sequence-state bounds
+/// passed in rather than read as constants, so a test can run it at a fraction
+/// of them.
+///
+/// Two timers run beside the event channel, independent of one another and of
+/// traffic: the keepalive tick (when enabled) and the sweep of the sequence
+/// state, which must run on a quiet interface too, since a context's lifetime
+/// is measured in silence.
 async fn run_delivery(
     mut receiver: mpsc::Receiver<IriEvent>,
     config: Arc<LiX2Config>,
     keepalive: Option<Duration>,
     network_function_id: Option<String>,
+    timings: ContextTimings,
 ) {
     let use_tls = config.transport.eq_ignore_ascii_case("tls");
     info!(
@@ -507,19 +533,26 @@ async fn run_delivery(
         timer.tick().await;
     }
 
+    let mut sweep_timer = tokio::time::interval(timings.sweep_interval);
+    sweep_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    sweep_timer.tick().await;
+
     loop {
-        let received = match keepalive_timer.as_mut() {
-            // `recv` is cancel-safe, so a tick that wins the race loses no event.
-            Some((period, timer)) => tokio::select! {
-                received = receiver.recv() => received,
-                _ = timer.tick() => {
+        // `recv` is cancel-safe, so a tick that wins the race loses no event.
+        let received = tokio::select! {
+            received = receiver.recv() => received,
+            _ = sweep_timer.tick() => {
+                sweep_deliveries(&mut deliveries, &timings);
+                continue;
+            }
+            _ = next_keepalive_tick(&mut keepalive_timer) => {
+                if let Some(period) = keepalive {
                     for delivery in deliveries.values_mut() {
-                        delivery.keepalive_if_idle(*period).await;
+                        delivery.keepalive_if_idle(period).await;
                     }
-                    continue;
                 }
-            },
-            None => receiver.recv().await,
+                continue;
+            }
         };
         let Some(event) = received else {
             break;
@@ -544,9 +577,10 @@ async fn run_delivery(
                     connector: connector.clone(),
                     server_name,
                     connection: None,
-                    contexts: ContextSequences::new(Instant::now().into_std()),
+                    contexts: ContextSequences::new(timings),
                     keepalive_sequence: 0,
                     last_sent: Instant::now(),
+                    last_record: Instant::now(),
                     network_function_id: network_function_id.clone(),
                 });
             delivery.deliver(&event, reconnect_interval).await;
@@ -554,6 +588,26 @@ async fn run_delivery(
     }
 
     info!("X2 IRI delivery task stopped (channel closed)");
+}
+
+/// Release what no longer needs holding: contexts past their bounds, then any
+/// destination left with none that has had no record for the idle bound, so
+/// destinations that come and go do not accumulate. Dropping one closes its
+/// connection; the next record for it reconnects.
+fn sweep_deliveries(deliveries: &mut HashMap<String, Delivery>, timings: &ContextTimings) {
+    let now = Instant::now().into_std();
+    deliveries.retain(|address, delivery| {
+        let swept = delivery.contexts.sweep(now);
+        if swept > 0 {
+            debug!(address = %address, swept, "X2 sequence state of finished contexts released");
+        }
+        let idle =
+            delivery.contexts.is_empty() && delivery.last_record.elapsed() > timings.max_idle;
+        if idle {
+            debug!(address = %address, "X2 destination idle, released");
+        }
+        !idle
+    });
 }
 
 /// Where one event has to go.
@@ -745,6 +799,7 @@ fn summarise(event: &IriEvent) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::x1::types::{DeliveryType, TargetIdentifier, XId};
+    use super::super::x2_context::{CONTEXT_END_LINGER, CONTEXT_MAX_IDLE};
     use super::*;
     use crate::li::pdu::{attribute_type, PayloadDirection};
     use crate::li::target::MatchedParty;
@@ -1633,6 +1688,7 @@ mod tests {
             keepalive_test_config(address, 1),
             Some(TEST_KEEPALIVE),
             Some("siphon-ne-1".to_string()),
+            ContextTimings::DEFAULT,
         ));
 
         sender.send(test_iri_event()).await.expect("send");
@@ -1674,6 +1730,7 @@ mod tests {
             keepalive_test_config(address, 1),
             None,
             Some("siphon-ne-1".to_string()),
+            ContextTimings::DEFAULT,
         ));
 
         sender.send(test_iri_event()).await.expect("send");
@@ -1702,6 +1759,7 @@ mod tests {
             keepalive_test_config(address, 1),
             Some(TEST_KEEPALIVE),
             Some("siphon-ne-1".to_string()),
+            ContextTimings::DEFAULT,
         ));
 
         sender.send(test_iri_event()).await.expect("send");
@@ -1755,6 +1813,7 @@ mod tests {
             keepalive_test_config(address, reconnect_interval_secs),
             Some(TEST_KEEPALIVE),
             Some("siphon-ne-1".to_string()),
+            ContextTimings::DEFAULT,
         ));
 
         sender.send(test_iri_event()).await.expect("send");
@@ -1855,6 +1914,7 @@ mod tests {
             keepalive_test_config(address, 1),
             Some(TEST_KEEPALIVE),
             Some("siphon-ne-1".to_string()),
+            ContextTimings::DEFAULT,
         ));
 
         for correlation_id in [10, 20, 10, 20, 10, 20] {
@@ -1908,6 +1968,7 @@ mod tests {
             keepalive_test_config(address, 5),
             Some(TEST_KEEPALIVE),
             Some("siphon-ne-1".to_string()),
+            ContextTimings::DEFAULT,
         ));
 
         for correlation_id in [10, 20, 10, 20] {
@@ -1966,74 +2027,205 @@ mod tests {
         );
     }
 
-    /// The leak rule for the per-context numbering: after N sessions that ended
-    /// and N whose End record could not be delivered, nothing is left behind.
-    #[tokio::test]
-    async fn per_context_state_drains_after_completed_and_undeliverable_sessions() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let address = listener.local_addr().expect("addr").to_string();
-        let mut delivery = Delivery {
-            address: address.clone(),
-            connector: None,
-            server_name: String::new(),
-            connection: None,
-            contexts: super::super::x2_context::ContextSequences::new(Instant::now().into_std()),
-            keepalive_sequence: 0,
-            last_sent: Instant::now(),
-            network_function_id: None,
-        };
-        let sessions = 25u64;
-        for session in 0..sessions {
-            for event_type in [IriEventType::Begin, IriEventType::End] {
-                let mut event = event_in_context(1000 + session);
-                event.event_type = event_type;
-                delivery.deliver(&event, Duration::from_millis(10)).await;
-            }
-        }
-        assert_eq!(delivery.contexts.len(), 0, "completed sessions drain");
-
-        // Sessions whose End never came: only the sweep can find them.
-        for session in 0..sessions {
-            let mut event = event_in_context(2000 + session);
-            event.event_type = IriEventType::Begin;
-            delivery.deliver(&event, Duration::from_millis(10)).await;
-        }
-        assert_eq!(
-            delivery.contexts.len(),
-            usize::try_from(sessions).unwrap_or(usize::MAX)
-        );
-        let swept = delivery.contexts.sweep(
-            Instant::now().into_std()
-                + super::super::x2_context::CONTEXT_MAX_IDLE
-                + Duration::from_secs(1),
-        );
-        assert_eq!(swept, 25);
-        assert_eq!(delivery.contexts.len(), 0);
-    }
-
-    /// A session whose End cannot be delivered at all (no collector) is still
-    /// over: its numbering is released rather than held for the sweep.
-    #[tokio::test]
-    async fn an_end_record_that_cannot_be_delivered_still_releases_its_context() {
-        // Bound and then dropped: nothing listens, connects are refused.
-        let address = crate::transport::testutil::free_tcp_port().to_string();
-        let mut delivery = Delivery {
+    fn delivery_to(address: String) -> Delivery {
+        Delivery {
             address,
             connector: None,
             server_name: String::new(),
             connection: None,
-            contexts: super::super::x2_context::ContextSequences::new(Instant::now().into_std()),
+            contexts: ContextSequences::new(ContextTimings::DEFAULT),
             keepalive_sequence: 0,
             last_sent: Instant::now(),
+            last_record: Instant::now(),
             network_function_id: None,
-        };
-        let mut begin = event_in_context(77);
-        begin.event_type = IriEventType::Begin;
-        let mut end = event_in_context(77);
-        end.event_type = IriEventType::End;
-        delivery.deliver(&begin, Duration::from_millis(1)).await;
-        delivery.deliver(&end, Duration::from_millis(1)).await;
+        }
+    }
+
+    fn event_of(correlation_id: u64, event_type: IriEventType) -> IriEvent {
+        let mut event = event_in_context(correlation_id);
+        event.event_type = event_type;
+        event
+    }
+
+    /// The leak rule for the per-context numbering: after N sessions that
+    /// ended and N whose End never came, nothing is left once each one's bound
+    /// has passed.
+    #[tokio::test]
+    async fn per_context_state_drains_after_completed_and_abandoned_sessions() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let mut delivery = delivery_to(listener.local_addr().expect("addr").to_string());
+        let sessions = 25u64;
+        for session in 0..sessions {
+            for event_type in [IriEventType::Begin, IriEventType::End] {
+                delivery
+                    .deliver(
+                        &event_of(1000 + session, event_type),
+                        Duration::from_millis(10),
+                    )
+                    .await;
+            }
+        }
+        let count = usize::try_from(sessions).unwrap_or(usize::MAX);
+        assert_eq!(delivery.contexts.len(), count, "ended, lingering");
+        for session in 0..sessions {
+            delivery
+                .deliver(
+                    &event_of(2000 + session, IriEventType::Begin),
+                    Duration::from_millis(10),
+                )
+                .await;
+        }
+        assert_eq!(delivery.contexts.len(), 2 * count);
+
+        let now = Instant::now().into_std();
+        assert_eq!(
+            delivery
+                .contexts
+                .sweep(now + CONTEXT_END_LINGER + Duration::from_secs(1)),
+            count
+        );
+        assert_eq!(delivery.contexts.len(), count, "only the abandoned remain");
+        assert_eq!(
+            delivery
+                .contexts
+                .sweep(now + CONTEXT_MAX_IDLE + Duration::from_secs(1)),
+            count
+        );
         assert_eq!(delivery.contexts.len(), 0);
+    }
+
+    /// An End is the BYE; its 200 and a retransmitted BYE are PDUs of the same
+    /// context and number on from it, not from 0.
+    #[tokio::test]
+    async fn the_bye_its_200_and_a_retransmitted_bye_number_on() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let mut delivery = delivery_to(listener.local_addr().expect("addr").to_string());
+        for event_type in [
+            IriEventType::Begin,
+            IriEventType::End,
+            IriEventType::Continue,
+            IriEventType::End,
+        ] {
+            delivery
+                .deliver(&event_of(55, event_type), Duration::from_millis(10))
+                .await;
+        }
+        let mut stream = accept(&listener).await;
+        let (records, _) = read_records(&mut stream, 4).await;
+        assert_eq!(
+            records
+                .iter()
+                .map(|(_, sequence, _)| *sequence)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert_eq!(delivery.contexts.len(), 1, "held through the linger");
+    }
+
+    /// A session whose End cannot be delivered is still over: its context is
+    /// marked ended and drops after the linger, instead of waiting out the
+    /// idle bound.
+    #[tokio::test]
+    async fn an_end_record_that_cannot_be_delivered_still_ends_its_context() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let mut delivery = delivery_to(address.to_string());
+        delivery
+            .deliver(&event_of(77, IriEventType::Begin), Duration::from_millis(1))
+            .await;
+        assert_eq!(delivery.contexts.len(), 1, "the Begin was delivered");
+
+        // The collector goes away and the connection with it.
+        drop(accept(&listener).await);
+        drop(listener);
+        delivery.connection = None;
+        delivery
+            .deliver(&event_of(77, IriEventType::End), Duration::from_millis(1))
+            .await;
+        assert_eq!(delivery.contexts.len(), 1, "the End was not delivered");
+
+        let later = Instant::now().into_std() + CONTEXT_END_LINGER + Duration::from_secs(1);
+        assert_eq!(delivery.contexts.sweep(later), 1);
+        assert_eq!(delivery.contexts.len(), 0);
+    }
+
+    /// The sweep belongs to the delivery loop, not to traffic: with keepalives
+    /// off and no event arriving, an ended context, an abandoned one and then
+    /// the whole idle destination are released. Read off the wire, because the
+    /// map is the task's own: a released context numbers from 0 again, and a
+    /// released destination is reconnected.
+    ///
+    /// Real time at millisecond bounds rather than a paused clock: a paused
+    /// clock auto-advances whenever the runtime waits on the socket, which
+    /// fires the read timeouts of the very sockets this test depends on.
+    #[tokio::test]
+    async fn the_loop_sweeps_on_its_own_interval_with_no_traffic() {
+        let timings = ContextTimings {
+            max_idle: Duration::from_millis(600),
+            end_linger: Duration::from_millis(100),
+            sweep_interval: Duration::from_millis(20),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr").to_string();
+        let (sender, receiver) = mpsc::channel(100);
+        tokio::spawn(run_delivery(
+            receiver,
+            keepalive_test_config(address, 1),
+            None,
+            None,
+            timings,
+        ));
+        let sequences = |records: Vec<(u64, u32, Option<Vec<u8>>)>| -> Vec<(u64, u32)> {
+            records
+                .into_iter()
+                .map(|(correlation_id, sequence, _)| (correlation_id, sequence))
+                .collect()
+        };
+
+        for (correlation_id, event_type) in [
+            (1, IriEventType::Begin),
+            (1, IriEventType::End),
+            (2, IriEventType::Begin),
+        ] {
+            sender
+                .send(event_of(correlation_id, event_type))
+                .await
+                .expect("send");
+        }
+        let mut first = accept(&listener).await;
+        let (records, _) = read_records(&mut first, 3).await;
+        assert_eq!(sequences(records), [(1, 0), (1, 1), (2, 0)]);
+
+        // Past the linger, well inside the idle bound, and nothing sent.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for (correlation_id, event_type) in [(1, IriEventType::Begin), (2, IriEventType::Continue)]
+        {
+            sender
+                .send(event_of(correlation_id, event_type))
+                .await
+                .expect("send");
+        }
+        let (records, _) = read_records(&mut first, 2).await;
+        assert_eq!(
+            sequences(records),
+            [(1, 0), (2, 1)],
+            "the ended context was released; the live one carried on"
+        );
+
+        // Past the idle bound with nothing sent: the contexts, then the
+        // destination, go.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        sender
+            .send(event_of(2, IriEventType::Continue))
+            .await
+            .expect("send");
+        let mut second = accept(&listener).await;
+        let (records, _) = read_records(&mut second, 1).await;
+        assert_eq!(
+            sequences(records),
+            [(2, 0)],
+            "an idle context restarts, on a new connection to the dropped destination"
+        );
     }
 
     /// Clause 5.3 layout, octet by octet, for a PDU that carries the NFID.

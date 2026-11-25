@@ -203,7 +203,8 @@ pub struct LiX2Config {
     /// It must be the same string as the media engine's
     /// `x3_network_function_id`, so a mediation function files the signalling
     /// and the content of one call under one network element. 1 to 255 octets
-    /// of UTF-8, no control characters; checked at load.
+    /// of UTF-8, no control characters; checked at load. The bound is
+    /// siphon's own: clause 5.3.7 leaves the format to the architecture.
     #[serde(default)]
     pub network_function_id: Option<String>,
 }
