@@ -741,6 +741,8 @@ const ORPHAN_CALL_ID: &str = "reg-before-the-kill";
 struct StubLookup {
     answer: Result<Option<RegistrantRow>, String>,
     asked: AtomicUsize,
+    /// How long the source takes to answer.
+    delay: Duration,
 }
 
 impl StubLookup {
@@ -760,6 +762,16 @@ impl StubLookup {
         Arc::new(Self {
             answer,
             asked: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+        })
+    }
+
+    fn slow(username: &str, password: &str, delay: Duration) -> Arc<Self> {
+        let knowing = Self::knowing(username, password);
+        Arc::new(Self {
+            answer: knowing.answer.clone(),
+            asked: AtomicUsize::new(0),
+            delay,
         })
     }
 }
@@ -778,7 +790,11 @@ impl CredentialLookup for StubLookup {
         assert_eq!(aor, TRUNK, "asked for another AoR");
         self.asked.fetch_add(1, Ordering::SeqCst);
         let answer = self.answer.clone();
-        Box::pin(async move { answer })
+        let delay = self.delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            answer
+        })
     }
 }
 
@@ -978,4 +994,32 @@ async fn restart_de_registers_leave_nothing_behind_whichever_way_they_end() {
     assert!(store.load().await.expect("loaded").is_empty());
     assert_eq!(store.pending_writes(), 0);
     assert!(test_support::take_deregistrations(&setup.registrant).is_empty());
+}
+
+/// Re-checked before the authorised retry too: the lookup was slow, the trunk
+/// was added and registered on that Contact meanwhile, and an `Expires: 0` now
+/// would delete its binding.
+#[tokio::test]
+async fn a_slow_lookup_does_not_send_the_retry_once_the_trunk_registered_meanwhile() {
+    let setup = Setup::new();
+    let lookup = StubLookup::slow("user-a", "pw", Duration::from_millis(300));
+    let (store, deregister) = setup.startup_orphan(Some(Arc::clone(&lookup)));
+    setup.challenge(&deregister, "401 Unauthorized", "WWW-Authenticate");
+
+    // While the source thinks: the trunk is live here, on the same Contact.
+    setup.registrant.add(trunk(TRUNK));
+    let (register, _) = setup.send(TRUNK, 3600);
+    setup.answer(&register.message, "200 OK", "Expires: 3600\r\n");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    assert_eq!(lookup.asked.load(Ordering::SeqCst), 1);
+    assert!(
+        test_support::take_deregistrations(&setup.registrant).is_empty(),
+        "an authorised de-REGISTER was queued over a live registration"
+    );
+    assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
+    // The record is the live registration's now.
+    let left = store.load().await.expect("loaded");
+    assert_eq!(left.len(), 1);
+    assert_ne!(left[0].call_id, ORPHAN_CALL_ID);
 }

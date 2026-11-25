@@ -70,6 +70,9 @@ pub(super) struct RestartState {
     /// Looks credentials up by AoR for the challenge to a restart's
     /// de-REGISTER (see [`super::source::CredentialLookup`]).
     pub(super) credential_lookup: std::sync::OnceLock<Arc<dyn super::source::CredentialLookup>>,
+    /// The Call-ID of the latest record this process wrote for each AoR: a live
+    /// registration's record, which a finished clean-up must not delete.
+    pub(super) written: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 /// What one start-up cleanup did.
@@ -100,8 +103,26 @@ impl RegistrantManager {
                 .and_then(|until| until.checked_duration_since(Instant::now()))
                 .map(|remaining| remaining.as_secs());
             if let Some(record) = remaining.and_then(|secs| self.binding_record(&entry, secs)) {
-                store.save(record);
+                self.save_tracked(&store, record);
             }
+        }
+    }
+
+    /// Save a live registration's `record`, remembering it is the live one's.
+    fn save_tracked(&self, store: &BindingStore, record: BindingRecord) {
+        match self.restart.written.lock() {
+            Ok(mut written) => written.insert(record.aor.clone(), record.call_id.clone()),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .insert(record.aor.clone(), record.call_id.clone()),
+        };
+        store.save(record);
+    }
+
+    fn written_call_id(&self, aor: &str) -> Option<String> {
+        match self.restart.written.lock() {
+            Ok(written) => written.get(aor).cloned(),
+            Err(poisoned) => poisoned.into_inner().get(aor).cloned(),
         }
     }
 
@@ -145,7 +166,7 @@ impl RegistrantManager {
             self.binding_record(entry, granted_secs),
             self.restart.bindings.get(),
         ) {
-            store.save(record);
+            self.save_tracked(store, record);
         }
     }
 
@@ -157,20 +178,23 @@ impl RegistrantManager {
         }
     }
 
-    /// Drop the stored binding of `aor`, which the registration `call_id`
-    /// owned. Not when a live entry of the AoR has another Call-ID: that one
-    /// owns the record now.
+    /// Drop the stored binding of `aor` that the registration `call_id` owned,
+    /// unless a live registration has written a record of its own for the AoR
+    /// since (that record is not this one's to delete). A live entry that
+    /// merely exists has written nothing.
     pub(super) fn forget_binding_record(&self, aor: &str, call_id: &str) {
         let Some(store) = self.restart.bindings.get() else {
             return;
         };
-        let replaced = self
-            .entries
-            .get(aor)
-            .is_some_and(|entry| entry.call_id != call_id);
-        if !replaced {
-            store.remove(aor);
+        let mut written = match self.restart.written.lock() {
+            Ok(written) => written,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if written.get(aor).is_some_and(|written| written != call_id) {
+            return;
         }
+        written.remove(aor);
+        store.remove(aor);
     }
 
     /// The source was read for the first time (or there is none): "no longer
@@ -242,11 +266,25 @@ impl RegistrantManager {
                     store.remove(&record.aor);
                     report.dropped += 1;
                 }
+                Outcome::Orphan if !self.contact_names_this_node(&record, defaults) => {
+                    info!(
+                        aor = %record.aor,
+                        registrar = %record.registrar_uri,
+                        contact = %record.contact,
+                        "restart clean-up: the binding's Contact does not name this node, so it is \
+                         another node's or was replaced by its REGISTER: left alone"
+                    );
+                    store.remove(&record.aor);
+                    report.dropped += 1;
+                }
                 Outcome::Orphan => {
                     if self.deregister_orphan(&record, defaults) {
-                        let mut attempted = record.clone();
-                        attempted.attempts += 1;
-                        store.save(attempted);
+                        // Not over a record a live registration has written since.
+                        if self.written_call_id(&record.aor).is_none() {
+                            let mut attempted = record.clone();
+                            attempted.attempts += 1;
+                            store.save(attempted);
+                        }
                         report.deregistered += 1;
                     } else {
                         store.remove(&record.aor);
@@ -256,6 +294,62 @@ impl RegistrantManager {
             }
         }
         report
+    }
+
+    /// The Contact `live`'s REGISTER carries (or will).
+    pub(super) fn predicted_contact(
+        live: &RegistrantEntry,
+        defaults: EgressDefaults<'_>,
+    ) -> String {
+        live.contact_uri.clone().unwrap_or_else(|| {
+            default_contact_uri(
+                &live.credentials.username,
+                super::messages::EntryEgress::of(live, defaults).sent_by,
+                live.transport,
+            )
+        })
+    }
+
+    /// Whether `record`'s Contact names this node: its host is one of the
+    /// addresses it registers from or advertises, on a port it listens on. A
+    /// registrar keys a binding by its Contact (RFC 3261 §10.3), so an
+    /// `Expires: 0` on any other could delete a binding another node holds.
+    fn contact_names_this_node(
+        &self,
+        record: &BindingRecord,
+        defaults: EgressDefaults<'_>,
+    ) -> bool {
+        let Some((host, port)) = contact_host_port(&record.contact) else {
+            return false;
+        };
+        let mut hosts: Vec<String> = defaults
+            .listen_addrs
+            .values()
+            .map(|address| address.ip().to_string())
+            .collect();
+        hosts.push(defaults.local_addr.ip().to_string());
+        hosts.push(defaults.ue_ip.to_string());
+        hosts.extend(record.local_addr.map(|address| address.to_string()));
+        let mut ports: Vec<u16> = defaults.listen_addrs.values().map(|a| a.port()).collect();
+        ports.push(defaults.local_addr.port());
+        ports.push(defaults.plain_port());
+        let advertised = self.egress.get().is_some_and(|egress| {
+            egress
+                .advertised_addrs
+                .values()
+                .chain(egress.advertised_address.iter())
+                .any(|advertised| {
+                    advertised
+                        .rsplit_once(':')
+                        .filter(|(_, tail)| tail.parse::<u16>().is_ok())
+                        .map_or(advertised.as_str(), |(head, _)| head)
+                        .trim_matches(|c| c == '[' || c == ']')
+                        .eq_ignore_ascii_case(&host)
+                })
+        });
+        let own_host = hosts.iter().any(|own| own.eq_ignore_ascii_case(&host));
+        // An advertised name may sit behind another port (a NAT mapping).
+        advertised || (own_host && port.is_none_or(|port| ports.contains(&port)))
     }
 
     /// What a stored binding is to the live entries.
@@ -270,17 +364,11 @@ impl RegistrantManager {
         if live.call_id == record.call_id {
             return Outcome::Left;
         }
-        let contact = live.contact_uri.clone().unwrap_or_else(|| {
-            default_contact_uri(
-                &live.credentials.username,
-                super::messages::EntryEgress::of(&live, defaults).sent_by,
-                live.transport,
-            )
-        });
+        // The configured registrar, not the address it resolved to: DNS can
+        // answer with another frontend after a restart.
         let same_target = live.registrar_uri == record.registrar_uri
-            && live.destination == record.destination
             && live.transport == record.transport
-            && contact == record.contact;
+            && Self::predicted_contact(&live, defaults) == record.contact;
         if !same_target {
             return Outcome::Orphan;
         }
@@ -380,21 +468,67 @@ impl RegistrantManager {
     }
 }
 
+/// The host and port of a Contact URI (`sip:user@host:port;params`).
+fn contact_host_port(contact: &str) -> Option<(String, Option<u16>)> {
+    let rest = contact
+        .strip_prefix("sips:")
+        .or_else(|| contact.strip_prefix("sip:"))?;
+    let rest = rest.split(';').next()?.split('?').next()?;
+    let hostport = rest.rsplit_once('@').map_or(rest, |(_, hostport)| hostport);
+    if let Some(bracketed) = hostport.strip_prefix('[') {
+        let (host, tail) = bracketed.split_once(']')?;
+        let port = tail.strip_prefix(':').and_then(|port| port.parse().ok());
+        return Some((host.to_string(), port));
+    }
+    match hostport.rsplit_once(':') {
+        Some((host, port)) => Some((host.to_string(), Some(port.parse().ok()?))),
+        None => Some((hostport.to_string(), None)),
+    }
+}
+
+/// Read the stored records, then attach the store. In that order: attaching
+/// writes the live bindings, and a live binding written over a record is a
+/// record the clean-up never sees.
+pub(super) async fn snapshot_then_attach(
+    manager: &RegistrantManager,
+    store: Arc<BindingStore>,
+) -> Result<Vec<BindingRecord>, String> {
+    let records = store.load().await?;
+    manager.attach_binding_store(store);
+    Ok(records)
+}
+
 /// Run the start-up cleanup once its conditions hold (see the module). Returns
 /// when it has run, or at shutdown.
 pub async fn run_startup_cleanup(manager: Arc<RegistrantManager>) {
+    run_startup_cleanup_from(manager, super::persist::published_store).await;
+}
+
+/// [`run_startup_cleanup`] taking the store from `published`, once it has one.
+pub(super) async fn run_startup_cleanup_from(
+    manager: Arc<RegistrantManager>,
+    published: impl Fn() -> Option<Arc<BindingStore>>,
+) {
     let started = Instant::now();
     let mut noticed = false;
+    let mut snapshot: Option<Vec<BindingRecord>> = None;
+    let mut retry_read_at = Instant::now();
     loop {
         if manager.is_shutting_down() {
             return;
         }
-        if manager.restart.bindings.get().is_none() {
-            if let Some(store) = super::persist::published_store() {
-                manager.attach_binding_store(store);
+        if snapshot.is_none() && Instant::now() >= retry_read_at {
+            if let Some(store) = published() {
+                match snapshot_then_attach(&manager, store).await {
+                    Ok(records) => snapshot = Some(records),
+                    Err(error) => {
+                        error!(%error, "restart clean-up: the stored bindings cannot be read, retrying");
+                        retry_read_at = Instant::now() + Duration::from_secs(5);
+                    }
+                }
             }
         }
-        if manager.startup_ready() {
+        if snapshot.is_some() && manager.startup_ready() {
             break;
         }
         if !noticed && started.elapsed() >= WAIT_NOTICE {
@@ -407,23 +541,11 @@ pub async fn run_startup_cleanup(manager: Arc<RegistrantManager>) {
         }
         tokio::time::sleep(POLL).await;
     }
-    let Some(store) = manager.restart.bindings.get().cloned() else {
-        return;
-    };
-    let mut records = None;
-    for attempt in 1..=6u32 {
-        match store.load().await {
-            Ok(loaded) => {
-                records = Some(loaded);
-                break;
-            }
-            Err(error) => {
-                error!(%error, attempt, "restart clean-up: the stored bindings cannot be read");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    }
-    let (Some(records), Some(egress)) = (records, manager.egress.get()) else {
+    let (Some(records), Some(store), Some(egress)) = (
+        snapshot,
+        manager.restart.bindings.get().cloned(),
+        manager.egress.get(),
+    ) else {
         return;
     };
     let stored = records.len();
@@ -438,6 +560,17 @@ pub async fn run_startup_cleanup(manager: Arc<RegistrantManager>) {
     );
     // The key every record is under: written before the task ends.
     store.flush(Duration::from_secs(5)).await;
+}
+
+/// Count `aor`'s source row as listed although siphon could not use it (its
+/// entry could not be built, say): its binding is not cleared at restart.
+impl RegistrantManager {
+    pub fn note_source_unusable(&self, aor: &str) {
+        match self.restart.source_unusable.lock() {
+            Ok(mut unusable) => unusable.insert(aor.to_string()),
+            Err(poisoned) => poisoned.into_inner().insert(aor.to_string()),
+        };
+    }
 }
 
 #[cfg(test)]

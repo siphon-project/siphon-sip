@@ -231,3 +231,20 @@ async fn a_failed_first_read_does_not_mark_the_source_loaded() {
         .load(std::sync::atomic::Ordering::SeqCst));
     task.abort();
 }
+
+/// A row siphon cannot build an entry for (the registrar does not resolve) is
+/// still listed, like a malformed one: its binding is left alone at restart.
+#[tokio::test]
+async fn a_row_whose_entry_cannot_be_built_still_counts_as_listed() {
+    let body = r#"{"registrants":[
+        {"aor":"sip:nodns@carrier.example","registrar":"sip:no-such-host.invalid:5060","username":"u","password":"p"}
+    ]}"#;
+    let stub = stub("200 OK", body).await;
+    let manager = Arc::new(test_support::manager());
+    let source = source(&stub.base, false);
+
+    let report = reconcile_once(&manager, &source).await.expect("a pass");
+
+    assert_eq!(report.rejected, 1);
+    assert!(manager.source_row_unusable("sip:nodns@carrier.example"));
+}

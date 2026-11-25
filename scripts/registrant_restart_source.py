@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The trunk source scripts/registrant_restart_test.sh points siphon at.
 
-    registrant_restart_source.py PORT STATE_FILE TOKEN
+    registrant_restart_source.py PORT STATE_FILE TOKEN [LOOKUP_PASSWORD]
 
 Serves the two halves of the registrant HTTP source contract
 (docs/reference/registrant-api.md):
@@ -33,6 +33,8 @@ TRUNK = {
 
 def main() -> None:
     port, state_file, token = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+    # What the lookup answers with; a test of the digest check gives it a wrong one.
+    lookup_password = sys.argv[4] if len(sys.argv) > 4 else TRUNK["password"]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -60,7 +62,7 @@ def main() -> None:
             if url.path == "/lookup":
                 aor = urllib.parse.parse_qs(url.query).get("aor", [""])[0]
                 if aor == AOR:
-                    return self._answer(200, TRUNK)
+                    return self._answer(200, {**TRUNK, "password": lookup_password})
                 return self._answer(404, None)
             return self._answer(404, None)
 

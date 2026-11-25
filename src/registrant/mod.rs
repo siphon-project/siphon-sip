@@ -876,14 +876,6 @@ impl RegistrantManager {
         let _ = self.egress.set(egress);
     }
 
-    /// Take the de-registrations queued by [`Self::remove`], leaving none.
-    fn take_pending_deregistrations(&self) -> Vec<BuiltRegister> {
-        match self.pending_deregistrations.lock() {
-            Ok(mut pending) => std::mem::take(&mut *pending),
-            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-        }
-    }
-
     /// Base for UE IPsec SPI allocation, well clear of the RFC 4303 §2.1
     /// reserved 0..255 range and kept in a normal, handset-like magnitude (not
     /// 0x20000000): the value advertised in Security-Client IS the value

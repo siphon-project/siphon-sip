@@ -335,7 +335,12 @@ async fn the_start_up_task_waits_for_a_late_store_then_clears_the_orphans() {
     test_support::install_egress(&manager);
     test_support::attach_untracked_transactions(&manager);
     manager.mark_source_loaded();
-    let task = tokio::spawn(super::run_startup_cleanup(Arc::clone(&manager)));
+    let late: Arc<std::sync::Mutex<Option<Arc<BindingStore>>>> = Arc::default();
+    let published = Arc::clone(&late);
+    let task = tokio::spawn(super::run_startup_cleanup_from(
+        Arc::clone(&manager),
+        move || published.lock().ok().and_then(|store| store.clone()),
+    ));
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!task.is_finished(), "ran without a store");
@@ -344,7 +349,7 @@ async fn the_start_up_task_waits_for_a_late_store_then_clears_the_orphans() {
     // Redis came up after boot.
     let store = BindingStore::in_memory("node-a", 30);
     store.save(record(AOR));
-    manager.attach_binding_store(Arc::clone(&store));
+    *late.lock().expect("lock") = Some(Arc::clone(&store));
     tokio::time::timeout(Duration::from_secs(5), task)
         .await
         .expect("the task ends once it has run")
@@ -519,4 +524,195 @@ async fn orphans_leave_no_tracked_de_register_and_no_record_whichever_way_they_e
     assert_eq!(store.pending_writes(), 0);
     assert!(test_support::take_deregistrations(&manager).is_empty());
     assert!(manager.is_empty());
+}
+
+// --- review findings ---------------------------------------------------------
+
+/// A registrar keys a binding by its Contact (RFC 3261 §10.3): an `Expires: 0`
+/// on a Contact that does not name this node could delete the binding another
+/// node registered on it.
+#[tokio::test]
+async fn a_binding_on_a_contact_that_is_not_this_nodes_is_not_de_registered() {
+    for contact in [
+        // Another host.
+        "sip:edge@203.0.113.9:5060",
+        // This host, a port nothing here listens on.
+        "sip:trunk@192.0.2.1:5099",
+    ] {
+        let (manager, store) = manager_with_store();
+        let listen = listen();
+        let mut stored = record(AOR);
+        stored.contact = contact.to_string();
+        store.save(stored.clone());
+
+        let report = manager.startup_cleanup(vec![stored], defaults(&listen));
+
+        assert_eq!(report.dropped, 1, "{contact}");
+        assert_eq!(report.deregistered, 0, "{contact}");
+        assert!(
+            test_support::take_deregistrations(&manager).is_empty(),
+            "{contact}: a de-REGISTER went out"
+        );
+        assert!(
+            store.load().await.expect("loaded").is_empty(),
+            "{contact}: the record stayed"
+        );
+    }
+}
+
+/// A Contact naming the process's advertised address or an entry's own
+/// `local_addr` is this node's too.
+#[tokio::test]
+async fn a_binding_on_the_nodes_advertised_or_local_address_is_still_cleared() {
+    let (manager, store) = manager_with_store();
+    let listen = listen();
+    let mut stored = record(AOR);
+    stored.local_addr = Some("192.0.2.77".parse().expect("addr"));
+    stored.contact = "sip:trunk@192.0.2.77:5060".to_string();
+    store.save(stored.clone());
+
+    let report = manager.startup_cleanup(vec![stored], defaults(&listen));
+
+    assert_eq!(report.deregistered, 1);
+}
+
+/// DNS can hand back another frontend after a restart: the configured registrar
+/// names the target, not the address it resolved to.
+#[tokio::test]
+async fn a_registrar_that_resolves_elsewhere_after_the_restart_is_the_same_target() {
+    let (manager, store) = manager_with_store();
+    let listen = listen();
+    let mut entry = trunk(AOR);
+    entry.destination = "198.51.100.77:5060".parse().expect("addr");
+    manager.add(entry);
+    let stored = record(AOR);
+    store.save(stored.clone());
+
+    let report = manager.startup_cleanup(vec![stored], defaults(&listen));
+
+    assert_eq!(report.carried, 1);
+    assert!(test_support::take_deregistrations(&manager).is_empty());
+}
+
+/// Checked again when the de-REGISTER is about to leave: a live entry took the
+/// Contact since it was queued, so it would delete that entry's binding.
+#[tokio::test]
+async fn a_queued_restart_de_register_is_dropped_once_a_live_entry_holds_the_contact() {
+    let (manager, store) = manager_with_store();
+    let listen = listen();
+    let stored = record(AOR);
+    store.save(stored.clone());
+    manager.startup_cleanup(vec![stored], defaults(&listen));
+    assert_eq!(manager.removed_deregistrations_pending(), 1);
+    manager.add(trunk(AOR));
+
+    assert!(
+        test_support::take_deregistrations(&manager).is_empty(),
+        "the de-REGISTER left although the trunk is live on that Contact"
+    );
+    assert_eq!(manager.removed_deregistrations_pending(), 0);
+}
+
+/// A live entry that holds the AoR on another Contact does not stop the
+/// de-REGISTER of the old one.
+#[tokio::test]
+async fn a_live_entry_on_another_contact_does_not_stop_the_de_register() {
+    let (manager, store) = manager_with_store();
+    let listen = listen();
+    let mut entry = trunk(AOR);
+    entry.contact_uri = Some("sip:trunk@192.0.2.1:5090".to_string());
+    manager.add(entry);
+    let stored = record(AOR);
+    store.save(stored.clone());
+    manager.startup_cleanup(vec![stored], defaults(&listen));
+
+    assert_eq!(test_support::take_deregistrations(&manager).len(), 1);
+}
+
+/// The record of a cleaned-up binding goes with its de-REGISTER unless a live
+/// entry has actually written one of its own; a live entry that merely exists
+/// (here on another Contact, never registered) wrote nothing.
+#[tokio::test]
+async fn a_cleaned_up_record_is_dropped_although_a_live_entry_holds_the_aor() {
+    let (manager, store) = manager_with_store();
+    let listen = listen();
+    let mut entry = trunk(AOR);
+    entry.contact_uri = Some("sip:trunk@192.0.2.1:5090".to_string());
+    manager.add(entry);
+    let stored = record(AOR);
+    store.save(stored.clone());
+    manager.startup_cleanup(vec![stored.clone()], defaults(&listen));
+    let built = test_support::take_deregistrations(&manager)
+        .pop()
+        .expect("a de-REGISTER");
+
+    manager.answer_removed_deregistration(
+        &header(&built.message, "Call-ID"),
+        cseq_number(&built.message),
+        200,
+        None,
+        defaults(&listen),
+    );
+
+    assert!(store.load().await.expect("loaded").is_empty());
+}
+
+/// ...and one a live entry did write stays.
+#[tokio::test]
+async fn a_record_a_live_entry_wrote_survives_the_clean_up_of_the_old_one() {
+    let (manager, store) = manager_with_store();
+    let listen = listen();
+    let mut entry = trunk(AOR);
+    entry.contact_uri = Some("sip:trunk@192.0.2.1:5090".to_string());
+    let live_call_id = entry.call_id.clone();
+    manager.add(entry);
+    let stored = record(AOR);
+    store.save(stored.clone());
+    manager.startup_cleanup(vec![stored], defaults(&listen));
+    let built = test_support::take_deregistrations(&manager)
+        .pop()
+        .expect("a de-REGISTER");
+    manager.build_register(AOR, defaults(&listen), 600);
+    manager.handle_success(AOR, 600);
+
+    manager.answer_removed_deregistration(
+        &header(&built.message, "Call-ID"),
+        cseq_number(&built.message),
+        200,
+        None,
+        defaults(&listen),
+    );
+
+    let left = store.load().await.expect("loaded");
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].call_id, live_call_id);
+}
+
+/// The previous process's records are read before any live binding is written
+/// over them, a store that attaches late or not.
+#[tokio::test]
+async fn the_stored_records_are_read_before_a_live_binding_overwrites_them() {
+    let manager = Arc::new(test_support::manager());
+    test_support::install_egress(&manager);
+    let listen = listen();
+    let mut entry = trunk(AOR);
+    entry.contact_uri = Some("sip:trunk@192.0.2.1:5090".to_string());
+    manager.add(entry);
+    manager.build_register(AOR, defaults(&listen), 600);
+    manager.handle_success(AOR, 600);
+    let store = BindingStore::in_memory("node-a", 30);
+    store.save(record(AOR));
+
+    let snapshot = super::snapshot_then_attach(&manager, Arc::clone(&store))
+        .await
+        .expect("read");
+
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(
+        snapshot[0].contact, CONTACT,
+        "the previous process's record"
+    );
+    // And the live binding is written afterwards.
+    let now = store.load().await.expect("loaded");
+    assert_eq!(now[0].contact, "sip:trunk@192.0.2.1:5090");
 }

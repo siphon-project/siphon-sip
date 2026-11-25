@@ -9,7 +9,9 @@
 # node). The registrar must then receive an `Expires: 0` REGISTER on the old
 # Call-ID and Contact with a higher CSeq (RFC 3261 §10.2.2, §10.2.4), challenge
 # it (§22), and get the authorised retry (the credential comes from the
-# source's lookup by AoR: nothing stores it), which it accepts. The Redis record
+# source's lookup by AoR: nothing stores it, and SIPp verifies the digest against
+# the password, LOOKUP_PASSWORD=wrong makes the lookup serve a wrong one and the
+# test fail), which it accepts. The Redis record
 # of the binding must hold no credential, and be gone at the end.
 #
 #   scripts/registrant_restart_test.sh
@@ -66,7 +68,8 @@ redis-server --port "${REDIS_PORT}" --bind 127.0.0.1 --save "" --appendonly no \
 for _ in $(seq 50); do redis-cli -p "${REDIS_PORT}" ping >/dev/null 2>&1 && break; sleep 0.1; done
 
 echo listed > "${WORK}/state"
-python3 -I scripts/registrant_restart_source.py "${SOURCE_PORT}" "${WORK}/state" "${TOKEN}" &
+python3 -I scripts/registrant_restart_source.py "${SOURCE_PORT}" "${WORK}/state" "${TOKEN}" \
+  "${LOOKUP_PASSWORD:-secret123}" &
 SOURCE_PID=$!
 for _ in $(seq 50); do
   python3 -I -c "import socket,sys; socket.create_connection(('127.0.0.1',${SOURCE_PORT}),0.2)" 2>/dev/null && break
@@ -183,6 +186,11 @@ retry_cseq="$(header_of "${WORK}/registrar-second.msg" CSeq 2 | cut -d' ' -f1)"
 [[ "${dereg_call_id}" == "${first_call_id}" ]] \
   || fail "the de-REGISTER is on Call-ID ${dereg_call_id}, not the old ${first_call_id}"
 [[ "${retry_call_id}" == "${first_call_id}" ]] || fail "the authorised retry left the Call-ID"
+first_contact="$(header_of "${WORK}/registrar-first.msg" Contact 1)"
+dereg_contact="$(header_of "${WORK}/registrar-second.msg" Contact 1)"
+retry_contact="$(header_of "${WORK}/registrar-second.msg" Contact 2)"
+[[ -n "${first_contact}" && "${dereg_contact}" == "${first_contact}" && "${retry_contact}" == "${first_contact}" ]] \
+  || fail "the de-REGISTER Contacts (${dereg_contact} / ${retry_contact}) are not the registered one (${first_contact})"
 (( dereg_cseq > first_cseq )) || fail "de-REGISTER CSeq ${dereg_cseq} does not outrank ${first_cseq}"
 (( retry_cseq > dereg_cseq )) || fail "retry CSeq ${retry_cseq} does not outrank ${dereg_cseq}"
 grep -q "authorised=True" "${WORK}/state.requests" && grep -q "^/lookup" "${WORK}/state.requests" \

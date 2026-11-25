@@ -34,15 +34,42 @@
     ]]>
   </send>
 
+  <!-- The digest response is verified against the trunk's password (RFC 2617
+       / 7616): a wrong credential from the lookup is answered 403 and fails
+       the scenario. -->
   <recv request="REGISTER">
     <action>
       <ereg regexp="Expires: 0" search_in="msg" check_it="true"
             assign_to="retry_expires" />
+      <ereg regexp="sip:edge@127.0.0.1:25060" search_in="hdr" header="Contact:"
+            check_it="true" assign_to="retry_contact" />
       <ereg regexp="username=.line-user-7." search_in="hdr" header="Authorization:"
             check_it="true" assign_to="retry_auth" />
-      <log message="authorised de-REGISTER carried Expires [$retry_expires] and [$retry_auth]" />
+      <verifyauth assign_to="authok" username="line-user-7" password="secret123" />
+      <log message="authorised de-REGISTER carried Expires [$retry_expires], Contact [$retry_contact] and [$retry_auth]" />
     </action>
   </recv>
+
+  <nop test="authok" next="accepted" />
+
+  <send>
+    <![CDATA[
+
+      SIP/2.0 403 Forbidden
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Never arrives: the call fails, so SIPp exits non-zero. -->
+  <recv request="BYE" timeout="2000" />
+
+  <label id="accepted" />
 
   <send>
     <![CDATA[

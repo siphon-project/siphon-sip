@@ -223,6 +223,59 @@ impl RegistrantManager {
         );
     }
 
+    /// Take the de-registrations queued by [`Self::remove`] and the restart
+    /// clean-up, leaving none. A restart's is checked again here, just before it
+    /// would leave: see [`Self::startup_deregistration_superseded`].
+    pub(super) fn take_pending_deregistrations(&self) -> Vec<BuiltRegister> {
+        let taken = match self.pending_deregistrations.lock() {
+            Ok(mut pending) => std::mem::take(&mut *pending),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        taken
+            .into_iter()
+            .filter(|built| {
+                !built
+                    .message
+                    .headers
+                    .get("Call-ID")
+                    .is_some_and(|call_id| self.startup_deregistration_superseded(call_id))
+            })
+            .collect()
+    }
+
+    /// Whether the restart de-REGISTER on `call_id` must not go: a live entry
+    /// now holds the AoR on the same Contact, so an `Expires: 0` on that Contact
+    /// would delete its binding (RFC 3261 §10.3). It is forgotten, record
+    /// included.
+    pub(super) fn startup_deregistration_superseded(&self, call_id: &str) -> bool {
+        let superseded = self
+            .draining_deregistrations
+            .get(call_id)
+            .filter(|draining| draining.needs_lookup)
+            .is_some_and(|draining| {
+                let Some(contact) = draining.entry.contact_uri.as_deref() else {
+                    return false;
+                };
+                self.entries.get(&draining.entry.aor).is_some_and(|live| {
+                    live.sent_contact.as_deref() == Some(contact)
+                        || self.egress.get().is_some_and(|egress| {
+                            Self::predicted_contact(&live, egress.defaults()) == contact
+                        })
+                })
+            });
+        if superseded {
+            if let Some((_, draining)) = self.draining_deregistrations.remove(call_id) {
+                info!(
+                    aor = %draining.entry.aor,
+                    registrar = %draining.entry.registrar_uri,
+                    "restart clean-up: a live entry holds the binding now, its de-REGISTER is not sent"
+                );
+                self.forget_binding_record(&draining.entry.aor, call_id);
+            }
+        }
+        superseded
+    }
+
     /// How many removed entries' de-REGISTERs are still tracked.
     pub fn removed_deregistrations_pending(&self) -> usize {
         self.draining_deregistrations.len()
@@ -328,6 +381,11 @@ impl RegistrantManager {
         credentials: Result<Option<RegistrantCredentials>, String>,
         defaults: EgressDefaults<'_>,
     ) -> RemovedAnswer {
+        // The lookup may have taken a while: the trunk may be live on that
+        // Contact by now.
+        if self.startup_deregistration_superseded(&request.call_id) {
+            return RemovedAnswer::Finished;
+        }
         let Some(mut draining) = self.draining_deregistrations.get_mut(&request.call_id) else {
             // Ended meanwhile (Timer F, the sweep): nothing to answer.
             return RemovedAnswer::NotTracked;

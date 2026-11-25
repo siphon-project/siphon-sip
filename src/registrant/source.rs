@@ -762,6 +762,7 @@ pub async fn reconcile_once(
     for action in actions {
         match action {
             ReconcileAction::Add(entry) => {
+                let aor = entry.aor.clone();
                 match build_entry_off_thread(entry, default_interval).await {
                     Ok(built) => {
                         manager.add(built);
@@ -769,11 +770,13 @@ pub async fn reconcile_once(
                     }
                     Err(error) => {
                         report.rejected += 1;
+                        manager.note_source_unusable(&aor);
                         warn!(%error, "registrant source: cannot add a trunk");
                     }
                 }
             }
             ReconcileAction::Update(entry) => {
+                let aor = entry.aor.clone();
                 match build_entry_off_thread(entry, default_interval).await {
                     Ok(built) => {
                         if manager.update_from_source(built) {
@@ -782,6 +785,7 @@ pub async fn reconcile_once(
                     }
                     Err(error) => {
                         report.rejected += 1;
+                        manager.note_source_unusable(&aor);
                         warn!(%error, "registrant source: cannot update a trunk");
                     }
                 }

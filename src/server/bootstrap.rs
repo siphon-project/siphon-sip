@@ -324,20 +324,25 @@ pub(super) async fn init_registrant_bindings(
     redis: &crate::config::RedisBackendConfig,
     instance_id: String,
 ) {
-    let connection = match crate::redis_target::RedisConnection::connect(redis.target.clone()).await
-    {
-        Ok(connection) => connection,
-        Err(error) => {
-            error!(%error, "failed to connect to Redis for the registrant's bindings");
-            return;
-        }
-    };
-    crate::registrant::persist::publish_store(crate::registrant::persist::BindingStore::redis(
-        connection,
-        instance_id,
-        redis.registrant_key_prefix.clone(),
-        u64::from(redis.ttl_slack_secs),
-    ));
+    let target = redis.target.clone();
+    let key_prefix = redis.registrant_key_prefix.clone();
+    let ttl_slack_secs = u64::from(redis.ttl_slack_secs);
+    // Its own connection, retried until it answers as the registrar's is: a
+    // Redis in a maintenance window at boot must not mean no clean-up ever.
+    tokio::spawn(async move {
+        let connection = super::registrar_backend::connect_and_hand_on(
+            "the registrant's bindings",
+            super::registrar_backend::RETRY_INTERVAL,
+            || crate::redis_target::RedisConnection::connect(target.clone()),
+        )
+        .await;
+        crate::registrant::persist::publish_store(crate::registrant::persist::BindingStore::redis(
+            connection,
+            instance_id,
+            key_prefix,
+            ttl_slack_secs,
+        ));
+    });
 }
 
 /// Stand-in when the `redis-backend` feature is off: the bindings are not kept.
