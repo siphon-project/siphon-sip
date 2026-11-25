@@ -1108,7 +1108,12 @@ pub(super) async fn spawn_li_tasks(li_state: Option<LiState>, config: &Config) {
     // Spawn X2 IRI delivery task
     if let Some(ref x2_config) = li_config.x2 {
         let x2_arc = Arc::new(x2_config.clone());
-        tokio::spawn(crate::li::x2::delivery_task(iri_rx, x2_arc));
+        let network_function_id = li_config.x2_network_function_id().map(str::to_string);
+        tokio::spawn(crate::li::x2::delivery_task(
+            iri_rx,
+            x2_arc,
+            network_function_id,
+        ));
         info!("X2 IRI delivery task started");
     } else {
         tokio::spawn(async move {

@@ -2254,6 +2254,15 @@ auth:
 #                                         # dropped at the tick and reconnected
 #                                         # by the next record.
 #     channel_size: 10000
+#     # Network Function ID (TS 103 221-2 clause 5.3.7, attribute 6) on every
+#     # X2 PDU. Defaults to x1.ne_identifier; with neither set there is no
+#     # attribute. It MUST equal the media engine's x3_network_function_id, so
+#     # the mediation function files a call's signalling and content under one
+#     # network element. 1 to 255 octets of UTF-8, no control characters.
+#     network_function_id: "siphon-ne-1"
+#     # Sequence numbers (clause 5.3.9) are counted per (XID, CID) context from
+#     # 0 and continue across reconnects. Keepalives (payload format 0) count
+#     # on their own, per connection.
 #     # TLS is refused rather than downgraded: if any of this is wrong the
 #     # delivery task stops and says so, because quietly sending a warrant's
 #     # contents in the clear is the worst available outcome.

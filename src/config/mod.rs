@@ -898,6 +898,20 @@ impl Config {
         if !lawful_intercept.enabled {
             return Ok(());
         }
+        if lawful_intercept.x2.is_some() {
+            if let Some(identifier) = lawful_intercept.x2_network_function_id() {
+                crate::li::pdu::validate_network_function_id(identifier).map_err(|reason| {
+                    SiphonError::Config(format!(
+                        "the X2 Network Function ID {identifier:?} is not usable \
+                         (TS 103 221-2 clause 5.3.7): {reason}. It is \
+                         lawful_intercept.x2.network_function_id, or \
+                         lawful_intercept.x1.ne_identifier when that is unset; set the \
+                         former to a 1 to 255 octet name, the same one the media engine's \
+                         x3_network_function_id carries."
+                    ))
+                })?;
+            }
+        }
         // `enabled: false` is the same as no block at all, so a node that has
         // turned content off is not held to the backend requirement.
         if !lawful_intercept.x3.as_ref().is_some_and(|x3| x3.enabled) {
