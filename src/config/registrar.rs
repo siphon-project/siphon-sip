@@ -174,6 +174,12 @@ pub struct RedisBackendConfig {
     /// this same Redis and restored at boot (default: "siphon:presence:").
     /// Kept apart from `key_prefix`, so neither restore walks the other's keys.
     pub presence_key_prefix: String,
+    /// Key prefix of the outbound registrations' bindings, written through to
+    /// this same Redis so a restarted node can de-register what the process
+    /// before it left on a registrar (default: "siphon:registrant:"). Holds no
+    /// credential. Kept apart from `key_prefix` for the same reason as
+    /// `presence_key_prefix`.
+    pub registrant_key_prefix: String,
     /// How long, in milliseconds, a node serves an AoR from its own memory
     /// before reading Redis again (default 1000). This is the bound on how
     /// stale another node's registration, refresh or removal can look.
@@ -205,6 +211,8 @@ struct RawRedisBackendConfig {
     /// Kept apart from `key_prefix`, so neither restore walks the other's keys.
     #[serde(default = "default_presence_key_prefix")]
     pub presence_key_prefix: String,
+    #[serde(default = "default_registrant_key_prefix")]
+    pub registrant_key_prefix: String,
     #[serde(default = "default_read_through_ttl_ms")]
     pub read_through_ttl_ms: u64,
     #[serde(default)]
@@ -216,6 +224,18 @@ impl TryFrom<RawRedisBackendConfig> for RedisBackendConfig {
     fn try_from(raw: RawRedisBackendConfig) -> Result<Self, Self::Error> {
         if raw.urls.len() != raw.shard_count {
             return Err("Redis shard_count must match the number of urls".into());
+        }
+        // The registrar builds its index by scanning `{key_prefix}*`: a prefix
+        // of ours under it would be read as bindings.
+        if raw.registrant_key_prefix.is_empty()
+            || raw.registrant_key_prefix.starts_with(&raw.key_prefix)
+            || raw.key_prefix.starts_with(&raw.registrant_key_prefix)
+        {
+            return Err(format!(
+                "registrar.redis.registrant_key_prefix {:?} must be non-empty and apart from \
+                 key_prefix {:?} (neither may begin with the other)",
+                raw.registrant_key_prefix, raw.key_prefix
+            ));
         }
         // In sharded mode the first shard also hosts iFC and presence data.
         let target = if raw.target.url.is_none() && raw.target.sentinel.is_none() {
@@ -233,6 +253,7 @@ impl TryFrom<RawRedisBackendConfig> for RedisBackendConfig {
             key_prefix: raw.key_prefix,
             ttl_slack_secs: raw.ttl_slack_secs,
             presence_key_prefix: raw.presence_key_prefix,
+            registrant_key_prefix: raw.registrant_key_prefix,
             read_through_ttl_ms: raw.read_through_ttl_ms,
             required_for_readiness: raw.required_for_readiness,
         })
@@ -241,6 +262,10 @@ impl TryFrom<RawRedisBackendConfig> for RedisBackendConfig {
 
 fn default_redis_key_prefix() -> String {
     "siphon:reg:".to_owned()
+}
+
+fn default_registrant_key_prefix() -> String {
+    crate::registrant::persist::DEFAULT_REGISTRANT_KEY_PREFIX.to_owned()
 }
 
 fn default_presence_key_prefix() -> String {

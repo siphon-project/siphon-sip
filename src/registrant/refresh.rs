@@ -588,13 +588,20 @@ pub async fn await_deregistrations(
     manager: &RegistrantManager,
     deadline: tokio::time::Instant,
 ) -> bool {
+    let mut ended = true;
     while manager.deregistrations_pending() {
         if tokio::time::Instant::now() >= deadline {
-            return false;
+            ended = false;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    true
+    // The records of the bindings just cleared go before the process does, or
+    // the next start would clear them again.
+    if let Some(store) = manager.restart.bindings.get() {
+        store.flush(Duration::from_secs(2)).await;
+    }
+    ended
 }
 
 /// The most shutdown spends deleting the SA sets left after that wait.

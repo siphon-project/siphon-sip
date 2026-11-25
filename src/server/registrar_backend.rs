@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use tracing::{error, info, warn};
 
-use super::bootstrap::{init_ifc_redis_backend, init_presence_redis_backend};
+use super::bootstrap::{
+    init_ifc_redis_backend, init_presence_redis_backend, init_registrant_bindings, instance_id,
+};
 use super::restored_stream_eviction::evict_restored_stream_bindings;
 use crate::config::{Config, RegistrarBackendType};
 use crate::registrar::backend::{self, RegistrarBackend};
@@ -234,6 +236,11 @@ async fn attach_redis(
 
     // --- presence subscriptions (the same Redis, its own prefix) ---
     init_presence_redis_backend(redis_cfg).await;
+
+    // --- the registrant's bindings (the same Redis, its own prefix) ---
+    if config.registrant.is_some() {
+        init_registrant_bindings(redis_cfg, instance_id(config)).await;
+    }
 }
 
 /// Restore the registrar from `backend`, install its writer, and mark the

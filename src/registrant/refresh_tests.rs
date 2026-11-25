@@ -792,6 +792,7 @@ async fn a_reconcile_after_shutdown_reads_nothing_and_adds_nothing() {
             refresh_secs: 30,
             timeout_ms: 50,
             auth_header: None,
+            lookup_url: None,
         })
         .expect("the HTTP client builds"),
     );

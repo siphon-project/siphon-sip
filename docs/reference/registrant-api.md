@@ -23,6 +23,8 @@ registrant:
     refresh_secs: 30            # how often to re-read and reconcile
     timeout_ms: 2000
     auth_header: "Bearer ${PROVISIONING_TOKEN}"
+    # Optional: one trunk by AoR, for the restart clean-up (see "Lookup by AoR").
+    lookup_url: "http://127.0.0.1:8080/registrants/lookup?aor={aor}"
   default_interval: 3600        # used by a row that omits `interval`
 ```
 
@@ -36,6 +38,9 @@ registrant:
     query: "SELECT aor, registrar, username, password, realm, expires AS interval,
              contact, transport, enabled FROM registrants WHERE node = $1"
     refresh_secs: 30
+    # Optional: the one trunk whose AoR is $1 (see "Lookup by AoR").
+    lookup_query: "SELECT aor, registrar, username, password, realm, contact, transport,
+                    enabled FROM registrants WHERE aor = $1"
 ```
 
 `aor`, `registrar` and `username` are required; every other column is optional
@@ -158,6 +163,51 @@ the JSON fields in the table above.
 | `transport` | `str` | `"udp"` |
 | `enabled` | `bool` | `True` |
 | `gateway` | `str \| None` | `None` |
+
+## Lookup by AoR (optional)
+
+With `registrar.backend: redis` siphon keeps one record per granted binding
+under `registrar.redis.registrant_key_prefix` (default `siphon:registrant:`), so
+a node that is **killed without a graceful shutdown** can clear what it left on
+the registrar when it restarts. Without that, a trunk whose lease moved to
+another node meanwhile stays registered from the dead node, as a second contact,
+until the old binding expires (up to one `interval`).
+
+At restart, once the source has been read for the first time, siphon sends
+`Expires: 0` (RFC 3261 §10.2.2) for every stored binding no live entry owns, on
+the stored Contact, with the stored Call-ID and a CSeq above every one the
+process before used (§10.2.4). A live entry that has not registered yet and
+targets the same contact takes the binding over instead (same Call-ID, CSeq
+continued), so its first REGISTER refreshes it. Rows the source returned that
+siphon rejected count as still listed and are left alone.
+
+**No credential is stored.** A registrar that challenges that de-REGISTER (RFC
+3261 §22) is answered from a lookup of the trunk by AoR, once. Configure it with
+`lookup_url` (HTTP) or `lookup_query` (database); without one the challenge is
+not answered, the binding expires as it would have, and the record is dropped
+(logged with the AoR and registrar).
+
+- `lookup_url` is a template with an `{aor}` placeholder, replaced by the AoR
+  percent-encoded as a URL query component. siphon `GET`s it with the same
+  `Authorization` header as the list.
+- The answer is **one trunk row**: exactly the JSON of one element of
+  `registrants`. Only `username` and `password` (or `ha1` with `ha1_algorithm`)
+  and `realm` are read. It must be answered whether or not the trunk is listed
+  for this node and **whether or not it is `enabled`**: the trunk may have moved
+  to another node or been switched off, which is why its binding is being
+  cleared.
+- `404` means the AoR is unknown. Any other non-2xx, a timeout or a body that
+  does not parse is treated the same: the challenge is not answered.
+- `lookup_query` is a statement returning the one row whose AoR is `$1`, in the
+  columns of `query`.
+
+Records hold the AoR, registrar, destination, transport, the Contact sent, the
+Call-ID, the next CSeq, the local address, the interval, the grant's end and an
+attempt counter (at most 3 start-ups try one binding). They expire by themselves
+once the registrar would have dropped the binding. IMS AKA / IPsec entries are
+not covered (their de-REGISTER needs the USIM's state). The Contact's user part
+is derived from the `username` unless the row sets `contact`; set `contact` if
+the username must not appear in Redis at all.
 
 ## Behavior notes
 

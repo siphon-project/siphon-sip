@@ -501,7 +501,7 @@ fn try_send_registrant_request(
 /// §22, §10.2.2); any other final answer ends it. The answer to a removed IMS
 /// entry's protected de-REGISTER releases its SA sets (TS 24.229 5.1.1.6.1).
 fn handle_removed_entry_answer(
-    registrant: &crate::registrant::RegistrantManager,
+    registrant: &Arc<crate::registrant::RegistrantManager>,
     message: &SipMessage,
     status_code: u16,
     call_id: &str,
@@ -533,6 +533,23 @@ fn handle_removed_entry_answer(
             if let Err(error) = try_send_registrant_request(registrant, &built, state) {
                 registrant
                     .removed_deregistration_ended(&built.branch, &format!("not sent: {error}"));
+            }
+        }
+        // The credentials come from the source, asked off this thread; the
+        // authenticated de-REGISTER goes out on the loop's next tick.
+        RemovedAnswer::Lookup(request) => {
+            let request = *request;
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn(Arc::clone(registrant).complete_credential_lookup(request));
+                }
+                Err(_) => {
+                    registrant.answer_after_lookup(
+                        &request,
+                        Err("no runtime to ask the source on".to_string()),
+                        defaults,
+                    );
+                }
             }
         }
         RemovedAnswer::Finished | RemovedAnswer::Stale => {}

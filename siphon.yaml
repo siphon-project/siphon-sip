@@ -495,6 +495,7 @@ registrar:
   #   # and writes what it accepted meanwhile through). true holds /admin/ready
   #   # at 503 until it has answered. siphon_registrar_backend_up shows which.
   #   presence_key_prefix: "siphon:presence:"
+  #   registrant_key_prefix: "siphon:registrant:"   # the registrant's granted bindings (no credential)
   #   # presence subscriptions (presence.subscribe_dialog) are written through
   #   # to this Redis under their own prefix and restored at boot, so a
   #   # restarted reg event notifier keeps NOTIFYing its watchers in their
@@ -672,12 +673,28 @@ registrar:
 #              FROM registrants WHERE node = $1"
 #     refresh_secs: 30
 #     timeout_ms: 2000
+#     # Optional: the one trunk whose AoR is $1, same columns as `query`, even
+#     # when it is not listed for this node or is disabled.  Answers the
+#     # challenge to the de-REGISTER that clears a binding a killed process left
+#     # behind (needs `registrar.backend: redis`); nothing persists a credential.
+#     lookup_query: "SELECT aor, registrar, username, password, realm,
+#                     contact, transport, enabled FROM registrants WHERE aor = $1"
 #   # ...or an endpoint the controller serves:
 #   http:
 #     url: "http://127.0.0.1:8080/registrants"
 #     refresh_secs: 30
 #     timeout_ms: 2000
 #     auth_header: "Bearer ${PROVISIONING_TOKEN}"
+#     # Optional, same purpose as `lookup_query`: GET with {aor} replaced by the
+#     # percent-encoded AoR, same Authorization, one trunk row as JSON (404 =
+#     # unknown, enabled: false still answered).  See the reference doc.
+#     lookup_url: "http://127.0.0.1:8080/registrants/lookup?aor={aor}"
+#
+# With `registrar.backend: redis` each granted binding is also kept in Redis (own
+# key prefix, `registrar.redis.registrant_key_prefix`, default
+# "siphon:registrant:"; no credential is stored) so a node that was killed
+# without shutting down de-registers at restart what it left on the registrar,
+# instead of leaving a second contact there until it expires.
 #
 # Script-managed entries (still supported, and unaffected by the above):
 # Use the `registration` Python API to add/remove entries from scripts.

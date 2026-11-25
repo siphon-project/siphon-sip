@@ -8,6 +8,7 @@ from siphon_sdk.registrants import (
     CONTRACT_VERSION,
     RegistrantListResponse,
     RegistrantRow,
+    lookup_response,
 )
 
 
@@ -82,3 +83,16 @@ def test_disabled_rows_survive_the_round_trip():
     disabled = row(enabled=False)
     assert disabled.to_dict()["enabled"] is False
     assert RegistrantRow.from_dict(disabled.to_dict()).enabled is False
+
+
+def test_a_lookup_answers_one_row_even_when_the_trunk_is_disabled():
+    body = lookup_response(row(enabled=False))
+    assert body is not None
+    assert body["enabled"] is False
+    assert body["username"] == "trunk1"
+    # exactly one element of a list answer, so one parser reads both
+    assert RegistrantRow.from_dict(body) == row(enabled=False)
+
+
+def test_a_lookup_of_an_unknown_aor_is_no_body():
+    assert lookup_response(None) is None
