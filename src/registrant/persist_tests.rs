@@ -166,3 +166,36 @@ fn the_key_names_the_instance_apart_from_the_registrar_prefix() {
     // The registrar builds its index by scanning `siphon:reg:*`.
     assert!(!key.starts_with("siphon:reg:"));
 }
+
+#[tokio::test]
+async fn a_guarded_removal_leaves_a_record_another_registration_wrote() {
+    let store = BindingStore::in_memory("node-a", 30);
+    let mut newer = record("sip:trunk@carrier.example");
+    newer.call_id = "reg-newer".to_string();
+    store.save(newer.clone());
+
+    store.remove_if("sip:trunk@carrier.example", "reg-0001");
+    assert_eq!(store.load().await.expect("loaded"), vec![newer]);
+
+    store.remove_if("sip:trunk@carrier.example", "reg-newer");
+    assert!(store.load().await.expect("loaded").is_empty());
+}
+
+#[tokio::test]
+async fn other_instances_records_are_found_by_aor_and_never_our_own() {
+    let store = BindingStore::in_memory("node-a", 30);
+    store.save(record("sip:trunk@carrier.example"));
+    let mut other = record("sip:trunk@carrier.example");
+    other.instance = "node-b".to_string();
+    store.save_as_instance(other.clone());
+    let mut unrelated = record("sip:elsewhere@carrier.example");
+    unrelated.instance = "node-b".to_string();
+    store.save_as_instance(unrelated);
+
+    let found = store
+        .others_holding(&["sip:trunk@carrier.example".to_string()])
+        .await
+        .expect("read");
+
+    assert_eq!(found, vec![other]);
+}

@@ -248,3 +248,41 @@ async fn a_row_whose_entry_cannot_be_built_still_counts_as_listed() {
     assert_eq!(report.rejected, 1);
     assert!(manager.source_row_unusable("sip:nodns@carrier.example"));
 }
+
+/// A slow DNS answer in a later pass must not unprotect the row: the old set
+/// holds until the new one is complete.
+#[tokio::test]
+async fn a_rejected_row_stays_protected_while_a_later_pass_is_still_resolving() {
+    let aor = "sip:slowdns@carrier.example";
+    let body = format!(
+        r#"{{"registrants":[{{"aor":"{aor}","registrar":"sip:no-such-host.invalid:5060","username":"u","password":"p"}}]}}"#
+    );
+    let stub = stub("200 OK", &body).await;
+    let manager = Arc::new(test_support::manager());
+    let source = source(&stub.base, false);
+    reconcile_once(&manager, &source).await.expect("first pass");
+    assert!(manager.source_row_unusable(aor));
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&seen);
+    let watched = Arc::clone(&manager);
+    let hook: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |building: &str| {
+        if building == aor {
+            if let Ok(mut seen) = observed.lock() {
+                seen.push(watched.source_row_unusable(aor));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+    if let Ok(mut slot) = BUILD_HOOK.lock() {
+        *slot = Some(hook);
+    }
+    let second = reconcile_once(&manager, &source).await;
+    if let Ok(mut slot) = BUILD_HOOK.lock() {
+        *slot = None;
+    }
+
+    second.expect("second pass");
+    assert_eq!(seen.lock().expect("lock").as_slice(), [true]);
+    assert!(manager.source_row_unusable(aor));
+}

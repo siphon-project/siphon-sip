@@ -26,7 +26,7 @@
       [last_To:];tag=[pid]SIPpTag01[call_number]
       [last_Call-ID:]
       [last_CSeq:]
-      Contact: <sip:edge@127.0.0.1:25060>;expires=600
+      Contact: <sip:trunk@127.0.0.1:25060>;expires=600
       Expires: 600
       Content-Length: 0
 

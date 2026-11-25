@@ -257,10 +257,14 @@ impl RegistrantManager {
                     return false;
                 };
                 self.entries.get(&draining.entry.aor).is_some_and(|live| {
-                    live.sent_contact.as_deref() == Some(contact)
-                        || self.egress.get().is_some_and(|egress| {
-                            Self::predicted_contact(&live, egress.defaults()) == contact
-                        })
+                    // The same registrar: one moved to another is a binding the
+                    // old registrar still holds.
+                    live.registrar_uri == draining.entry.registrar_uri
+                        && live.transport == draining.entry.transport
+                        && (live.sent_contact.as_deref() == Some(contact)
+                            || self.egress.get().is_some_and(|egress| {
+                                Self::predicted_contact(&live, egress.defaults()) == contact
+                            }))
                 })
             });
         if superseded {

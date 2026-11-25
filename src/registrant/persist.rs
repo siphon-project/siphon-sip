@@ -185,7 +185,15 @@ impl BindingRecord {
 enum Write {
     Save(Box<BindingRecord>),
     Remove,
+    /// Remove the stored record only if it is the registration `call_id`'s.
+    RemoveIf(String),
 }
+
+/// Delete a record only when it is still the one being cleaned up: another
+/// registration may have replaced it since. Atomic in Redis.
+#[cfg(feature = "redis-backend")]
+const REMOVE_IF_SCRIPT: &str = "if redis.call('HGET', KEYS[1], 'call_id') == ARGV[1] then \
+     return redis.call('DEL', KEYS[1]) else return 0 end";
 
 /// Where the records live.
 enum Backend {
@@ -278,6 +286,13 @@ impl Shared {
                         .await
                         .map(|_| ())
                         .map_err(|error| error.to_string()),
+                    Write::RemoveIf(call_id) => redis::Script::new(REMOVE_IF_SCRIPT)
+                        .key(&key)
+                        .arg(call_id)
+                        .invoke_async::<i64>(&mut connection)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
                     Write::Save(record) => {
                         let mut pipeline = redis::pipe();
                         pipeline.atomic().cmd("DEL").arg(&key).ignore();
@@ -322,6 +337,15 @@ impl Shared {
             }
             Write::Save(record) => {
                 records.insert(self.key(aor), ((**record).clone(), self.ttl_for(record)));
+            }
+            Write::RemoveIf(call_id) => {
+                let key = self.key(aor);
+                if records
+                    .get(&key)
+                    .is_some_and(|(stored, _)| stored.call_id == *call_id)
+                {
+                    records.remove(&key);
+                }
             }
         }
     }
@@ -419,15 +443,30 @@ impl BindingStore {
             self.shared.apply_memory(aor, &write);
             return;
         }
-        match self.shared.pending.lock() {
-            Ok(mut pending) => {
-                pending.insert(aor.to_string(), write);
+        let mut pending = match self.shared.pending.lock() {
+            Ok(pending) => pending,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // A guarded removal never undoes a save still waiting: a save of another
+        // registration is the newer record, and one of the same registration is
+        // simply removed.
+        let write = match (&write, pending.get(aor)) {
+            (Write::RemoveIf(call_id), Some(Write::Save(queued))) => {
+                if queued.call_id != *call_id {
+                    return;
+                }
+                Write::Remove
             }
-            Err(poisoned) => {
-                poisoned.into_inner().insert(aor.to_string(), write);
-            }
-        }
+            _ => write,
+        };
+        pending.insert(aor.to_string(), write);
+        drop(pending);
         self.shared.notify.notify_one();
+    }
+
+    /// Remove the record of `aor` if it is still the registration `call_id`'s.
+    pub fn remove_if(&self, aor: &str, call_id: &str) {
+        self.enqueue(aor, Write::RemoveIf(call_id.to_string()));
     }
 
     /// Store `record` (replacing the AoR's earlier one).
@@ -474,52 +513,63 @@ impl BindingStore {
         Ok(records)
     }
 
+    /// The records OTHER instances hold for `aors`: a registrar keys a binding
+    /// by its Contact, so another node's record of the same AoR and Contact is
+    /// a REGISTER that already replaced ours (RFC 3261 §10.3). Scans
+    /// `{prefix}*:{aor}` for each (SCAN, never KEYS).
+    pub async fn others_holding(&self, aors: &[String]) -> Result<Vec<BindingRecord>, String> {
+        let mut found = Vec::new();
+        for aor in aors {
+            match &self.shared.backend {
+                #[cfg(feature = "redis-backend")]
+                Backend::Redis(connection) => {
+                    let pattern = format!(
+                        "{}*:{}",
+                        glob_escape(&self.shared.key_prefix),
+                        glob_escape(aor)
+                    );
+                    found.extend(scan_records(&mut connection.clone(), &pattern).await?);
+                }
+                #[cfg(test)]
+                Backend::Memory(records) => {
+                    let records = match records.lock() {
+                        Ok(records) => records,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    found.extend(records.values().map(|(record, _)| record.clone()));
+                }
+            }
+        }
+        found.retain(|record| record.instance != self.shared.instance_id);
+        found.retain(|record| aors.contains(&record.aor));
+        Ok(found)
+    }
+
+    /// Hold a record as another instance wrote it.
+    #[cfg(test)]
+    pub(crate) fn save_as_instance(&self, record: BindingRecord) {
+        if let Backend::Memory(records) = &self.shared.backend {
+            let key = format!(
+                "{}{}:{}",
+                self.shared.key_prefix, record.instance, record.aor
+            );
+            let ttl = self.shared.ttl_for(&record);
+            if let Ok(mut records) = records.lock() {
+                records.insert(key, (record, ttl));
+            }
+        }
+    }
+
     async fn load_raw(&self) -> Result<Vec<BindingRecord>, String> {
         match &self.shared.backend {
             #[cfg(feature = "redis-backend")]
             Backend::Redis(connection) => {
-                let mut connection = connection.clone();
                 let pattern = format!(
                     "{}{}:*",
                     glob_escape(&self.shared.key_prefix),
                     glob_escape(&self.shared.instance_id)
                 );
-                let mut keys: std::collections::BTreeSet<String> =
-                    std::collections::BTreeSet::new();
-                let mut cursor: u64 = 0;
-                loop {
-                    let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
-                        .arg(cursor)
-                        .arg("MATCH")
-                        .arg(&pattern)
-                        .arg("COUNT")
-                        .arg(1000)
-                        .query_async(&mut connection)
-                        .await
-                        .map_err(|error| format!("SCAN failed: {error}"))?;
-                    keys.extend(batch);
-                    cursor = next;
-                    if cursor == 0 {
-                        break;
-                    }
-                }
-                let mut records = Vec::new();
-                for key in keys {
-                    let fields: HashMap<String, String> = redis::cmd("HGETALL")
-                        .arg(&key)
-                        .query_async(&mut connection)
-                        .await
-                        .map_err(|error| format!("HGETALL failed: {error}"))?;
-                    // Gone between the SCAN and now: its TTL ran out.
-                    if fields.is_empty() {
-                        continue;
-                    }
-                    match BindingRecord::from_fields(&fields) {
-                        Some(record) => records.push(record),
-                        None => debug!(%key, "registrant bindings: unreadable record skipped"),
-                    }
-                }
-                Ok(records)
+                scan_records(&mut connection.clone(), &pattern).await
             }
             #[cfg(test)]
             Backend::Memory(records) => Ok(match records.lock() {
@@ -552,6 +602,49 @@ impl BindingStore {
     pub(crate) fn key_of(&self, aor: &str) -> String {
         self.shared.key(aor)
     }
+}
+
+/// Every readable record under the keys matching `pattern`, found by SCAN.
+#[cfg(feature = "redis-backend")]
+async fn scan_records(
+    connection: &mut crate::redis_target::RedisConnection,
+    pattern: &str,
+) -> Result<Vec<BindingRecord>, String> {
+    let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut cursor: u64 = 0;
+    loop {
+        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(1000)
+            .query_async(connection)
+            .await
+            .map_err(|error| format!("SCAN failed: {error}"))?;
+        keys.extend(batch);
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+    }
+    let mut records = Vec::new();
+    for key in keys {
+        let fields: HashMap<String, String> = redis::cmd("HGETALL")
+            .arg(&key)
+            .query_async(connection)
+            .await
+            .map_err(|error| format!("HGETALL failed: {error}"))?;
+        // Gone between the SCAN and now: its TTL ran out.
+        if fields.is_empty() {
+            continue;
+        }
+        match BindingRecord::from_fields(&fields) {
+            Some(record) => records.push(record),
+            None => debug!(%key, "registrant bindings: unreadable record skipped"),
+        }
+    }
+    Ok(records)
 }
 
 /// Escape the glob characters of `text` for a `SCAN MATCH`.

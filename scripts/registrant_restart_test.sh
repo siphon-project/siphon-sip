@@ -16,6 +16,7 @@
 #
 #   scripts/registrant_restart_test.sh
 #   SIPHON_BIN=target/release/siphon scripts/registrant_restart_test.sh
+#   DEFAULT_CONTACT=1 scripts/registrant_restart_test.sh   # the generated Contact
 #
 # Needs redis-server, redis-cli, sipp and python3 on the PATH and a built siphon
 # binary (default: $CARGO_TARGET_DIR or target, release profile). Starts its own
@@ -68,6 +69,7 @@ redis-server --port "${REDIS_PORT}" --bind 127.0.0.1 --save "" --appendonly no \
 for _ in $(seq 50); do redis-cli -p "${REDIS_PORT}" ping >/dev/null 2>&1 && break; sleep 0.1; done
 
 echo listed > "${WORK}/state"
+if [[ -n "${DEFAULT_CONTACT:-}" ]]; then export TRUNK_CONTACT=""; fi
 python3 -I scripts/registrant_restart_source.py "${SOURCE_PORT}" "${WORK}/state" "${TOKEN}" \
   "${LOOKUP_PASSWORD:-secret123}" &
 SOURCE_PID=$!
@@ -159,7 +161,12 @@ done
 [[ -n "${key}" ]] || fail "no binding record in Redis after the registration"
 echo "[*] record: ${key}"
 record="$(redis-cli -p "${REDIS_PORT}" hgetall "${key}")"
-for secret in secret123 line-user-7; do
+# With DEFAULT_CONTACT=1 the row sets no `contact`, siphon builds the default one
+# from its own address and the digest username is its user part: only the
+# password must stay out of Redis then.
+secrets=(secret123 line-user-7)
+if [[ -n "${DEFAULT_CONTACT:-}" ]]; then secrets=(secret123); fi
+for secret in "${secrets[@]}"; do
   if grep -q "${secret}" <<<"${record}"; then fail "the Redis record holds '${secret}'"; fi
 done
 

@@ -734,8 +734,6 @@ pub async fn reconcile_once(
         }
     }
 
-    manager.set_source_unusable(unusable);
-
     // A row whose AoR is already held by YAML or a script is not the source's
     // to take over. Said once per pass rather than silently, because the
     // symptom otherwise is a trunk that never picks up its new credentials.
@@ -755,6 +753,7 @@ pub async fn reconcile_once(
     let live = manager.source_fingerprints();
     let actions = reconcile(&desired, &live);
     if actions.is_empty() {
+        manager.set_source_unusable(unusable);
         return Ok(report);
     }
 
@@ -770,7 +769,7 @@ pub async fn reconcile_once(
                     }
                     Err(error) => {
                         report.rejected += 1;
-                        manager.note_source_unusable(&aor);
+                        unusable.insert(aor);
                         warn!(%error, "registrant source: cannot add a trunk");
                     }
                 }
@@ -785,7 +784,7 @@ pub async fn reconcile_once(
                     }
                     Err(error) => {
                         report.rejected += 1;
-                        manager.note_source_unusable(&aor);
+                        unusable.insert(aor);
                         warn!(%error, "registrant source: cannot update a trunk");
                     }
                 }
@@ -800,17 +799,36 @@ pub async fn reconcile_once(
         }
     }
 
+    // Swapped in whole, once every entry has been tried: the earlier set protects
+    // a row whose entry could not be built until this one says the same.
+    manager.set_source_unusable(unusable);
     Ok(report)
 }
+
+#[cfg(test)]
+pub(crate) type BuildHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+/// A test's view into the middle of a reconcile pass, called with the AoR of
+/// each entry about to be built.
+#[cfg(test)]
+pub(crate) static BUILD_HOOK: std::sync::Mutex<Option<BuildHook>> = std::sync::Mutex::new(None);
 
 /// [`entry_from_desired`] off the runtime: it resolves DNS, which blocks.
 async fn build_entry_off_thread(
     desired: DesiredRegistrant,
     default_interval: u32,
 ) -> Result<super::RegistrantEntry, String> {
-    tokio::task::spawn_blocking(move || entry_from_desired(&desired, default_interval))
-        .await
-        .map_err(|error| format!("the entry builder panicked: {error}"))?
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Ok(hook) = BUILD_HOOK.lock() {
+            if let Some(hook) = hook.clone() {
+                hook(&desired.aor);
+            }
+        }
+        entry_from_desired(&desired, default_interval)
+    })
+    .await
+    .map_err(|error| format!("the entry builder panicked: {error}"))?
 }
 
 /// The configured source, so an out-of-band refresh can reach it.

@@ -190,11 +190,11 @@ impl RegistrantManager {
             Ok(written) => written,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if written.get(aor).is_some_and(|written| written != call_id) {
-            return;
+        if written.get(aor).is_some_and(|written| written == call_id) {
+            written.remove(aor);
         }
-        written.remove(aor);
-        store.remove(aor);
+        drop(written);
+        store.remove_if(aor, call_id);
     }
 
     /// The source was read for the first time (or there is none): "no longer
@@ -235,6 +235,19 @@ impl RegistrantManager {
         records: Vec<BindingRecord>,
         defaults: EgressDefaults<'_>,
     ) -> CleanupReport {
+        self.startup_cleanup_with(records, &[], defaults)
+    }
+
+    /// [`startup_cleanup`](Self::startup_cleanup) knowing the records other
+    /// instances hold for the same AoRs: a binding one of them holds on the same
+    /// Contact was replaced by that node's REGISTER (RFC 3261 §10.3), and an
+    /// `Expires: 0` on it would delete that node's binding.
+    pub fn startup_cleanup_with(
+        &self,
+        records: Vec<BindingRecord>,
+        others: &[BindingRecord],
+        defaults: EgressDefaults<'_>,
+    ) -> CleanupReport {
         let mut report = CleanupReport::default();
         let Some(store) = self.restart.bindings.get() else {
             return report;
@@ -250,7 +263,7 @@ impl RegistrantManager {
                     attempts = record.attempts,
                     "restart clean-up: giving up on a binding, it is left to expire"
                 );
-                store.remove(&record.aor);
+                store.remove_if(&record.aor, &record.call_id);
                 report.dropped += 1;
                 continue;
             }
@@ -263,18 +276,23 @@ impl RegistrantManager {
                 Outcome::Carried => report.carried += 1,
                 Outcome::Left => report.left += 1,
                 Outcome::Dropped => {
-                    store.remove(&record.aor);
+                    store.remove_if(&record.aor, &record.call_id);
                     report.dropped += 1;
                 }
-                Outcome::Orphan if !self.contact_names_this_node(&record, defaults) => {
+                Outcome::Orphan
+                    if !self.contact_is_held_here(&record, defaults)
+                        || others.iter().any(|other| {
+                            other.aor == record.aor && other.contact == record.contact
+                        }) =>
+                {
                     info!(
                         aor = %record.aor,
                         registrar = %record.registrar_uri,
                         contact = %record.contact,
-                        "restart clean-up: the binding's Contact does not name this node, so it is \
-                         another node's or was replaced by its REGISTER: left alone"
+                        "restart clean-up: the binding's Contact is not one only this node holds, so \
+                         it is another node's or was replaced by its REGISTER: left alone"
                     );
-                    store.remove(&record.aor);
+                    store.remove_if(&record.aor, &record.call_id);
                     report.dropped += 1;
                 }
                 Outcome::Orphan => {
@@ -287,7 +305,7 @@ impl RegistrantManager {
                         }
                         report.deregistered += 1;
                     } else {
-                        store.remove(&record.aor);
+                        store.remove_if(&record.aor, &record.call_id);
                         report.dropped += 1;
                     }
                 }
@@ -310,46 +328,30 @@ impl RegistrantManager {
         })
     }
 
-    /// Whether `record`'s Contact names this node: its host is one of the
-    /// addresses it registers from or advertises, on a port it listens on. A
-    /// registrar keys a binding by its Contact (RFC 3261 §10.3), so an
-    /// `Expires: 0` on any other could delete a binding another node holds.
-    fn contact_names_this_node(
-        &self,
-        record: &BindingRecord,
-        defaults: EgressDefaults<'_>,
-    ) -> bool {
+    /// Whether `record`'s Contact is an address this node holds right now, on a
+    /// port it registers from: a listener's or the egress IP, or an IP a plain
+    /// bind succeeds on. A floating address that moved away fails to bind
+    /// (EADDRNOTAVAIL), and a name advertised by every node, or the address a
+    /// record once used, proves nothing. A registrar keys a binding by its
+    /// Contact (RFC 3261 §10.3), so an `Expires: 0` on a Contact another node
+    /// holds would delete its binding.
+    fn contact_is_held_here(&self, record: &BindingRecord, defaults: EgressDefaults<'_>) -> bool {
         let Some((host, port)) = contact_host_port(&record.contact) else {
             return false;
         };
-        let mut hosts: Vec<String> = defaults
-            .listen_addrs
-            .values()
-            .map(|address| address.ip().to_string())
-            .collect();
-        hosts.push(defaults.local_addr.ip().to_string());
-        hosts.push(defaults.ue_ip.to_string());
-        hosts.extend(record.local_addr.map(|address| address.to_string()));
+        let Ok(address) = host.parse::<std::net::IpAddr>() else {
+            return false;
+        };
         let mut ports: Vec<u16> = defaults.listen_addrs.values().map(|a| a.port()).collect();
         ports.push(defaults.local_addr.port());
         ports.push(defaults.plain_port());
-        let advertised = self.egress.get().is_some_and(|egress| {
-            egress
-                .advertised_addrs
-                .values()
-                .chain(egress.advertised_address.iter())
-                .any(|advertised| {
-                    advertised
-                        .rsplit_once(':')
-                        .filter(|(_, tail)| tail.parse::<u16>().is_ok())
-                        .map_or(advertised.as_str(), |(head, _)| head)
-                        .trim_matches(|c| c == '[' || c == ']')
-                        .eq_ignore_ascii_case(&host)
-                })
-        });
-        let own_host = hosts.iter().any(|own| own.eq_ignore_ascii_case(&host));
-        // An advertised name may sit behind another port (a NAT mapping).
-        advertised || (own_host && port.is_none_or(|port| ports.contains(&port)))
+        if port.is_some_and(|port| !ports.contains(&port)) {
+            return false;
+        }
+        defaults.local_addr.ip() == address
+            || defaults.listen_addrs.values().any(|listen| listen.ip() == address)
+            // No IP_FREEBIND / IP_TRANSPARENT: only an address on this host binds.
+            || std::net::UdpSocket::bind((address, 0)).is_ok()
     }
 
     /// What a stored binding is to the live entries.
@@ -549,7 +551,17 @@ pub(super) async fn run_startup_cleanup_from(
         return;
     };
     let stored = records.len();
-    let report = manager.startup_cleanup(records, egress.defaults());
+    let aors: Vec<String> = records.iter().map(|record| record.aor.clone()).collect();
+    // Without what the other nodes hold the clean-up could delete their
+    // bindings: when it cannot be read, nothing is de-registered.
+    let others = match store.others_holding(&aors).await {
+        Ok(others) => others,
+        Err(error) => {
+            error!(%error, "restart clean-up: the other nodes' bindings cannot be read, nothing is cleared");
+            return;
+        }
+    };
+    let report = manager.startup_cleanup_with(records, &others, egress.defaults());
     info!(
         stored,
         carried = report.carried,
@@ -560,17 +572,6 @@ pub(super) async fn run_startup_cleanup_from(
     );
     // The key every record is under: written before the task ends.
     store.flush(Duration::from_secs(5)).await;
-}
-
-/// Count `aor`'s source row as listed although siphon could not use it (its
-/// entry could not be built, say): its binding is not cleared at restart.
-impl RegistrantManager {
-    pub fn note_source_unusable(&self, aor: &str) {
-        match self.restart.source_unusable.lock() {
-            Ok(mut unusable) => unusable.insert(aor.to_string()),
-            Err(poisoned) => poisoned.into_inner().insert(aor.to_string()),
-        };
-    }
 }
 
 #[cfg(test)]

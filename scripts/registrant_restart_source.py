@@ -16,6 +16,7 @@ tell the lookup was asked.
 """
 
 import json
+import os
 import sys
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -32,6 +33,9 @@ TRUNK = {
 
 
 def main() -> None:
+    if os.environ.get("TRUNK_CONTACT") == "":
+        # No `contact` on the row: siphon builds the default one from its address.
+        TRUNK.pop("contact", None)
     port, state_file, token = int(sys.argv[1]), sys.argv[2], sys.argv[3]
     # What the lookup answers with; a test of the digest check gives it a wrong one.
     lookup_password = sys.argv[4] if len(sys.argv) > 4 else TRUNK["password"]

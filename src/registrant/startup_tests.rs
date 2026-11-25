@@ -560,10 +560,11 @@ async fn a_binding_on_a_contact_that_is_not_this_nodes_is_not_de_registered() {
     }
 }
 
-/// A Contact naming the process's advertised address or an entry's own
-/// `local_addr` is this node's too.
+/// A per-entry address moves to another node with the trunk, which then
+/// registers the same Contact: an address this node no longer holds is not its
+/// own, whatever the old record says.
 #[tokio::test]
-async fn a_binding_on_the_nodes_advertised_or_local_address_is_still_cleared() {
+async fn a_per_entry_address_that_moved_away_is_not_cleared() {
     let (manager, store) = manager_with_store();
     let listen = listen();
     let mut stored = record(AOR);
@@ -573,9 +574,155 @@ async fn a_binding_on_the_nodes_advertised_or_local_address_is_still_cleared() {
 
     let report = manager.startup_cleanup(vec![stored], defaults(&listen));
 
+    assert_eq!(report.dropped, 1);
+    assert!(test_support::take_deregistrations(&manager).is_empty());
+    assert!(store.load().await.expect("loaded").is_empty());
+}
+
+/// ...while an address this node does hold (a plain bind succeeds on it) is.
+#[tokio::test]
+async fn a_floating_address_this_node_holds_is_cleared() {
+    let (manager, store) = manager_with_store();
+    let listen = listen();
+    let mut stored = record(AOR);
+    stored.contact = "sip:trunk@127.0.0.1:5060".to_string();
+    store.save(stored.clone());
+
+    let report = manager.startup_cleanup(vec![stored], defaults(&listen));
+
     assert_eq!(report.deregistered, 1);
 }
 
+/// A name advertised by every node proves nothing about whose Contact it is.
+#[tokio::test]
+async fn an_advertised_shared_host_does_not_make_a_contact_this_nodes() {
+    let manager = Arc::new(test_support::manager());
+    let listen = listen();
+    manager.set_egress(crate::registrant::RegistrantEgress {
+        local_addr: "192.0.2.1:5060".parse().expect("addr"),
+        listen_addrs: listen.clone(),
+        advertised_addrs: HashMap::from([(Transport::Udp, "sbc.example".to_string())]),
+        advertised_address: Some("sbc.example".to_string()),
+        hep_sender: None,
+    });
+    test_support::attach_untracked_transactions(&manager);
+    let store = BindingStore::in_memory("node-a", 30);
+    manager.attach_binding_store(Arc::clone(&store));
+    let mut stored = record(AOR);
+    stored.contact = "sip:trunk@sbc.example:5060".to_string();
+    store.save(stored.clone());
+
+    let report = manager.startup_cleanup(vec![stored], defaults(&listen));
+
+    assert_eq!(report.dropped, 1);
+    assert!(test_support::take_deregistrations(&manager).is_empty());
+}
+
+fn other_instance_record(contact: &str) -> BindingRecord {
+    let mut other = record(AOR);
+    other.instance = "node-b".to_string();
+    other.call_id = "reg-on-the-other-node".to_string();
+    other.contact = contact.to_string();
+    other
+}
+
+/// Another node's record of the same AoR on the same Contact: its REGISTER
+/// already replaced ours (RFC 3261 §10.3), and ours would delete it.
+#[tokio::test]
+async fn another_instance_holding_the_same_contact_stops_the_de_register() {
+    let (manager, store) = manager_with_store();
+    let listen = listen();
+    let stored = record(AOR);
+    store.save(stored.clone());
+
+    let report = manager.startup_cleanup_with(
+        vec![stored],
+        &[other_instance_record(CONTACT)],
+        defaults(&listen),
+    );
+
+    assert_eq!(report.dropped, 1);
+    assert!(test_support::take_deregistrations(&manager).is_empty());
+    assert!(store.load().await.expect("loaded").is_empty());
+}
+
+/// ...but another node on another Contact does not.
+#[tokio::test]
+async fn another_instance_on_another_contact_does_not_stop_it() {
+    let (manager, store) = manager_with_store();
+    let listen = listen();
+    let stored = record(AOR);
+    store.save(stored.clone());
+
+    let report = manager.startup_cleanup_with(
+        vec![stored],
+        &[other_instance_record("sip:trunk@192.0.2.9:5060")],
+        defaults(&listen),
+    );
+
+    assert_eq!(report.deregistered, 1);
+}
+
+/// The registrar target is part of what a live entry replaces: a trunk moved
+/// from one registrar to another on the same Contact leaves the old
+/// registrar's binding to be cleared.
+#[tokio::test]
+async fn a_trunk_moved_to_another_registrar_does_not_cancel_the_old_ones_clean_up() {
+    let (manager, store) = manager_with_store();
+    let listen = listen();
+    let stored = record(AOR);
+    store.save(stored.clone());
+    manager.startup_cleanup(vec![stored], defaults(&listen));
+    let mut entry = trunk(AOR);
+    entry.registrar_uri = "sip:198.51.100.99:5060".to_string();
+    entry.contact_uri = Some(CONTACT.to_string());
+    manager.add(entry);
+
+    assert_eq!(
+        test_support::take_deregistrations(&manager).len(),
+        1,
+        "the old registrar's binding was abandoned"
+    );
+}
+
+/// A replacement record saved at late attach is not the clean-up's to delete,
+/// by whichever path the clean-up drops a record.
+#[tokio::test]
+async fn a_replacement_record_saved_at_late_attach_survives_the_clean_up() {
+    for attempts in [0, MAX_STARTUP_ATTEMPTS] {
+        let manager = Arc::new(test_support::manager());
+        test_support::install_egress(&manager);
+        let listen = listen();
+        let mut entry = trunk(AOR);
+        entry.contact_uri = Some("sip:trunk@192.0.2.1:5090".to_string());
+        let live_call_id = entry.call_id.clone();
+        manager.add(entry);
+        manager.build_register(AOR, defaults(&listen), 600);
+        manager.handle_success(AOR, 600);
+        let store = BindingStore::in_memory("node-a", 30);
+        let mut stored = record(AOR);
+        stored.attempts = attempts;
+        store.save(stored);
+
+        let snapshot = super::snapshot_then_attach(&manager, Arc::clone(&store))
+            .await
+            .expect("read");
+        manager.startup_cleanup(snapshot, defaults(&listen));
+        if let Some(built) = test_support::take_deregistrations(&manager).pop() {
+            manager.answer_removed_deregistration(
+                &header(&built.message, "Call-ID"),
+                cseq_number(&built.message),
+                200,
+                None,
+                defaults(&listen),
+            );
+        }
+
+        let left = store.load().await.expect("loaded");
+        assert_eq!(left.len(), 1, "attempts {attempts}");
+        assert_eq!(left[0].call_id, live_call_id, "attempts {attempts}");
+    }
+}
 /// DNS can hand back another frontend after a restart: the configured registrar
 /// names the target, not the address it resolved to.
 #[tokio::test]

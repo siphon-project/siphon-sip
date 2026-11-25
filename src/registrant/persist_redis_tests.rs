@@ -165,3 +165,64 @@ async fn a_burst_for_one_aor_leaves_one_pending_write_and_drains_to_zero() {
     assert_eq!(loaded.len(), 1);
     assert_eq!(loaded[0].next_cseq, 499);
 }
+
+/// Atomic in Redis: the stored record's Call-ID decides, and a save still
+/// waiting is not undone by a removal of an older registration.
+#[tokio::test]
+async fn a_guarded_removal_keeps_a_newer_record_in_redis() {
+    let Some(connection) = connection().await else {
+        return;
+    };
+    let store = BindingStore::redis(
+        connection,
+        "node-a".to_string(),
+        unique_prefix("removeif"),
+        30,
+    );
+    let mut first = record("node-a", "sip:trunk@carrier.example");
+    first.call_id = "reg-first".to_string();
+    let mut second = first.clone();
+    second.call_id = "reg-second".to_string();
+    store.save(first);
+    store.flush(Duration::from_secs(5)).await;
+    store.save(second.clone());
+    store.flush(Duration::from_secs(5)).await;
+
+    store.remove_if("sip:trunk@carrier.example", "reg-first");
+    store.flush(Duration::from_secs(5)).await;
+    assert_eq!(store.load().await.expect("loaded"), vec![second.clone()]);
+
+    // Queued behind a save of the newer registration: still not removed.
+    store.save(second.clone());
+    store.remove_if("sip:trunk@carrier.example", "reg-first");
+    store.flush(Duration::from_secs(5)).await;
+    assert_eq!(store.load().await.expect("loaded"), vec![second]);
+
+    store.remove_if("sip:trunk@carrier.example", "reg-second");
+    store.flush(Duration::from_secs(5)).await;
+    assert!(store.load().await.expect("loaded").is_empty());
+}
+
+#[tokio::test]
+async fn other_instances_records_of_an_aor_are_found_by_scan() {
+    let Some(connection) = connection().await else {
+        return;
+    };
+    let prefix = unique_prefix("others");
+    let node_a = BindingStore::redis(connection.clone(), "node-a".to_string(), prefix.clone(), 30);
+    let node_b = BindingStore::redis(connection, "node-b".to_string(), prefix, 30);
+    node_a.save(record("node-a", "sip:trunk@carrier.example"));
+    node_b.save(record("node-b", "sip:trunk@carrier.example"));
+    node_b.save(record("node-b", "sip:other@carrier.example"));
+    node_a.flush(Duration::from_secs(5)).await;
+    node_b.flush(Duration::from_secs(5)).await;
+
+    let found = node_a
+        .others_holding(&["sip:trunk@carrier.example".to_string()])
+        .await
+        .expect("read");
+
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].instance, "node-b");
+    assert_eq!(found[0].aor, "sip:trunk@carrier.example");
+}

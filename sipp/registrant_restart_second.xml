@@ -13,7 +13,7 @@
     <action>
       <ereg regexp="Expires: 0" search_in="msg" check_it="true"
             assign_to="dereg_expires" />
-      <ereg regexp="sip:edge@127.0.0.1:25060" search_in="hdr" header="Contact:"
+      <ereg regexp="sip:[a-z0-9-]+@127.0.0.1:25060" search_in="hdr" header="Contact:"
             check_it="true" assign_to="dereg_contact" />
       <log message="de-REGISTER carried Expires [$dereg_expires] on Contact [$dereg_contact]" />
     </action>
@@ -41,7 +41,7 @@
     <action>
       <ereg regexp="Expires: 0" search_in="msg" check_it="true"
             assign_to="retry_expires" />
-      <ereg regexp="sip:edge@127.0.0.1:25060" search_in="hdr" header="Contact:"
+      <ereg regexp="sip:[a-z0-9-]+@127.0.0.1:25060" search_in="hdr" header="Contact:"
             check_it="true" assign_to="retry_contact" />
       <ereg regexp="username=.line-user-7." search_in="hdr" header="Authorization:"
             check_it="true" assign_to="retry_auth" />
