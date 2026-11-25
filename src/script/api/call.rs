@@ -481,7 +481,6 @@ impl PyCall {
         &self.transport_name
     }
 
-    /// Record the username verified by `auth.require_*_digest(call, …)`.
     /// Attach the inbound flow the A-leg INVITE arrived on. Called by the
     /// dispatcher, which builds it from the A-leg's `TransportInfo`.
     pub fn with_flow(mut self, flow: Option<super::registrar::PyFlow>) -> Self {
@@ -489,6 +488,12 @@ impl PyCall {
         self
     }
 
+    pub fn with_state(mut self, state: &str) -> Self {
+        self.state = state.to_string();
+        self
+    }
+
+    /// Record the username verified by `auth.require_*_digest(call, …)`.
     pub fn set_auth_user(&mut self, username: String) {
         self.auth_user = Some(username);
     }
@@ -658,11 +663,6 @@ impl PyCall {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
         Ok(guard.clone())
-    }
-
-    /// Update the call state (called by the B2BUA core).
-    pub fn set_state(&mut self, state: &str) {
-        self.state = state.to_string();
     }
 
     /// Get the per-call session timer override (if set by the script).
@@ -4525,16 +4525,16 @@ mod tests {
     #[test]
     fn call_state_transition() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new(
+        let call = PyCall::new(
             "test-id".to_string(),
             message,
             "10.0.0.1".to_string(),
             "udp".to_string(),
         );
         assert_eq!(call.state, "calling");
-        call.set_state("ringing");
+        let call = call.with_state("ringing");
         assert_eq!(call.state, "ringing");
-        call.set_state("answered");
+        let call = call.with_state("answered");
         assert_eq!(call.state, "answered");
     }
 

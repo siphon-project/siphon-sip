@@ -779,6 +779,121 @@ for participant in others:
         headers={"Resource-Priority": "example.0"})
 ```
 
+## INFO: `@b2bua.on_info` and `b2bua.send_info`
+
+An in-dialog INFO (RFC 6086) is how two parties speak an application package
+inside a call: a request, an event, a state. `@b2bua.on_info` is the script's
+side of it, `b2bua.send_info()` the way to start one.
+
+### Receiving: `@b2bua.on_info`
+
+Called with `(call, request)`, or `(call, request, leg)`, for an INFO from
+either party of a bridged call, or from the caller of a call the script
+answered itself. Every registered handler runs, in order.
+
+- **`call`** is the call. `call.state` is its own: `"calling"`, `"ringing"` or
+  `"answered"` (an INFO can arrive on an early dialog, and a script may refuse
+  it). Call actions (`dial()`, `reject()`) have no effect here and are logged.
+- **`request`** is the INFO: `request.body`, `request.content_type`,
+  `request.get_header("Info-Package")`.
+- **`leg`** is optional, and passed only to a handler that declares it (a `leg`
+  parameter or `**kwargs`); `(call, request)` handlers are called as before.
+  It is `"caller"` for an INFO from the A-leg party and `"callee"` from the
+  B-leg party, the names `b2bua.send_info(leg=)` takes. It comes from the
+  dialog, so it holds under `call.keep_call_id()`, where both legs share one
+  Call-ID and comparing the INFO's Call-ID with `call.call_id` tells nothing.
+
+**Answering.** `request.reply(code, reason)` answers it with a final status
+(200-699), `request.set_reply_header(name, value)` adds a header to the answer
+and `request.set_reply_body(body, content_type)` a body. For an Info Package,
+RFC 6086 §4.3.2 forbids putting the package's own data in an INFO response (it
+travels in INFO requests, see `send_info` below), so a body is for a legacy
+INFO usage or data that is not the package's. An INFO the handler answers is **not** relayed.
+
+**What it does not answer.** On a call with a far leg the INFO is relayed to
+the other party, as it is with no handler. On a call siphon answered itself
+there is no one to relay to, so siphon answers a bare `200 OK`. A handler that
+raises leaves it the same way, and a `request.relay()` or other action is
+ignored with a warning: only `reply()` answers an INFO.
+
+**Retransmissions.** One gets the answer the first got, and the handler does
+not run again (RFC 3261 §17.2.2).
+
+**DTMF.** An INFO carrying `application/dtmf-relay` or `application/dtmf` is
+surfaced to `@rtpengine.on_dtmf` and to a controller whichever way the INFO
+goes, so a handler that leaves it (and sees it relayed) changes nothing.
+
+**Async handlers.** An `async def` handler works the same way. Answer, then
+start follow-up work with `asyncio.create_task(...)` and return.
+`request.reply()` records the decision; siphon sends the response after the
+handler's coroutine completes, and the task runs on the async driver
+independently, so it can run first. The state INFO a task sends and the
+response to the INFO that started it are separate transactions, and RFC 6086
+defines no order between them (section 4.4): the response first is usual, not
+guaranteed.
+
+A handler that names `asyncio.create_task`, `ensure_future`,
+`get_running_loop` or `get_event_loop` (directly, through an alias, or through
+the `asyncio` module) is run on the async driver, which has the event loop
+they need. The limit: siphon reads the names the handler's own code uses, so a
+handler with no `await` that calls a plain helper which reaches for the loop
+is not seen and fails with `no running event loop`. Add an `await` to the
+handler (any one, even `await asyncio.sleep(0)`).
+
+```python
+import asyncio
+from siphon import b2bua
+
+@b2bua.on_info
+async def on_info(call, request, leg):
+    if request.get_header("Info-Package") != "example-package":
+        return                                  # DTMF and the rest: relayed
+    if call.state != "answered":
+        request.reply(403, "Forbidden")
+        return
+    request.reply(200, "OK")
+    asyncio.create_task(push_state(call, leg))
+```
+
+The [Info-Package cookbook](../cookbook/info-packages.md) builds a whole
+package on it.
+
+In the SDK, `SipTestHarness.send_info()` delivers an INFO to the handlers
+(`leg=`, `headers=`, `body=`, `content_type=`, `bridged=`) and returns an
+`InfoResult` with the answer, or `relayed` when none answered.
+
+### Sending: `b2bua.send_info`
+
+```python
+status = await b2bua.send_info(call_id, body=None, content_type=None,
+                               headers=None, timeout_ms=5000, leg="caller",
+                               with_body=False)
+```
+
+Sends an INFO in the caller's dialog of the call whose SIP Call-ID is
+`call_id` (`call.call_id`), or with `leg="callee"` in the answered callee's. On
+a call siphon answered itself the caller's is its only dialog.
+
+- **`body`** is `str` or `bytes`, of `content_type`.
+- **`headers`** is a dict of extra headers (`Info-Package`,
+  `Content-Disposition`, ...). The ones that place a request in its dialog
+  (Call-ID, CSeq, From, To, Via, Route, Content-Length, ...) are siphon's and
+  refused.
+- **CSeq** is the dialog's next one on siphon's side, so a BYE siphon sends
+  later follows it in order (RFC 3261 §12.2.1.1). The request goes to the
+  remote target through the route set, and on UDP is retransmitted until
+  answered.
+- **The response** is awaited for `timeout_ms`. It resolves to the final status
+  code, or with `with_body=True` to `(status, body bytes, content_type)`, or to
+  `None` when none arrived in time (a late response is then absorbed).
+- **Errors** are `ValueError` carrying a token: `not_found` (no such call),
+  `bad_request` (a header may not be set), `invalid_state` (the leg has no
+  dialog yet, such as a callee that has not answered).
+
+`b2bua.send_info()` sends; it does not check what the party said it would
+accept. RFC 6086 §4.2.1 forbids an INFO for a package the other party has not
+advertised in `Recv-Info`, so the script reads that first.
+
 ## An announcement, then the callee
 
 A caller that hears a prompt in early media and is then put through to the

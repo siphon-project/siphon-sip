@@ -248,6 +248,8 @@ mod inbound_drop_tests;
 #[cfg(test)]
 mod inflight_invite_tests;
 #[cfg(test)]
+mod info_package_flow_tests;
+#[cfg(test)]
 mod invite_response_path_tests;
 #[cfg(test)]
 mod late_provisional_tests;

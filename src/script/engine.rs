@@ -490,6 +490,7 @@ impl ScriptEngine {
                 self.state.store(Arc::new(new_state));
                 // The verdicts describe code objects this reload replaced.
                 inline_dispatch::clear_inline_verdicts();
+                crate::script::handler_keyword::clear_keyword_verdicts();
                 // And which handlers use asyncio: the callables are new.
                 crate::script::runner::clear_demoted();
                 self.restart_timers();

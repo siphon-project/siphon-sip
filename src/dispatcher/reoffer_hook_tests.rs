@@ -182,6 +182,24 @@ async fn a_hold_and_its_resume_are_shown_before_they_are_relayed_and_after_they_
     );
 }
 
+/// The `call` an `on_reoffer` handler is shown carries the call's own state:
+/// a call both parties are talking on reads `answered`, not the `calling` a
+/// freshly built `Call` starts at.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_reoffer_sees_an_answered_call_as_answered() {
+    let call = call_deciding(83090, "call.set_header(\"X-State\", call.state)");
+    let caller = caller_of(&call);
+    acks(&call.dispatcher.state, &caller);
+    offers(
+        &call,
+        &caller,
+        "INVITE",
+        2,
+        Some(&caller_sdp(&call, "a=sendonly\r\n")),
+    );
+    assert_eq!(written(&call, "X-State").as_deref(), Some("answered"));
+}
+
 /// RFC 3264 §8.4: an old phone holds with a connection address of `0.0.0.0`,
 /// and the callee holds too: the side is the callee's.
 #[tokio::test(flavor = "multi_thread")]

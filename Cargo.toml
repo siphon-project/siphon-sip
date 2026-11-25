@@ -252,7 +252,11 @@ name = "registrar_contact" # lookup by Contact (lookup_contact / binding_for_con
 harness = false
 
 [[bench]]
-name = "custom_metrics"    # script custom metric updates: repeat-label counter_inc / histogram observe / gauge set
+name = "handler_keyword"   # optional keyword a handler declares (on_info leg=, scope=): decided once per handler
+harness = false
+
+[[bench]]
+name = "custom_metrics"   # script custom metric updates: repeat-label counter_inc / histogram observe / gauge set
 harness = false
 
 [[bench]]

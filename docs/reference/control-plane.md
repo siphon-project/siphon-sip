@@ -673,9 +673,12 @@ anchor's channel). An event whose tag names neither party is not delivered.
 A digit signalled as **SIP INFO** rather than in the media (RFC 2976 / RFC 6086
 `application/dtmf-relay`, which some handsets and trunks send instead of
 RFC 4733) produces the same event, from the same code path — an app collecting
-digits does not have to know which wire carried them. The INFO itself is relayed
-to the far leg on a two-leg call and answered `200` on a one-legged one; an INFO
-body that is not DTMF is relayed or answered but produces no event.
+digits does not have to know which wire carried them. The event fires whatever
+becomes of the INFO. The INFO itself goes to the script's `@b2bua.on_info`
+handler first, when it has one: a handler that answers it (`request.reply()`)
+settles it, and it is not relayed. One it leaves, or no handler, is relayed to
+the far leg on a two-leg call and answered `200` on a one-legged one. An INFO
+body that is not DTMF goes the same way but produces no event.
 
 ### Media summary
 

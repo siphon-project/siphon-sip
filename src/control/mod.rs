@@ -648,12 +648,7 @@ fn channel_snapshot(bus: &Arc<ControlBus>, channel: &ChannelRef) -> serde_json::
 
 /// Render a `CallState` to the wire string the control app sees.
 pub(in crate::control) fn call_state_str(state: &crate::b2bua::actor::CallState) -> &'static str {
-    match state {
-        crate::b2bua::actor::CallState::Calling => "calling",
-        crate::b2bua::actor::CallState::Ringing => "ringing",
-        crate::b2bua::actor::CallState::Answered => "answered",
-        crate::b2bua::actor::CallState::Terminated => "terminated",
-    }
+    state.as_str()
 }
 
 #[cfg(test)]
