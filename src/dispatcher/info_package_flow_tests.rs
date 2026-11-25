@@ -50,9 +50,9 @@ fn parse(raw: &str) -> SipMessage {
     parse_sip_message_bytes(raw.as_bytes()).expect("the message parses")
 }
 
-fn drain(dispatcher: &TestDispatcher) -> Vec<Sent> {
+fn drain(udp: &flume::Receiver<OutboundMessage>) -> Vec<Sent> {
     let mut sent = Vec::new();
-    while let Ok(outbound) = dispatcher.udp.try_recv() {
+    while let Ok(outbound) = udp.try_recv() {
         sent.push(Sent {
             destination: outbound.destination,
             message: parse_sip_message_bytes(&outbound.data)
@@ -82,7 +82,8 @@ enum Party {
 
 /// A caller's call through a dispatcher running a script, dialled to a callee.
 struct Flow {
-    dispatcher: TestDispatcher,
+    state: Arc<DispatcherState>,
+    udp: flume::Receiver<OutboundMessage>,
     sip_call_id: String,
     /// The INVITE siphon sent the callee.
     callee_invite: SipMessage,
@@ -94,14 +95,16 @@ struct Flow {
 
 impl Flow {
     fn start(sip_call_id: &str, script: &str) -> Flow {
-        let dispatcher = test_dispatcher_with_script(script);
+        let TestDispatcher { state, udp } = test_dispatcher_with_script(script);
+        let state = Arc::new(state);
         let raw = caller_invite(sip_call_id);
         tokio::task::block_in_place(|| {
-            handle_b2bua_invite(inbound(CALLER, &raw), parse(&raw), &dispatcher.state)
+            handle_b2bua_invite(inbound(CALLER, &raw), parse(&raw), &state)
         });
-        let callee_invite = invite_to(drain(&dispatcher), CALLEE);
+        let callee_invite = invite_to(drain(&udp), CALLEE);
         Flow {
-            dispatcher,
+            state,
+            udp,
             sip_call_id: sip_call_id.to_string(),
             callee_invite,
             callee_answer: None,
@@ -118,11 +121,11 @@ impl Flow {
                 &mut ringing,
                 180,
                 CALLEE.parse().expect("a literal address"),
-                &self.dispatcher.state,
+                &self.state,
             )
         });
         assert!(handled);
-        drain(&self.dispatcher);
+        drain(&self.udp);
     }
 
     fn callee_answers(&mut self) {
@@ -151,11 +154,11 @@ impl Flow {
                 &mut answer,
                 200,
                 CALLEE.parse().expect("a literal address"),
-                &self.dispatcher.state,
+                &self.state,
             )
         });
         assert!(handled);
-        self.caller_answer = drain(&self.dispatcher)
+        self.caller_answer = drain(&self.udp)
             .into_iter()
             .find(|sent| {
                 sent.destination == CALLER.parse().expect("a literal address")
@@ -167,8 +170,7 @@ impl Flow {
     }
 
     fn internal_call_id(&self) -> String {
-        self.dispatcher
-            .state
+        self.state
             .call_actors
             .find_by_sip_call_id(&self.sip_call_id)
             .expect("the call is tracked")
@@ -245,14 +247,13 @@ impl Flow {
         }
         let message = parse(&raw);
         let arrived = inbound(address, &raw);
-        tokio::task::block_in_place(|| handle_b2bua_info(arrived, message, &self.dispatcher.state));
-        drain(&self.dispatcher)
+        tokio::task::block_in_place(|| handle_b2bua_info(arrived, message, &self.state));
+        drain(&self.udp)
     }
 
     /// The To siphon gave the caller on its early dialog, with siphon's tag.
     fn early_to_of_caller(&self) -> String {
         let call = self
-            .dispatcher
             .state
             .call_actors
             .get_call(&self.internal_call_id())
@@ -525,6 +526,38 @@ async fn an_unadvertised_package_is_a_469_with_the_accepted_list() {
     assert_eq!(infos_to(&sent, CALLEE), 0);
 }
 
+/// A 469 that lists no package (siphon advertised none to that leg) carries an
+/// empty `Recv-Info`, which RFC 6086 allows (section 5.2.2): the header is on
+/// the wire and empty, not dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_recv_info_reaches_the_wire_as_an_empty_header() {
+    let script = concat!(
+        "from siphon import b2bua\n",
+        "\n",
+        "@b2bua.on_invite\n",
+        "def on_invite(call):\n",
+        "    call.dial(\"sip:15550100042@198.51.100.7:5060\")\n",
+        "\n",
+        "@b2bua.on_info\n",
+        "def on_info(call, request):\n",
+        "    request.set_reply_header(\"Recv-Info\", \"\")\n",
+        "    request.reply(469, \"Bad Info Package\")\n",
+    );
+    let mut flow = Flow::start("toggle-empty@192.0.2.10", script);
+    flow.callee_rings();
+    flow.callee_answers();
+    let sent = flow.info(Party::Caller, 2, PACKAGE_INFO, None);
+    let answer = sent
+        .iter()
+        .find(|each| each.message.status_code().is_some())
+        .expect("an answer");
+    assert_eq!(answer.message.status_code(), Some(469));
+    assert_eq!(
+        answer.message.headers.get("Recv-Info").map(String::as_str),
+        Some("")
+    );
+}
+
 /// Before the answer the script refuses with 403, using `call.state`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_package_info_before_the_answer_is_a_403() {
@@ -562,46 +595,130 @@ async fn a_dtmf_info_is_still_relayed() {
     );
 }
 
-/// After replying, the handler's task runs. Polled: the task is the async
-/// driver's, not the handler's.
+/// Poll `read` until it has a value, as the async driver runs the task on its
+/// own thread. A plain sleep on a blocking-safe thread: the guard on the shared
+/// pool is a std mutex and is held for the whole test.
+fn eventually<T>(mut read: impl FnMut() -> Option<T>) -> Option<T> {
+    tokio::task::block_in_place(|| {
+        for _ in 0..200 {
+            if let Some(value) = read() {
+                return Some(value);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        None
+    })
+}
+
+fn header_on_call(flow: &Flow, name: &str) -> Option<String> {
+    let call = flow.internal_call_id();
+    flow.state
+        .call_actors
+        .get_call(&call)
+        .and_then(|actor| actor.a_leg_invite.clone())
+        .and_then(|invite| {
+            invite
+                .lock()
+                .ok()
+                .and_then(|message| message.headers.get(name).cloned())
+        })
+}
+
+/// A handler with no `await` that replies and starts a task goes the driver
+/// way (the inline path has no event loop): the reply goes out and the task
+/// runs, under the real driver pool.
 #[tokio::test(flavor = "multi_thread")]
 async fn follow_up_work_started_after_the_reply_runs() {
-    // The handler yields once after starting the task, so the task's first
-    // step runs whether or not the async driver pool is installed.
-    let script = TOGGLE.replace(
-        "    asyncio.create_task(follow_up(call, leg))\n",
-        "    asyncio.create_task(follow_up(call, leg))\n    await asyncio.sleep(0)\n",
-    );
-    let mut flow = Flow::start("toggle-task@192.0.2.10", &script);
+    let _serial = crate::script::async_pool::pool_test_guard();
+    crate::script::async_pool::ensure_test_pools();
+    let mut flow = toggle("toggle-task@192.0.2.10");
     flow.callee_rings();
     flow.callee_answers();
-    flow.info(
+    let sent = flow.info(
         Party::Caller,
         2,
         PACKAGE_INFO,
         Some(("application/example+json", "{}")),
     );
-    let call = flow.internal_call_id();
-    let mut marked = None;
-    for _ in 0..100 {
-        marked = flow
-            .dispatcher
-            .state
-            .call_actors
-            .get_call(&call)
-            .and_then(|actor| actor.a_leg_invite.clone())
-            .and_then(|invite| {
-                invite
-                    .lock()
-                    .ok()
-                    .and_then(|message| message.headers.get("X-Follow-Up").cloned())
-            });
-        if marked.is_some() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    assert_eq!(marked.as_deref(), Some("caller"));
+    let answer = sent
+        .iter()
+        .find(|each| each.message.status_code().is_some())
+        .expect("the reply goes out");
+    assert_eq!(answer.message.status_code(), Some(200));
+    let marked = eventually(|| header_on_call(&flow, "X-Follow-Up"));
+    assert_eq!(marked.as_deref(), Some("caller"), "the task ran");
+}
+
+/// The whole loop from a script: a package INFO is answered, a task sends the
+/// state INFO to the party that asked with `b2bua.send_info`, that party
+/// answers it, and the task reads the status back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_task_sends_the_state_info_and_reads_the_status() {
+    let _serial = crate::script::async_pool::pool_test_guard();
+    crate::script::async_pool::ensure_test_pools();
+    let script = TOGGLE.replace(
+        "async def follow_up(call, leg):\n    call.set_header(\"X-Follow-Up\", leg)\n",
+        concat!(
+            "async def follow_up(call, leg):\n",
+            "    status = await b2bua.send_info(\n",
+            "        call.call_id, b\"{}\", \"application/example+json\",\n",
+            "        headers={\"Info-Package\": PACKAGE, \"Content-Disposition\": \"Info-Package\"},\n",
+            "        leg=leg)\n",
+            "    call.set_header(\"X-Push-Status\", str(status))\n",
+        ),
+    );
+    assert_ne!(script, TOGGLE, "the follow-up is replaced");
+    // What `b2bua.send_info()` reaches the dispatcher through goes in before
+    // the script engine is built, which is when it is injected.
+    pyo3::Python::attach(crate::script::api::set_b2bua_control_singleton)
+        .expect("the script reaches the dispatcher");
+    let mut flow = Flow::start("toggle-push@192.0.2.10", &script);
+    register_test_control(&flow.sip_call_id, Arc::clone(&flow.state));
+    flow.callee_rings();
+    flow.callee_answers();
+    // The task may send its INFO before `info` has read the wire back, so what
+    // that read returned is searched too.
+    let mut seen = flow.info(
+        Party::Caller,
+        2,
+        PACKAGE_INFO,
+        Some(("application/example+json", "{}")),
+    );
+    let pushed = eventually(|| {
+        seen.extend(drain(&flow.udp));
+        seen.iter()
+            .position(|each| each.message.method() == Some(&Method::Info))
+            .map(|index| seen.remove(index))
+    })
+    .expect("the task sends the INFO");
+    assert_eq!(pushed.destination, CALLER.parse().expect("an address"));
+    assert_eq!(
+        pushed
+            .message
+            .headers
+            .get("Info-Package")
+            .map(String::as_str),
+        Some(PACKAGE)
+    );
+    let reply = parse(&format!(
+        concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: {via}\r\n",
+            "From: {from}\r\n",
+            "To: {to}\r\n",
+            "Call-ID: {call_id}\r\n",
+            "CSeq: {cseq}\r\n",
+            "Content-Length: 0\r\n\r\n",
+        ),
+        via = pushed.message.headers.get("Via").expect("Via"),
+        from = pushed.message.headers.from().expect("From"),
+        to = pushed.message.headers.to().expect("To"),
+        call_id = flow.sip_call_id,
+        cseq = pushed.message.headers.get("CSeq").expect("CSeq"),
+    ));
+    assert!(take_sent_info_response(&reply, 200));
+    let status = eventually(|| header_on_call(&flow, "X-Push-Status"));
+    assert_eq!(status.as_deref(), Some("200"));
 }
 
 /// The package INFO a script sends from a task is in the caller's dialog with
@@ -613,7 +730,7 @@ async fn a_package_info_sent_to_the_caller_returns_its_status() {
     flow.callee_answers();
     let internal = flow.internal_call_id();
     let mut sent = send_info_on_leg(
-        &flow.dispatcher.state,
+        &flow.state,
         &internal,
         true,
         Some("application/example+json"),
@@ -627,7 +744,7 @@ async fn a_package_info_sent_to_the_caller_returns_its_status() {
         ],
     )
     .expect("sent");
-    let wire = drain(&flow.dispatcher);
+    let wire = drain(&flow.udp);
     let info = wire
         .iter()
         .find(|each| each.message.method() == Some(&Method::Info))
@@ -677,12 +794,8 @@ async fn the_call_a_hook_is_shown_carries_the_actors_state() {
         (CallState::Answered, "answered"),
         (CallState::Terminated, "terminated"),
     ] {
-        flow.dispatcher
-            .state
-            .call_actors
-            .set_state(&internal, state);
-        let built =
-            py_call_for(&internal, None, &flow.dispatcher.state).expect("the call is tracked");
+        flow.state.call_actors.set_state(&internal, state);
+        let built = py_call_for(&internal, None, &flow.state).expect("the call is tracked");
         let read = pyo3::Python::attach(|python| {
             pyo3::Py::new(python, built)
                 .and_then(|object| object.bind(python).getattr("state")?.extract::<String>())

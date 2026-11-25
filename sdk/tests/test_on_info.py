@@ -175,3 +175,79 @@ def on_info(call, request):
         assert harness.send_info(call=call).body == b"ringing"
         harness.send_answer(call=call)
         assert harness.send_info(call=call).body == b"answered"
+
+    @pytest.mark.parametrize(
+        "status,expected",
+        [(100, "calling"), (101, "ringing"), (180, "ringing"), (183, "ringing")],
+    )
+    def test_the_state_after_a_provisional(self, harness, status, expected):
+        from siphon_sdk.call import Call
+
+        call = Call()
+        harness.send_provisional(call=call, status_code=status, reason="x")
+        assert call.state == expected
+
+
+class TestFinalAction:
+    """The last action decides, as in siphon, across every handler."""
+
+    def test_a_reply_a_later_relay_replaced_leaves_it_relayed(self, harness):
+        harness.load_source(
+            """
+from siphon import b2bua
+
+@b2bua.on_info
+def on_info(call, request):
+    request.reply(200, "OK")
+    request.relay()
+"""
+        )
+        result = harness.send_info()
+        assert result.relayed and not result.answered
+        assert result.status_code is None
+
+    def test_a_relay_a_later_reply_replaced_is_answered(self, harness):
+        harness.load_source(
+            """
+from siphon import b2bua
+
+@b2bua.on_info
+def on_info(call, request):
+    request.relay()
+    request.reply(486, "Busy Here")
+"""
+        )
+        result = harness.send_info()
+        assert result.answered and result.status_code == 486
+
+    def test_the_last_handler_decides(self, harness):
+        harness.load_source(
+            """
+from siphon import b2bua
+
+@b2bua.on_info
+def first(call, request):
+    request.reply(200, "OK")
+
+@b2bua.on_info
+def second(call, request):
+    request.reply(469, "Bad Info Package")
+"""
+        )
+        assert harness.send_info().status_code == 469
+
+    def test_a_later_handler_that_does_nothing_leaves_the_earlier_reply(self, harness):
+        harness.load_source(
+            """
+from siphon import b2bua
+
+@b2bua.on_info
+def first(call, request):
+    request.reply(200, "OK")
+
+@b2bua.on_info
+def second(call, request):
+    pass
+"""
+        )
+        assert harness.send_info().status_code == 200

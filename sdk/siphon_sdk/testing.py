@@ -816,20 +816,31 @@ class SipTestHarness:
             source_ip=source_ip,
         )
 
-    def send_answer(self, call: Optional[Call] = None, **kwargs: Any) -> CallResult:
-        """Send a B2BUA answer event."""
+    def send_answer(
+        self,
+        call: Optional[Call] = None,
+        reply: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> CallResult:
+        """Send a B2BUA answer event.
+
+        Pass ``reply`` (a :class:`~siphon_sdk.reply.Reply`, with the headers the
+        callee's 200 carries) to give the handlers that 200 and read back what
+        they set on it; one is built when omitted.
+        """
         if call is None:
             call = Call(state="answered", **kwargs)
 
         from siphon_sdk.reply import Reply
-        import inspect
 
-        answer_reply = Reply(
-            status_code=200,
-            from_uri=call.from_uri,
-            to_uri=call.to_uri,
-            call_id=call.call_id,
-        )
+        answer_reply = reply
+        if answer_reply is None:
+            answer_reply = Reply(
+                status_code=200,
+                from_uri=call.from_uri,
+                to_uri=call.to_uri,
+                call_id=call.call_id,
+            )
 
         registry = mock_module.get_registry()
         handlers = registry.get("b2bua.on_answer")
@@ -902,7 +913,7 @@ class SipTestHarness:
 
         # A provisional that goes on to the caller moves a calling call to
         # ringing, as siphon does; a later hook (an INFO handler, say) reads it.
-        if call.state == "calling" and 180 <= reply.status_code <= 199:
+        if call.state == "calling" and 101 <= reply.status_code <= 199:
             call._state = "ringing"
 
         return CallResult(call=call, actions=list(call.actions))
@@ -1269,12 +1280,16 @@ class SipTestHarness:
                 raised = True
                 break
         answer = None
-        if not raised:
-            for action in reversed(request.actions):
-                if action.kind == "reply" and action.status_code is not None:
-                    if 200 <= action.status_code <= 699:
-                        answer = action
-                    break
+        if not raised and request.actions:
+            # The last action decides, as in siphon: a reply that a later
+            # relay() replaced leaves the INFO unanswered.
+            last = request.actions[-1]
+            if (
+                last.kind == "reply"
+                and last.status_code is not None
+                and 200 <= last.status_code <= 699
+            ):
+                answer = last
         if answer is not None:
             result.answered = True
             result.status_code = answer.status_code

@@ -823,10 +823,22 @@ not run again (RFC 3261 §17.2.2).
 surfaced to `@rtpengine.on_dtmf` and to a controller whichever way the INFO
 goes, so a handler that leaves it (and sees it relayed) changes nothing.
 
-**Async handlers.** An `async def` handler works the same way. Answer first,
-then start follow-up work with `asyncio.create_task(...)` and return: the
-answer goes out when the handler returns, and the task runs on the async
-driver afterwards.
+**Async handlers.** An `async def` handler works the same way. Answer, then
+start follow-up work with `asyncio.create_task(...)` and return.
+`request.reply()` records the decision; siphon sends the response after the
+handler's coroutine completes, and the task runs on the async driver
+independently, so it can run first. The state INFO a task sends and the
+response to the INFO that started it are separate transactions, and RFC 6086
+defines no order between them (section 4.4): the response first is usual, not
+guaranteed.
+
+A handler that names `asyncio.create_task`, `ensure_future`,
+`get_running_loop` or `get_event_loop` (directly, through an alias, or through
+the `asyncio` module) is run on the async driver, which has the event loop
+they need. The limit: siphon reads the names the handler's own code uses, so a
+handler with no `await` that calls a plain helper which reaches for the loop
+is not seen and fails with `no running event loop`. Add an `await` to the
+handler (any one, even `await asyncio.sleep(0)`).
 
 ```python
 import asyncio
