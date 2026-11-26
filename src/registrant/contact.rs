@@ -1,6 +1,8 @@
 //! The Contact header an outbound registration registers: the binding and the
 //! IMS feature tags it advertises.
 
+use super::{AuthMode, RegistrantEntry, RegistrantManager, Transport};
+
 /// IMS Contact-header feature tags (3GPP TS 24.229 §5.1.1.2 / GSMA IR.92,
 /// NG.114). These let the S-CSCF match iFCs and register the UE's MMTel /
 /// voice / video / SMS services, and carry the instance ID for GRUU/outbound
@@ -82,4 +84,158 @@ pub(super) fn build_contact_header(contact_uri: &str, ims: Option<&ImsContactPar
         }
     }
     header
+}
+
+impl RegistrantManager {
+    /// The instance id the Contact token of every generated Contact is made
+    /// of. Without one, no token is added (a Contact as older versions built
+    /// it). Call before anything registers.
+    pub fn with_instance_id(mut self, instance_id: String) -> Self {
+        self.instance_id = Some(instance_id);
+        self
+    }
+
+    /// The token this instance puts in the Contact it generates for `aor`.
+    pub(super) fn instance_token(&self, aor: &str) -> Option<String> {
+        self.instance_id
+            .as_deref()
+            .map(|instance| instance_token(instance, aor))
+    }
+
+    /// The token for `entry`'s generated Contact: a digest entry's only. An
+    /// AKA / IPsec entry registers from an address of its own into a core that
+    /// keys the binding by that address, is not persisted and never cleared by
+    /// the restart clean-up, so its Contact stays as it was.
+    pub(super) fn contact_token(&self, entry: &RegistrantEntry) -> Option<String> {
+        (entry.auth_mode == AuthMode::Digest && entry.ue_ipsec.is_none())
+            .then(|| self.instance_token(&entry.aor))
+            .flatten()
+    }
+}
+
+/// Build a default Contact URI from the entry's username, effective address, and transport.
+///
+/// Appends `;transport=<proto>` for non-UDP transports (UDP is the default per RFC 3261).
+pub(super) fn default_contact_uri(
+    username: &str,
+    address: impl std::fmt::Display,
+    transport: Transport,
+    token: Option<&str>,
+) -> String {
+    let transport_param = match transport {
+        Transport::Udp => "",
+        Transport::Tcp => ";transport=tcp",
+        Transport::Tls => ";transport=tls",
+        Transport::WebSocket => ";transport=ws",
+        Transport::WebSocketSecure => ";transport=wss",
+        Transport::Sctp => ";transport=sctp",
+    };
+    // For IMS the username is the IMPI (`user@home-domain`); the Contact
+    // userpart is just the `user` portion — otherwise we'd emit a malformed
+    // `sip:user@domain@ip:port` (two `@`). For a plain trunk username with no
+    // `@`, this is a no-op.
+    let user = username.split('@').next().unwrap_or(username);
+    let token = token
+        .map(|token| format!(";{}={token}", TOKEN_PARAMETER))
+        .unwrap_or_default();
+    format!("sip:{}@{}{}{}", user, address, transport_param, token)
+}
+
+/// The token of `instance_id`'s Contact for `aor`, for the dispatcher's tests.
+#[cfg(test)]
+pub(crate) fn contact_token_for_tests(instance_id: &str, aor: &str) -> String {
+    instance_token(instance_id, aor)
+}
+
+/// The URI parameter that carries a node's token in a Contact siphon generates.
+/// Not one RFC 3261 §19.1.1 or any registry assigns a meaning to.
+pub(super) const TOKEN_PARAMETER: &str = "rnode";
+
+/// A token naming `instance_id`'s registration of `aor`: 16 hex digits of the
+/// 64-bit FNV-1a hash of `instance_id`, a zero byte and `aor`.
+///
+/// It goes in the Contact of every registration siphon generates a Contact for
+/// (see [`TOKEN_PARAMETER`]). A registrar keys a binding by its Contact URI,
+/// parameters included (RFC 3261 §10.3, §19.1.4), so two nodes registering the
+/// same AoR behind one shared address hold two bindings, and a node can tell
+/// from the stored Contact alone whether a binding is its own. A hash rather
+/// than the name keeps the instance id off the wire.
+///
+/// The hash is written out here, not taken from `std`: the token is stored in
+/// Redis and compared after a restart, possibly by a binary built with another
+/// Rust version, and `DefaultHasher` makes no promise to give the same value
+/// across releases. FNV-1a is fixed by its published constants.
+pub(super) fn instance_token(instance_id: &str, aor: &str) -> String {
+    let bytes = instance_id
+        .bytes()
+        .chain(std::iter::once(0))
+        .chain(aor.bytes());
+    format!("{:016x}", fnv1a_64(bytes))
+}
+
+/// The 64-bit FNV-1a hash of `bytes` (offset basis `0xcbf29ce484222325`, prime
+/// `0x100000001b3`).
+fn fnv1a_64(bytes: impl IntoIterator<Item = u8>) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes.into_iter().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+    })
+}
+
+/// The token a Contact URI carries, if it has one.
+pub(super) fn contact_token_of(contact: &str) -> Option<&str> {
+    let rest = contact.split('?').next()?;
+    rest.split(';')
+        .skip(1)
+        .find_map(|parameter| parameter.strip_prefix(TOKEN_PARAMETER)?.strip_prefix('='))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The published FNV-1a 64-bit test vectors (draft-eastlake-fnv).
+    #[test]
+    fn fnv1a_matches_the_published_vectors() {
+        assert_eq!(fnv1a_64(*b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64(*b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_64(*b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    /// Fixed forever: a stored Contact's token is compared with the one a
+    /// later binary computes, so these values must never move.
+    #[test]
+    fn the_token_is_a_known_answer() {
+        assert_eq!(
+            instance_token("node-a", "sip:trunk@carrier.example"),
+            "b2e45f9359b95ae3"
+        );
+        assert_eq!(
+            instance_token("node-b", "sip:trunk@carrier.example"),
+            "866ac152f2ad37fa"
+        );
+    }
+
+    #[test]
+    fn the_token_differs_by_instance_and_by_aor_and_hides_the_instance() {
+        let token = instance_token("node-a", "sip:trunk@carrier.example");
+        assert_eq!(token.len(), 16);
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(token, instance_token("node-b", "sip:trunk@carrier.example"));
+        assert_ne!(token, instance_token("node-a", "sip:other@carrier.example"));
+        // The separator keeps ("ab", "c") apart from ("a", "bc").
+        assert_ne!(instance_token("ab", "c"), instance_token("a", "bc"));
+        assert!(!token.contains("node"));
+    }
+
+    #[test]
+    fn a_contacts_token_is_read_from_its_parameters_only() {
+        assert_eq!(
+            contact_token_of("sip:u@203.0.113.10:5060;transport=tcp;rnode=00ff00ff00ff00ff"),
+            Some("00ff00ff00ff00ff")
+        );
+        assert_eq!(contact_token_of("sip:u@203.0.113.10:5060"), None);
+        assert_eq!(contact_token_of("sip:rnode=x@203.0.113.10:5060"), None);
+    }
 }

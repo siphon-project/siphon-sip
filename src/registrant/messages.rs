@@ -54,22 +54,6 @@ impl<'a> EgressDefaults<'a> {
         self
     }
 
-    /// The IP literals this node advertises: the per-transport ones and the
-    /// global one, for the other nodes to compare with their own.
-    pub fn advertised_literals(&self) -> Vec<String> {
-        let mut literals: Vec<String> = self
-            .advertised_addrs
-            .into_iter()
-            .flat_map(|addrs| addrs.values().map(String::as_str))
-            .chain(self.advertised_address)
-            .filter_map(|value| value.parse::<std::net::IpAddr>().ok())
-            .map(|address| address.to_string())
-            .collect();
-        literals.sort();
-        literals.dedup();
-        literals
-    }
-
     /// The `host:port` an entry's REGISTER names in its Via sent-by and default
     /// Contact. For a wildcard listener with an advertised address configured,
     /// that address as written, a host name or an IP literal, per transport
@@ -261,6 +245,7 @@ impl RegistrantManager {
                 &entry.credentials.username,
                 &effective_addr,
                 entry.transport,
+                self.contact_token(entry).as_deref(),
             )
         });
         entry.sent_contact = Some(contact.clone());
@@ -406,6 +391,7 @@ impl RegistrantManager {
                 &entry.credentials.username,
                 &effective_addr,
                 entry.transport,
+                self.contact_token(entry).as_deref(),
             )
         });
         entry.sent_contact = Some(contact.clone());
@@ -601,7 +587,12 @@ impl RegistrantManager {
             _ => (egress.sent_by, effective_addr.clone()),
         };
         let contact = entry.contact_uri.clone().unwrap_or_else(|| {
-            default_contact_uri(&entry.credentials.username, &via_host, entry.transport)
+            default_contact_uri(
+                &entry.credentials.username,
+                &via_host,
+                entry.transport,
+                None,
+            )
         });
         let via = format!(
             "SIP/2.0/{} {};branch={};rport",

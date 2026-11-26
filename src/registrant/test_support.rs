@@ -129,6 +129,24 @@ pub(crate) fn install_egress(manager: &RegistrantManager) {
     });
 }
 
+/// [`install_egress`] for a process on `local_addr` with `listen_addrs` and the
+/// given advertised addresses.
+pub(crate) fn install_egress_with(
+    manager: &RegistrantManager,
+    local_addr: &str,
+    listen_addrs: std::collections::HashMap<Transport, std::net::SocketAddr>,
+    advertised_addrs: std::collections::HashMap<Transport, String>,
+    advertised_address: Option<&str>,
+) {
+    manager.set_egress(super::RegistrantEgress {
+        local_addr: local_addr.parse().expect("an address"),
+        listen_addrs,
+        advertised_addrs,
+        advertised_address: advertised_address.map(str::to_string),
+        hep_sender: None,
+    });
+}
+
 /// The de-registrations `remove` queued.
 pub(crate) fn take_deregistrations(manager: &RegistrantManager) -> Vec<super::BuiltRegister> {
     manager.take_pending_deregistrations()

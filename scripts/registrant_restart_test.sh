@@ -21,7 +21,7 @@
 #       # the cloud shape: listen on 0.0.0.0 with an advertised_address on no
 #       # local interface (a public address in front of a 1:1 NAT). The generated
 #       # Contact and the Via must name the advertised address, never 0.0.0.0, and
-#       # the clean-up must still recognise the Contact as this node's.
+#       # the clean-up must still recognise the Contact (its per-node token) as this node's.
 #
 # Needs redis-server, redis-cli, sipp and python3 on the PATH and a built siphon
 # binary (default: $CARGO_TARGET_DIR or target, release profile). Starts its own
@@ -183,12 +183,6 @@ for secret in "${secrets[@]}"; do
   if grep -q "${secret}" <<<"${record}"; then fail "the Redis record holds '${secret}'"; fi
 done
 
-if [[ -n "${WILDCARD_ADVERTISED:-}" ]]; then
-  published="$(redis-cli -p "${REDIS_PORT}" get "siphon:registrant:~advertised~${INSTANCE}")"
-  [[ "${published}" == "${ADVERTISED}" ]] \
-    || fail "the node did not publish its advertised address (got '${published}')"
-fi
-
 echo "[*] SIGKILL: no shutdown, no de-REGISTER"
 kill -9 "${SIPHON_PID}"
 wait "${SIPHON_PID}" 2>/dev/null || true
@@ -224,6 +218,21 @@ if [[ -n "${WILDCARD_ADVERTISED:-}" ]]; then
   [[ "${first_via}" == *" ${ADVERTISED}:${SIP_PORT};"* ]] \
     || fail "the Via (${first_via}) does not name the advertised address"
   grep -q "0\.0\.0\.0" <<<"${first_contact} ${first_via}" && fail "the wildcard is on the wire"
+fi
+if [[ -n "${DEFAULT_CONTACT:-}" ]]; then
+  # A generated Contact carries this instance's token (FNV-1a 64 of the instance
+  # id, a zero byte and the AoR), the same on the de-REGISTER and its retry.
+  token="$(python3 -I - "${INSTANCE}" "${AOR}" <<'PY'
+import sys
+h = 0xcbf29ce484222325
+for b in sys.argv[1].encode() + b"\0" + sys.argv[2].encode():
+    h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+print(f"{h:016x}")
+PY
+)"
+  [[ "${first_contact}" == *";rnode=${token}"* ]] \
+    || fail "the Contact (${first_contact}) does not carry this instance's token ${token}"
+  [[ "${first_contact}" != *"${INSTANCE}"* ]] || fail "the instance id is on the wire"
 fi
 (( dereg_cseq > first_cseq )) || fail "de-REGISTER CSeq ${dereg_cseq} does not outrank ${first_cseq}"
 (( retry_cseq > dereg_cseq )) || fail "retry CSeq ${retry_cseq} does not outrank ${dereg_cseq}"

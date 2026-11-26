@@ -76,28 +76,7 @@ pub(super) struct RestartState {
     /// Restart de-REGISTERs built and waiting for the checks made just before
     /// they may go (see [`RegistrantManager::release_startup_deregistrations`]).
     pub(super) staged: std::sync::Mutex<Vec<super::BuiltRegister>>,
-    /// When REGISTERs stop waiting for this node's advertised addresses to be
-    /// published (see [`super::persist::AdvertisedView`]): set when a store is
-    /// expected and there is something to publish, cleared by the publish.
-    pub(super) advertised_gate: std::sync::Mutex<Option<Instant>>,
-    /// A REGISTER left before the addresses were published (the wait ran out).
-    /// Sticky for the life of the process: see
-    /// [`RegistrantManager::awaiting_advertised_publication`].
-    pub(super) registered_unpublished: std::sync::atomic::AtomicBool,
-    /// When the advertised addresses were last published.
-    pub(super) advertised_published: std::sync::Mutex<Option<Instant>>,
-    /// The advertised IPs this node publishes and no other node does, as of the
-    /// last read of the store. Empty means none: the fail-closed state.
-    pub(super) owned_advertised: std::sync::Mutex<HashSet<std::net::IpAddr>>,
 }
-
-/// How long before an advertised-address entry expires it is published again.
-const ADVERTISED_REPUBLISH: Duration = Duration::from_secs(100);
-
-/// How long REGISTERs wait for this node's advertised addresses to be
-/// published before they go anyway: a Redis outage at boot must not keep the
-/// trunks down.
-pub(super) const ADVERTISED_PUBLISH_WAIT: Duration = Duration::from_secs(5);
 
 /// What one start-up cleanup did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -114,132 +93,6 @@ pub struct CleanupReport {
 }
 
 impl RegistrantManager {
-    /// Hold REGISTERs back for `wait` or until the advertised addresses are
-    /// published, whichever comes first. Called once, when the loop starts, if
-    /// a store is expected and the node advertises an IP literal.
-    pub(super) fn gate_registrations_on_advertised(&self, wait: Duration) {
-        let deadline = Instant::now() + wait;
-        match self.restart.advertised_gate.lock() {
-            Ok(mut gate) => *gate = Some(deadline),
-            Err(poisoned) => *poisoned.into_inner() = Some(deadline),
-        }
-    }
-
-    /// Whether a REGISTER must still wait for the advertised addresses to be
-    /// published. Once the wait has run out the REGISTER goes, and the node
-    /// remembers it did so unpublished for the rest of the process: another
-    /// node's clean-up could not tell this node's Contact from its own while
-    /// that REGISTER was out, and a later publish does not change that. Its own
-    /// clean-up then counts no advertised address as its own (concrete listener
-    /// sockets still count, a host name never does); it keeps republishing so
-    /// that other nodes see the address.
-    pub(super) fn awaiting_advertised_publication(&self) -> bool {
-        let deadline = match self.restart.advertised_gate.lock() {
-            Ok(gate) => *gate,
-            Err(poisoned) => *poisoned.into_inner(),
-        };
-        let Some(deadline) = deadline else {
-            return false;
-        };
-        if Instant::now() < deadline {
-            return true;
-        }
-        if !self
-            .restart
-            .registered_unpublished
-            .swap(true, Ordering::SeqCst)
-        {
-            warn!("registrant: the advertised addresses are not published yet, registering anyway; this node's clean-up will not count an advertised address as its own");
-        }
-        false
-    }
-
-    /// Publish this node's advertised IP literals to `store` when they are due
-    /// (never published, or about to expire), and lift the gate on the first
-    /// success. Before the first REGISTER, so that no other node's clean-up can
-    /// take this node's Contact for its own.
-    pub async fn maintain_advertised(&self, store: &BindingStore) {
-        let Some(egress) = self.egress.get() else {
-            return;
-        };
-        let due = match self.restart.advertised_published.lock() {
-            Ok(last) => last.is_none_or(|at| at.elapsed() >= ADVERTISED_REPUBLISH),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .is_none_or(|at| at.elapsed() >= ADVERTISED_REPUBLISH),
-        };
-        if !due {
-            return;
-        }
-        match store
-            .publish_advertised(&egress.defaults().advertised_literals())
-            .await
-        {
-            Ok(()) => {
-                match self.restart.advertised_published.lock() {
-                    Ok(mut last) => *last = Some(Instant::now()),
-                    Err(poisoned) => *poisoned.into_inner() = Some(Instant::now()),
-                }
-                match self.restart.advertised_gate.lock() {
-                    Ok(mut gate) => *gate = None,
-                    Err(poisoned) => *poisoned.into_inner() = None,
-                }
-            }
-            Err(error) => {
-                warn!(%error, "registrant: the advertised addresses cannot be published, REGISTERs wait");
-            }
-        }
-    }
-
-    /// Read which of this node's advertised IPs no other node advertises, and
-    /// keep that set for the ownership check. An unreadable store, or this
-    /// node's own entry missing or expired, leaves the set empty and says why.
-    pub(super) async fn refresh_owned_advertised(
-        &self,
-        store: &BindingStore,
-        defaults: EgressDefaults<'_>,
-    ) -> Result<(), String> {
-        // A REGISTER of this node was out before its addresses were published:
-        // nothing read now can show the Contact on it is not another node's.
-        if self.restart.registered_unpublished.load(Ordering::SeqCst) {
-            match self.restart.owned_advertised.lock() {
-                Ok(mut held) => held.clear(),
-                Err(poisoned) => poisoned.into_inner().clear(),
-            }
-            return Err(
-                "this node registered before publishing its advertised addresses".to_string(),
-            );
-        }
-        let owned = match store.advertised_view().await {
-            Ok(view) => match view.own {
-                Some(own) => Ok(defaults
-                    .advertised_literals()
-                    .iter()
-                    .filter(|literal| own.contains(*literal) && !view.others.contains(*literal))
-                    .filter_map(|literal| literal.parse::<std::net::IpAddr>().ok())
-                    .collect::<HashSet<_>>()),
-                None => Err("this node's advertised addresses are not published".to_string()),
-            },
-            Err(error) => Err(error),
-        };
-        let set = match &owned {
-            Ok(set) => set.clone(),
-            Err(_) => HashSet::new(),
-        };
-        match self.restart.owned_advertised.lock() {
-            Ok(mut held) => *held = set,
-            Err(poisoned) => *poisoned.into_inner() = set,
-        }
-        owned.map(|_| ())
-    }
-
-    fn owned_advertised(&self) -> HashSet<std::net::IpAddr> {
-        match self.restart.owned_advertised.lock() {
-            Ok(held) => held.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
-    }
-
     /// Attach the store the bindings are kept in, and write what is registered
     /// already (a store that connected after the first REGISTERs). Only the
     /// first attach counts.
@@ -410,7 +263,7 @@ impl RegistrantManager {
                     report.dropped += 1;
                 }
                 Outcome::Orphan
-                    if !self.contact_is_held_here(&record.contact, record.transport, defaults) =>
+                    if !self.contact_is_held_here(&record.contact, &record.aor, defaults) =>
                 {
                     info!(
                         aor = %record.aor,
@@ -439,6 +292,7 @@ impl RegistrantManager {
 
     /// The Contact `live`'s REGISTER carries (or will).
     pub(super) fn predicted_contact(
+        &self,
         live: &RegistrantEntry,
         defaults: EgressDefaults<'_>,
     ) -> String {
@@ -450,42 +304,36 @@ impl RegistrantManager {
                     super::messages::EntryEgress::of(live, defaults),
                 ),
                 live.transport,
+                self.contact_token(live).as_deref(),
             )
         })
     }
 
-    /// Whether `contact` names exactly a socket this node registers from. A
-    /// registrar keys a binding by its Contact (RFC 3261 §10.3), so an
-    /// `Expires: 0` on a Contact another node holds would delete its binding.
-    /// Two shapes qualify, both needing an explicit IP and port:
+    /// Whether the binding stored under `contact` is this node's to clear. A
+    /// registrar keys a binding by its Contact (RFC 3261 §10.3, URIs compared
+    /// per §19.1.4, parameters included), so an `Expires: 0` on a Contact
+    /// another node holds would delete its binding.
     ///
-    /// - a specific (non-wildcard) listener or the egress address: an address
-    ///   one node owns;
-    /// - an advertised IP literal (per-transport, else global) on that
-    ///   transport's listener port, which is what a wildcard listener puts in
-    ///   its Contact (see [`EgressDefaults::sent_by_of`]), but only one in
-    ///   `owned_advertised`: published by this node and by no other node,
-    ///   read from the store (see [`Self::refresh_owned_advertised`]).
+    /// - A Contact carrying this instance's token for `aor` (see
+    ///   [`super::contact::instance_token`]) is this node's, whatever its
+    ///   address: a concrete socket, an advertised IP, a host name or an
+    ///   address every node shares. Another instance's token never is, because
+    ///   the two nodes' Contacts differ in that parameter and so do their
+    ///   bindings. A token that is not this node's is not this node's even on
+    ///   one of its own sockets.
+    /// - A Contact with no token (a source row's explicit `contact`, or one an
+    ///   older version stored) falls back to the old rule: exactly a specific
+    ///   (non-wildcard) listener socket or the egress address, with an explicit
+    ///   IP and port. A wildcard, a name, a missing port or an address the node
+    ///   merely could bind never qualifies: those bindings expire.
     ///
-    /// Ownership of an advertised IP is decided by what the nodes publish, not
-    /// by what their records show. A record is written after the REGISTER is
-    /// answered, so a node that registered a moment ago has none, and its
-    /// binding, on the same Contact behind a shared address, would read as
-    /// nobody's: a timing guess. A published address is there before the
-    /// node's first REGISTER, so while another node advertises the same IP the
-    /// Contact is never this node's alone, whatever the timing. A missing or
-    /// expired entry of this node's own, or an unreadable store, counts no
-    /// address. A name never qualifies: it is how a fleet shares one front.
     /// `others_holding` (no other node records the same AoR and Contact,
     /// checked again just before the de-REGISTER leaves) stays the second
-    /// guard. A wildcard, a name, a missing port or an address the node merely
-    /// could bind never qualifies on its own: those bindings expire.
-    fn contact_is_held_here(
-        &self,
-        contact: &str,
-        transport: crate::transport::Transport,
-        defaults: EgressDefaults<'_>,
-    ) -> bool {
+    /// guard.
+    fn contact_is_held_here(&self, contact: &str, aor: &str, defaults: EgressDefaults<'_>) -> bool {
+        if let Some(token) = super::contact::contact_token_of(contact) {
+            return self.instance_token(aor).as_deref() == Some(token);
+        }
         let Some((host, Some(port))) = contact_host_port(contact) else {
             return false;
         };
@@ -496,20 +344,7 @@ impl RegistrantManager {
             return false;
         }
         let socket = std::net::SocketAddr::new(address, port);
-        if defaults.local_addr == socket || defaults.listen_addrs.values().any(|l| *l == socket) {
-            return true;
-        }
-        let advertised = defaults
-            .advertised_addrs
-            .and_then(|addrs| addrs.get(&transport).map(String::as_str))
-            .or(defaults.advertised_address)
-            .and_then(|value| value.parse::<std::net::IpAddr>().ok());
-        advertised == Some(address)
-            && self.owned_advertised().contains(&address)
-            && defaults
-                .listen_addrs
-                .get(&transport)
-                .is_some_and(|listener| listener.port() == port)
+        defaults.local_addr == socket || defaults.listen_addrs.values().any(|l| *l == socket)
     }
 
     /// What a stored binding is to the live entries.
@@ -528,7 +363,7 @@ impl RegistrantManager {
         // answer with another frontend after a restart.
         let same_target = live.registrar_uri == record.registrar_uri
             && live.transport == record.transport
-            && Self::predicted_contact(&live, defaults) == record.contact;
+            && self.predicted_contact(&live, defaults) == record.contact;
         if !same_target {
             return Outcome::Orphan;
         }
@@ -667,14 +502,13 @@ impl RegistrantManager {
         if self.startup_deregistration_superseded(call_id) {
             return false;
         }
-        let Some((aor, contact, transport)) =
+        let Some((aor, contact)) =
             self.draining_deregistrations
                 .get(call_id)
                 .and_then(|draining| {
                     Some((
                         draining.entry.aor.clone(),
                         draining.entry.contact_uri.clone()?,
-                        draining.entry.transport,
                     ))
                 })
         else {
@@ -683,15 +517,7 @@ impl RegistrantManager {
         let (Some(egress), Some(store)) = (self.egress.get(), self.restart.bindings.get()) else {
             return false;
         };
-        // A failure leaves no advertised address counted as this node's, which
-        // only matters to a Contact on one: a listener's own socket still is.
-        if let Err(error) = self
-            .refresh_owned_advertised(store, egress.defaults())
-            .await
-        {
-            debug!(%aor, %error, "restart clean-up: no advertised address counts as this node's");
-        }
-        if !self.contact_is_held_here(&contact, transport, egress.defaults()) {
+        if !self.contact_is_held_here(&contact, &aor, egress.defaults()) {
             return false;
         }
         match store.others_holding(std::slice::from_ref(&aor)).await {
@@ -768,9 +594,6 @@ pub(super) async fn run_startup_cleanup_from(
         }
         if snapshot.is_none() && Instant::now() >= retry_read_at {
             if let Some(store) = published() {
-                // Before the store takes the live bindings: no REGISTER of this
-                // node is out before its addresses are.
-                manager.maintain_advertised(&store).await;
                 match snapshot_then_attach(&manager, store).await {
                     Ok(records) => snapshot = Some(records),
                     Err(error) => {
@@ -801,12 +624,6 @@ pub(super) async fn run_startup_cleanup_from(
         return;
     };
     let stored = records.len();
-    if let Err(error) = manager
-        .refresh_owned_advertised(&store, egress.defaults())
-        .await
-    {
-        warn!(%error, "restart clean-up: no advertised address counts as this node's");
-    }
     let report = manager.startup_cleanup(records, egress.defaults());
     info!(
         stored,

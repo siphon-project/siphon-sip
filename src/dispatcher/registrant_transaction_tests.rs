@@ -1058,3 +1058,49 @@ async fn another_nodes_record_appearing_during_a_slow_lookup_stops_the_retry() {
     assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
     assert!(store.load().await.expect("loaded").is_empty());
 }
+
+/// A challenged REGISTER carries the Contact the first one did, even when the
+/// dispatcher's own view of the addressing differs from the registration
+/// loop's: only a wildcard UDP listener and a global advertised host name, so
+/// the dispatcher's resolved local address is a concrete IP.
+#[tokio::test]
+async fn a_challenged_register_keeps_the_contact_of_the_first_one() {
+    let registrant = Arc::new(test_support::manager().with_instance_id("node-a".to_string()));
+    test_support::install_egress_with(
+        &registrant,
+        "0.0.0.0:5060",
+        HashMap::new(),
+        HashMap::new(),
+        Some("sbc.example.org"),
+    );
+    let mut dispatcher = super::test_dispatcher::test_dispatcher();
+    dispatcher.state.registrant_manager = Some(Arc::clone(&registrant));
+    registrant.attach_transactions(Arc::new(RegisterTransactionLayer::of(&dispatcher.state)));
+    let setup = Setup {
+        registrant: Arc::clone(&registrant),
+        dispatcher,
+        listen: HashMap::new(),
+    };
+    registrant.add(trunk(TRUNK));
+
+    let first = registrant
+        .build_register(TRUNK, registrant.egress_defaults().expect("an egress"), 600)
+        .expect("first");
+    send_registrant_request(&registrant, TRUNK, &first, &setup.dispatcher.state);
+    let first_sent = setup.dispatcher.udp.try_recv().expect("the REGISTER");
+    let first_message = parse_sent(&first_sent);
+
+    setup.answer(
+        &first_message,
+        "401 Unauthorized",
+        "WWW-Authenticate: Digest realm=\"registrar.example\", nonce=\"abc123\", algorithm=MD5, qop=\"auth\"\r\n",
+    );
+    let retry = parse_sent(&setup.dispatcher.udp.try_recv().expect("the retry"));
+
+    let expected = format!(
+        "<sip:trunk@sbc.example.org:5060;rnode={}>",
+        crate::registrant::contact_token_for_tests("node-a", TRUNK)
+    );
+    assert_eq!(header(&first_message, "Contact"), expected);
+    assert_eq!(header(&retry, "Contact"), expected);
+}

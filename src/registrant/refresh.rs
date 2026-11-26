@@ -93,17 +93,11 @@ pub async fn registration_loop(manager: Arc<RegistrantManager>, context: Registr
     // Every REGISTER goes under a client transaction of the dispatcher's
     // (see `lifecycle`), which attaches its layer as it starts.
     manager.transactions_attached().await;
-    if super::persist::store_expected() && !egress.defaults().advertised_literals().is_empty() {
-        manager.gate_registrations_on_advertised(super::startup::ADVERTISED_PUBLISH_WAIT);
-    }
 
     loop {
         tokio::time::sleep(tick_interval).await;
         // A restart's de-REGISTER is checked once more right before it can go.
         manager.release_startup_deregistrations().await;
-        if let Some(store) = super::persist::published_store() {
-            manager.maintain_advertised(&store).await;
-        }
         run_tick(&manager, &context, egress, limiter.as_mut());
     }
 }

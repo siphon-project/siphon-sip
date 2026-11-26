@@ -276,3 +276,150 @@ async fn the_stored_contact_carries_the_advertised_host_name_as_sent() {
     assert_eq!(stored.contact, "sip:trunk@sbc.example.org:5060");
     assert!(contact(&built).contains(&stored.contact));
 }
+
+// ---------------------------------------------------------------------------
+// The per-node token in a generated Contact
+// ---------------------------------------------------------------------------
+
+fn node_manager(instance: &str) -> super::RegistrantManager {
+    test_support::manager().with_instance_id(instance.to_string())
+}
+
+fn token_of(built: &BuiltRegister) -> String {
+    let header = contact(built);
+    super::contact::contact_token_of(header.trim_matches(|c| c == '<' || c == '>'))
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
+fn challenge() -> crate::auth::DigestChallenge {
+    crate::auth::parse_challenge(
+        "Digest realm=\"registrar.example\", nonce=\"abc123\", algorithm=MD5, qop=\"auth\"",
+    )
+    .expect("a challenge")
+}
+
+/// Every REGISTER of one registration carries the same Contact, token
+/// included: the initial, the challenged retry, a refresh and the de-REGISTER.
+/// A registrar keys the binding by it (RFC 3261 §10.3).
+#[test]
+fn every_register_of_a_registration_carries_the_same_contact_with_its_token() {
+    let manager = node_manager("node-a");
+    manager.add(trunk(AOR));
+    let listen = wildcards();
+    let merged = HashMap::new();
+    let defaults = EgressDefaults::new(addr("0.0.0.0:5060"), &listen)
+        .with_advertised(&merged, Some("203.0.113.10"));
+
+    let initial = manager.build_register(AOR, defaults, 600).expect("initial");
+    let challenged = manager
+        .build_register_with_auth(AOR, defaults, &challenge(), false, 600)
+        .expect("challenged");
+    let refresh = manager.build_register(AOR, defaults, 600).expect("refresh");
+    let deregister = manager
+        .build_register(AOR, defaults, 0)
+        .expect("de-REGISTER");
+
+    let expected = format!(
+        "<sip:trunk@203.0.113.10:5060;rnode={}>",
+        super::contact::instance_token("node-a", AOR)
+    );
+    for (name, built) in [
+        ("initial", &initial),
+        ("challenged", &challenged),
+        ("refresh", &refresh),
+        ("de-REGISTER", &deregister),
+    ] {
+        assert_eq!(contact(built), expected, "{name}");
+    }
+}
+
+#[test]
+fn two_instances_registering_one_aor_behind_one_address_hold_different_contacts() {
+    let mut contacts = Vec::new();
+    for instance in ["node-a", "node-b"] {
+        let manager = node_manager(instance);
+        manager.add(trunk(AOR));
+        let listen = wildcards();
+        let merged = HashMap::new();
+        let defaults = EgressDefaults::new(addr("0.0.0.0:5060"), &listen)
+            .with_advertised(&merged, Some("203.0.113.10"));
+        let built = manager
+            .build_register(AOR, defaults, 600)
+            .expect("REGISTER");
+        assert!(
+            !contact(&built).contains(instance),
+            "the instance id is not on the wire"
+        );
+        contacts.push(contact(&built));
+    }
+    assert_ne!(contacts[0], contacts[1]);
+}
+
+/// With no instance id (an embedder) or an explicit contact from the source
+/// row, the Contact is what it always was.
+#[test]
+fn a_contact_without_an_instance_or_with_an_explicit_one_has_no_token() {
+    let listen = wildcards();
+    let merged = HashMap::new();
+    let defaults = EgressDefaults::new(addr("0.0.0.0:5060"), &listen)
+        .with_advertised(&merged, Some("203.0.113.10"));
+
+    let manager = test_support::manager();
+    manager.add(trunk(AOR));
+    let built = manager
+        .build_register(AOR, defaults, 600)
+        .expect("REGISTER");
+    assert!(!contact(&built).contains("rnode"), "{}", contact(&built));
+
+    let manager = node_manager("node-a");
+    let mut explicit = trunk(AOR);
+    explicit.contact_uri = Some("sip:trunk@192.0.2.1:5060".to_string());
+    manager.add(explicit);
+    let built = manager
+        .build_register(AOR, defaults, 600)
+        .expect("REGISTER");
+    assert_eq!(contact(&built), "<sip:trunk@192.0.2.1:5060>");
+}
+
+/// An AKA / IPsec entry registers from an address of its own into a core, is
+/// not persisted and is never cleared by the restart clean-up: its Contact
+/// stays as it was, on the unprotected and the protected REGISTER alike.
+#[test]
+fn an_aka_ipsec_entry_keeps_its_contact_without_a_token() {
+    let manager = node_manager("node-a");
+    manager.add(test_support::ue(1, Some(addr("192.0.2.77:0").ip())));
+    let listen = wildcards();
+    let defaults = EgressDefaults::new(addr("192.0.2.1:5060"), &listen);
+    let built = manager
+        .build_register(&test_support::impu(1), defaults, 600)
+        .expect("REGISTER");
+    assert!(!contact(&built).contains("rnode"), "{}", contact(&built));
+    assert_eq!(token_of(&built), "");
+}
+
+#[tokio::test]
+async fn the_stored_contact_carries_the_token_as_sent() {
+    let manager = node_manager("node-a");
+    let store = super::persist::BindingStore::in_memory("node-a", 30);
+    manager.attach_binding_store(std::sync::Arc::clone(&store));
+    manager.add(trunk(AOR));
+    let listen = wildcards();
+    let merged = HashMap::new();
+    let defaults = EgressDefaults::new(addr("0.0.0.0:5060"), &listen)
+        .with_advertised(&merged, Some("sbc.example.org"));
+    let built = manager
+        .build_register(AOR, defaults, 600)
+        .expect("REGISTER");
+    manager.handle_success(AOR, 600);
+
+    let stored = store.load().await.expect("loaded").pop().expect("a record");
+    assert_eq!(
+        stored.contact,
+        format!(
+            "sip:trunk@sbc.example.org:5060;rnode={}",
+            super::contact::instance_token("node-a", AOR)
+        )
+    );
+    assert!(contact(&built).contains(&stored.contact));
+}

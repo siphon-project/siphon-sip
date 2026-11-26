@@ -264,7 +264,7 @@ impl RegistrantManager {
                         && live.transport == draining.entry.transport
                         && (live.sent_contact.as_deref() == Some(contact)
                             || self.egress.get().is_some_and(|egress| {
-                                Self::predicted_contact(&live, egress.defaults()) == contact
+                                self.predicted_contact(&live, egress.defaults()) == contact
                             }))
                 })
             });

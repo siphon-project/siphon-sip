@@ -17,6 +17,9 @@
 pub mod address;
 pub mod aka;
 mod contact;
+#[cfg(test)]
+pub(crate) use contact::contact_token_for_tests;
+use contact::default_contact_uri;
 mod egress;
 #[cfg(test)]
 pub(crate) use egress::{established_ue, rotate_sa_set, rotate_sa_set_against};
@@ -783,6 +786,8 @@ pub struct RegistrantManager {
     /// The client transaction layer every REGISTER is sent under, attached by
     /// the dispatcher (see [`lifecycle`]).
     transactions: std::sync::OnceLock<Arc<dyn RegisterTransactions>>,
+    /// `server.instance_id`: what the Contact token (see [`contact`]) is made of.
+    instance_id: Option<String>,
     restart: startup::RestartState, // clearing a killed process's bindings (see [`startup`])
 }
 
@@ -836,6 +841,7 @@ impl RegistrantManager {
             max_registers_per_sec: None,
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             transactions: std::sync::OnceLock::new(),
+            instance_id: None,
             restart: startup::RestartState::default(),
         }
     }
@@ -870,6 +876,16 @@ impl RegistrantManager {
     /// The configured start-rate cap.
     pub fn max_registers_per_sec(&self) -> Option<u32> {
         self.max_registers_per_sec
+    }
+
+    /// The addressing REGISTERs egress with: what the loop recorded, the same
+    /// for every request of every entry. `None` until the loop has started.
+    ///
+    /// A challenged REGISTER, a refresh and a de-REGISTER must carry the
+    /// Contact the first one did, so whoever builds one asks here rather than
+    /// rebuilding the addressing from its own, differently resolved, view.
+    pub fn egress_defaults(&self) -> Option<EgressDefaults<'_>> {
+        self.egress.get().map(RegistrantEgress::defaults)
     }
 
     /// Record how REGISTERs egress. Called once by [`registration_loop`].
@@ -1417,30 +1433,6 @@ impl fmt::Debug for RegistrantManager {
 /// — what a real VoLTE handset offers, so the S-CSCF/AS see the supported set.
 const IMS_ALLOW_METHODS: &str =
     "INVITE, ACK, OPTIONS, CANCEL, BYE, UPDATE, INFO, REFER, NOTIFY, MESSAGE, PRACK";
-
-/// Build a default Contact URI from the entry's username, effective address, and transport.
-///
-/// Appends `;transport=<proto>` for non-UDP transports (UDP is the default per RFC 3261).
-fn default_contact_uri(
-    username: &str,
-    address: impl std::fmt::Display,
-    transport: Transport,
-) -> String {
-    let transport_param = match transport {
-        Transport::Udp => "",
-        Transport::Tcp => ";transport=tcp",
-        Transport::Tls => ";transport=tls",
-        Transport::WebSocket => ";transport=ws",
-        Transport::WebSocketSecure => ";transport=wss",
-        Transport::Sctp => ";transport=sctp",
-    };
-    // For IMS the username is the IMPI (`user@home-domain`); the Contact
-    // userpart is just the `user` portion — otherwise we'd emit a malformed
-    // `sip:user@domain@ip:port` (two `@`). For a plain trunk username with no
-    // `@`, this is a no-op.
-    let user = username.split('@').next().unwrap_or(username);
-    format!("sip:{}@{}{}", user, address, transport_param)
-}
 
 /// Parse a registrar URI ("sip:host:port" or "sip:host") into the REGISTER
 /// Request-URI. Uses the full SIP-URI parser so host and port are split

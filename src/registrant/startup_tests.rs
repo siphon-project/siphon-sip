@@ -692,178 +692,6 @@ async fn an_advertised_shared_host_does_not_make_a_contact_this_nodes() {
     assert!(released(&manager).await.is_empty());
 }
 
-/// A wildcard listener with an advertised address on no interface: the node's
-/// own Contact is that address on the listener's port.
-fn wildcard_with_advertised_on(
-    store: Arc<BindingStore>,
-) -> (
-    Arc<RegistrantManager>,
-    HashMap<Transport, std::net::SocketAddr>,
-    HashMap<Transport, String>,
-) {
-    let manager = Arc::new(test_support::manager());
-    let listen = HashMap::from([(Transport::Udp, "0.0.0.0:5060".parse().expect("addr"))]);
-    let advertised = HashMap::from([(Transport::Udp, "203.0.113.10".to_string())]);
-    manager.set_egress(crate::registrant::RegistrantEgress {
-        local_addr: "0.0.0.0:5060".parse().expect("addr"),
-        listen_addrs: listen.clone(),
-        advertised_addrs: advertised.clone(),
-        advertised_address: Some("203.0.113.10".to_string()),
-        hep_sender: None,
-    });
-    test_support::attach_untracked_transactions(&manager);
-    manager.attach_binding_store(store);
-    (manager, listen, advertised)
-}
-
-fn advertised_defaults<'a>(
-    listen: &'a HashMap<Transport, std::net::SocketAddr>,
-    advertised: &'a HashMap<Transport, String>,
-) -> EgressDefaults<'a> {
-    EgressDefaults::new("0.0.0.0:5060".parse().expect("addr"), listen)
-        .with_advertised(advertised, Some("203.0.113.10"))
-}
-
-/// What a node does before its clean-up: publish its addresses, then read
-/// which ones are its alone.
-async fn publish_and_read(
-    manager: &RegistrantManager,
-    store: &BindingStore,
-    defaults: EgressDefaults<'_>,
-) {
-    manager.maintain_advertised(store).await;
-    let _ = manager.refresh_owned_advertised(store, defaults).await;
-}
-
-fn advertised_record(contact: &str) -> BindingRecord {
-    let mut stored = record(AOR);
-    stored.contact = contact.to_string();
-    stored
-}
-
-/// The Contact a wildcard node registers with is its advertised address on the
-/// listener port: a hard-killed node's binding is de-registered, not left, when
-/// no other node advertises that address.
-#[tokio::test]
-async fn an_advertised_address_only_this_node_publishes_is_its_contact() {
-    let store = BindingStore::in_memory("node-a", 30);
-    let (manager, listen, advertised) = wildcard_with_advertised_on(Arc::clone(&store));
-    let defaults = advertised_defaults(&listen, &advertised);
-    publish_and_read(&manager, &store, defaults).await;
-
-    let report = manager.startup_cleanup(
-        vec![advertised_record("sip:trunk@203.0.113.10:5060")],
-        defaults,
-    );
-
-    assert_eq!(report.deregistered, 1);
-    assert_eq!(released(&manager).await.len(), 1);
-}
-
-/// The advertised address on a port the node does not listen on, or another
-/// address altogether, is not proof.
-#[tokio::test]
-async fn an_advertised_address_on_another_port_or_another_address_is_not_this_nodes() {
-    let store = BindingStore::in_memory("node-a", 30);
-    let (manager, listen, advertised) = wildcard_with_advertised_on(Arc::clone(&store));
-    let defaults = advertised_defaults(&listen, &advertised);
-    publish_and_read(&manager, &store, defaults).await;
-    for contact in ["sip:trunk@203.0.113.10:5099", "sip:trunk@203.0.113.11:5060"] {
-        let report = manager.startup_cleanup(vec![advertised_record(contact)], defaults);
-        assert_eq!(report.dropped, 1, "{contact}");
-    }
-    assert!(released(&manager).await.is_empty());
-}
-
-/// Another node publishes the same address (a shared front): the Contact is
-/// both nodes' and proves nothing, however the timing falls. The other node has
-/// no record of its binding yet (its write is still queued): the race.
-#[tokio::test]
-async fn an_address_another_node_publishes_is_never_this_nodes_even_with_no_record_of_it() {
-    let store = BindingStore::in_memory("node-a", 30);
-    store.save_advertised_as_instance("node-b", &["203.0.113.10"]);
-    let (manager, listen, advertised) = wildcard_with_advertised_on(Arc::clone(&store));
-    let defaults = advertised_defaults(&listen, &advertised);
-    publish_and_read(&manager, &store, defaults).await;
-
-    let report = manager.startup_cleanup(
-        vec![advertised_record("sip:trunk@203.0.113.10:5060")],
-        defaults,
-    );
-
-    assert_eq!(report.dropped, 1);
-    assert_eq!(report.deregistered, 0);
-    assert!(released(&manager).await.is_empty());
-}
-
-/// A store that cannot be read proves nothing.
-#[tokio::test]
-async fn an_unreadable_store_sends_nothing_for_an_advertised_contact() {
-    let store = BindingStore::inert("node-a");
-    let (manager, listen, advertised) = wildcard_with_advertised_on(Arc::clone(&store));
-    let defaults = advertised_defaults(&listen, &advertised);
-    publish_and_read(&manager, &store, defaults).await;
-
-    let report = manager.startup_cleanup(
-        vec![advertised_record("sip:trunk@203.0.113.10:5060")],
-        defaults,
-    );
-
-    assert_eq!(report.deregistered, 0);
-    assert!(released(&manager).await.is_empty());
-}
-
-/// This node's own entry missing (never published, or expired) proves nothing
-/// either.
-#[tokio::test]
-async fn a_missing_own_entry_sends_nothing_for_an_advertised_contact() {
-    let store = BindingStore::in_memory("node-a", 30);
-    let (manager, listen, advertised) = wildcard_with_advertised_on(Arc::clone(&store));
-    let defaults = advertised_defaults(&listen, &advertised);
-    let _ = manager.refresh_owned_advertised(&store, defaults).await;
-
-    let report = manager.startup_cleanup(
-        vec![advertised_record("sip:trunk@203.0.113.10:5060")],
-        defaults,
-    );
-
-    assert_eq!(report.deregistered, 0);
-}
-
-/// A node that published a moment ago has its entry read again right before
-/// the de-REGISTER leaves: one that appears between stops it.
-#[tokio::test]
-async fn a_node_publishing_the_address_after_the_clean_up_stops_the_de_register() {
-    let store = BindingStore::in_memory("node-a", 30);
-    let (manager, listen, advertised) = wildcard_with_advertised_on(Arc::clone(&store));
-    let defaults = advertised_defaults(&listen, &advertised);
-    publish_and_read(&manager, &store, defaults).await;
-    let stored = advertised_record("sip:trunk@203.0.113.10:5060");
-    store.save(stored.clone());
-    let report = manager.startup_cleanup(vec![stored], defaults);
-    assert_eq!(report.deregistered, 1);
-
-    store.save_advertised_as_instance("node-b", &["203.0.113.10"]);
-
-    assert!(released(&manager).await.is_empty());
-}
-
-/// Every node advertising the same literal makes every node's Contact the
-/// same: the other node's record of it stops the de-REGISTER too.
-#[tokio::test]
-async fn another_node_holding_the_advertised_contact_stops_the_de_register() {
-    let store = BindingStore::in_memory("node-a", 30);
-    let (manager, listen, advertised) = wildcard_with_advertised_on(Arc::clone(&store));
-    let defaults = advertised_defaults(&listen, &advertised);
-    publish_and_read(&manager, &store, defaults).await;
-    let stored = advertised_record("sip:trunk@203.0.113.10:5060");
-    store.save(stored.clone());
-    manager.startup_cleanup(vec![stored], defaults);
-    store.save_as_instance(other_instance_record("sip:trunk@203.0.113.10:5060"));
-
-    assert!(released(&manager).await.is_empty());
-}
-
 fn other_instance_record(contact: &str) -> BindingRecord {
     let mut other = record(AOR);
     other.instance = "node-b".to_string();
@@ -1143,62 +971,126 @@ async fn the_stored_records_are_read_before_a_live_binding_overwrites_them() {
     assert_eq!(now[0].contact, "sip:trunk@192.0.2.1:5090");
 }
 
-/// With a store expected and an IP literal advertised, no REGISTER is built
-/// until the addresses are published, or the wait runs out.
-#[tokio::test]
-async fn a_register_waits_for_the_advertised_addresses_up_to_the_bound() {
-    let store = BindingStore::in_memory("node-a", 30);
-    let (manager, listen, advertised) = wildcard_with_advertised_on(Arc::clone(&store));
-    let defaults = advertised_defaults(&listen, &advertised);
-    manager.add(trunk(AOR));
-    manager.gate_registrations_on_advertised(Duration::from_secs(3600));
-    assert!(manager.build_register(AOR, defaults, 600).is_none());
+// ---------------------------------------------------------------------------
+// Ownership by the per-node Contact token
+// ---------------------------------------------------------------------------
 
-    manager.maintain_advertised(&store).await;
-    assert!(manager.build_register(AOR, defaults, 600).is_some());
-    let view = store.advertised_view().await.expect("readable");
-    assert_eq!(view.own, Some(HashSet::from(["203.0.113.10".to_string()])));
-}
-
-/// Redis unreachable at boot: the REGISTER goes once the wait has run out.
-#[tokio::test]
-async fn an_unreachable_store_does_not_keep_the_register_back_past_the_bound() {
-    let unwritable = BindingStore::inert("node-a");
-    let (manager, listen, advertised) = wildcard_with_advertised_on(Arc::clone(&unwritable));
-    let defaults = advertised_defaults(&listen, &advertised);
-    manager.add(trunk(AOR));
-    manager.gate_registrations_on_advertised(Duration::from_millis(50));
-    manager.maintain_advertised(&unwritable).await;
-    assert!(manager.build_register(AOR, defaults, 600).is_none());
-
-    tokio::time::sleep(Duration::from_millis(80)).await;
-
-    assert!(manager.build_register(AOR, defaults, 600).is_some());
-}
-
-/// A node that registered before it published does not claim its advertised
-/// Contact in its clean-up, even when a later publish succeeds and no other
-/// node advertises the address.
-#[tokio::test]
-async fn a_node_that_registered_unpublished_does_not_claim_its_advertised_contact() {
-    let store = BindingStore::in_memory("node-a", 30);
-    let (manager, listen, advertised) = wildcard_with_advertised_on(Arc::clone(&store));
-    let defaults = advertised_defaults(&listen, &advertised);
-    const OTHER: &str = "sip:other@carrier.example";
-    manager.add(trunk(OTHER));
-    manager.gate_registrations_on_advertised(Duration::ZERO);
-    assert!(manager.build_register(OTHER, defaults, 600).is_some());
-
-    publish_and_read(&manager, &store, defaults).await;
-    let report = manager.startup_cleanup(
-        vec![advertised_record("sip:trunk@203.0.113.10:5060")],
-        defaults,
+fn token_manager(instance: &str) -> (Arc<RegistrantManager>, Arc<BindingStore>) {
+    let manager = Arc::new(test_support::manager().with_instance_id(instance.to_string()));
+    test_support::install_egress_with(
+        &manager,
+        "0.0.0.0:5060",
+        HashMap::from([(Transport::Udp, "0.0.0.0:5060".parse().expect("addr"))]),
+        HashMap::new(),
+        Some("203.0.113.10"),
     );
+    test_support::attach_untracked_transactions(&manager);
+    let store = BindingStore::in_memory(instance, 30);
+    manager.attach_binding_store(Arc::clone(&store));
+    (manager, store)
+}
 
+fn tokened(instance: &str, host: &str) -> String {
+    format!(
+        "sip:trunk@{host};rnode={}",
+        crate::registrant::contact::instance_token(instance, AOR)
+    )
+}
+
+fn cleanup_of(
+    manager: &RegistrantManager,
+    contact: &str,
+) -> crate::registrant::startup::CleanupReport {
+    let mut stored = record(AOR);
+    stored.contact = contact.to_string();
+    let defaults = manager.egress_defaults().expect("an egress");
+    manager.startup_cleanup(vec![stored], defaults)
+}
+
+/// A Contact carrying this instance's token is its own whatever its address:
+/// the advertised IP, a host name, an address every node shares.
+#[tokio::test]
+async fn a_contact_with_this_instances_token_is_cleared_whatever_its_host() {
+    for host in [
+        "203.0.113.10:5060",
+        "sbc.example.org:5060",
+        "198.51.100.7:5099",
+    ] {
+        let (manager, _store) = token_manager("node-a");
+        let report = cleanup_of(&manager, &tokened("node-a", host));
+        assert_eq!(report.deregistered, 1, "{host}");
+        assert_eq!(released(&manager).await.len(), 1, "{host}");
+    }
+}
+
+/// Another instance's token on the shared address is never de-registered, with
+/// or without a record of that node's binding: the registrar holds a different
+/// binding for it.
+#[tokio::test]
+async fn another_instances_token_on_a_shared_address_is_never_cleared() {
+    let (manager, store) = token_manager("node-a");
+    let report = cleanup_of(&manager, &tokened("node-b", "203.0.113.10:5060"));
     assert_eq!(report.deregistered, 0);
     assert_eq!(report.dropped, 1);
     assert!(released(&manager).await.is_empty());
-    // It still publishes, for the other nodes to see.
-    let view = store.advertised_view().await.expect("readable");
-    assert_eq!(view.own, Some(HashSet::from(["203.0.113.10".to_string()])));
+    assert!(store.load().await.expect("loaded").is_empty());
+}
+
+/// A token that is not this node's is not its own even on one of its sockets.
+#[tokio::test]
+async fn another_instances_token_on_this_nodes_own_socket_is_not_cleared() {
+    let manager = Arc::new(test_support::manager().with_instance_id("node-a".to_string()));
+    test_support::install_egress(&manager);
+    test_support::attach_untracked_transactions(&manager);
+    manager.attach_binding_store(BindingStore::in_memory("node-a", 30));
+    let report = cleanup_of(&manager, &tokened("node-b", "192.0.2.1:5060"));
+    assert_eq!(report.deregistered, 0);
+}
+
+/// No token (a source row's explicit contact, or one an older version stored):
+/// only a concrete listener socket counts, as before.
+#[tokio::test]
+async fn a_contact_without_a_token_falls_back_to_the_concrete_socket_rule() {
+    let manager = Arc::new(test_support::manager().with_instance_id("node-a".to_string()));
+    test_support::install_egress(&manager);
+    test_support::attach_untracked_transactions(&manager);
+    manager.attach_binding_store(BindingStore::in_memory("node-a", 30));
+    assert_eq!(
+        cleanup_of(&manager, "sip:trunk@192.0.2.1:5060").deregistered,
+        1
+    );
+
+    let (wildcard, _store) = token_manager("node-a");
+    // The advertised address with no token proves nothing.
+    assert_eq!(
+        cleanup_of(&wildcard, "sip:trunk@203.0.113.10:5060").deregistered,
+        0
+    );
+    assert_eq!(
+        cleanup_of(&wildcard, "sip:trunk@sbc.example.org:5060").deregistered,
+        0
+    );
+}
+
+/// The second guard still stops a de-REGISTER over a binding another node
+/// recorded on the very same Contact.
+#[tokio::test]
+async fn another_node_recording_the_same_tokened_contact_stops_the_de_register() {
+    let (manager, store) = token_manager("node-a");
+    let contact = tokened("node-a", "203.0.113.10:5060");
+    assert_eq!(cleanup_of(&manager, &contact).deregistered, 1);
+    store.save_as_instance(other_instance_record(&contact));
+    assert!(released(&manager).await.is_empty());
+}
+
+/// A binding this node's live entry registers on the same Contact is taken
+/// over, not de-registered: the live entry predicts the tokened Contact.
+#[tokio::test]
+async fn a_live_entry_takes_over_a_binding_on_its_own_tokened_contact() {
+    let (manager, _store) = token_manager("node-a");
+    manager.add(trunk(AOR));
+    let contact = tokened("node-a", "203.0.113.10:5060");
+    let report = cleanup_of(&manager, &contact);
+    assert_eq!(report.carried, 1);
+    assert_eq!(report.deregistered, 0);
 }

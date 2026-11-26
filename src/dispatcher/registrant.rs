@@ -180,9 +180,7 @@ fn handle_answer(
             // A REGISTER that was in flight at shutdown got its binding: clear
             // it at once, over the SA set the answer just settled.
             if deregistration == Deregistration::Owed {
-                let defaults =
-                    crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs)
-                        .with_advertised(&state.advertised_addrs, None);
+                let defaults = state_defaults(registrant, state);
                 if let Some(built) = registrant.take_owed_deregistration(&aor, defaults) {
                     send_registrant_request(registrant, &aor, &built, state);
                 }
@@ -227,9 +225,7 @@ fn handle_answer(
                 // IMS AKA entries run Milenage over the RAND/AUTN in the nonce;
                 // carrier-trunk entries use password digest. The IMS challenge
                 // always arrives as a 401 (WWW-Authenticate).
-                let defaults =
-                    crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs)
-                        .with_advertised(&state.advertised_addrs, None);
+                let defaults = state_defaults(registrant, state);
                 let built = if is_aka {
                     registrant.build_register_aka(
                         &aor,
@@ -306,8 +302,7 @@ pub(super) fn handle_registrant_ipsec_challenge(
     let verify = registrant.security_server_value(aor);
     let built = registrant.build_register_aka(
         aor,
-        crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs)
-            .with_advertised(&state.advertised_addrs, None),
+        state_defaults(registrant, state),
         challenge,
         registrant.challenge_expires(aor),
         verify.as_deref(),
@@ -521,8 +516,7 @@ fn handle_removed_entry_answer(
         .then(|| message.headers.get(header_name))
         .flatten()
         .and_then(|raw| crate::auth::parse_challenge(raw));
-    let defaults = crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs)
-        .with_advertised(&state.advertised_addrs, None);
+    let defaults = state_defaults(registrant, state);
     let answer = registrant.answer_removed_deregistration(
         call_id,
         crate::registrant::cseq_number(message),
@@ -677,3 +671,19 @@ mod transaction_tests;
 #[cfg(test)]
 #[path = "registrant_over_mtu_tests.rs"]
 mod over_mtu_tests;
+
+/// The addressing a REGISTER the dispatcher builds (a challenge answer, a
+/// removed entry's de-REGISTER) leaves with: the one the registration loop
+/// built the first REGISTER with, so the Contact is the same. The dispatcher's
+/// own view (`state.local_addr` is already resolved to an address, and its
+/// advertised map only inherits the global value for transports that listen)
+/// is the fallback before the loop has started.
+fn state_defaults<'a>(
+    registrant: &'a crate::registrant::RegistrantManager,
+    state: &'a DispatcherState,
+) -> crate::registrant::EgressDefaults<'a> {
+    registrant.egress_defaults().unwrap_or_else(|| {
+        crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs)
+            .with_advertised(&state.advertised_addrs, None)
+    })
+}
