@@ -970,3 +970,386 @@ async fn the_stored_records_are_read_before_a_live_binding_overwrites_them() {
     let now = store.load().await.expect("loaded");
     assert_eq!(now[0].contact, "sip:trunk@192.0.2.1:5090");
 }
+
+// ---------------------------------------------------------------------------
+// Ownership by the per-node Contact token
+// ---------------------------------------------------------------------------
+
+fn token_manager(instance: &str) -> (Arc<RegistrantManager>, Arc<BindingStore>) {
+    let manager = Arc::new(test_support::manager().with_instance_id(instance.to_string()));
+    test_support::install_egress_with(
+        &manager,
+        "0.0.0.0:5060",
+        HashMap::from([(Transport::Udp, "0.0.0.0:5060".parse().expect("addr"))]),
+        HashMap::new(),
+        Some("203.0.113.10"),
+    );
+    test_support::attach_untracked_transactions(&manager);
+    let store = BindingStore::in_memory(instance, 30);
+    manager.attach_binding_store(Arc::clone(&store));
+    (manager, store)
+}
+
+fn tokened(instance: &str, host: &str) -> String {
+    format!(
+        "sip:trunk@{host};rnode={}",
+        crate::registrant::contact::instance_token(instance, AOR)
+    )
+}
+
+fn cleanup_of(
+    manager: &RegistrantManager,
+    contact: &str,
+) -> crate::registrant::startup::CleanupReport {
+    let mut stored = record(AOR);
+    stored.contact = contact.to_string();
+    let defaults = manager.egress_defaults().expect("an egress");
+    manager.startup_cleanup(vec![stored], defaults)
+}
+
+/// A Contact carrying this instance's token is its own whatever its address:
+/// the advertised IP, a host name, an address every node shares.
+#[tokio::test]
+async fn a_contact_with_this_instances_token_is_cleared_whatever_its_host() {
+    for host in [
+        "203.0.113.10:5060",
+        "sbc.example.org:5060",
+        "198.51.100.7:5099",
+    ] {
+        let (manager, _store) = token_manager("node-a");
+        let report = cleanup_of(&manager, &tokened("node-a", host));
+        assert_eq!(report.deregistered, 1, "{host}");
+        assert_eq!(released(&manager).await.len(), 1, "{host}");
+    }
+}
+
+/// Another instance's token on the shared address is never de-registered, with
+/// or without a record of that node's binding: the registrar holds a different
+/// binding for it.
+#[tokio::test]
+async fn another_instances_token_on_a_shared_address_is_never_cleared() {
+    let (manager, store) = token_manager("node-a");
+    let report = cleanup_of(&manager, &tokened("node-b", "203.0.113.10:5060"));
+    assert_eq!(report.deregistered, 0);
+    assert_eq!(report.dropped, 1);
+    assert!(released(&manager).await.is_empty());
+    assert!(store.load().await.expect("loaded").is_empty());
+}
+
+/// A token that is not this node's is not its own even on one of its sockets.
+#[tokio::test]
+async fn another_instances_token_on_this_nodes_own_socket_is_not_cleared() {
+    let manager = Arc::new(test_support::manager().with_instance_id("node-a".to_string()));
+    test_support::install_egress(&manager);
+    test_support::attach_untracked_transactions(&manager);
+    manager.attach_binding_store(BindingStore::in_memory("node-a", 30));
+    let report = cleanup_of(&manager, &tokened("node-b", "192.0.2.1:5060"));
+    assert_eq!(report.deregistered, 0);
+}
+
+/// No token (a source row's explicit contact, or one an older version stored):
+/// only a concrete listener socket counts, as before.
+#[tokio::test]
+async fn a_contact_without_a_token_falls_back_to_the_concrete_socket_rule() {
+    let manager = Arc::new(test_support::manager().with_instance_id("node-a".to_string()));
+    test_support::install_egress(&manager);
+    test_support::attach_untracked_transactions(&manager);
+    manager.attach_binding_store(BindingStore::in_memory("node-a", 30));
+    assert_eq!(
+        cleanup_of(&manager, "sip:trunk@192.0.2.1:5060").deregistered,
+        1
+    );
+
+    let (wildcard, _store) = token_manager("node-a");
+    // The advertised address with no token proves nothing.
+    assert_eq!(
+        cleanup_of(&wildcard, "sip:trunk@203.0.113.10:5060").deregistered,
+        0
+    );
+    assert_eq!(
+        cleanup_of(&wildcard, "sip:trunk@sbc.example.org:5060").deregistered,
+        0
+    );
+}
+
+/// The second guard still stops a de-REGISTER over a binding another node
+/// recorded on the very same Contact.
+#[tokio::test]
+async fn another_node_recording_the_same_tokened_contact_stops_the_de_register() {
+    let (manager, store) = token_manager("node-a");
+    let contact = tokened("node-a", "203.0.113.10:5060");
+    assert_eq!(cleanup_of(&manager, &contact).deregistered, 1);
+    store.save_as_instance(other_instance_record(&contact));
+    assert!(released(&manager).await.is_empty());
+}
+
+/// A binding this node's live entry registers on the same Contact is taken
+/// over, not de-registered: the live entry predicts the tokened Contact.
+#[tokio::test]
+async fn a_live_entry_takes_over_a_binding_on_its_own_tokened_contact() {
+    let (manager, _store) = token_manager("node-a");
+    manager.add(trunk(AOR));
+    let contact = tokened("node-a", "203.0.113.10:5060");
+    let report = cleanup_of(&manager, &contact);
+    assert_eq!(report.carried, 1);
+    assert_eq!(report.deregistered, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Contacts compared as SIP URIs (RFC 3261 §19.1.4), token case
+// ---------------------------------------------------------------------------
+
+/// Another node registered the same AoR with a tokenless Contact on the same
+/// address: a parameter on one URI only is ignored, so it is the same binding
+/// at the registrar, and this node's de-REGISTER would delete it.
+#[tokio::test]
+async fn a_tokenless_contact_equivalent_to_ours_stops_the_de_register() {
+    let (manager, store) = token_manager("node-a");
+    assert_eq!(
+        cleanup_of(&manager, &tokened("node-a", "203.0.113.10:5060")).deregistered,
+        1
+    );
+    store.save_as_instance(other_instance_record("sip:trunk@203.0.113.10:5060"));
+    assert!(released(&manager).await.is_empty());
+}
+
+/// And a Contact of another instance's token, in another spelling, does not.
+#[tokio::test]
+async fn a_contact_with_another_token_does_not_stop_the_de_register() {
+    let (manager, store) = token_manager("node-a");
+    assert_eq!(
+        cleanup_of(&manager, &tokened("node-a", "203.0.113.10:5060")).deregistered,
+        1
+    );
+    store.save_as_instance(other_instance_record(&tokened(
+        "node-b",
+        "203.0.113.10:5060",
+    )));
+    assert_eq!(released(&manager).await.len(), 1);
+}
+
+/// A live entry registered the same binding in another spelling (parameter
+/// order, case): the stored record is that entry's, taken over, not an orphan.
+#[tokio::test]
+async fn a_live_entry_takes_over_a_binding_spelled_another_way() {
+    let (manager, _store) = manager_with_store();
+    let listen = listen();
+    let mut entry = trunk(AOR);
+    entry.contact_uri = Some("sip:trunk@192.0.2.1:5060;rnode=ab12;transport=udp".to_string());
+    manager.add(entry);
+    let mut stored = record(AOR);
+    stored.contact = "sip:trunk@192.0.2.1:5060;Transport=UDP;RNode=AB12".to_string();
+
+    let report = manager.startup_cleanup(vec![stored], defaults(&listen));
+
+    assert_eq!(report.carried, 1);
+    assert_eq!(report.deregistered, 0);
+}
+
+/// The final guard: a live entry that took the Contact, spelled another way,
+/// stops a queued de-REGISTER.
+#[tokio::test]
+async fn a_queued_de_register_is_dropped_once_a_live_entry_holds_an_equivalent_contact() {
+    let (manager, store) = manager_with_store();
+    let listen = listen();
+    let mut stored = record(AOR);
+    stored.contact = "sip:trunk@192.0.2.1:5060;transport=UDP".to_string();
+    store.save(stored.clone());
+    manager.startup_cleanup(vec![stored], defaults(&listen));
+    assert_eq!(manager.removed_deregistrations_pending(), 1);
+    let mut entry = trunk(AOR);
+    entry.contact_uri = Some("sip:trunk@192.0.2.1:5060;transport=udp".to_string());
+    manager.add(entry);
+    // It registers on it, so its sent Contact is the equivalent spelling.
+    manager.build_register(AOR, defaults(&listen), 600);
+
+    assert!(released(&manager).await.is_empty());
+}
+
+/// A token in another spelling of the parameter name, foreign, on this node's
+/// own socket: never accepted through the concrete-socket fallback.
+#[tokio::test]
+async fn a_foreign_token_in_any_case_is_never_cleared_on_a_concrete_socket() {
+    let manager = Arc::new(test_support::manager().with_instance_id("node-a".to_string()));
+    test_support::install_egress(&manager);
+    test_support::attach_untracked_transactions(&manager);
+    manager.attach_binding_store(BindingStore::in_memory("node-a", 30));
+    let foreign = crate::registrant::contact::instance_token("node-b", AOR);
+    for contact in [
+        format!("sip:trunk@192.0.2.1:5060;RNode={foreign}"),
+        format!("sip:trunk@192.0.2.1:5060;rnode={}", foreign.to_uppercase()),
+    ] {
+        assert_eq!(cleanup_of(&manager, &contact).deregistered, 0, "{contact}");
+    }
+}
+
+/// This node's own token, upper-cased, is still its own.
+#[tokio::test]
+async fn this_nodes_token_in_upper_case_is_still_its_own() {
+    let (manager, _store) = token_manager("node-a");
+    let own = crate::registrant::contact::instance_token("node-a", AOR).to_uppercase();
+    let contact = format!("sip:trunk@203.0.113.10:5060;RNODE={own}");
+    assert_eq!(cleanup_of(&manager, &contact).deregistered, 1);
+}
+
+// ---------------------------------------------------------------------------
+// A tokened claim and the trunk source: another node's tokenless Contact
+// ---------------------------------------------------------------------------
+
+/// A source that answers the lookup of every AoR the same way.
+struct SourceStub {
+    answer: Result<Option<crate::registrant::source::RegistrantRow>, String>,
+    configured: bool,
+}
+
+impl crate::registrant::source::CredentialLookup for SourceStub {
+    fn is_configured(&self) -> bool {
+        self.configured
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        _aor: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<crate::registrant::source::RegistrantRow>, String>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let answer = self.answer.clone();
+        Box::pin(async move { answer })
+    }
+}
+
+fn row(contact: Option<&str>) -> crate::registrant::source::RegistrantRow {
+    serde_json::from_value(serde_json::json!({
+        "aor": AOR,
+        "registrar": "sip:198.51.100.10:5060",
+        "username": "u",
+        "password": "p",
+        "contact": contact,
+    }))
+    .expect("a row")
+}
+
+/// The clean-up of a tokened binding of this node's on a shared address, with
+/// the source answering `answer`: whether its de-REGISTER may leave.
+async fn tokened_claim_with(
+    answer: Option<Result<Option<crate::registrant::source::RegistrantRow>, String>>,
+    configured: bool,
+) -> bool {
+    let (manager, _store) = token_manager("node-a");
+    if let Some(answer) = answer {
+        manager.set_credential_lookup(Arc::new(SourceStub { answer, configured }));
+    }
+    let report = cleanup_of(&manager, &tokened("node-a", "203.0.113.10:5060"));
+    assert_eq!(report.deregistered, 1);
+    !released(&manager).await.is_empty()
+}
+
+/// Another node registers a tokenless Contact only from a source row with an
+/// explicit contact (or on an older version): the trunk source says so, not
+/// Redis timing.
+#[tokio::test]
+async fn a_source_row_with_an_explicit_contact_blocks_the_tokened_claim() {
+    // The AoR is not listed here, the lookup knows it with an explicit contact.
+    assert!(!tokened_claim_with(Some(Ok(Some(row(Some("sip:u@203.0.113.10:5060"))))), true).await);
+}
+
+#[tokio::test]
+async fn a_generated_source_row_or_an_unknown_aor_allows_the_tokened_claim() {
+    assert!(tokened_claim_with(Some(Ok(Some(row(None)))), true).await);
+    assert!(tokened_claim_with(Some(Ok(Some(row(Some(" "))))), true).await);
+    assert!(tokened_claim_with(Some(Ok(None)), true).await);
+    // No source at all: what is configured is all there is.
+    assert!(tokened_claim_with(None, true).await);
+}
+
+#[tokio::test]
+async fn a_failed_or_missing_lookup_blocks_the_tokened_claim() {
+    assert!(!tokened_claim_with(Some(Err("down".to_string())), true).await);
+    // A source with no lookup cannot say whether the AoR has an explicit one.
+    assert!(!tokened_claim_with(Some(Ok(None)), false).await);
+}
+
+/// An AoR in this node's own list answers from the list: an explicit contact
+/// blocks, a generated one allows, without asking the lookup.
+#[tokio::test]
+async fn a_listed_aor_answers_from_its_live_entry() {
+    for (explicit, allowed) in [(Some("sip:u@198.51.100.7:5099"), false), (None, true)] {
+        let (manager, _store) = token_manager("node-a");
+        manager.set_credential_lookup(Arc::new(SourceStub {
+            answer: Err("must not be asked".to_string()),
+            configured: true,
+        }));
+        let mut entry = trunk(AOR);
+        entry.contact_uri = explicit.map(str::to_string);
+        manager.add(entry);
+        // On another host than the live entry's: an orphan, not an adoption.
+        let report = cleanup_of(&manager, &tokened("node-a", "198.51.100.99:5060"));
+        assert_eq!(report.deregistered, 1, "{explicit:?}");
+        assert_eq!(
+            !released(&manager).await.is_empty(),
+            allowed,
+            "{explicit:?}"
+        );
+    }
+}
+
+/// A tokenless Contact on one of this node's own sockets, with the trunk source
+/// answering `answer` (none: no source): whether its de-REGISTER may leave.
+async fn tokenless_claim_with(
+    answer: Option<Result<Option<crate::registrant::source::RegistrantRow>, String>>,
+    configured: bool,
+) -> bool {
+    let manager = Arc::new(test_support::manager().with_instance_id("node-a".to_string()));
+    test_support::install_egress(&manager);
+    test_support::attach_untracked_transactions(&manager);
+    manager.attach_binding_store(BindingStore::in_memory("node-a", 30));
+    if let Some(answer) = answer {
+        manager.set_credential_lookup(Arc::new(SourceStub { answer, configured }));
+    }
+    let report = cleanup_of(&manager, "sip:trunk@192.0.2.1:5060");
+    assert_eq!(report.deregistered, 1);
+    !released(&manager).await.is_empty()
+}
+
+/// Another node may hold the same explicit Contact (the socket may be a shared
+/// address): when the source's row for the AoR names an equivalent one, no claim.
+#[tokio::test]
+async fn a_tokenless_claim_is_blocked_by_an_equivalent_explicit_contact_in_the_source() {
+    assert!(
+        !tokenless_claim_with(
+            Some(Ok(Some(row(Some("SIP:trunk@192.0.2.1:5060;x=1"))))),
+            true
+        )
+        .await,
+        "equivalent but not identical spelling"
+    );
+    assert!(!tokenless_claim_with(Some(Err("down".to_string())), true).await);
+    assert!(!tokenless_claim_with(Some(Ok(None)), false).await);
+}
+
+#[tokio::test]
+async fn a_tokenless_claim_goes_when_the_source_shows_no_equivalent_contact() {
+    assert!(tokenless_claim_with(Some(Ok(Some(row(None)))), true).await);
+    assert!(
+        tokenless_claim_with(Some(Ok(Some(row(Some("sip:trunk@192.0.2.1:5090"))))), true).await
+    );
+    assert!(tokenless_claim_with(Some(Ok(None)), true).await);
+    assert!(tokenless_claim_with(None, true).await);
+}
+
+/// An escaped spelling of the token parameter's name is the token parameter.
+#[tokio::test]
+async fn a_foreign_token_behind_an_escaped_parameter_name_is_never_cleared() {
+    let manager = Arc::new(test_support::manager().with_instance_id("node-a".to_string()));
+    test_support::install_egress(&manager);
+    test_support::attach_untracked_transactions(&manager);
+    manager.attach_binding_store(BindingStore::in_memory("node-a", 30));
+    let foreign = crate::registrant::contact::instance_token("node-b", AOR);
+    let contact = format!("sip:trunk@192.0.2.1:5060;%72node={foreign}");
+    assert_eq!(cleanup_of(&manager, &contact).deregistered, 0);
+}

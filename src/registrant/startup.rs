@@ -262,7 +262,9 @@ impl RegistrantManager {
                     store.remove_if(&record.aor, &record.call_id);
                     report.dropped += 1;
                 }
-                Outcome::Orphan if !Self::contact_is_held_here(&record.contact, defaults) => {
+                Outcome::Orphan
+                    if !self.contact_is_held_here(&record.contact, &record.aor, defaults) =>
+                {
                     info!(
                         aor = %record.aor,
                         registrar = %record.registrar_uri,
@@ -290,25 +292,50 @@ impl RegistrantManager {
 
     /// The Contact `live`'s REGISTER carries (or will).
     pub(super) fn predicted_contact(
+        &self,
         live: &RegistrantEntry,
         defaults: EgressDefaults<'_>,
     ) -> String {
         live.contact_uri.clone().unwrap_or_else(|| {
             default_contact_uri(
                 &live.credentials.username,
-                super::messages::EntryEgress::of(live, defaults).sent_by,
+                defaults.header_sent_by(
+                    live.transport,
+                    super::messages::EntryEgress::of(live, defaults),
+                ),
                 live.transport,
+                self.contact_token(live).as_deref(),
             )
         })
     }
 
-    /// Whether `contact` names exactly a socket this node registers from: an
-    /// explicit IP and port equal to a specific (non-wildcard) listener or the
-    /// egress address. A wildcard, a name, a missing port or an address the node
-    /// merely could bind never qualifies: those bindings just expire. A registrar
-    /// keys a binding by its Contact (RFC 3261 §10.3), so an `Expires: 0` on a
-    /// Contact another node holds would delete its binding.
-    fn contact_is_held_here(contact: &str, defaults: EgressDefaults<'_>) -> bool {
+    /// Whether the binding stored under `contact` is this node's to clear. A
+    /// registrar keys a binding by its Contact (RFC 3261 §10.3, URIs compared
+    /// per §19.1.4, parameters included), so an `Expires: 0` on a Contact
+    /// another node holds would delete its binding.
+    ///
+    /// - A Contact carrying this instance's token for `aor` (see
+    ///   [`super::contact::instance_token`]) is this node's, whatever its
+    ///   address: a concrete socket, an advertised IP, a host name or an
+    ///   address every node shares. Another instance's token never is, because
+    ///   the two nodes' Contacts differ in that parameter and so do their
+    ///   bindings. A token that is not this node's is not this node's even on
+    ///   one of its own sockets.
+    /// - A Contact with no token (a source row's explicit `contact`, or one an
+    ///   older version stored) falls back to the old rule: exactly a specific
+    ///   (non-wildcard) listener socket or the egress address, with an explicit
+    ///   IP and port. A wildcard, a name, a missing port or an address the node
+    ///   merely could bind never qualifies: those bindings expire.
+    ///
+    /// `others_holding` (no other node records the same AoR and Contact,
+    /// checked again just before the de-REGISTER leaves) stays the second
+    /// guard.
+    fn contact_is_held_here(&self, contact: &str, aor: &str, defaults: EgressDefaults<'_>) -> bool {
+        if let Some(token) = super::contact::contact_token_of(contact) {
+            return self
+                .instance_token(aor)
+                .is_some_and(|own| own.eq_ignore_ascii_case(&token));
+        }
         let Some((host, Some(port))) = contact_host_port(contact) else {
             return false;
         };
@@ -338,7 +365,10 @@ impl RegistrantManager {
         // answer with another frontend after a restart.
         let same_target = live.registrar_uri == record.registrar_uri
             && live.transport == record.transport
-            && Self::predicted_contact(&live, defaults) == record.contact;
+            && super::contact::contacts_equivalent(
+                &self.predicted_contact(&live, defaults),
+                &record.contact,
+            );
         if !same_target {
             return Outcome::Orphan;
         }
@@ -473,17 +503,84 @@ impl RegistrantManager {
         }
     }
 
+    /// Whether the trunk source allows a claim of `aor`'s stored `contact`.
+    ///
+    /// Another node may hold the same binding without a record in Redis yet:
+    /// - behind a shared address, a tokenless Contact (a source row's explicit
+    ///   `contact`, or an older version) is the same binding as a tokened one
+    ///   (RFC 3261 §19.1.4);
+    /// - an explicit `contact` is the same text on every node the row reaches,
+    ///   so a stored tokenless Contact on a socket this node also listens on
+    ///   may be held by the node the trunk moved to.
+    ///
+    /// The answer comes from the source, not from what Redis shows: the AoR's
+    /// live entry when this node lists it, else the source's lookup by AoR.
+    /// - A tokened claim is blocked by an explicit contact in the row.
+    /// - A tokenless claim is blocked by an explicit contact in the row that is
+    ///   equivalent to the stored one.
+    /// - A failed lookup, or a source with no lookup (it cannot say), blocks both.
+    /// - An AoR the source does not know, a row that does not block, or no
+    ///   source at all, allows it.
+    ///
+    /// Known limits: mixed versions during a rolling upgrade (upgrade every node
+    /// before relying on the clean-up behind a shared address), duplicate
+    /// instance ids, and an explicit contact cleared from the source while a
+    /// node was down, with the other node's record not yet in the store: it can
+    /// still be de-registered.
+    async fn source_allows_claim(
+        &self,
+        aor: &str,
+        registrar: &str,
+        contact: &str,
+        tokened: bool,
+    ) -> bool {
+        // A row for another registrar does not hold this registrar's binding.
+        let bare = |uri: &str| uri.trim().trim_start_matches("sip:").to_string();
+        let blocks = |row_registrar: &str, row_contact: Option<&str>| {
+            if bare(row_registrar) != bare(registrar) {
+                return false;
+            }
+            match row_contact
+                .map(str::trim)
+                .filter(|candidate| !candidate.is_empty())
+            {
+                None => false,
+                Some(_) if tokened => true,
+                Some(candidate) => super::contact::contacts_equivalent(candidate, contact),
+            }
+        };
+        if let Some(live) = self.entries.get(aor) {
+            return !blocks(&live.registrar_uri, live.contact_uri.as_deref());
+        }
+        let Some(lookup) = self.restart.credential_lookup.get().cloned() else {
+            return true;
+        };
+        if !lookup.is_configured() {
+            debug!(%aor, "restart clean-up: the source has no lookup, the binding is not claimed");
+            return false;
+        }
+        match lookup.lookup(aor).await {
+            Ok(None) => true,
+            Ok(Some(row)) => !blocks(&row.registrar, row.contact.as_deref()),
+            Err(error) => {
+                warn!(%aor, %error, "restart clean-up: the source cannot say whether the AoR has an explicit contact, nothing is sent");
+                false
+            }
+        }
+    }
+
     async fn startup_deregistration_may_go(&self, call_id: &str) -> bool {
         if self.startup_deregistration_superseded(call_id) {
             return false;
         }
-        let Some((aor, contact)) =
+        let Some((aor, contact, registrar)) =
             self.draining_deregistrations
                 .get(call_id)
                 .and_then(|draining| {
                     Some((
                         draining.entry.aor.clone(),
                         draining.entry.contact_uri.clone()?,
+                        draining.entry.registrar_uri.clone(),
                     ))
                 })
         else {
@@ -492,13 +589,20 @@ impl RegistrantManager {
         let (Some(egress), Some(store)) = (self.egress.get(), self.restart.bindings.get()) else {
             return false;
         };
-        if !Self::contact_is_held_here(&contact, egress.defaults()) {
+        if !self.contact_is_held_here(&contact, &aor, egress.defaults()) {
+            return false;
+        }
+        let tokened = super::contact::contact_token_of(&contact).is_some();
+        if !self
+            .source_allows_claim(&aor, &registrar, &contact, tokened)
+            .await
+        {
             return false;
         }
         match store.others_holding(std::slice::from_ref(&aor)).await {
-            Ok(others) => !others
-                .iter()
-                .any(|other| other.aor == aor && other.contact == contact),
+            Ok(others) => !others.iter().any(|other| {
+                other.aor == aor && super::contact::contacts_equivalent(&other.contact, &contact)
+            }),
             Err(error) => {
                 warn!(%aor, %error, "restart clean-up: the other nodes' bindings cannot be read, nothing is sent");
                 false

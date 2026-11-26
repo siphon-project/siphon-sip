@@ -256,6 +256,40 @@ impl UriExtras {
     }
 }
 
+/// `text` as the octets RFC 3261 §19.1.4 compares: an escape of an unreserved
+/// character (alphanumeric or one of `-_.!~*'()`) is that character, any other
+/// escape stays an escape, with its hex digits upper-cased, so a reserved
+/// character escaped is never the character unescaped. Octets, not text: an
+/// escape of a byte that is not UTF-8 stays distinct from another.
+pub(crate) fn comparable_octets(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut octets = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escaped = (bytes[index] == b'%')
+            .then(|| bytes.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|pair| std::str::from_utf8(pair).ok())
+            .and_then(|pair| u8::from_str_radix(pair, 16).ok().map(|byte| (pair, byte)));
+        match escaped {
+            Some((_, byte)) if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) => {
+                octets.push(byte);
+                index += 3;
+            }
+            Some((pair, _)) => {
+                octets.push(b'%');
+                octets.extend(pair.bytes().map(|digit| digit.to_ascii_uppercase()));
+                index += 3;
+            }
+            None => {
+                octets.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    octets
+}
+
 /// SIP URI as defined in RFC 3261
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SipUri {
@@ -296,6 +330,112 @@ impl SipUri {
     pub fn with_param(mut self, name: String, value: Option<String>) -> Self {
         self.params.push((name, value));
         self
+    }
+
+    /// Whether two URIs are equivalent under RFC 3261 §19.1.4, the comparison
+    /// a registrar keys a binding by.
+    ///
+    /// - The scheme (its text, without case), the host (without case) and the
+    ///   port must match; a port on one URI only is a difference, as in the
+    ///   RFC's own example.
+    /// - The userinfo, the user and its parameters, is compared as a whole,
+    ///   with case and order significant.
+    /// - A `user`, `ttl`, `method`, `maddr` or `transport` parameter on one URI
+    ///   only is a difference. Any other parameter on one URI only is ignored.
+    ///   A parameter on both must match; names and values compare without
+    ///   case, and the order does not matter.
+    /// - A URI header on one URI only is a difference. Header names compare
+    ///   without case and their order does not matter; header values compare
+    ///   exactly, whatever the header: no per-header rule is applied.
+    /// - An escape of an unreserved character is that character everywhere,
+    ///   names included; a reserved character escaped is not the character
+    ///   unescaped. Octets are compared, not text.
+    pub fn is_equivalent_to(&self, other: &SipUri) -> bool {
+        if !self
+            .scheme
+            .as_str()
+            .eq_ignore_ascii_case(other.scheme.as_str())
+            || self.port != other.port
+            || !self.host.eq_ignore_ascii_case(&other.host)
+            || self.user.as_deref().map(comparable_octets)
+                != other.user.as_deref().map(comparable_octets)
+            || !Self::ordered_pairs_equal(self.user_params(), other.user_params())
+        {
+            return false;
+        }
+        Self::pairs_equivalent(self.headers(), other.headers(), true)
+            && Self::pairs_equivalent(&self.params, &other.params, false)
+    }
+
+    /// Userinfo parameters: the same, in the same order, case-sensitively.
+    fn ordered_pairs_equal(
+        left: &[(String, Option<String>)],
+        right: &[(String, Option<String>)],
+    ) -> bool {
+        let octets = |list: &[(String, Option<String>)]| -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+            list.iter()
+                .map(|(name, value)| {
+                    (
+                        comparable_octets(name),
+                        value.as_deref().map(comparable_octets),
+                    )
+                })
+                .collect()
+        };
+        octets(left) == octets(right)
+    }
+
+    /// `headers`: the list is URI headers (values exact) rather than URI
+    /// parameters (values without case). `true` also makes a name on one side
+    /// only a difference; for parameters only the five RFC 3261 §19.1.4 names
+    /// are.
+    fn pairs_equivalent(
+        left: &[(String, Option<String>)],
+        right: &[(String, Option<String>)],
+        headers: bool,
+    ) -> bool {
+        const MUST_MATCH: [&str; 5] = ["user", "ttl", "method", "maddr", "transport"];
+        type Pair = (Vec<u8>, Option<Vec<u8>>);
+        let decode = |list: &[(String, Option<String>)]| -> Vec<Pair> {
+            list.iter()
+                .map(|(name, value)| {
+                    (
+                        comparable_octets(name),
+                        value.as_deref().map(comparable_octets),
+                    )
+                })
+                .collect()
+        };
+        let (left, right) = (decode(left), decode(right));
+        let find = |list: &'_ [Pair], name: &[u8]| {
+            list.iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        };
+        for (name, _) in left.iter().chain(right.iter()) {
+            match (find(&left, name), find(&right, name)) {
+                (Some(a), Some(b)) => {
+                    let same = match (&a, &b) {
+                        (Some(a), Some(b)) if headers => a == b,
+                        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if !same {
+                        return false;
+                    }
+                }
+                _ if headers
+                    || MUST_MATCH
+                        .iter()
+                        .any(|m| name.eq_ignore_ascii_case(m.as_bytes())) =>
+                {
+                    return false
+                }
+                _ => {}
+            }
+        }
+        true
     }
 
     /// URI headers (after `?`). Empty slice when the URI has none, which is
@@ -754,5 +894,144 @@ mod scheme_tests {
         assert_ne!(Scheme::Sip, "sips");
         assert_eq!(Scheme::from_token("http"), "http");
         assert_eq!(Scheme::Sip.as_ref(), "sip");
+    }
+}
+
+#[cfg(test)]
+mod equivalence_tests {
+    use super::*;
+    use crate::sip::parser::parse_uri_complete;
+
+    fn same(left: &str, right: &str) -> bool {
+        let left = parse_uri_complete(left).expect(left);
+        let right = parse_uri_complete(right).expect(right);
+        let forward = left.is_equivalent_to(&right);
+        assert_eq!(forward, right.is_equivalent_to(&left), "{left:?} {right:?}");
+        forward
+    }
+
+    /// RFC 3261 §19.1.4, the examples of equivalent URIs.
+    #[test]
+    fn the_rfc_examples_of_equivalent_uris_match() {
+        assert!(same(
+            "sip:%61lice@atlanta.com;transport=TCP",
+            "sip:alice@AtLanta.COM;Transport=tcp"
+        ));
+        assert!(same(
+            "sip:carol@chicago.com",
+            "sip:carol@chicago.com;newparam=5"
+        ));
+        assert!(same(
+            "sip:carol@chicago.com;security=on",
+            "sip:carol@chicago.com;newparam=5"
+        ));
+        assert!(same(
+            "sip:biloxi.com;transport=tcp;method=REGISTER?to=sip:bob%40biloxi.com",
+            "sip:biloxi.com;method=REGISTER;transport=tcp?to=sip:bob%40biloxi.com"
+        ));
+        assert!(same(
+            "sip:alice@atlanta.com?subject=project%20x&priority=urgent",
+            "sip:alice@atlanta.com?priority=urgent&subject=project%20x"
+        ));
+    }
+
+    /// RFC 3261 §19.1.4, the examples of URIs that differ.
+    #[test]
+    fn the_rfc_examples_of_different_uris_do_not_match() {
+        assert!(!same("sip:ALICE@atlanta.com", "sip:alice@atlanta.com"));
+        assert!(!same("sip:bob@biloxi.com", "sip:bob@biloxi.com:5060"));
+        assert!(!same(
+            "sip:bob@biloxi.com",
+            "sip:bob@biloxi.com;transport=udp"
+        ));
+        assert!(!same("sip:bob@biloxi.com", "sip:bob@192.0.2.4"));
+        assert!(!same(
+            "sip:alice@atlanta.com?subject=project%20x",
+            "sip:alice@atlanta.com"
+        ));
+    }
+
+    #[test]
+    fn a_parameter_on_one_side_only_is_ignored_unless_it_is_one_of_the_five() {
+        assert!(same("sip:u@vip:5060;rnode=a1", "sip:u@vip:5060"));
+        for special in ["user=phone", "ttl=3", "method=INVITE", "maddr=192.0.2.1"] {
+            assert!(
+                !same(&format!("sip:u@vip:5060;{special}"), "sip:u@vip:5060"),
+                "{special}"
+            );
+        }
+        // Both sides: they must match, names and values without case.
+        assert!(same(
+            "sip:u@vip:5060;RNode=AB12",
+            "sip:u@vip:5060;rnode=ab12"
+        ));
+        assert!(!same(
+            "sip:u@vip:5060;rnode=ab12",
+            "sip:u@vip:5060;rnode=cd34"
+        ));
+    }
+
+    #[test]
+    fn the_scheme_is_part_of_the_identity() {
+        assert!(!same("sip:u@vip:5060", "sips:u@vip:5060"));
+    }
+
+    /// The parser keeps `SIP:` as `Scheme::Other("SIP")`; the scheme is
+    /// case-insensitive (RFC 3261 §19.1.1, §19.1.4).
+    #[test]
+    fn the_scheme_text_is_compared_without_case() {
+        let lower = parse_uri_complete("sip:u@host:5060;rnode=t").expect("uri");
+        let mut upper = lower.clone();
+        upper.scheme = Scheme::from_token("SIP");
+        assert!(lower.is_equivalent_to(&upper));
+        assert!(upper.is_equivalent_to(&lower));
+        let mut other = lower.clone();
+        other.scheme = Scheme::from_token("SIPS");
+        assert!(!lower.is_equivalent_to(&other));
+    }
+
+    /// An escape of an unreserved character is that character, in parameter
+    /// and header names too.
+    #[test]
+    fn escaped_unreserved_characters_in_names_are_decoded() {
+        assert!(same("sip:u@h;%74ransport=tcp", "sip:u@h;transport=tcp"));
+        assert!(!same("sip:u@h;%74ransport=tcp", "sip:u@h"));
+        assert!(same("sip:u@h?%73ubject=x", "sip:u@h?subject=x"));
+    }
+
+    /// A reserved character escaped is not the character unescaped, and
+    /// octets that are not UTF-8 do not collapse into one another.
+    #[test]
+    fn reserved_escapes_are_kept_and_octets_compared_raw() {
+        assert!(!same("sip:a/b@h", "sip:a%2Fb@h"));
+        assert!(same("sip:a%2Fb@h", "sip:a%2fb@h"));
+        assert!(!same("sip:a%FFb@h", "sip:a%FEb@h"));
+        assert!(same("sip:%61lice@h", "sip:alice@h"));
+    }
+
+    /// The userinfo, user and its parameters, is compared as a whole, with
+    /// case and order significant.
+    #[test]
+    fn the_userinfo_keeps_case_and_order() {
+        assert!(!same(
+            "sip:alice;day=Tuesday@host:5060",
+            "sip:alice;day=tuesday@host:5060"
+        ));
+        assert!(!same(
+            "sip:alice;a=1;b=2@host:5060",
+            "sip:alice;b=2;a=1@host:5060"
+        ));
+        assert!(same(
+            "sip:alice;a=1;b=2@host:5060",
+            "sip:alice;a=1;b=2@host:5060"
+        ));
+    }
+
+    /// Header values are compared exactly, whatever the header: no per-header
+    /// rules (the Call-ID, a token, an address) are applied.
+    #[test]
+    fn header_values_are_case_sensitive() {
+        assert!(!same("sip:u@h?Call-ID=ABC", "sip:u@h?Call-ID=abc"));
+        assert!(same("sip:u@h?Call-ID=ABC", "sip:u@h?call-id=ABC"));
     }
 }

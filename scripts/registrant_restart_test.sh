@@ -17,6 +17,11 @@
 #   scripts/registrant_restart_test.sh
 #   SIPHON_BIN=target/release/siphon scripts/registrant_restart_test.sh
 #   DEFAULT_CONTACT=1 scripts/registrant_restart_test.sh   # the generated Contact
+#   WILDCARD_ADVERTISED=1 scripts/registrant_restart_test.sh
+#       # the cloud shape: listen on 0.0.0.0 with an advertised_address on no
+#       # local interface (a public address in front of a 1:1 NAT). The generated
+#       # Contact and the Via must name the advertised address, never 0.0.0.0, and
+#       # the clean-up must still recognise the Contact (its per-node token) as this node's.
 #
 # Needs redis-server, redis-cli, sipp and python3 on the PATH and a built siphon
 # binary (default: $CARGO_TARGET_DIR or target, release profile). Starts its own
@@ -69,7 +74,18 @@ redis-server --port "${REDIS_PORT}" --bind 127.0.0.1 --save "" --appendonly no \
 for _ in $(seq 50); do redis-cli -p "${REDIS_PORT}" ping >/dev/null 2>&1 && break; sleep 0.1; done
 
 echo listed > "${WORK}/state"
-if [[ -n "${DEFAULT_CONTACT:-}" ]]; then export TRUNK_CONTACT=""; fi
+# The restart clean-up claims a tokenless (explicit) Contact only when the source's
+# row for the AoR shows no equivalent explicit contact: the lookup serves the row
+# without it, as after the controller cleared the override.
+export LOOKUP_WITHOUT_CONTACT=1
+if [[ -n "${DEFAULT_CONTACT:-}" || -n "${WILDCARD_ADVERTISED:-}" ]]; then export TRUNK_CONTACT=""; DEFAULT_CONTACT=1; fi
+ADVERTISED="203.0.113.10"
+LISTEN_ADDRESS="127.0.0.1"
+ADVERTISED_YAML=""
+if [[ -n "${WILDCARD_ADVERTISED:-}" ]]; then
+  LISTEN_ADDRESS="0.0.0.0"
+  ADVERTISED_YAML="advertised_address: \"${ADVERTISED}\""
+fi
 python3 -I scripts/registrant_restart_source.py "${SOURCE_PORT}" "${WORK}/state" "${TOKEN}" \
   "${LOOKUP_PASSWORD:-secret123}" &
 SOURCE_PID=$!
@@ -81,7 +97,8 @@ done
 cat > "${WORK}/siphon.yaml" <<EOF
 listen:
   udp:
-    - "127.0.0.1:${SIP_PORT}"
+    - "${LISTEN_ADDRESS}:${SIP_PORT}"
+${ADVERTISED_YAML}
 domain:
   local:
     - "example.test"
@@ -152,11 +169,11 @@ start_registrar first
 start_siphon first
 await_registrar first 40 || fail "the registrar never saw the trunk's REGISTER"
 
-key="$(redis-cli -p "${REDIS_PORT}" --scan --pattern 'siphon:registrant:*' | head -1)"
+key="$(redis-cli -p "${REDIS_PORT}" --scan --pattern "siphon:registrant:${INSTANCE}:*" | head -1)"
 for _ in $(seq 50); do
   [[ -n "${key}" ]] && break
   sleep 0.1
-  key="$(redis-cli -p "${REDIS_PORT}" --scan --pattern 'siphon:registrant:*' | head -1)"
+  key="$(redis-cli -p "${REDIS_PORT}" --scan --pattern "siphon:registrant:${INSTANCE}:*" | head -1)"
 done
 [[ -n "${key}" ]] || fail "no binding record in Redis after the registration"
 echo "[*] record: ${key}"
@@ -198,6 +215,29 @@ dereg_contact="$(header_of "${WORK}/registrar-second.msg" Contact 1)"
 retry_contact="$(header_of "${WORK}/registrar-second.msg" Contact 2)"
 [[ -n "${first_contact}" && "${dereg_contact}" == "${first_contact}" && "${retry_contact}" == "${first_contact}" ]] \
   || fail "the de-REGISTER Contacts (${dereg_contact} / ${retry_contact}) are not the registered one (${first_contact})"
+if [[ -n "${WILDCARD_ADVERTISED:-}" ]]; then
+  [[ "${first_contact}" == *"@${ADVERTISED}:${SIP_PORT}"* ]] \
+    || fail "the Contact (${first_contact}) does not name the advertised address ${ADVERTISED}:${SIP_PORT}"
+  first_via="$(header_of "${WORK}/registrar-first.msg" Via 1)"
+  [[ "${first_via}" == *" ${ADVERTISED}:${SIP_PORT};"* ]] \
+    || fail "the Via (${first_via}) does not name the advertised address"
+  grep -q "0\.0\.0\.0" <<<"${first_contact} ${first_via}" && fail "the wildcard is on the wire"
+fi
+if [[ -n "${DEFAULT_CONTACT:-}" ]]; then
+  # A generated Contact carries this instance's token (FNV-1a 64 of the instance
+  # id, a zero byte and the AoR), the same on the de-REGISTER and its retry.
+  token="$(python3 -I - "${INSTANCE}" "${AOR}" <<'PY'
+import sys
+h = 0xcbf29ce484222325
+for b in sys.argv[1].encode() + b"\0" + sys.argv[2].encode():
+    h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+print(f"{h:016x}")
+PY
+)"
+  [[ "${first_contact}" == *";rnode=${token}"* ]] \
+    || fail "the Contact (${first_contact}) does not carry this instance's token ${token}"
+  [[ "${first_contact}" != *"${INSTANCE}"* ]] || fail "the instance id is on the wire"
+fi
 (( dereg_cseq > first_cseq )) || fail "de-REGISTER CSeq ${dereg_cseq} does not outrank ${first_cseq}"
 (( retry_cseq > dereg_cseq )) || fail "retry CSeq ${retry_cseq} does not outrank ${dereg_cseq}"
 grep -q "authorised=True" "${WORK}/state.requests" && grep -q "^/lookup" "${WORK}/state.requests" \

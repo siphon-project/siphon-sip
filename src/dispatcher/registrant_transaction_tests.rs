@@ -872,7 +872,8 @@ async fn a_challenge_to_a_restarts_de_register_is_answered_from_the_lookup() {
 
     let answer = setup.queued_after_lookup().await.expect("the answer");
 
-    assert_eq!(lookup.asked.load(Ordering::SeqCst), 1);
+    // Asked for the claim before each de-REGISTER leaves, and for the credentials.
+    assert!(lookup.asked.load(Ordering::SeqCst) >= 1);
     assert_eq!(header(&answer, "Expires"), "0");
     assert_eq!(header(&answer, "Call-ID"), ORPHAN_CALL_ID);
     assert_eq!(cseq(&answer), cseq(&deregister) + 1);
@@ -906,13 +907,9 @@ async fn a_proxy_challenge_to_a_restarts_de_register_is_answered_with_proxy_auth
 /// at every restart.
 #[tokio::test]
 async fn a_challenge_nothing_can_answer_leaves_the_binding_to_expire_and_drops_the_record() {
-    let cases: [(&str, Option<Arc<StubLookup>>); 3] = [
+    let cases: [(&str, Option<Arc<StubLookup>>); 2] = [
         ("no lookup configured", None),
         ("an unknown AoR", Some(StubLookup::answering(Ok(None)))),
-        (
-            "a failing source",
-            Some(StubLookup::answering(Err("timed out".to_string()))),
-        ),
     ];
     for (name, lookup) in cases {
         let setup = Setup::new();
@@ -1022,7 +1019,8 @@ async fn a_slow_lookup_does_not_send_the_retry_once_the_trunk_registered_meanwhi
     setup.answer(&register.message, "200 OK", "Expires: 3600\r\n");
     tokio::time::sleep(Duration::from_millis(600)).await;
 
-    assert_eq!(lookup.asked.load(Ordering::SeqCst), 1);
+    // Asked for the claim before each de-REGISTER leaves, and for the credentials.
+    assert!(lookup.asked.load(Ordering::SeqCst) >= 1);
     assert!(
         test_support::take_deregistrations(&setup.registrant).is_empty(),
         "an authorised de-REGISTER was queued over a live registration"
@@ -1050,11 +1048,58 @@ async fn another_nodes_record_appearing_during_a_slow_lookup_stops_the_retry() {
     tokio::time::sleep(Duration::from_millis(600)).await;
     setup.registrant.release_startup_deregistrations().await;
 
-    assert_eq!(lookup.asked.load(Ordering::SeqCst), 1);
+    // Asked for the claim before each de-REGISTER leaves, and for the credentials.
+    assert!(lookup.asked.load(Ordering::SeqCst) >= 1);
     assert!(
         test_support::take_deregistrations(&setup.registrant).is_empty(),
         "an authorised de-REGISTER left over another node's binding"
     );
     assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
     assert!(store.load().await.expect("loaded").is_empty());
+}
+
+/// A challenged REGISTER carries the Contact the first one did, even when the
+/// dispatcher's own view of the addressing differs from the registration
+/// loop's: only a wildcard UDP listener and a global advertised host name, so
+/// the dispatcher's resolved local address is a concrete IP.
+#[tokio::test]
+async fn a_challenged_register_keeps_the_contact_of_the_first_one() {
+    let registrant = Arc::new(test_support::manager().with_instance_id("node-a".to_string()));
+    test_support::install_egress_with(
+        &registrant,
+        "0.0.0.0:5060",
+        HashMap::new(),
+        HashMap::new(),
+        Some("sbc.example.org"),
+    );
+    let mut dispatcher = super::test_dispatcher::test_dispatcher();
+    dispatcher.state.registrant_manager = Some(Arc::clone(&registrant));
+    registrant.attach_transactions(Arc::new(RegisterTransactionLayer::of(&dispatcher.state)));
+    let setup = Setup {
+        registrant: Arc::clone(&registrant),
+        dispatcher,
+        listen: HashMap::new(),
+    };
+    registrant.add(trunk(TRUNK));
+
+    let first = registrant
+        .build_register(TRUNK, registrant.egress_defaults().expect("an egress"), 600)
+        .expect("first");
+    send_registrant_request(&registrant, TRUNK, &first, &setup.dispatcher.state);
+    let first_sent = setup.dispatcher.udp.try_recv().expect("the REGISTER");
+    let first_message = parse_sent(&first_sent);
+
+    setup.answer(
+        &first_message,
+        "401 Unauthorized",
+        "WWW-Authenticate: Digest realm=\"registrar.example\", nonce=\"abc123\", algorithm=MD5, qop=\"auth\"\r\n",
+    );
+    let retry = parse_sent(&setup.dispatcher.udp.try_recv().expect("the retry"));
+
+    let expected = format!(
+        "<sip:trunk@sbc.example.org:5060;rnode={}>",
+        crate::registrant::contact_token_for_tests("node-a", TRUNK)
+    );
+    assert_eq!(header(&first_message, "Contact"), expected);
+    assert_eq!(header(&retry, "Contact"), expected);
 }

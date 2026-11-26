@@ -696,6 +696,15 @@ registrar:
 # without shutting down de-registers at restart what it left on the registrar,
 # instead of leaving a second contact there until it expires.
 #
+# EVERY NODE NEEDS A UNIQUE `server.instance_id` (or a unique HOSTNAME) for that
+# clean-up. The Contact siphon generates for a trunk carries `;rnode=<hash of the
+# instance id and the AoR>`, which is how a node knows a stored binding is its own
+# and not another node's behind the same address; two nodes with one id share the
+# token and the Redis keys and would clear each other's bindings. With neither set
+# the built-in id "siphon" is the same everywhere: no token is generated and only
+# bindings on a concrete listener socket are cleared. (Changing the id changes the
+# Contact, and so the binding.)
+#
 # Script-managed entries (still supported, and unaffected by the above):
 # Use the `registration` Python API to add/remove entries from scripts.
 # This is useful when trunk credentials are stored in a database and may
@@ -1743,6 +1752,10 @@ auth:
 # Server identity headers
 # ---------------------------------------------------------------------------
 # server:
+#   instance_id: "edge-1"            # unique per node (default: $HOSTNAME, then "siphon").
+#                                    # Names the node in the registrar's records, the
+#                                    # media-control claim and the registrant's Contact
+#                                    # token: two nodes must never share one.
 #   server_header: "SIPhon/0.1.0"    # default: "SIPhon/<cargo version>"
 #   user_agent_header: "SIPhon/0.1.0" # default: "SIPhon/<cargo version>"
 #   drain_secs: 30                    # Graceful shutdown drain (seconds).

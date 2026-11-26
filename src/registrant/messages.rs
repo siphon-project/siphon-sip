@@ -22,6 +22,11 @@ pub struct EgressDefaults<'a> {
     /// The UE side of a process-address entry's IPsec SAs (the dispatcher's
     /// resolved local address).
     pub ue_ip: IpAddr,
+    /// `advertised_addrs`: the per-transport advertised addresses, merged by
+    /// the caller with the global one or not. Empty when none are set.
+    pub advertised_addrs: Option<&'a HashMap<Transport, String>>,
+    /// The global `advertised_address`.
+    pub advertised_address: Option<&'a str>,
 }
 
 impl<'a> EgressDefaults<'a> {
@@ -32,7 +37,71 @@ impl<'a> EgressDefaults<'a> {
             local_addr,
             listen_addrs,
             ue_ip: local_addr.ip(),
+            advertised_addrs: None,
+            advertised_address: None,
         }
+    }
+
+    /// The same defaults with the node's advertised addresses: a wildcard
+    /// listener names one of them, not itself, in a Via and Contact.
+    pub fn with_advertised(
+        mut self,
+        advertised_addrs: &'a HashMap<Transport, String>,
+        advertised_address: Option<&'a str>,
+    ) -> Self {
+        self.advertised_addrs = Some(advertised_addrs);
+        self.advertised_address = advertised_address;
+        self
+    }
+
+    /// The `host:port` an entry's REGISTER names in its Via sent-by and default
+    /// Contact. For a wildcard listener with an advertised address configured,
+    /// that address as written, a host name or an IP literal, per transport
+    /// before global, on the listener's port (RFC 3261 §20.42 and §19.1 allow a
+    /// name in both); otherwise the socket address `egress` resolved. The
+    /// socket and the source it is pinned to stay addresses, separate from it.
+    pub(super) fn header_sent_by(&self, transport: Transport, egress: EntryEgress) -> String {
+        let listener = self
+            .listen_addrs
+            .get(&transport)
+            .copied()
+            .unwrap_or(self.local_addr);
+        if egress.own_address || !listener.ip().is_unspecified() {
+            return egress.sent_by.to_string();
+        }
+        let advertised = self
+            .advertised_addrs
+            .and_then(|addrs| addrs.get(&transport).map(String::as_str))
+            .or(self.advertised_address)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        match advertised {
+            Some(host) => format!(
+                "{}:{}",
+                crate::sip::uri::format_sip_host(host),
+                listener.port()
+            ),
+            None => egress.sent_by.to_string(),
+        }
+    }
+
+    /// The address a request leaving from `listener` (a socket of `transport`)
+    /// names in its Via sent-by and Contact (RFC 3261 §18.2.1, §20.42, §10.2.1):
+    /// the listener's own address when it is specific, else, for a wildcard,
+    /// the advertised address (per transport, then global) on the listener's
+    /// port, else the routable local address: the rule the proxy's own Via
+    /// follows, never `0.0.0.0` or `::` on the wire.
+    pub fn sent_by_of(&self, transport: Transport, listener: SocketAddr) -> SocketAddr {
+        if !listener.ip().is_unspecified() {
+            return listener;
+        }
+        let none = HashMap::new();
+        crate::uac::resolve_via_addr(
+            listener,
+            &transport,
+            self.advertised_addrs.unwrap_or(&none),
+            self.advertised_address,
+        )
     }
 
     /// The port an entry's plain (unprotected) SIP socket uses on its own
@@ -67,11 +136,16 @@ impl EntryEgress {
             // REGISTER could egress from a protected port while the Via said
             // 5060, breaking the 401 return path.
             None => Self {
-                sent_by: defaults
-                    .listen_addrs
-                    .get(&entry.transport)
-                    .copied()
-                    .unwrap_or(defaults.local_addr),
+                // The socket it leaves from stays the listener (`source`); what
+                // it names is the advertised address when that is a wildcard.
+                sent_by: defaults.sent_by_of(
+                    entry.transport,
+                    defaults
+                        .listen_addrs
+                        .get(&entry.transport)
+                        .copied()
+                        .unwrap_or(defaults.local_addr),
+                ),
                 source: (entry.transport == Transport::Udp).then(|| {
                     defaults
                         .listen_addrs
@@ -160,14 +234,19 @@ impl RegistrantManager {
     ) -> Option<BuiltRegister> {
         let challenge_rejected = authorization.is_some();
         let egress = EntryEgress::of(entry, defaults);
-        let effective_addr = egress.sent_by;
+        let effective_addr = defaults.header_sent_by(entry.transport, egress);
         let cseq = entry.next_cseq();
         let branch = format!("z9hG4bK-reg-{}", uuid::Uuid::new_v4());
 
         let request_uri = registrar_request_uri(&entry.registrar_uri);
 
         let contact = entry.contact_uri.clone().unwrap_or_else(|| {
-            default_contact_uri(&entry.credentials.username, effective_addr, entry.transport)
+            default_contact_uri(
+                &entry.credentials.username,
+                &effective_addr,
+                entry.transport,
+                self.contact_token(entry).as_deref(),
+            )
         });
         entry.sent_contact = Some(contact.clone());
 
@@ -296,7 +375,7 @@ impl RegistrantManager {
         expires: u32,
     ) -> Option<BuiltRegister> {
         let egress = EntryEgress::of(entry, defaults);
-        let effective_addr = egress.sent_by;
+        let effective_addr = defaults.header_sent_by(entry.transport, egress);
         let cseq = entry.next_cseq();
         let branch = format!("z9hG4bK-reg-{}", uuid::Uuid::new_v4());
 
@@ -308,7 +387,12 @@ impl RegistrantManager {
         let request_uri = registrar_request_uri(&entry.registrar_uri);
 
         let contact = entry.contact_uri.clone().unwrap_or_else(|| {
-            default_contact_uri(&entry.credentials.username, effective_addr, entry.transport)
+            default_contact_uri(
+                &entry.credentials.username,
+                &effective_addr,
+                entry.transport,
+                self.contact_token(entry).as_deref(),
+            )
         });
         entry.sent_contact = Some(contact.clone());
 
@@ -478,7 +562,7 @@ impl RegistrantManager {
         let challenge_rejected = res.is_empty();
 
         let egress = EntryEgress::of(&entry, defaults);
-        let effective_addr = egress.sent_by;
+        let effective_addr = defaults.header_sent_by(entry.transport, egress);
         let cseq = entry.next_cseq();
         let branch = format!("z9hG4bK-reg-{}", uuid::Uuid::new_v4());
 
@@ -494,18 +578,25 @@ impl RegistrantManager {
         // the binding the network then sends requests to over the set (TS
         // 24.229 5.1.1.2.2 b, c; 5.1.1.4.2 b, c; TS 33.203 7.1); any other
         // names the plain port.
-        let via_sent_by = match entry.ue_ipsec.as_ref() {
+        let (via_sent_by, via_host) = match entry.ue_ipsec.as_ref() {
             Some(ipsec) if security_verify.is_some() => {
-                SocketAddr::new(entry.local_addr.unwrap_or(defaults.ue_ip), ipsec.ue_port_s)
+                let protected =
+                    SocketAddr::new(entry.local_addr.unwrap_or(defaults.ue_ip), ipsec.ue_port_s);
+                (protected, protected.to_string())
             }
-            _ => effective_addr,
+            _ => (egress.sent_by, effective_addr.clone()),
         };
         let contact = entry.contact_uri.clone().unwrap_or_else(|| {
-            default_contact_uri(&entry.credentials.username, via_sent_by, entry.transport)
+            default_contact_uri(
+                &entry.credentials.username,
+                &via_host,
+                entry.transport,
+                None,
+            )
         });
         let via = format!(
             "SIP/2.0/{} {};branch={};rport",
-            entry.transport, via_sent_by, branch
+            entry.transport, via_host, branch
         );
 
         let nc = entry.nonce_counter.next_for(&challenge.nonce);
@@ -637,3 +728,7 @@ pub(super) fn empty_response(authorization: &str) -> String {
         None => authorization.to_string(),
     }
 }
+
+#[cfg(test)]
+#[path = "advertised_tests.rs"]
+mod advertised_tests;

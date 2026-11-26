@@ -66,7 +66,12 @@ def main() -> None:
             if url.path == "/lookup":
                 aor = urllib.parse.parse_qs(url.query).get("aor", [""])[0]
                 if aor == AOR:
-                    return self._answer(200, {**TRUNK, "password": lookup_password})
+                    row = {**TRUNK, "password": lookup_password}
+                    if os.environ.get("LOOKUP_WITHOUT_CONTACT"):
+                        # The row as it is now: its explicit contact was cleared, so
+                        # the stored one is not held by a node the source still names.
+                        row.pop("contact", None)
+                    return self._answer(200, row)
                 return self._answer(404, None)
             return self._answer(404, None)
 

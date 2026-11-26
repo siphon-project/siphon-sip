@@ -581,7 +581,7 @@ impl RegistrantManager {
         // the requests for this UE over the set (TS 24.229 5.1.1.4.2 b,
         // 5.1.1.6.2 b; TS 33.203 7.1).
         let contact = entry.contact_uri.clone().unwrap_or_else(|| {
-            default_contact_uri(&entry.credentials.username, sent_by, entry.transport)
+            default_contact_uri(&entry.credentials.username, sent_by, entry.transport, None)
         });
         let mut builder = SipMessageBuilder::new()
             .request(

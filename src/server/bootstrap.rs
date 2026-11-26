@@ -188,6 +188,31 @@ pub(crate) fn instance_id(config: &Config) -> String {
         .unwrap_or_else(|| "siphon".to_string())
 }
 
+/// `server.instance_id` or `HOSTNAME`, when one of them names this node.
+pub(crate) fn explicit_instance_id(config: &Config) -> Option<String> {
+    let (id, explicit) = resolve_instance_id(
+        config
+            .server
+            .as_ref()
+            .and_then(|server| server.instance_id.as_deref()),
+        std::env::var("HOSTNAME").ok().as_deref(),
+    );
+    explicit.then_some(id)
+}
+
+/// The id from `configured`, else `hostname`, else the built-in `"siphon"`;
+/// and whether it names this node. The built-in is the same on every node that
+/// sets neither, so it names none.
+pub(crate) fn resolve_instance_id(
+    configured: Option<&str>,
+    hostname: Option<&str>,
+) -> (String, bool) {
+    match configured.or(hostname) {
+        Some(id) => (id.to_string(), true),
+        None => ("siphon".to_string(), false),
+    }
+}
+
 /// Reconcile a new IPsec manager with what a previous process left behind, and
 /// return how many kernel SAs it adopted.
 ///
@@ -1444,4 +1469,32 @@ pub(super) async fn init_gateway_allow_set(
     }
     crate::firewall::gateways::install(Arc::clone(&allow_set));
     tokio::spawn(allow_set.run());
+}
+
+#[cfg(test)]
+mod instance_identity_tests {
+    use super::*;
+
+    /// The built-in "siphon" fallback is the same on every node that sets
+    /// neither `server.instance_id` nor `HOSTNAME`: it names no node.
+    #[test]
+    fn the_built_in_fallback_is_not_an_explicit_identity() {
+        assert_eq!(
+            resolve_instance_id(None, None),
+            (String::from("siphon"), false)
+        );
+        assert_eq!(
+            resolve_instance_id(Some("edge-1"), Some("host")),
+            (String::from("edge-1"), true)
+        );
+        assert_eq!(
+            resolve_instance_id(None, Some("host")),
+            (String::from("host"), true)
+        );
+        // The same name, configured, is a choice.
+        assert_eq!(
+            resolve_instance_id(Some("siphon"), None),
+            (String::from("siphon"), true)
+        );
+    }
 }
