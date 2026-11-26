@@ -346,3 +346,40 @@ class TestScope:
             "call-1@example.com", "tag-a", reason="detached", scope="out"
         )
         assert [split["scope"] for split in engine.splits.values()] == [None]
+
+
+class TestNegotiatedTakeover:
+    def test_a_takeover_negotiated_at_offer_and_answer_refuses_a_split(self, engine):
+        target = ("call-1@example.com", "tag-a")
+        asyncio.run(engine.offer(target, sdp="v=0\r\n", ws_uri="wss://ai.example.net/s"))
+        asyncio.run(engine.answer(target, sdp="v=0\r\n", to_tag="tag-b", ws_uri="wss://ai.example.net/s"))
+        with pytest.raises(RuntimeError) as raised:
+            attach(engine)
+        assert raised.value.token == "ws-split-already-bridged"
+
+    def test_the_takeover_goes_with_the_call(self, engine):
+        target = ("call-1@example.com", "tag-a")
+        asyncio.run(engine.offer(target, sdp="v=0\r\n", ws_uri="wss://ai.example.net/s"))
+        asyncio.run(engine.answer(target, sdp="v=0\r\n", to_tag="tag-b", ws_uri="wss://ai.example.net/s"))
+        asyncio.run(engine.delete_call("call-1@example.com"))
+        engine.anchor_call("call-1@example.com")
+        assert attach(engine) is True
+
+
+class TestEndedCallDeleted:
+    def test_call_deleted_forgets_the_call_like_a_delete(self, engine):
+        engine.anchor_call("call-1@example.com")
+        asyncio.run(
+            engine.attach_ws_bridge(("call-1@example.com", "tag-a"), "wss://ai.example.net/s")
+        )
+        engine.splits["call-1@example.com"] = {
+            "call_id": "call-1@example.com", "scope": None, "from_tag": "tag-a",
+            "stream_id": "split-call-1@example.com", "ws_uri": "wss://x",
+            "sample_rate": 16000, "offerer_profile": None, "answerer_profile": None,
+            "isolated": True, "ended": False, "end_reason": None,
+        }
+        engine.fire_ws_split_ended("call-1@example.com", "tag-a", reason="call_deleted")
+        with pytest.raises(RuntimeError, match="unknown call"):
+            attach(engine)
+        engine.anchor_call("call-1@example.com")
+        assert attach(engine) is True, "no takeover is left behind"

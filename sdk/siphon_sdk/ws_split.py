@@ -565,7 +565,12 @@ class _WsSplitMixin:
                 "the engine reports one end per split"
             )
         stream_id = stream_id or split["stream_id"]
-        if reason in _RESTORING_REASONS:
+        if reason == "call_deleted":
+            # The engine deleted the call: everything it held for it goes, as
+            # for a delete (reported once, below).
+            split["ended"] = True
+            self._forget_call(call_id, scope)
+        elif reason in _RESTORING_REASONS:
             self.splits.pop(key)
         else:
             split["ended"] = True

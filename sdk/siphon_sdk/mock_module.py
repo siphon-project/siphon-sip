@@ -6233,7 +6233,14 @@ class MockRtpEngine(_WsSplitMixin):
         self.operations.append(("answer", profile))
         self.media_scopes.append(("answer", scope))
         self._track_answered(_resolve_media_target(call if call is not None else reply)[0], scope=scope)
-        self.ws_uris.append(("answer", self._resolve_ws_uri(ws_uri, call or reply)))
+        resolved_ws_uri = self._resolve_ws_uri(ws_uri, call or reply)
+        self.ws_uris.append(("answer", resolved_ws_uri))
+        if resolved_ws_uri is not None:
+            # A takeover negotiated at offer/answer: the engine refuses a split
+            # over it, and it goes with the call like an attached one.
+            self._record_takeover(
+                _resolve_media_target(call if call is not None else reply)[0], scope, True
+            )
         self.media_overrides.append(("answer", _media_overrides(
             beep_detection, beep_cadence_guard_ms, ws_sample_rate,
             ws_tee_sample_rate, ws_vad_engine, ws_vad_min_speech_ms,
@@ -8881,6 +8888,7 @@ class MockRtpEngine(_WsSplitMixin):
         self._conference_dtmf_supported = True
         self._conference_seat_refusal = None
         self._anchored_legs.clear()
+        self.ws_uris.clear()
         self._ws_split_clear()
 
 
