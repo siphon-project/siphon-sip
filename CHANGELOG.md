@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.18.0] — 2026-11-26
+
 ### Added
 
 - `lawful_intercept.x2.network_function_id`: the Network Function ID (TS 103 221-2 clause 5.3.7, attribute 6) that every X2 PDU carries. It defaults to `lawful_intercept.x1.ne_identifier`, and with neither set PDUs carry no NFID. It must equal the media engine's `x3_network_function_id` so a mediation function files the signalling and the content of one call under one network element. A value that is empty, over 255 octets or holds a control character is refused at config load.
