@@ -2600,6 +2600,11 @@
         "kind": "method_descriptor",
         "sig": "($self, target, ws_uri, profile=None, scope=None)"
       },
+      "attach_ws_split": {
+        "doc": "Attach a **split bridge** to a live, answered two-party call: both legs",
+        "kind": "method_descriptor",
+        "sig": "($self, target, ws_uri, sample_rate=None, offerer_profile=None, answerer_profile=None, scope=None)"
+      },
       "attach_ws_tee": {
         "doc": "Attach a **WebSocket tee** to a live call \u2014 stream a copy of its decoded",
         "kind": "method_descriptor",
@@ -2690,6 +2695,11 @@
         "kind": "method_descriptor",
         "sig": "($self, target, scope=None)"
       },
+      "detach_ws_split": {
+        "doc": "Detach a call's **split bridge**, putting the direct path back between",
+        "kind": "method_descriptor",
+        "sig": "($self, target, scope=None)"
+      },
       "detach_ws_tee": {
         "doc": "Detach a call's **WebSocket tee**, closing its stream.",
         "kind": "method_descriptor",
@@ -2756,6 +2766,16 @@
       },
       "on_ws_bridge_started": {
         "doc": "Register a handler for **WebSocket takeover bridge started** events.",
+        "kind": "method_descriptor",
+        "sig": "($self, func_or_none=None, *, call_id=None, from_tag=None)"
+      },
+      "on_ws_split_ended": {
+        "doc": "Register a handler for **split bridge ended** events.",
+        "kind": "method_descriptor",
+        "sig": "($self, func_or_none=None, *, call_id=None, from_tag=None)"
+      },
+      "on_ws_split_started": {
+        "doc": "Register a handler for **split bridge started** events.",
         "kind": "method_descriptor",
         "sig": "($self, func_or_none=None, *, call_id=None, from_tag=None)"
       },

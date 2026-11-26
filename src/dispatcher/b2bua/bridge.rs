@@ -128,6 +128,7 @@ pub fn bridge_leg_snapshot(
             // the real tee on a leg that had one was never detached at all.
             has_tee: session.ws_tee.is_some(),
             has_ws_bridge: session.ws_bridge_attached,
+            has_ws_split: session.ws_split_attached,
             has_playback: crate::rtpengine::MediaBackend::playback_started(
                 session.rtpengine_id(),
                 &session.from_tag,
@@ -243,6 +244,13 @@ pub async fn bridge_run_media_step(
             from_tag,
         } => backend
             .detach_ws_bridge(media_call_id, from_tag)
+            .await
+            .map(|()| None),
+        MediaStep::DetachSplit {
+            media_call_id,
+            from_tag,
+        } => backend
+            .detach_ws_split(media_call_id, from_tag)
             .await
             .map(|()| None),
         MediaStep::DeleteSession {
@@ -1277,6 +1285,7 @@ pub fn bridge_adopt_media(
             ws_uri: None,
             ws_tee: None,
             ws_bridge_attached: false,
+            ws_split_attached: false,
             bridge_sides,
             created_at: std::time::Instant::now(),
         });

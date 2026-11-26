@@ -250,6 +250,7 @@ impl OfferCommand {
                 ws_uri: self.ws_uri,
                 ws_tee: flags.ws_tee.clone(),
                 ws_bridge_attached: false,
+                ws_split_attached: false,
                 bridge_sides: None,
                 created_at: std::time::Instant::now(),
             });

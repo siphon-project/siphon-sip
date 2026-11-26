@@ -52,8 +52,9 @@ it nowhere, with nothing logged and silence on the line.
 ## WebSocket audio: bridge vs tee
 
 `siphon-rtp` can stream a call's decoded audio to a WebSocket media server in
-two different shapes. They look similar in config and are not interchangeable —
-picking the wrong one is the most likely way to get this wrong.
+two different shapes, and a third, the **split**, that puts both parties of a
+call on one stereo socket. They look similar in config and are not
+interchangeable: picking the wrong one is the most likely way to get this wrong.
 
 | | `ws_uri` / `attach_ws_bridge` — **bridge** | `ws_tee` / `attach_ws_tee` — **tee** |
 |---|---|---|
@@ -104,6 +105,78 @@ took the bridge with it) are the orderly ends; every other reason
 and hearing nothing, which is why an unexpected end is logged at WARN
 even when no handler is registered. A re-point arrives as an `ended` with reason
 `detached` followed by a fresh `started`.
+
+**Split (`attach_ws_split`).** A third shape, for live translation and
+coaching: both legs of an *answered two-party call* stream to **one duplex
+stereo WebSocket**, and the two parties are isolated from each other for as long
+as it is attached. Channel 0 is the offerer (the party whose tag is the call's
+`from_tag`), channel 1 the answerer, in both directions. What the server sends on
+channel 0 is played to the offerer only, what it sends on channel 1 to the
+answerer only, and a channel the server leaves silent plays silence. There is no
+re-INVITE, either way.
+
+```python
+try:
+    await rtpengine.attach_ws_split(call, "wss://translate.internal/{call_id}",
+                                    sample_rate=16000,
+                                    offerer_profile="denoise")
+except RuntimeError as exc:
+    if exc.token == "ws-split-not-answered":
+        ...   # try again once the call is answered
+    else:
+        raise
+
+await rtpengine.detach_ws_split(call)   # the parties hear each other again
+```
+
+The coroutine resolves once the engine has dialled the server, sent `start` and
+isolated both parties. `sample_rate` is 8000, 16000, 24000 or 48000 Hz (16000
+when left out); anything else is a `ValueError` and nothing is sent.
+`offerer_profile` / `answerer_profile` name a media profile whose `answer`
+half sets what runs on that party's uplink. The engine applies only
+`noise_suppression` and refuses a profile that asks for more (echo cancellation,
+`ws_vad*`, `ws_uri`). `ws://` and `wss://` are both accepted; a script that
+wants TLS checks the scheme itself.
+
+It needs a siphon-rtp engine whose `node_info` lists `ws_split`; an engine that
+does not is refused with a `RuntimeError` before anything is sent. An engine
+refusal is a `RuntimeError` whose `token` attribute is the refusal token, so a
+script branches on it without parsing text: `ws-split-not-answered` (no far
+party yet), `ws-split-answer-local` (the engine answered the call itself),
+`ws-split-seated` (the leg is in a conference room), `ws-split-already-bridged`
+(the call already has a takeover or a split), `ws-split-secondary-source`,
+`ws-split-renegotiation`, `ws-split-profile` and `ws-split-sample-rate`. `token`
+is `None` for any other failure. Only the siphon-rtp backend can do it:
+rtpengine and rtpproxy raise.
+
+**After a split ends for any reason other than `detached` and `call_deleted`,
+the call stays isolated and silent in both directions** until the script
+detaches it. The server closing the socket, sending `stop`, a transport error,
+a re-offer the engine could not follow (`renegotiated`) and a call restored on
+a standby (`restored`) all end the split event-wise and none of them gives the
+parties their audio back: the engine lifts the isolation on a `detach_ws_split`
+you sent and on nothing else. Watch for it:
+
+```python
+@rtpengine.on_ws_split_ended
+async def split_down(call_id, from_tag, stream_id, reason):
+    if reason not in ("detached", "call_deleted"):
+        # Two people on a silent line until this: direct audio back.
+        await rtpengine.detach_ws_split((call_id, from_tag))
+        # ...or detach, then attach again for a new server.
+```
+
+`@rtpengine.on_ws_split_started(call_id, from_tag, stream_id, ws_uri,
+sample_rate)` is the matching start. `call_id` is the SIP Call-ID of the
+offerer's dialog. The reasons are `detached`, `ws_closed`, `ws_stopped`,
+`ws_error`, `call_deleted`, `renegotiated` and `restored`; a reason a newer
+engine adds arrives as its own string. `detach_ws_split` is idempotent and is
+safe to call from inside the hook. A leg that is bridged again has its split
+taken off first, so the new pairing is not left isolated.
+
+On the control plane the same shape is `stream_start {mode: "split"}` and
+`stream_stop {mode: "split"}`; see the
+[control plane reference](reference/control-plane.md).
 
 **Tee (`ws_tee`).** The call relays or transcodes exactly as it otherwise would,
 *and* a copy of the decoded audio is streamed out. Additive: one decode feeds

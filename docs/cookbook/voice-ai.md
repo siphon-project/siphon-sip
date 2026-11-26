@@ -197,6 +197,49 @@ noise suppression, echo cancellation, VAD and barge-in off: a bot that talks
 over its caller. The attach answers `ok` either way. Needs a siphon-rtp engine
 with runtime-attach profiles (0.11 or later); an older engine ignores the field.
 
+## Live translation: the split bridge
+
+A takeover bridge replaces one party's far side with a bot. For translation the
+bot sits *between* two people instead: each hears the bot, in their own
+language, and not the other. That is the **split bridge**: both legs of an
+answered two-party call go to one duplex stereo WebSocket (channel 0 the
+offerer, channel 1 the answerer) and the parties are isolated from each other
+until it is detached. No re-INVITE, in either direction.
+
+```python
+@b2bua.on_answer
+async def on_answer(call):
+    await rtpengine.attach_ws_split(call, "wss://translate.internal/{call_id}",
+                                    sample_rate=16000, offerer_profile="denoise")
+```
+
+```json
+{"verb": "stream_start", "args": {"ws_uri": "wss://translate.internal/{call_id}",
+                                  "mode": "split", "sample_rate": 16000}}
+```
+
+The server sees `start` with `direction: duplex` and `channels: 2`. Which SIP
+party is on which channel is in the `WsSplitStarted` event (`channels`) on the
+control plane, since the engine only knows "offerer" and "answerer".
+
+The part to get right is the end. **After the bot closes the socket, errors
+out, or the engine could not follow a re-offer (`renegotiated`), the call is
+still isolated and silent**, and it stays that way until the script (or the
+controller, with `stream_stop {mode: "split"}`) detaches it. Only `detached`
+and `call_deleted` give the parties their audio back on their own:
+
+```python
+@rtpengine.on_ws_split_ended
+async def split_down(call_id, from_tag, stream_id, reason):
+    if reason not in ("detached", "call_deleted"):
+        await rtpengine.detach_ws_split((call_id, from_tag))   # direct audio
+```
+
+An attach on a call the engine will not split raises `RuntimeError` with the
+refusal token on `exc.token` (`ws-split-not-answered`, `ws-split-seated`, ...).
+It needs a siphon-rtp engine that lists `ws_split`. `wss://` is accepted along
+with `ws://`; a script that carries a customer's speech enforces `wss` itself.
+
 ## Requirements
 
 The bridge needs `siphon-rtp` **0.1.5 or later** on both sides: siphon's pinned

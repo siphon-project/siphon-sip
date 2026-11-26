@@ -2039,8 +2039,16 @@ def test_stream_verbs_roundtrip():
                     profile="voice_ai",
                     media_flags={"echo_cancellation": False},
                 )
+                await call.stream_start(
+                    "wss://translate.example/call",
+                    mode="split",
+                    sample_rate=24_000,
+                    offerer_profile="denoise",
+                    answerer_profile="denoise",
+                )
                 await call.stream_stop()
                 await call.stream_stop(mode="bridge")
+                await call.stream_stop(mode="split")
                 for kwargs in (
                     {"mode": "takeover"},
                     {"direction": "inbound"},
@@ -2072,6 +2080,8 @@ def test_stream_verbs_roundtrip():
                 "stream_start",
                 "stream_start",
                 "stream_start",
+                "stream_start",
+                "stream_stop",
                 "stream_stop",
                 "stream_stop",
             ]
@@ -2103,9 +2113,17 @@ def test_stream_verbs_roundtrip():
                 "profile": "voice_ai",
                 "media_flags": {"echo_cancellation": False},
             }
-            assert frames[5]["args"] == {"mode": "tee"}
-            assert frames[6]["args"] == {"mode": "bridge"}
-            # Refused before a frame goes out: nothing past the five above.
+            assert frames[5]["args"] == {
+                "ws_uri": "wss://translate.example/call",
+                "mode": "split",
+                "sample_rate": 24_000,
+                "offerer_profile": "denoise",
+                "answerer_profile": "denoise",
+            }
+            assert frames[6]["args"] == {"mode": "tee"}
+            assert frames[7]["args"] == {"mode": "bridge"}
+            assert frames[8]["args"] == {"mode": "split"}
+            # Refused before a frame goes out: nothing past the six above.
             assert len(refused) == 4, refused
 
             client.shutdown()

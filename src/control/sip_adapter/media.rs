@@ -267,6 +267,9 @@ pub(in crate::control) fn play_blob_refusal(
 pub(super) enum StreamMode {
     Tee,
     Bridge,
+    /// Both legs of an answered call to one duplex stereo WebSocket, the two
+    /// parties isolated from each other ([`super::split`]).
+    Split,
 }
 
 /// Parse the optional `mode` arg. Absent means `tee`.
@@ -280,14 +283,15 @@ pub(super) fn parse_stream_mode(
         Some(serde_json::Value::String(mode)) => match mode.as_str() {
             "tee" => Ok(StreamMode::Tee),
             "bridge" => Ok(StreamMode::Bridge),
+            "split" => Ok(StreamMode::Split),
             other => Err(ControlResult::error(
                 ControlErrorCode::BadRequest,
-                format!("{verb} args.mode must be one of tee/bridge, got '{other}'"),
+                format!("{verb} args.mode must be one of tee/bridge/split, got '{other}'"),
             )),
         },
         Some(_) => Err(ControlResult::error(
             ControlErrorCode::BadRequest,
-            format!("{verb} args.mode must be a string, one of tee/bridge"),
+            format!("{verb} args.mode must be a string, one of tee/bridge/split"),
         )),
     }
 }
@@ -752,6 +756,31 @@ pub(super) async fn stream_start(channel: &ChannelRef, args: &serde_json::Value)
         Err(result) => return result,
     };
 
+    if mode == StreamMode::Split {
+        let request = match super::split::parse_split_request(&ws_uri, args) {
+            Ok(request) => request,
+            Err(result) => return result,
+        };
+        let (backend, call_id, from_tag) = match media_target(channel) {
+            Ok(target) => target,
+            Err(result) => return result,
+        };
+        let ws_uri = match channel_stream_uri(channel, &request.ws_uri, &from_tag) {
+            Ok(ws_uri) => ws_uri,
+            Err(result) => return result,
+        };
+        let request = super::split::SplitRequest { ws_uri, ..request };
+        return super::split::attach_split(&backend, &call_id, &from_tag, channel, &request).await;
+    }
+    // A split's party profiles name parties a tee and a takeover do not have.
+    for party in ["offerer_profile", "answerer_profile"] {
+        if args.get(party).is_some_and(|value| !value.is_null()) {
+            return ControlResult::error(
+                ControlErrorCode::BadRequest,
+                format!("stream_start args.{party} applies to mode=split only"),
+            );
+        }
+    }
     if mode == StreamMode::Bridge {
         // `direction`, `channels` and `sample_rate` shape a *tee's* wire; a
         // takeover bridge has one leg and negotiates its own rate with the
@@ -1115,6 +1144,11 @@ async fn stream_stop(channel: &ChannelRef, args: &serde_json::Value) -> ControlR
     let outcome = match mode {
         StreamMode::Tee => backend.detach_ws_tee(&call_id, &from_tag).await,
         StreamMode::Bridge => backend.detach_ws_bridge(&call_id, &from_tag).await,
+        // Idempotent like a tee's, and its own reply: the engine's refusal
+        // carries a token a controller branches on.
+        StreamMode::Split => {
+            return super::split::detach_split(&backend, &call_id, &from_tag, channel).await
+        }
     };
     match outcome {
         Ok(()) => {
@@ -1126,6 +1160,8 @@ async fn stream_stop(channel: &ChannelRef, args: &serde_json::Value) -> ControlR
                     &channel.sip_call_id,
                     false,
                 ),
+                // Answered above, with its own reply.
+                StreamMode::Split => {}
             }
             ControlResult::Ok(
                 serde_json::json!({ "channel": channel.channel_id, "state": "detached" }),

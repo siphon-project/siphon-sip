@@ -81,6 +81,16 @@ pub enum RtpEngineEvent {
     /// script re-point or tear down rather than strand the parties in silence.
     /// `siphon-rtp` native backend only.
     WsBridgeEnded(WsBridgeEnded),
+    /// A split bridge started: the engine dialled the server and both parties
+    /// of the call are now isolated from each other, each on one channel of
+    /// the stream.  `siphon-rtp` native backend only.
+    WsSplitStarted(WsSplitStarted),
+    /// A split bridge ended, for any reason.  Emitted exactly once per started
+    /// split.  After any end but `detached` and `call_deleted` the call is
+    /// still isolated and silent until the script detaches it
+    /// ([`WsSplitEnded::restores_direct_audio`]).  `siphon-rtp` native backend
+    /// only.
+    WsSplitEnded(WsSplitEnded),
     /// A record tone (the "voicemail beep") was detected on a leg armed with
     /// `beep_detection` — the media half of answering-machine detection.
     /// Emitted once per leg per call.  `siphon-rtp` native backend only.
@@ -136,6 +146,8 @@ impl RtpEngineEvent {
             Self::PlayFinished(event) => Some(&mut event.call_id),
             Self::WsBridgeStarted(event) => Some(&mut event.call_id),
             Self::WsBridgeEnded(event) => Some(&mut event.call_id),
+            Self::WsSplitStarted(event) => Some(&mut event.call_id),
+            Self::WsSplitEnded(event) => Some(&mut event.call_id),
             Self::BeepDetected(event) => Some(&mut event.call_id),
             Self::X3Started(event) => Some(&mut event.call_id),
             Self::X3Loss(event) => Some(&mut event.call_id),
@@ -656,6 +668,56 @@ impl WsBridgeEndReason {
     /// parties in silence. A reason this build does not know stays unexpected.
     pub fn is_unexpected(self) -> bool {
         !matches!(self, Self::Detached | Self::CallEnded)
+    }
+}
+
+/// A split bridge started, carried by [`RtpEngineEvent::WsSplitStarted`].
+///
+/// The engine dialled the server, sent `start` (`direction: duplex`,
+/// `channels: 2`) and isolated the parties: channel 0 is the offerer, the party
+/// whose tag is `from_tag`, and channel 1 the answerer.
+#[derive(Debug, Clone)]
+pub struct WsSplitStarted {
+    pub call_id: String,
+    /// The offerer's tag: channel 0.
+    pub from_tag: String,
+    /// The `streamId` of the `start` frame: `split-` and the engine call id.
+    pub stream_id: String,
+    /// The URI the engine dialled.
+    pub ws_uri: String,
+    /// The negotiated L16 wire rate in Hz.
+    pub sample_rate: u32,
+}
+
+/// A split bridge ended, carried by [`RtpEngineEvent::WsSplitEnded`].
+///
+/// Emitted exactly once per started split, and only after its
+/// [`WsSplitStarted`].
+#[derive(Debug, Clone)]
+pub struct WsSplitEnded {
+    pub call_id: String,
+    pub from_tag: String,
+    /// The stream id from the matching [`WsSplitStarted`].
+    pub stream_id: String,
+    /// Why it ended, as the engine spells it: `detached`, `ws_closed`,
+    /// `ws_stopped`, `ws_error`, `call_deleted`, `renegotiated` or `restored`.
+    /// The engine's reason enum is `#[non_exhaustive]`, so a reason a newer
+    /// engine adds arrives as its own spelling rather than being folded into
+    /// one this build knows.
+    pub reason: String,
+}
+
+impl WsSplitEnded {
+    /// Whether the parties have their direct audio back.
+    ///
+    /// Only two ends do: `detached` (the controller detached it) and
+    /// `call_deleted` (the call went). After **any other** end, whatever the
+    /// reason, the call is still isolated and silent in both directions: the
+    /// engine lifts a split's isolation on a detach the controller sent and
+    /// nothing else, not the server going away, a re-offer, a failure or a
+    /// failover. A reason this build does not know counts as one of those.
+    pub fn restores_direct_audio(&self) -> bool {
+        matches!(self.reason.as_str(), "detached" | "call_deleted")
     }
 }
 

@@ -278,6 +278,8 @@ export type SipEventKind =
   | "WsTeeEnded"
   | "WsBridgeStarted"
   | "WsBridgeEnded"
+  | "WsSplitStarted"
+  | "WsSplitEnded"
   | "MediaSummary"
   | "MediaStarted"
   | "DialBranch"
@@ -877,6 +879,61 @@ export interface WsBridgeEndedPayload {
   /** `detached`, `server_closed`, `server_stopped`, `call_ended` or `transport_error`. */
   reason: string;
   unexpected: boolean;
+}
+
+/**
+ * One channel of a split's duplex stereo stream and the SIP party on it.
+ * Channel 0 is the **offerer** (the party whose engine tag is the call's
+ * `from_tag`), channel 1 the **answerer**. The engine only knows those two
+ * roles, and which dialog siphon made the offerer is not visible to a
+ * controller, so the event says which channel is whose.
+ */
+export interface WsSplitChannel {
+  /** `0` or `1`. */
+  channel: number;
+  /** `offerer` or `answerer`. */
+  party: string;
+  /**
+   * The SIP Call-ID of that party's dialog, which is the id of its channel on
+   * this rail. `null` when siphon holds no dialog for it: the answerer of a
+   * call that is not a bridged pair.
+   */
+  sip_call_id: string | null;
+}
+
+/**
+ * The `payload` of a `WsSplitStarted` event: both legs of the call now stream
+ * to one duplex stereo WebSocket and the parties are isolated from each other.
+ */
+export interface WsSplitStartedPayload {
+  from_tag: string;
+  stream_id: string;
+  ws_uri: string;
+  /** The negotiated L16 wire rate in Hz. */
+  sample_rate: number;
+  /** Which SIP party is on which channel, in channel order. */
+  channels: WsSplitChannel[];
+}
+
+/**
+ * The `payload` of a `WsSplitEnded` event. Exactly one per `WsSplitStarted`.
+ *
+ * `isolated` is the field to branch on: after every end but `detached` and
+ * `call_deleted` the parties are **still isolated and silent**, because the
+ * engine lifts a split's isolation on a `streamStop({ mode: "split" })` the app
+ * sent and on nothing else. Detach for direct audio, or detach and start again
+ * for a new server.
+ */
+export interface WsSplitEndedPayload {
+  from_tag: string;
+  stream_id: string;
+  /**
+   * The engine's reason, verbatim: `detached`, `ws_closed`, `ws_stopped`,
+   * `ws_error`, `call_deleted`, `renegotiated` or `restored`, or a string a
+   * newer engine adds.
+   */
+  reason: string;
+  isolated: boolean;
 }
 
 /**

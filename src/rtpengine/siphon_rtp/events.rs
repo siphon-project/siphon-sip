@@ -14,7 +14,8 @@ use super::super::events::{
     ActiveSpeakerEvent, BeepDetectedEvent, CallLegSummary, CallSummary, DtmfEvent, MediaLeg,
     MediaStartedEvent, PlayEndReason as SiphonPlayEndReason, PlayFinishedEvent, RecordingFinished,
     RtpEngineEvent, TextEvent, TextStreamStats, WsBridgeEndReason, WsBridgeEnded, WsBridgeStarted,
-    WsTeeEndReason, WsTeeEnded, WsTeeStarted, X3EndedEvent, X3LossEvent, X3StartedEvent,
+    WsSplitEnded, WsSplitStarted, WsTeeEndReason, WsTeeEnded, WsTeeStarted, X3EndedEvent,
+    X3LossEvent, X3StartedEvent,
 };
 use super::ws_tee_direction_from_proto;
 
@@ -214,6 +215,19 @@ pub(super) fn convert_event(event: Event) -> RtpEngineEvent {
             stream_id,
             reason: ws_bridge_end_reason_from_proto(reason),
         }),
+        Event::WsSplitStarted(started) => RtpEngineEvent::WsSplitStarted(WsSplitStarted {
+            call_id: started.call_id,
+            from_tag: started.from_tag,
+            stream_id: started.stream_id,
+            ws_uri: started.ws_uri,
+            sample_rate: started.sample_rate,
+        }),
+        Event::WsSplitEnded(ended) => RtpEngineEvent::WsSplitEnded(WsSplitEnded {
+            call_id: ended.call_id,
+            from_tag: ended.from_tag,
+            stream_id: ended.stream_id,
+            reason: ws_split_end_reason_name(ended.reason),
+        }),
         Event::BeepDetected {
             call_id,
             from_tag,
@@ -407,6 +421,19 @@ pub(super) fn ws_bridge_end_reason_from_proto(reason: ProtoWsBridgeEndReason) ->
         ProtoWsBridgeEndReason::CallEnded => WsBridgeEndReason::CallEnded,
         ProtoWsBridgeEndReason::TransportError => WsBridgeEndReason::TransportError,
         _ => WsBridgeEndReason::TransportError,
+    }
+}
+
+/// A split's end reason as the engine spells it on the wire.
+///
+/// `WsSplitEndReason` is `#[non_exhaustive]` upstream, and a reason a newer
+/// engine adds still serialises as its own snake_case name, so the name is read
+/// off the type's wire form rather than from a `match` whose wildcard would have
+/// to invent one. The wire form is what a script and a controller are told.
+pub(crate) fn ws_split_end_reason_name(reason: siphon_rtp_proto::WsSplitEndReason) -> String {
+    match serde_json::to_value(reason) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => "unknown".to_string(),
     }
 }
 

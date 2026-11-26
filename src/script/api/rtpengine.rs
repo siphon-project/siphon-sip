@@ -36,6 +36,7 @@ mod message;
 mod offer;
 mod repeat;
 mod scope;
+mod split;
 
 use answer::{arm_auto_reject, AnswerExchange};
 use answer_local::{classify_answer_local, AnswerLocalOutcome};
@@ -1081,6 +1082,7 @@ impl PyRtpEngine {
                         ws_uri: resolved_ws_uri,
                         ws_tee: flags.ws_tee.clone(),
                         ws_bridge_attached: false,
+                        ws_split_attached: false,
                         bridge_sides: None,
                         created_at: std::time::Instant::now(),
                     });
@@ -2660,6 +2662,155 @@ impl PyRtpEngine {
         })
     }
 
+    /// Attach a **split bridge** to a live, answered two-party call: both legs
+    /// are streamed to one duplex stereo WebSocket and the two parties are
+    /// isolated from each other for as long as it is attached.
+    ///
+    /// The engine dials ``ws_uri`` once for the call.  Channel 0 of the stream
+    /// is the offerer (the party whose tag is the call's ``from_tag``) and
+    /// channel 1 the answerer, in both directions: what the server sends on
+    /// channel 0 is played to the offerer only, what it sends on channel 1 to
+    /// the answerer only.  A channel the server leaves silent plays silence.
+    /// This is the shape of live translation: each party hears a bot, not the
+    /// other.
+    ///
+    /// The coroutine resolves once the engine has dialled the server, sent
+    /// ``start`` and isolated both parties, i.e. the split is in place (the
+    /// ``on_ws_split_started`` event reports the same moment).  It raises
+    /// ``RuntimeError`` when the engine refuses, leaving the call as it was.
+    /// The exception's ``token`` attribute carries the engine's refusal token
+    /// (``ws-split-not-answered``, ``ws-split-answer-local``,
+    /// ``ws-split-seated``, ``ws-split-already-bridged``,
+    /// ``ws-split-secondary-source``, ``ws-split-renegotiation``,
+    /// ``ws-split-profile``, ``ws-split-sample-rate``), so a script branches on
+    /// it without parsing the text; ``token`` is ``None`` for any other
+    /// failure.  An engine that does not list ``ws_split`` in its
+    /// ``node_info`` features is refused before anything is sent.
+    ///
+    /// **After the split ends for any reason but ``detach_ws_split`` or the call
+    /// going, the call stays isolated and silent in both directions** until the
+    /// script detaches it; see :meth:`on_ws_split_ended`.
+    ///
+    /// Requires ``media.backend: siphon-rtp``.
+    ///
+    /// ```python,ignore
+    /// try:
+    ///     await rtpengine.attach_ws_split(call, "wss://translate.internal/session",
+    ///                                     sample_rate=16000,
+    ///                                     offerer_profile="denoise")
+    /// except RuntimeError as exc:
+    ///     if exc.token == "ws-split-not-answered":
+    ///         ...   # try again once the call is answered
+    ///     else:
+    ///         raise
+    /// ```
+    ///
+    /// Args:
+    ///     target: Request, Reply or Call identifying the media session, a
+    ///         ``(call_id, from_tag)`` pair, or a bare ``call_id``.
+    ///     ws_uri: ``ws://`` or ``wss://`` URI the engine dials as a client,
+    ///         templated as for :meth:`attach_ws_tee`.
+    ///     sample_rate: L16 wire rate in Hz, both ways: 8000, 16000, 24000 or
+    ///         48000.  ``None`` is the engine's default (16000).  Anything else
+    ///         raises ``ValueError``.
+    ///     offerer_profile: name of a media profile (built-in or
+    ///         ``media.profiles``) whose ``answer`` half sets what runs on the
+    ///         offerer's uplink before it is sent.  The engine applies only
+    ///         ``noise_suppression`` and refuses a profile that asks for more
+    ///         (echo cancellation, ``ws_vad*``, ``ws_uri``) with
+    ///         ``ws-split-profile``.  Raises ``ValueError`` for an unknown name.
+    ///     answerer_profile: the same for the answerer's uplink.
+    ///     scope: The leg's per-call scope, as for :meth:`play_media`.
+    #[pyo3(signature = (target, ws_uri, sample_rate=None, offerer_profile=None, answerer_profile=None, scope=None))]
+    fn attach_ws_split<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        ws_uri: String,
+        sample_rate: Option<u32>,
+        offerer_profile: Option<String>,
+        answerer_profile: Option<String>,
+        scope: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (call_id, from_tag, ws_uri) = stream_target(target, &ws_uri)?;
+        let leg = self.leg(scope, Some(target), &call_id, "attach_ws_split")?;
+        // Everything the engine would refuse for the arguments alone is
+        // refused here, before anything is sent.
+        split::check_sample_rate(sample_rate)?;
+        let offerer = split::party_profile(&self.registry, "offerer", offerer_profile.as_deref())?;
+        let answerer =
+            split::party_profile(&self.registry, "answerer", answerer_profile.as_deref())?;
+        let sessions = scope::store_for(&self.sessions, leg.scope())?;
+        let client = Arc::clone(&self.client);
+
+        crate::script::awaitable(python, async move {
+            leg.run(client.attach_ws_split(
+                leg.call_id(),
+                &from_tag,
+                &ws_uri,
+                sample_rate,
+                offerer.as_ref(),
+                answerer.as_ref(),
+            ))
+            .await
+            .map_err(|error| split::verb_failure("attach_ws_split", &error))?;
+            sessions.set_ws_split_attached(&call_id, true);
+            debug!(
+                call_id = %call_id,
+                from_tag = %from_tag,
+                ws_uri = %ws_uri,
+                "rtpengine attach_ws_split"
+            );
+            Ok(true)
+        })
+    }
+
+    /// Detach a call's **split bridge**, putting the direct path back between
+    /// the two parties without a re-INVITE.
+    ///
+    /// Idempotent: a call with no split is not an error.  This is the way out
+    /// of a split that ended on its own: after any ``on_ws_split_ended`` reason
+    /// but ``detached`` and ``call_deleted`` the call stays isolated and silent
+    /// until this is called.  To reconnect to a different server, detach and
+    /// attach again.
+    ///
+    /// Requires ``media.backend: siphon-rtp``; an engine that does not list
+    /// ``ws_split`` raises ``RuntimeError``.
+    ///
+    /// ```python,ignore
+    /// await rtpengine.detach_ws_split(call)   # parties hear each other again
+    /// ```
+    ///
+    /// Args:
+    ///     target: Request, Reply or Call identifying the media session, a
+    ///         ``(call_id, from_tag)`` pair, or a bare ``call_id``.
+    ///     scope: The leg's per-call scope, as for :meth:`play_media`.
+    #[pyo3(signature = (target, scope=None))]
+    fn detach_ws_split<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        scope: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let leg = self.leg(scope, Some(target), &call_id, "detach_ws_split")?;
+        let sessions = scope::store_for(&self.sessions, leg.scope())?;
+        let client = Arc::clone(&self.client);
+
+        crate::script::awaitable(python, async move {
+            leg.run(client.detach_ws_split(leg.call_id(), &from_tag))
+                .await
+                .map_err(|error| split::verb_failure("detach_ws_split", &error))?;
+            sessions.set_ws_split_attached(&call_id, false);
+            debug!(
+                call_id = %call_id,
+                from_tag = %from_tag,
+                "rtpengine detach_ws_split"
+            );
+            Ok(true)
+        })
+    }
+
     /// Register a handler for inbound DTMF events from rtpengine.
     ///
     /// rtpengine must be configured with ``dtmf-log-ng-tcp-uri=tcp://<siphon>``
@@ -2953,6 +3104,97 @@ impl PyRtpEngine {
         event_decorator(
             python,
             "rtpengine.on_ws_bridge_ended",
+            func_or_none,
+            call_id,
+            from_tag,
+        )
+    }
+
+    /// Register a handler for **split bridge started** events.
+    ///
+    /// Fires once the engine has dialled the split's WebSocket server and
+    /// isolated the two parties of the call from each other.  Channel 0 of the
+    /// stream is the offerer (the party whose tag is ``from_tag``), channel 1
+    /// the answerer.  ``stream_id`` is the correlator between this event and
+    /// the ``start`` frame on the socket.
+    ///
+    /// ``call_id`` is the SIP Call-ID of the offerer's dialog.
+    ///
+    /// Delivered by the native **siphon-rtp** backend only.
+    ///
+    /// ```python,ignore
+    /// @rtpengine.on_ws_split_started
+    /// def split_up(call_id, from_tag, stream_id, ws_uri, sample_rate):
+    ///     log.info(f"split {stream_id} @ {sample_rate}Hz -> {ws_uri}")
+    /// ```
+    ///
+    /// Args:
+    ///     func_or_none: When applied directly (``@rtpengine.on_ws_split_started``) this is
+    ///         the function.  When called with keyword filters the return value
+    ///         is a decorator.
+    ///     call_id: Optional SIP Call-ID filter.
+    ///     from_tag: Optional from-tag filter.
+    #[pyo3(signature = (func_or_none=None, *, call_id=None, from_tag=None))]
+    fn on_ws_split_started<'py>(
+        &self,
+        python: Python<'py>,
+        func_or_none: Option<Py<PyAny>>,
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        event_decorator(
+            python,
+            "rtpengine.on_ws_split_started",
+            func_or_none,
+            call_id,
+            from_tag,
+        )
+    }
+
+    /// Register a handler for **split bridge ended** events.
+    ///
+    /// Fires exactly once per started split, for any reason.  ``reason`` is
+    /// one of ``detached``, ``ws_closed``, ``ws_stopped``, ``ws_error``,
+    /// ``call_deleted``, ``renegotiated`` or ``restored``; a reason a newer
+    /// engine adds arrives as its own string.
+    ///
+    /// **After any end other than ``detached`` and ``call_deleted`` the call is
+    /// still isolated and silent in both directions**, whatever the reason: the
+    /// engine lifts a split's isolation on a ``detach_ws_split`` you sent and
+    /// on nothing else, not the server going away, a re-offer, a failure or a
+    /// failover.  The handler is where to act: ``detach_ws_split`` for direct
+    /// audio, or detach and attach again for a new server.  siphon logs such an
+    /// end at WARN even when no handler is registered.
+    ///
+    /// ``call_id`` is the SIP Call-ID of the offerer's dialog.
+    ///
+    /// Delivered by the native **siphon-rtp** backend only.
+    ///
+    /// ```python,ignore
+    /// @rtpengine.on_ws_split_ended
+    /// async def split_down(call_id, from_tag, stream_id, reason):
+    ///     if reason not in ("detached", "call_deleted"):
+    ///         # still isolated: give the parties each other back
+    ///         await rtpengine.detach_ws_split((call_id, from_tag))
+    /// ```
+    ///
+    /// Args:
+    ///     func_or_none: When applied directly (``@rtpengine.on_ws_split_ended``) this is
+    ///         the function.  When called with keyword filters the return value
+    ///         is a decorator.
+    ///     call_id: Optional SIP Call-ID filter.
+    ///     from_tag: Optional from-tag filter.
+    #[pyo3(signature = (func_or_none=None, *, call_id=None, from_tag=None))]
+    fn on_ws_split_ended<'py>(
+        &self,
+        python: Python<'py>,
+        func_or_none: Option<Py<PyAny>>,
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        event_decorator(
+            python,
+            "rtpengine.on_ws_split_ended",
             func_or_none,
             call_id,
             from_tag,
@@ -3542,6 +3784,7 @@ mod tests {
             ws_uri: None,
             ws_tee: None,
             ws_bridge_attached: false,
+            ws_split_attached: false,
             bridge_sides: None,
             created_at: std::time::Instant::now(),
         }

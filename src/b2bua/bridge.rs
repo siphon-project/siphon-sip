@@ -420,6 +420,17 @@ pub struct LegMedia {
     /// not `relaying`, so the plan already deletes it and offers the leg onto a
     /// fresh call-id, which ends the bridge with it.
     pub has_ws_bridge: bool,
+    /// Whether a **split bridge** is on this session: both parties streamed
+    /// to one WebSocket and isolated from each other.
+    ///
+    /// Tracked apart from [`LegMedia::has_ws_bridge`] because the verbs differ
+    /// and the wrong one does not undo the other. It stays set for a split
+    /// that ended for any reason but `detached` and `call_deleted`: the engine
+    /// leaves that call isolated and silent until a detach, so the plan still
+    /// has to send one. Without the step, an in-place re-offer of a relaying
+    /// anchor ends the split as `renegotiated` and the new pairing is left
+    /// isolated.
+    pub has_ws_split: bool,
     /// Whether siphon started a playback on this leg and has not stopped it.
     /// The stop only runs when it did: on an idle leg the engine answers
     /// "this call has no active media playback", and it counts that answer as a
@@ -470,6 +481,7 @@ impl LegMedia {
             // and this party has none.
             has_tee: false,
             has_ws_bridge: false,
+            has_ws_split: false,
             has_playback,
         })
     }
@@ -491,6 +503,7 @@ impl LegMedia {
             relaying: false,
             has_tee: false,
             has_ws_bridge: false,
+            has_ws_split: false,
             has_playback: false,
         }
     }
@@ -526,6 +539,17 @@ pub enum MediaStep {
     /// still its far side — the bridge would form on paper and neither party
     /// would hear the other.
     DetachBridge {
+        /// Engine call-id.
+        media_call_id: String,
+        /// The leg's engine tag.
+        from_tag: String,
+    },
+    /// Detach this leg's **split bridge**, putting the direct path back
+    /// between the parties without a re-INVITE. Ordered after the takeover
+    /// detach and before the leg is renegotiated into the new bridge: a re-offer
+    /// while the split holds the call ends it `renegotiated` and leaves the new
+    /// pairing isolated and silent. Idempotent on the engine.
+    DetachSplit {
         /// Engine call-id.
         media_call_id: String,
         /// The leg's engine tag.
@@ -717,6 +741,12 @@ pub fn bridge_media_plan(
                 from_tag: leg.from_tag.clone(),
             });
         }
+        if leg.has_ws_split {
+            steps.push(MediaStep::DetachSplit {
+                media_call_id: leg.media_call_id.clone(),
+                from_tag: leg.from_tag.clone(),
+            });
+        }
     }
     if let Some(anchor) = anchor {
         let profile = bridge_offer_profile(anchor_offer.pair_profile, anchor, peer).to_string();
@@ -768,7 +798,9 @@ pub fn classify_media_failure(
 ) -> Option<BridgeError> {
     let teardown = matches!(
         step,
-        MediaStep::StopPlayback { .. } | MediaStep::DetachTee { .. }
+        MediaStep::StopPlayback { .. }
+            | MediaStep::DetachTee { .. }
+            | MediaStep::DetachSplit { .. }
     );
     if teardown && (call_not_found || unsupported) {
         return None;
@@ -962,6 +994,7 @@ mod tests {
             relaying: false,
             has_tee: false,
             has_ws_bridge: false,
+            has_ws_split: false,
             has_playback: false,
         }
     }
@@ -981,6 +1014,7 @@ mod tests {
         LegMedia {
             relaying: true,
             has_ws_bridge: true,
+            has_ws_split: false,
             ..local_leg(call_id, tag)
         }
     }
@@ -992,6 +1026,7 @@ mod tests {
                 MediaStep::StopPlayback { .. } => "stop",
                 MediaStep::DetachTee { .. } => "detach",
                 MediaStep::DetachBridge { .. } => "detach_bridge",
+                MediaStep::DetachSplit { .. } => "detach_split",
                 MediaStep::DeleteSession { .. } => "delete",
                 MediaStep::Offer { .. } => "offer",
                 MediaStep::Reoffer { .. } => "reoffer",
@@ -1046,6 +1081,60 @@ mod tests {
             kinds(&steps),
             vec!["stop", "detach", "stop", "detach", "reoffer"]
         );
+    }
+
+    /// A split holds the call isolated, and a re-offer while it does ends it
+    /// `renegotiated` with the new pairing still silent: it comes off first,
+    /// after the takeover and before the renegotiation.
+    #[test]
+    fn plan_detaches_a_split_before_it_re_points_the_media() {
+        let anchor = LegMedia {
+            has_tee: true,
+            has_ws_split: true,
+            ..relaying_leg("cid-a", "tag-a")
+        };
+        let peer = LegMedia {
+            has_ws_bridge: true,
+            has_ws_split: true,
+            ..local_leg("cid-b", "tag-b")
+        };
+        let steps = bridge_media_plan(
+            Some(&anchor),
+            Some(&peer),
+            offer_of(b"v=0\r\n"),
+            "cid-fresh",
+        );
+        assert_eq!(
+            kinds(&steps),
+            vec![
+                "detach",
+                "detach_split",
+                "detach_bridge",
+                "detach_split",
+                "reoffer"
+            ]
+        );
+        assert!(matches!(
+            &steps[1],
+            MediaStep::DetachSplit { media_call_id, from_tag }
+                if media_call_id == "cid-a" && from_tag == "tag-a"
+        ));
+    }
+
+    /// A split that is already gone or an engine that never had one leaves
+    /// nothing to take off, as for a tee; any other refusal stops the bridge.
+    #[test]
+    fn a_split_detach_failing_on_a_missing_call_or_backend_is_tolerated() {
+        let step = MediaStep::DetachSplit {
+            media_call_id: "c".to_string(),
+            from_tag: "t".to_string(),
+        };
+        assert!(classify_media_failure(&step, true, false, "unknown call").is_none());
+        assert!(classify_media_failure(&step, false, true, "unsupported").is_none());
+        assert!(matches!(
+            classify_media_failure(&step, false, false, "boom"),
+            Some(BridgeError::Unavailable(_))
+        ));
     }
 
     #[test]
@@ -1375,6 +1464,7 @@ mod tests {
             ws_uri: None,
             ws_tee: None,
             ws_bridge_attached: false,
+            ws_split_attached: false,
             bridge_sides: Some(crate::rtpengine::session::BridgeSides {
                 anchor: side("open_caller", ProfileHalf::Answer),
                 peer: side("pinned_phone", ProfileHalf::Offer),

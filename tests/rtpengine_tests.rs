@@ -246,6 +246,7 @@ async fn session_store_tracks_offer_and_answer() {
         ws_uri: None,
         ws_tee: None,
         ws_bridge_attached: false,
+        ws_split_attached: false,
         bridge_sides: None,
         created_at: std::time::Instant::now(),
     });

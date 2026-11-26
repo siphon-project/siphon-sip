@@ -244,9 +244,15 @@ reported as a failure. That is damage control, not a substitute for closing.
   `hold()` and `unhold()` are the other media verbs. `hold` is a media gate, not a
   SIP hold, and is refused (`invalid_state`) on a call the engine only relays.
 - `await call.stream_start(ws_uri, direction=None, channels=None, *, mode="tee",
-  sample_rate=None, profile=None)` streams the call's audio to a WebSocket server, as
-  a copy (`"tee"`) or a takeover (`"bridge"`), and `await call.stream_stop(*,
-  mode="tee")` detaches it. siphon-rtp backend only.
+  sample_rate=None, profile=None, offerer_profile=None, answerer_profile=None)`
+  streams the call's audio to a WebSocket server, as a copy (`"tee"`), a takeover
+  (`"bridge"`) or a split (`"split"`: both legs of an answered two-party call to one
+  duplex stereo socket, the parties isolated from each other, for live translation),
+  and `await call.stream_stop(*, mode="tee")` detaches it. siphon-rtp backend only,
+  and a split needs an engine that lists `ws_split`. A split's `WsSplitStarted`
+  event names the SIP party on each channel (`channels`), and after a
+  `WsSplitEnded` whose `isolated` is true the call stays isolated and silent
+  until `stream_stop(mode="split")`.
 - `await client.originate(channel, aor=..., strategy=None, total_timeout=None, …)`
   rings every phone registered at the AoR, each over its own flow and Path; the first
   to answer becomes the channel's call. Exactly one of `to` and `aor`, and

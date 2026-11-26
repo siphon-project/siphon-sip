@@ -52,6 +52,7 @@ async fn offered_by_the_callee(engine: &NativeTestEngine, profile: &str) -> Offe
         ws_uri: None,
         ws_tee: None,
         ws_bridge_attached: false,
+        ws_split_attached: false,
         bridge_sides: None,
         created_at: std::time::Instant::now(),
     });

@@ -1294,18 +1294,20 @@ export interface DtmfOptions {
 
 /**
  * Which kind of WebSocket stream {@link Call.streamStart} /
- * {@link Call.streamStop} address. The two are opposites: a `"tee"` is
- * additive (a copy streams out, the call keeps relaying), a `"bridge"` is a
- * takeover (the server becomes the leg's far side and the call's own media
- * path is unwired).
+ * {@link Call.streamStop} address. A `"tee"` is additive (a copy streams out,
+ * the call keeps relaying), a `"bridge"` is a takeover (the server becomes the
+ * leg's far side and the call's own media path is unwired), and a `"split"`
+ * streams both legs of an answered two-party call to one duplex stereo socket
+ * and isolates the parties from each other (live translation).
  */
-export type StreamMode = "tee" | "bridge";
+export type StreamMode = "tee" | "bridge" | "split";
 
 /** Options for {@link Call.streamStart}. */
 export interface StreamOptions {
   /**
-   * `"tee"` (default) or `"bridge"`. Always sent, the default included, so a
-   * server whose default moved can never turn a transcription into a takeover.
+   * `"tee"` (default), `"bridge"` or `"split"`. Always sent, the default
+   * included, so a server whose default moved can never turn a transcription
+   * into a takeover.
    */
   mode?: StreamMode;
   /**
@@ -1320,7 +1322,8 @@ export interface StreamOptions {
   channels?: 1 | 2;
   /**
    * A tee's L16 sample rate in Hz: a multiple of 1000 within 8000–48000 (the
-   * engine's default when unset). Tee only; the server refuses anything else.
+   * engine's default when unset); a split's: 8000, 16000, 24000 or 48000.
+   * Refused alongside `mode: "bridge"`, and the server refuses any other rate.
    */
   sampleRate?: number;
   /**
@@ -1336,11 +1339,24 @@ export interface StreamOptions {
    * `profile` to merge over; without one, or on a tee, the server refuses them.
    */
   mediaFlags?: MediaFlags;
+  /**
+   * Split only: the name of a media profile whose `noise_suppression` runs on
+   * the offerer's uplink. The engine applies only that setting and refuses a
+   * profile that asks for more (echo cancellation, `ws_vad*`). An unknown name
+   * rejects with `bad_request`.
+   */
+  offererProfile?: string;
+  /** Split only: as `offererProfile`, for the answerer's uplink. */
+  answererProfile?: string;
 }
 
 /** Options for {@link Call.streamStop}. */
 export interface StreamStopOptions {
-  /** Which stream to detach: `"tee"` (default, always sent) or `"bridge"`. */
+  /**
+   * Which stream to detach: `"tee"` (default, always sent), `"bridge"` or
+   * `"split"`. A split detach puts the direct path back between the parties
+   * without a re-INVITE and is idempotent.
+   */
   mode?: StreamMode;
 }
 
@@ -2056,7 +2072,22 @@ export class Call {
    * // Hand the leg to a voice agent; the agent is now the far side, with the
    * // server's `voice_ai` profile's rate, echo cancellation and barge-in.
    * await call.streamStart("wss://ai.example/agent", { mode: "bridge", profile: "voice_ai" });
+   * // Live translation: both parties of an answered call to one duplex socket,
+   * // channel 0 the offerer and channel 1 the answerer, each hearing only what
+   * // the server sends for them. `WsSplitStarted` names the SIP party on each
+   * // channel; after a `WsSplitEnded` whose `isolated` is true the call stays
+   * // isolated and silent until `streamStop({ mode: "split" })`.
+   * await call.streamStart("wss://translate.example/call", {
+   *   mode: "split",
+   *   sampleRate: 16000,
+   *   offererProfile: "denoise",
+   * });
    * ```
+   *
+   * A split needs an engine that lists `ws_split` (`unsupported_verb`
+   * otherwise); an engine refusal carries its token (`ws-split-not-answered`,
+   * `ws-split-answer-local`, `ws-split-seated`, `ws-split-already-bridged`, ...)
+   * in the error's details.
    *
    * A bridge on a leg that already has one re-points it in place. `wsUri` may
    * use `{call_id}` / `{from_tag}` / `{from_user}` / `{to_user}`, which siphon
@@ -2085,6 +2116,12 @@ export class Call {
     if (options?.mediaFlags !== undefined) {
       args.media_flags = mediaFlagsArg(options.mediaFlags);
     }
+    if (options?.offererProfile !== undefined) {
+      args.offerer_profile = options.offererProfile;
+    }
+    if (options?.answererProfile !== undefined) {
+      args.answerer_profile = options.answererProfile;
+    }
     await this.sip(SipVerb.StreamStart, args);
   }
 
@@ -2092,7 +2129,8 @@ export class Call {
    * Detach the WebSocket stream of `options.mode` (`"tee"` by default, sent
    * explicitly). A tee detach is idempotent. A bridge detach is not: the
    * engine refuses one where there is no relay to hand the call back to, and
-   * that rejects rather than leaving a live call with no audio path.
+   * that rejects rather than leaving a live call with no audio path. A split
+   * detach is idempotent, and is how a split that ended on its own is released.
    */
   async streamStop(options?: StreamStopOptions): Promise<void> {
     await this.sip(SipVerb.StreamStop, { mode: options?.mode ?? "tee" });

@@ -31,6 +31,7 @@ from siphon_sdk.cdr import CallDetailRecord
 from siphon_sdk.lcr import Route
 from siphon_sdk.smpp import MockSmpp
 from siphon_sdk.http import MockHttp
+from siphon_sdk.ws_split import _WsSplitMixin
 
 
 def _strip_nameaddr(value: str) -> str:
@@ -5742,7 +5743,7 @@ def _resolve_play_source(
     return "db-id"
 
 
-class MockRtpEngine:
+class MockRtpEngine(_WsSplitMixin):
     """Mock RTPEngine namespace — records media operations for assertions.
 
     Example::
@@ -5828,6 +5829,7 @@ class MockRtpEngine:
         self._conference_dtmf_supported: bool = True
         self._conference_seat_refusal: Optional[str] = None
         self._active_speaker_handlers: list[dict[str, Any]] = []
+        self._ws_split_init()
         self.media_scopes: list[tuple[str, Optional[str]]] = []
         """``(operation, scope)`` per media verb (offer, answer, delete, delete_call,
         and every verb that addresses a call's media): the per-call scope the verb
@@ -6230,6 +6232,7 @@ class MockRtpEngine:
                 profile = "rtp_passthrough"
         self.operations.append(("answer", profile))
         self.media_scopes.append(("answer", scope))
+        self._track_answered(_resolve_media_target(call if call is not None else reply)[0])
         self.ws_uris.append(("answer", self._resolve_ws_uri(ws_uri, call or reply)))
         self.media_overrides.append(("answer", _media_overrides(
             beep_detection, beep_cadence_guard_ms, ws_sample_rate,
@@ -6353,6 +6356,7 @@ class MockRtpEngine:
         answered_call_id, _ = _resolve_media_target(call)
         if answered_call_id:
             self._anchored_legs.setdefault(answered_call_id, set()).add(scope)
+        self._track_answered(answered_call_id, locally=True)
         self.ws_uris.append(("answer_local", resolved_ws_uri))
         self.media_overrides.append(("answer_local", _media_overrides(
             beep_detection, beep_cadence_guard_ms, ws_sample_rate,
@@ -6394,6 +6398,7 @@ class MockRtpEngine:
         self.media_scopes.append(("delete", scope))
         call_id, _ = _resolve_media_target(request)
         self._forget_legs(call_id, scope)
+        self._end_splits_of(call_id)
         seated = self.conference_seat(call_id) if call_id else None
         if seated is not None:
             self._leave_seat(*seated)
@@ -6443,6 +6448,7 @@ class MockRtpEngine:
         scope = _media_scope(scope, (), "delete_call")
         self.media_scopes.append(("delete_call", scope))
         self._forget_legs(call_id, scope)
+        self._end_splits_of(call_id)
         seated = self.conference_seat(call_id)
         if seated is not None:
             self._leave_seat(*seated)
@@ -8872,6 +8878,8 @@ class MockRtpEngine:
         self._conference_seat_supported = True
         self._conference_dtmf_supported = True
         self._conference_seat_refusal = None
+        self._anchored_legs.clear()
+        self._ws_split_clear()
 
 
 # ---------------------------------------------------------------------------

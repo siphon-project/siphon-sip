@@ -53,6 +53,12 @@ pub fn spawn_rtpengine_events(
                     crate::rtpengine::events::RtpEngineEvent::WsBridgeEnded(bridge) => {
                         on_ws_bridge_ended(&state_for_events, bridge, scope).await;
                     }
+                    crate::rtpengine::events::RtpEngineEvent::WsSplitStarted(started) => {
+                        on_ws_split_started(&state_for_events, started, scope).await;
+                    }
+                    crate::rtpengine::events::RtpEngineEvent::WsSplitEnded(ended) => {
+                        on_ws_split_ended(&state_for_events, ended, scope).await;
+                    }
                     crate::rtpengine::events::RtpEngineEvent::WsTeeEnded(tee) => {
                         on_ws_tee_ended(&state_for_events, tee, scope).await;
                     }

@@ -803,6 +803,35 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     ]);
   });
 
+  it("stream: a split carries its rate and party profiles, and its stop names the mode", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.streamStart("wss://translate.example/call", { mode: "split" });
+    await call.streamStart("wss://translate.example/call", {
+      mode: "split",
+      sampleRate: 24000,
+      offererProfile: "denoise",
+      answererProfile: "denoise",
+    });
+    await call.streamStop({ mode: "split" });
+    expect(transport.calls).toEqual([
+      { module: MODULE_SIP, verb: "stream_start", target: { channel: "ch1" }, args: { ws_uri: "wss://translate.example/call", mode: "split" } },
+      {
+        module: MODULE_SIP,
+        verb: "stream_start",
+        target: { channel: "ch1" },
+        args: {
+          ws_uri: "wss://translate.example/call",
+          mode: "split",
+          sample_rate: 24000,
+          offerer_profile: "denoise",
+          answerer_profile: "denoise",
+        },
+      },
+      { module: MODULE_SIP, verb: "stream_stop", target: { channel: "ch1" }, args: { mode: "split" } },
+    ]);
+  });
+
   it("stream — the mode always rides the frame, a tee carries its sample rate", async () => {
     const transport = new RecordingTransport();
     const call = makeCall(transport);

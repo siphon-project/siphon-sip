@@ -37,6 +37,23 @@ pub enum RtpEngineError {
 }
 
 impl RtpEngineError {
+    /// The refusal token of an engine refusal that carries one: the
+    /// `ws-split-<reason>` an `attach_ws_split` (or an `answer` re-offered over
+    /// a split) is refused with, so a caller can branch on it without parsing
+    /// the text. The engine writes a refusal as `<verb>: <token>: <text>`; a
+    /// token is lowercase ASCII words joined by hyphens.
+    pub fn refusal_token(&self) -> Option<&str> {
+        let RtpEngineError::EngineError(reason) = self else {
+            return None;
+        };
+        reason.split(": ").find(|segment| {
+            segment.starts_with("ws-split-")
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+    }
+
     /// True when the error means "the engine has no such call" — the media
     /// session was already torn down (media-timeout reaper, a prior delete,
     /// glare). On a *safety-net* delete this is success, not failure: the net
@@ -236,5 +253,26 @@ mod tests {
         // Never mistaken for "the call is already gone" — a safety-net delete
         // must not treat an unsupported operation as success.
         assert!(!error.is_call_not_found());
+    }
+
+    #[test]
+    fn a_split_refusal_exposes_its_token() {
+        let refused = RtpEngineError::EngineError(
+            "attach_ws_split: ws-split-renegotiation: a DTLS re-handshake cannot be followed"
+                .to_string(),
+        );
+        assert_eq!(refused.refusal_token(), Some("ws-split-renegotiation"));
+        // The token is also found where another verb reports it.
+        let answered = RtpEngineError::EngineError(
+            "answer: ws-split-renegotiation: a DTLS re-handshake cannot be followed".to_string(),
+        );
+        assert_eq!(answered.refusal_token(), Some("ws-split-renegotiation"));
+        for error in [
+            RtpEngineError::EngineError("unknown call: c1".to_string()),
+            RtpEngineError::EngineError("attach_ws_split: the call has no codec".to_string()),
+            RtpEngineError::Protocol("ws-split-seated".to_string()),
+        ] {
+            assert_eq!(error.refusal_token(), None, "{error}");
+        }
     }
 }

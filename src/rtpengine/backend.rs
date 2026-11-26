@@ -1100,6 +1100,67 @@ impl MediaBackend {
         }
     }
 
+    /// Stream both legs of an answered two-party call to one duplex stereo
+    /// WebSocket and isolate the parties from each other.
+    ///
+    /// A native `siphon-rtp` extension, refused rather than hollow-successful
+    /// on the others: a split *replaces* the call's direct path between the
+    /// parties, so an `Ok(())` from a backend that cannot do it would read as
+    /// "both parties are on the bot" while they still hear each other.
+    pub async fn attach_ws_split(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        ws_uri: &str,
+        sample_rate: Option<u32>,
+        offerer_profile: Option<&NgFlags>,
+        answerer_profile: Option<&NgFlags>,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => {
+                client
+                    .attach_ws_split(
+                        call_id,
+                        from_tag,
+                        ws_uri,
+                        sample_rate,
+                        offerer_profile,
+                        answerer_profile,
+                    )
+                    .await
+            }
+            Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
+                operation: "attach_ws_split",
+                backend: "rtpengine",
+            }),
+            Self::RtpProxy(_) => Err(RtpEngineError::Unsupported {
+                operation: "attach_ws_split",
+                backend: "rtpproxy",
+            }),
+        }
+    }
+
+    /// End a call's split and put the direct path back, without a re-INVITE.
+    /// Idempotent on siphon-rtp; unsupported on the other backends for the
+    /// same reason as [`Self::attach_ws_split`].
+    pub async fn detach_ws_split(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => client.detach_ws_split(call_id, from_tag).await,
+            Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
+                operation: "detach_ws_split",
+                backend: "rtpengine",
+            }),
+            Self::RtpProxy(_) => Err(RtpEngineError::Unsupported {
+                operation: "detach_ws_split",
+                backend: "rtpproxy",
+            }),
+        }
+    }
+
     /// Begin ETSI TS 103 221-2 X3 content delivery for a call.
     ///
     /// Native `siphon-rtp` only, and refused rather than hollow-successful on
@@ -1577,6 +1638,54 @@ mod tests {
     /// cannot do it must refuse rather than answer `Ok(())` — a hollow success
     /// would read as "both parties are on the media server" while they are in
     /// fact still relaying to each other.
+    /// A split isolates the two parties, so a backend that cannot do it must
+    /// refuse rather than answer `Ok(())`.
+    #[tokio::test]
+    async fn ws_split_verbs_are_refused_on_rtpengine_and_rtpproxy() {
+        let rtpengine = MediaBackend::RtpEngine(Arc::new(
+            RtpEngineSet::new(vec![(dead_address(), 200, 1)])
+                .await
+                .unwrap(),
+        ));
+        let rtpproxy = MediaBackend::RtpProxy(
+            RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0)
+                .await
+                .unwrap(),
+        );
+
+        for (backend, name) in [(&rtpengine, "rtpengine"), (&rtpproxy, "rtpproxy")] {
+            let error = backend
+                .attach_ws_split(
+                    "call-1",
+                    "tag-a",
+                    "wss://bot.example.net/s",
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    RtpEngineError::Unsupported { operation: "attach_ws_split", backend: b } if b == name
+                ),
+                "{name} must refuse attach_ws_split, got {error:?}"
+            );
+            let error = backend
+                .detach_ws_split("call-1", "tag-a")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    RtpEngineError::Unsupported { operation: "detach_ws_split", backend: b } if b == name
+                ),
+                "{name} must refuse detach_ws_split, got {error:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn ws_bridge_verbs_are_refused_on_rtpengine_and_rtpproxy() {
         let rtpengine = MediaBackend::RtpEngine(Arc::new(
@@ -1920,6 +2029,7 @@ mod tests {
             ws_uri: None,
             ws_tee: None,
             ws_bridge_attached: false,
+            ws_split_attached: false,
             bridge_sides: None,
             created_at: std::time::Instant::now(),
         }

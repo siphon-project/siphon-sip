@@ -6,17 +6,19 @@
 
 use serde_json::json;
 
-use siphon_control_proto::sip::SipVerb;
+use siphon_control_proto::sip::{SipEvent, SipVerb, WsSplitEndedPayload, WsSplitStartedPayload};
 
 use crate::error::ControlError;
-use crate::sip::Call;
+use crate::sip::{Call, CallEvent};
 
 /// Which kind of WebSocket stream a `stream_start` / `stream_stop` addresses.
 ///
-/// The two are opposites, not two shapes of one stream. A **tee** is additive:
-/// a copy of the call's audio streams out and the call keeps relaying. A
-/// **bridge** is a takeover: the WebSocket server becomes the leg's far side
-/// and the call's own media path is unwired.
+/// A **tee** is additive: a copy of the call's audio streams out and the call
+/// keeps relaying. A **bridge** is a takeover: the WebSocket server becomes the
+/// leg's far side and the call's own media path is unwired. A **split** takes
+/// both legs of an answered two-party call to one duplex stereo socket, channel
+/// 0 the offerer and channel 1 the answerer, and isolates the parties from each
+/// other: each hears only what the server sends for them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StreamMode {
     /// Stream a copy; the call keeps relaying.
@@ -25,6 +27,12 @@ pub enum StreamMode {
     /// Hand the leg's media to the server. On a leg that already has one, the
     /// server re-points it in place.
     Bridge,
+    /// Stream both legs of an answered two-party call to one duplex stereo
+    /// socket and isolate the parties from each other. Needs an engine that
+    /// lists `ws_split` (`unsupported_verb` otherwise). After a
+    /// `WsSplitEnded` that is not `detached` or `call_deleted` the call stays
+    /// isolated and silent until [`StreamMode::Split`] is stopped.
+    Split,
 }
 
 impl StreamMode {
@@ -33,6 +41,7 @@ impl StreamMode {
         match self {
             StreamMode::Tee => "tee",
             StreamMode::Bridge => "bridge",
+            StreamMode::Split => "split",
         }
     }
 
@@ -41,6 +50,7 @@ impl StreamMode {
         match name.to_ascii_lowercase().as_str() {
             "tee" => Some(StreamMode::Tee),
             "bridge" => Some(StreamMode::Bridge),
+            "split" => Some(StreamMode::Split),
             _ => None,
         }
     }
@@ -138,6 +148,13 @@ pub struct StreamOptions {
     /// bridge only. They need a `profile` to merge over: without one, or on a
     /// tee, the server refuses them with `bad_request`.
     pub media_flags: Option<siphon_control_proto::media_flags::MediaFlags>,
+    /// A split's offerer uplink: the name of a media profile whose
+    /// `noise_suppression` runs on the offerer's audio before it is sent. The
+    /// engine applies only that setting and refuses a profile that asks for
+    /// more (echo cancellation, `ws_vad*`). An unknown name is `bad_request`.
+    pub offerer_profile: Option<String>,
+    /// A split's answerer uplink, as [`StreamOptions::offerer_profile`].
+    pub answerer_profile: Option<String>,
 }
 
 impl StreamOptions {
@@ -152,6 +169,29 @@ impl StreamOptions {
             mode: StreamMode::Bridge,
             ..Self::default()
         }
+    }
+
+    /// A split: both legs of the call to one duplex stereo socket, the parties
+    /// isolated from each other. [`StreamOptions::sample_rate`] is 8000, 16000,
+    /// 24000 or 48000 Hz here (the engine's default when unset); the server
+    /// refuses any other with `bad_request`.
+    pub fn split() -> Self {
+        Self {
+            mode: StreamMode::Split,
+            ..Self::default()
+        }
+    }
+
+    /// Run noise suppression on the offerer's uplink, as this profile sets it.
+    pub fn offerer_profile(mut self, name: impl Into<String>) -> Self {
+        self.offerer_profile = Some(name.into());
+        self
+    }
+
+    /// Run noise suppression on the answerer's uplink, as this profile sets it.
+    pub fn answerer_profile(mut self, name: impl Into<String>) -> Self {
+        self.answerer_profile = Some(name.into());
+        self
     }
 
     /// Tee this side of the call.
@@ -196,6 +236,7 @@ fn stream_start_args(
     sample_rate: Option<u32>,
     profile: Option<&str>,
     media_flags: Option<&siphon_control_proto::media_flags::MediaFlags>,
+    party_profiles: (Option<&str>, Option<&str>),
 ) -> serde_json::Value {
     let mut args = serde_json::Map::new();
     args.insert("ws_uri".to_string(), json!(ws_uri));
@@ -215,7 +256,37 @@ fn stream_start_args(
     if let Some(media_flags) = media_flags {
         args.insert("media_flags".to_string(), media_flags.to_json());
     }
+    let (offerer_profile, answerer_profile) = party_profiles;
+    if let Some(offerer_profile) = offerer_profile {
+        args.insert("offerer_profile".to_string(), json!(offerer_profile));
+    }
+    if let Some(answerer_profile) = answerer_profile {
+        args.insert("answerer_profile".to_string(), json!(answerer_profile));
+    }
     serde_json::Value::Object(args)
+}
+
+impl CallEvent {
+    /// The typed [`WsSplitStartedPayload`] when this is a
+    /// [`SipEvent::WsSplitStarted`] event, else `None`. Names the SIP party on
+    /// each channel of the stream, which the engine itself cannot.
+    pub fn ws_split_started(&self) -> Option<WsSplitStartedPayload> {
+        if self.kind != SipEvent::WsSplitStarted {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// The typed [`WsSplitEndedPayload`] when this is a
+    /// [`SipEvent::WsSplitEnded`] event, else `None`. Exactly one arrives per
+    /// `WsSplitStarted`. When its `isolated` is true the call stays isolated
+    /// and silent until the app calls `stream_stop_with(StreamMode::Split)`.
+    pub fn ws_split_ended(&self) -> Option<WsSplitEndedPayload> {
+        if self.kind != SipEvent::WsSplitEnded {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
 }
 
 impl Call {
@@ -251,6 +322,7 @@ impl Call {
             None,
             None,
             None,
+            (None, None),
         );
         self.sip(SipVerb::StreamStart, args).await.map(drop)
     }
@@ -277,6 +349,15 @@ impl Call {
     ///     StreamOptions::bridge().profile("voice_ai"),
     /// )
     /// .await?;
+    /// // Live translation: both parties of the call to one duplex socket,
+    /// // channel 0 the offerer and channel 1 the answerer, each hearing only
+    /// // what the server sends for them. `WsSplitStarted` names the SIP party
+    /// // on each channel.
+    /// call.stream_start_with(
+    ///     "wss://translate.example/call",
+    ///     StreamOptions::split().sample_rate(16_000),
+    /// )
+    /// .await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -300,6 +381,10 @@ impl Call {
             options.sample_rate,
             options.profile.as_deref(),
             options.media_flags.as_ref(),
+            (
+                options.offerer_profile.as_deref(),
+                options.answerer_profile.as_deref(),
+            ),
         );
         self.sip(SipVerb::StreamStart, args).await.map(drop)
     }
