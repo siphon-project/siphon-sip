@@ -249,25 +249,29 @@ impl RegistrantManager {
     /// would delete its binding (RFC 3261 §10.3). It is forgotten, record
     /// included.
     pub(super) fn startup_deregistration_superseded(&self, call_id: &str) -> bool {
-        let superseded = self
-            .draining_deregistrations
-            .get(call_id)
-            .filter(|draining| draining.needs_lookup)
-            .is_some_and(|draining| {
-                let Some(contact) = draining.entry.contact_uri.as_deref() else {
-                    return false;
-                };
-                self.entries.get(&draining.entry.aor).is_some_and(|live| {
-                    // The same registrar: one moved to another is a binding the
-                    // old registrar still holds.
-                    live.registrar_uri == draining.entry.registrar_uri
-                        && live.transport == draining.entry.transport
-                        && (live.sent_contact.as_deref() == Some(contact)
-                            || self.egress.get().is_some_and(|egress| {
-                                self.predicted_contact(&live, egress.defaults()) == contact
+        let superseded =
+            self.draining_deregistrations
+                .get(call_id)
+                .filter(|draining| draining.needs_lookup)
+                .is_some_and(|draining| {
+                    let Some(contact) = draining.entry.contact_uri.as_deref() else {
+                        return false;
+                    };
+                    self.entries.get(&draining.entry.aor).is_some_and(|live| {
+                        // The same registrar: one moved to another is a binding the
+                        // old registrar still holds.
+                        live.registrar_uri == draining.entry.registrar_uri
+                            && live.transport == draining.entry.transport
+                            && (live.sent_contact.as_deref().is_some_and(|sent| {
+                                super::contact::contacts_equivalent(sent, contact)
+                            }) || self.egress.get().is_some_and(|egress| {
+                                super::contact::contacts_equivalent(
+                                    &self.predicted_contact(&live, egress.defaults()),
+                                    contact,
+                                )
                             }))
-                })
-            });
+                    })
+                });
         if superseded {
             if let Some((_, draining)) = self.draining_deregistrations.remove(call_id) {
                 info!(

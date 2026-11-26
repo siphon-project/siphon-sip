@@ -256,6 +256,32 @@ impl UriExtras {
     }
 }
 
+/// `text` with its `%XX` escapes decoded (an escape that is not two hex digits
+/// is kept as it is), for the comparisons of RFC 3261 §19.1.4.
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escaped = (bytes[index] == b'%')
+            .then(|| bytes.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|pair| std::str::from_utf8(pair).ok())
+            .and_then(|pair| u8::from_str_radix(pair, 16).ok());
+        match escaped {
+            Some(byte) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            None => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 /// SIP URI as defined in RFC 3261
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SipUri {
@@ -296,6 +322,69 @@ impl SipUri {
     pub fn with_param(mut self, name: String, value: Option<String>) -> Self {
         self.params.push((name, value));
         self
+    }
+
+    /// Whether two URIs are equivalent under RFC 3261 §19.1.4, the comparison
+    /// a registrar keys a binding by.
+    ///
+    /// - The scheme, the user and user parameters (percent-escapes decoded,
+    ///   case-sensitive) and the host (case-insensitive) must match; a port on
+    ///   one URI only is a difference, as in the RFC's own example.
+    /// - A `user`, `ttl`, `method`, `maddr` or `transport` parameter on one URI
+    ///   only is a difference. Any other parameter on one URI only is ignored.
+    ///   A parameter on both must match. Parameter names and values compare
+    ///   without case, and their order does not matter.
+    /// - A URI header on one URI only is a difference; headers compare by name
+    ///   without case, their order does not matter.
+    pub fn is_equivalent_to(&self, other: &SipUri) -> bool {
+        if self.scheme != other.scheme
+            || self.port != other.port
+            || !self.host.eq_ignore_ascii_case(&other.host)
+            || self.user.as_deref().map(percent_decoded)
+                != other.user.as_deref().map(percent_decoded)
+        {
+            return false;
+        }
+        if !Self::pairs_equivalent(self.user_params(), other.user_params(), true)
+            || !Self::pairs_equivalent(self.headers(), other.headers(), true)
+        {
+            return false;
+        }
+        Self::pairs_equivalent(&self.params, &other.params, false)
+    }
+
+    /// `strict`: a name on one side only is a difference. Otherwise only one of
+    /// the parameters RFC 3261 §19.1.4 names is.
+    fn pairs_equivalent(
+        left: &[(String, Option<String>)],
+        right: &[(String, Option<String>)],
+        strict: bool,
+    ) -> bool {
+        const MUST_MATCH: [&str; 5] = ["user", "ttl", "method", "maddr", "transport"];
+        let find = |list: &'_ [(String, Option<String>)], name: &str| {
+            list.iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_deref().map(percent_decoded))
+        };
+        let one_sided =
+            |name: &str| strict || MUST_MATCH.iter().any(|m| m.eq_ignore_ascii_case(name));
+        for (name, _) in left.iter().chain(right.iter()) {
+            match (find(left, name), find(right, name)) {
+                (Some(a), Some(b)) => {
+                    let same = match (&a, &b) {
+                        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if !same {
+                        return false;
+                    }
+                }
+                _ if one_sided(name) => return false,
+                _ => {}
+            }
+        }
+        true
     }
 
     /// URI headers (after `?`). Empty slice when the URI has none, which is
@@ -754,5 +843,84 @@ mod scheme_tests {
         assert_ne!(Scheme::Sip, "sips");
         assert_eq!(Scheme::from_token("http"), "http");
         assert_eq!(Scheme::Sip.as_ref(), "sip");
+    }
+}
+
+#[cfg(test)]
+mod equivalence_tests {
+    use crate::sip::parser::parse_uri_complete;
+
+    fn same(left: &str, right: &str) -> bool {
+        let left = parse_uri_complete(left).expect(left);
+        let right = parse_uri_complete(right).expect(right);
+        let forward = left.is_equivalent_to(&right);
+        assert_eq!(forward, right.is_equivalent_to(&left), "{left:?} {right:?}");
+        forward
+    }
+
+    /// RFC 3261 §19.1.4, the examples of equivalent URIs.
+    #[test]
+    fn the_rfc_examples_of_equivalent_uris_match() {
+        assert!(same(
+            "sip:%61lice@atlanta.com;transport=TCP",
+            "sip:alice@AtLanta.COM;Transport=tcp"
+        ));
+        assert!(same(
+            "sip:carol@chicago.com",
+            "sip:carol@chicago.com;newparam=5"
+        ));
+        assert!(same(
+            "sip:carol@chicago.com;security=on",
+            "sip:carol@chicago.com;newparam=5"
+        ));
+        assert!(same(
+            "sip:biloxi.com;transport=tcp;method=REGISTER?to=sip:bob%40biloxi.com",
+            "sip:biloxi.com;method=REGISTER;transport=tcp?to=sip:bob%40biloxi.com"
+        ));
+        assert!(same(
+            "sip:alice@atlanta.com?subject=project%20x&priority=urgent",
+            "sip:alice@atlanta.com?priority=urgent&subject=project%20x"
+        ));
+    }
+
+    /// RFC 3261 §19.1.4, the examples of URIs that differ.
+    #[test]
+    fn the_rfc_examples_of_different_uris_do_not_match() {
+        assert!(!same("sip:ALICE@atlanta.com", "sip:alice@atlanta.com"));
+        assert!(!same("sip:bob@biloxi.com", "sip:bob@biloxi.com:5060"));
+        assert!(!same(
+            "sip:bob@biloxi.com",
+            "sip:bob@biloxi.com;transport=udp"
+        ));
+        assert!(!same("sip:bob@biloxi.com", "sip:bob@192.0.2.4"));
+        assert!(!same(
+            "sip:alice@atlanta.com?subject=project%20x",
+            "sip:alice@atlanta.com"
+        ));
+    }
+
+    #[test]
+    fn a_parameter_on_one_side_only_is_ignored_unless_it_is_one_of_the_five() {
+        assert!(same("sip:u@vip:5060;rnode=a1", "sip:u@vip:5060"));
+        for special in ["user=phone", "ttl=3", "method=INVITE", "maddr=192.0.2.1"] {
+            assert!(
+                !same(&format!("sip:u@vip:5060;{special}"), "sip:u@vip:5060"),
+                "{special}"
+            );
+        }
+        // Both sides: they must match, names and values without case.
+        assert!(same(
+            "sip:u@vip:5060;RNode=AB12",
+            "sip:u@vip:5060;rnode=ab12"
+        ));
+        assert!(!same(
+            "sip:u@vip:5060;rnode=ab12",
+            "sip:u@vip:5060;rnode=cd34"
+        ));
+    }
+
+    #[test]
+    fn the_scheme_is_part_of_the_identity() {
+        assert!(!same("sip:u@vip:5060", "sips:u@vip:5060"));
     }
 }

@@ -88,10 +88,24 @@ pub(super) fn build_contact_header(contact_uri: &str, ims: Option<&ImsContactPar
 
 impl RegistrantManager {
     /// The instance id the Contact token of every generated Contact is made
-    /// of. Without one, no token is added (a Contact as older versions built
-    /// it). Call before anything registers.
-    pub fn with_instance_id(mut self, instance_id: String) -> Self {
-        self.instance_id = Some(instance_id);
+    /// of. `None`, or no call, adds no token (a Contact as older versions
+    /// built it) and claims no binding by token in the restart clean-up. Call
+    /// before anything registers.
+    ///
+    /// A token is as unique as the id: two nodes with one id hold one token,
+    /// and one's clean-up would take the other's binding for its own
+    /// (`others_holding` skips records of its own instance id, which is the id
+    /// both use). So the id must name one node; the built-in fallback, the same
+    /// on every node, is not passed here, and says so once at start-up.
+    pub fn with_instance_id(mut self, instance_id: impl Into<Option<String>>) -> Self {
+        self.instance_id = instance_id.into();
+        if self.instance_id.is_none() {
+            tracing::warn!(
+                "neither server.instance_id nor HOSTNAME is set: trunk Contacts carry no node \
+                 token and the restart clean-up only clears bindings on a concrete listener \
+                 socket (it needs a unique server.instance_id on every node)"
+            );
+        }
         self
     }
 
@@ -183,12 +197,26 @@ fn fnv1a_64(bytes: impl IntoIterator<Item = u8>) -> u64 {
     })
 }
 
-/// The token a Contact URI carries, if it has one.
+/// Whether two Contact URIs name the same binding at a registrar (RFC 3261
+/// §19.1.4). Text that does not parse as a URI is compared as text.
+pub(super) fn contacts_equivalent(left: &str, right: &str) -> bool {
+    match (
+        crate::sip::parser::parse_uri_complete(left),
+        crate::sip::parser::parse_uri_complete(right),
+    ) {
+        (Ok(left), Ok(right)) => left.is_equivalent_to(&right),
+        _ => left == right,
+    }
+}
+
+/// The token a Contact URI carries, if it has one (the parameter name is
+/// compared without case, RFC 3261 §19.1.4; so is the value, at the use).
 pub(super) fn contact_token_of(contact: &str) -> Option<&str> {
     let rest = contact.split('?').next()?;
-    rest.split(';')
-        .skip(1)
-        .find_map(|parameter| parameter.strip_prefix(TOKEN_PARAMETER)?.strip_prefix('='))
+    rest.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        name.eq_ignore_ascii_case(TOKEN_PARAMETER).then_some(value)
+    })
 }
 
 #[cfg(test)]
@@ -237,5 +265,38 @@ mod tests {
         );
         assert_eq!(contact_token_of("sip:u@203.0.113.10:5060"), None);
         assert_eq!(contact_token_of("sip:rnode=x@203.0.113.10:5060"), None);
+    }
+}
+
+#[cfg(test)]
+mod case_tests {
+    use super::*;
+
+    #[test]
+    fn the_token_parameter_name_is_read_without_case() {
+        assert_eq!(
+            contact_token_of("sip:u@h:5060;RNode=00ff00ff00ff00ff"),
+            Some("00ff00ff00ff00ff")
+        );
+        assert_eq!(
+            contact_token_of("sip:u@h:5060;transport=tcp;RNODE=aa"),
+            Some("aa")
+        );
+    }
+
+    #[test]
+    fn contacts_are_compared_as_uris() {
+        assert!(contacts_equivalent(
+            "sip:u@vip:5060;transport=tcp;rnode=AB",
+            "sip:u@VIP:5060;rnode=ab;Transport=TCP"
+        ));
+        assert!(contacts_equivalent(
+            "sip:u@vip:5060;rnode=ab",
+            "sip:u@vip:5060"
+        ));
+        assert!(!contacts_equivalent(
+            "sip:u@vip:5060;rnode=ab",
+            "sip:u@vip:5061"
+        ));
     }
 }

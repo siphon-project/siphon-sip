@@ -595,7 +595,10 @@ impl BindingStore {
 
     /// The records OTHER instances hold for `aors`: a registrar keys a binding
     /// by its Contact, so another node's record of the same AoR and Contact is
-    /// a REGISTER that already replaced ours (RFC 3261 §10.3). Scans
+    /// a REGISTER that already replaced ours (RFC 3261 §10.3). Records of this
+    /// store's own instance id are left out, so two processes that share an
+    /// `instance_id` do not see each other here, and write the same keys: every
+    /// node needs a unique `server.instance_id` (see `siphon.yaml`). Scans
     /// `{prefix}*:{aor}` for each (SCAN, never KEYS).
     #[cfg_attr(not(any(feature = "redis-backend", test)), allow(clippy::never_loop))]
     pub async fn others_holding(&self, aors: &[String]) -> Result<Vec<BindingRecord>, String> {

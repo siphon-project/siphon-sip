@@ -1094,3 +1094,100 @@ async fn a_live_entry_takes_over_a_binding_on_its_own_tokened_contact() {
     assert_eq!(report.carried, 1);
     assert_eq!(report.deregistered, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Contacts compared as SIP URIs (RFC 3261 §19.1.4), token case
+// ---------------------------------------------------------------------------
+
+/// Another node registered the same AoR with a tokenless Contact on the same
+/// address: a parameter on one URI only is ignored, so it is the same binding
+/// at the registrar, and this node's de-REGISTER would delete it.
+#[tokio::test]
+async fn a_tokenless_contact_equivalent_to_ours_stops_the_de_register() {
+    let (manager, store) = token_manager("node-a");
+    assert_eq!(
+        cleanup_of(&manager, &tokened("node-a", "203.0.113.10:5060")).deregistered,
+        1
+    );
+    store.save_as_instance(other_instance_record("sip:trunk@203.0.113.10:5060"));
+    assert!(released(&manager).await.is_empty());
+}
+
+/// And a Contact of another instance's token, in another spelling, does not.
+#[tokio::test]
+async fn a_contact_with_another_token_does_not_stop_the_de_register() {
+    let (manager, store) = token_manager("node-a");
+    assert_eq!(
+        cleanup_of(&manager, &tokened("node-a", "203.0.113.10:5060")).deregistered,
+        1
+    );
+    store.save_as_instance(other_instance_record(&tokened(
+        "node-b",
+        "203.0.113.10:5060",
+    )));
+    assert_eq!(released(&manager).await.len(), 1);
+}
+
+/// A live entry registered the same binding in another spelling (parameter
+/// order, case): the stored record is that entry's, taken over, not an orphan.
+#[tokio::test]
+async fn a_live_entry_takes_over_a_binding_spelled_another_way() {
+    let (manager, _store) = manager_with_store();
+    let listen = listen();
+    let mut entry = trunk(AOR);
+    entry.contact_uri = Some("sip:trunk@192.0.2.1:5060;rnode=ab12;transport=udp".to_string());
+    manager.add(entry);
+    let mut stored = record(AOR);
+    stored.contact = "sip:trunk@192.0.2.1:5060;Transport=UDP;RNode=AB12".to_string();
+
+    let report = manager.startup_cleanup(vec![stored], defaults(&listen));
+
+    assert_eq!(report.carried, 1);
+    assert_eq!(report.deregistered, 0);
+}
+
+/// The final guard: a live entry that took the Contact, spelled another way,
+/// stops a queued de-REGISTER.
+#[tokio::test]
+async fn a_queued_de_register_is_dropped_once_a_live_entry_holds_an_equivalent_contact() {
+    let (manager, store) = manager_with_store();
+    let listen = listen();
+    let mut stored = record(AOR);
+    stored.contact = "sip:trunk@192.0.2.1:5060;transport=UDP".to_string();
+    store.save(stored.clone());
+    manager.startup_cleanup(vec![stored], defaults(&listen));
+    assert_eq!(manager.removed_deregistrations_pending(), 1);
+    let mut entry = trunk(AOR);
+    entry.contact_uri = Some("sip:trunk@192.0.2.1:5060;transport=udp".to_string());
+    manager.add(entry);
+    // It registers on it, so its sent Contact is the equivalent spelling.
+    manager.build_register(AOR, defaults(&listen), 600);
+
+    assert!(released(&manager).await.is_empty());
+}
+
+/// A token in another spelling of the parameter name, foreign, on this node's
+/// own socket: never accepted through the concrete-socket fallback.
+#[tokio::test]
+async fn a_foreign_token_in_any_case_is_never_cleared_on_a_concrete_socket() {
+    let manager = Arc::new(test_support::manager().with_instance_id("node-a".to_string()));
+    test_support::install_egress(&manager);
+    test_support::attach_untracked_transactions(&manager);
+    manager.attach_binding_store(BindingStore::in_memory("node-a", 30));
+    let foreign = crate::registrant::contact::instance_token("node-b", AOR);
+    for contact in [
+        format!("sip:trunk@192.0.2.1:5060;RNode={foreign}"),
+        format!("sip:trunk@192.0.2.1:5060;rnode={}", foreign.to_uppercase()),
+    ] {
+        assert_eq!(cleanup_of(&manager, &contact).deregistered, 0, "{contact}");
+    }
+}
+
+/// This node's own token, upper-cased, is still its own.
+#[tokio::test]
+async fn this_nodes_token_in_upper_case_is_still_its_own() {
+    let (manager, _store) = token_manager("node-a");
+    let own = crate::registrant::contact::instance_token("node-a", AOR).to_uppercase();
+    let contact = format!("sip:trunk@203.0.113.10:5060;RNODE={own}");
+    assert_eq!(cleanup_of(&manager, &contact).deregistered, 1);
+}

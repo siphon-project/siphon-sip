@@ -1146,7 +1146,7 @@ impl SiphonServer {
                         std::time::Duration::from_secs(registrant_config.max_retry_interval),
                         Arc::clone(&identity),
                     )
-                    .with_instance_id(bootstrap::instance_id(&config))
+                    .with_instance_id(bootstrap::explicit_instance_id(&config))
                     .with_event_capacity(registrant_config.effective_event_capacity())
                     .with_refresh_window(
                         registrant_config

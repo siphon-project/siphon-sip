@@ -332,7 +332,9 @@ impl RegistrantManager {
     /// guard.
     fn contact_is_held_here(&self, contact: &str, aor: &str, defaults: EgressDefaults<'_>) -> bool {
         if let Some(token) = super::contact::contact_token_of(contact) {
-            return self.instance_token(aor).as_deref() == Some(token);
+            return self
+                .instance_token(aor)
+                .is_some_and(|own| own.eq_ignore_ascii_case(token));
         }
         let Some((host, Some(port))) = contact_host_port(contact) else {
             return false;
@@ -363,7 +365,10 @@ impl RegistrantManager {
         // answer with another frontend after a restart.
         let same_target = live.registrar_uri == record.registrar_uri
             && live.transport == record.transport
-            && self.predicted_contact(&live, defaults) == record.contact;
+            && super::contact::contacts_equivalent(
+                &self.predicted_contact(&live, defaults),
+                &record.contact,
+            );
         if !same_target {
             return Outcome::Orphan;
         }
@@ -521,9 +526,9 @@ impl RegistrantManager {
             return false;
         }
         match store.others_holding(std::slice::from_ref(&aor)).await {
-            Ok(others) => !others
-                .iter()
-                .any(|other| other.aor == aor && other.contact == contact),
+            Ok(others) => !others.iter().any(|other| {
+                other.aor == aor && super::contact::contacts_equivalent(&other.contact, &contact)
+            }),
             Err(error) => {
                 warn!(%aor, %error, "restart clean-up: the other nodes' bindings cannot be read, nothing is sent");
                 false
