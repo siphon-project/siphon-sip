@@ -334,7 +334,7 @@ impl RegistrantManager {
         if let Some(token) = super::contact::contact_token_of(contact) {
             return self
                 .instance_token(aor)
-                .is_some_and(|own| own.eq_ignore_ascii_case(token));
+                .is_some_and(|own| own.eq_ignore_ascii_case(&token));
         }
         let Some((host, Some(port))) = contact_host_port(contact) else {
             return false;
@@ -503,33 +503,65 @@ impl RegistrantManager {
         }
     }
 
-    /// Whether the trunk source allows a tokened claim of `aor`'s binding.
+    /// Whether the trunk source allows a claim of `aor`'s stored `contact`.
     ///
-    /// Another node registers a tokenless Contact for the AoR (the same binding
-    /// at the registrar when the address is shared, RFC 3261 §19.1.4) only from
-    /// a source row with an explicit `contact`, or on an older version. Its
-    /// record may not be in Redis yet, so the answer comes from the source, not
-    /// from what Redis shows: the AoR's live entry when this node lists it, else
-    /// the source's lookup by AoR. An explicit contact, a failed lookup, or a
-    /// source with no lookup (it cannot say) means no claim. An AoR the source
-    /// does not know, a row without a contact, or no source at all, allows it.
-    /// Mixed versions during a rolling upgrade remain a limit: upgrade every
-    /// node before relying on the clean-up behind a shared address.
-    async fn tokened_claim_allowed(&self, aor: &str) -> bool {
-        let blank = |contact: Option<&str>| contact.is_none_or(|contact| contact.trim().is_empty());
+    /// Another node may hold the same binding without a record in Redis yet:
+    /// - behind a shared address, a tokenless Contact (a source row's explicit
+    ///   `contact`, or an older version) is the same binding as a tokened one
+    ///   (RFC 3261 §19.1.4);
+    /// - an explicit `contact` is the same text on every node the row reaches,
+    ///   so a stored tokenless Contact on a socket this node also listens on
+    ///   may be held by the node the trunk moved to.
+    ///
+    /// The answer comes from the source, not from what Redis shows: the AoR's
+    /// live entry when this node lists it, else the source's lookup by AoR.
+    /// - A tokened claim is blocked by an explicit contact in the row.
+    /// - A tokenless claim is blocked by an explicit contact in the row that is
+    ///   equivalent to the stored one.
+    /// - A failed lookup, or a source with no lookup (it cannot say), blocks both.
+    /// - An AoR the source does not know, a row that does not block, or no
+    ///   source at all, allows it.
+    ///
+    /// Known limits: mixed versions during a rolling upgrade (upgrade every node
+    /// before relying on the clean-up behind a shared address), duplicate
+    /// instance ids, and an explicit contact cleared from the source while a
+    /// node was down, with the other node's record not yet in the store: it can
+    /// still be de-registered.
+    async fn source_allows_claim(
+        &self,
+        aor: &str,
+        registrar: &str,
+        contact: &str,
+        tokened: bool,
+    ) -> bool {
+        // A row for another registrar does not hold this registrar's binding.
+        let bare = |uri: &str| uri.trim().trim_start_matches("sip:").to_string();
+        let blocks = |row_registrar: &str, row_contact: Option<&str>| {
+            if bare(row_registrar) != bare(registrar) {
+                return false;
+            }
+            match row_contact
+                .map(str::trim)
+                .filter(|candidate| !candidate.is_empty())
+            {
+                None => false,
+                Some(_) if tokened => true,
+                Some(candidate) => super::contact::contacts_equivalent(candidate, contact),
+            }
+        };
         if let Some(live) = self.entries.get(aor) {
-            return blank(live.contact_uri.as_deref());
+            return !blocks(&live.registrar_uri, live.contact_uri.as_deref());
         }
         let Some(lookup) = self.restart.credential_lookup.get().cloned() else {
             return true;
         };
         if !lookup.is_configured() {
-            debug!(%aor, "restart clean-up: the source has no lookup, a tokened binding is not claimed");
+            debug!(%aor, "restart clean-up: the source has no lookup, the binding is not claimed");
             return false;
         }
         match lookup.lookup(aor).await {
             Ok(None) => true,
-            Ok(Some(row)) => blank(row.contact.as_deref()),
+            Ok(Some(row)) => !blocks(&row.registrar, row.contact.as_deref()),
             Err(error) => {
                 warn!(%aor, %error, "restart clean-up: the source cannot say whether the AoR has an explicit contact, nothing is sent");
                 false
@@ -541,13 +573,14 @@ impl RegistrantManager {
         if self.startup_deregistration_superseded(call_id) {
             return false;
         }
-        let Some((aor, contact)) =
+        let Some((aor, contact, registrar)) =
             self.draining_deregistrations
                 .get(call_id)
                 .and_then(|draining| {
                     Some((
                         draining.entry.aor.clone(),
                         draining.entry.contact_uri.clone()?,
+                        draining.entry.registrar_uri.clone(),
                     ))
                 })
         else {
@@ -559,8 +592,10 @@ impl RegistrantManager {
         if !self.contact_is_held_here(&contact, &aor, egress.defaults()) {
             return false;
         }
-        if super::contact::contact_token_of(&contact).is_some()
-            && !self.tokened_claim_allowed(&aor).await
+        let tokened = super::contact::contact_token_of(&contact).is_some();
+        if !self
+            .source_allows_claim(&aor, &registrar, &contact, tokened)
+            .await
         {
             return false;
         }

@@ -288,7 +288,6 @@ fn node_manager(instance: &str) -> super::RegistrantManager {
 fn token_of(built: &BuiltRegister) -> String {
     let header = contact(built);
     super::contact::contact_token_of(header.trim_matches(|c| c == '<' || c == '>'))
-        .map(str::to_string)
         .unwrap_or_default()
 }
 

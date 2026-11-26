@@ -74,6 +74,10 @@ redis-server --port "${REDIS_PORT}" --bind 127.0.0.1 --save "" --appendonly no \
 for _ in $(seq 50); do redis-cli -p "${REDIS_PORT}" ping >/dev/null 2>&1 && break; sleep 0.1; done
 
 echo listed > "${WORK}/state"
+# The restart clean-up claims a tokenless (explicit) Contact only when the source's
+# row for the AoR shows no equivalent explicit contact: the lookup serves the row
+# without it, as after the controller cleared the override.
+export LOOKUP_WITHOUT_CONTACT=1
 if [[ -n "${DEFAULT_CONTACT:-}" || -n "${WILDCARD_ADVERTISED:-}" ]]; then export TRUNK_CONTACT=""; DEFAULT_CONTACT=1; fi
 ADVERTISED="203.0.113.10"
 LISTEN_ADDRESS="127.0.0.1"

@@ -1297,3 +1297,59 @@ async fn a_listed_aor_answers_from_its_live_entry() {
         );
     }
 }
+
+/// A tokenless Contact on one of this node's own sockets, with the trunk source
+/// answering `answer` (none: no source): whether its de-REGISTER may leave.
+async fn tokenless_claim_with(
+    answer: Option<Result<Option<crate::registrant::source::RegistrantRow>, String>>,
+    configured: bool,
+) -> bool {
+    let manager = Arc::new(test_support::manager().with_instance_id("node-a".to_string()));
+    test_support::install_egress(&manager);
+    test_support::attach_untracked_transactions(&manager);
+    manager.attach_binding_store(BindingStore::in_memory("node-a", 30));
+    if let Some(answer) = answer {
+        manager.set_credential_lookup(Arc::new(SourceStub { answer, configured }));
+    }
+    let report = cleanup_of(&manager, "sip:trunk@192.0.2.1:5060");
+    assert_eq!(report.deregistered, 1);
+    !released(&manager).await.is_empty()
+}
+
+/// Another node may hold the same explicit Contact (the socket may be a shared
+/// address): when the source's row for the AoR names an equivalent one, no claim.
+#[tokio::test]
+async fn a_tokenless_claim_is_blocked_by_an_equivalent_explicit_contact_in_the_source() {
+    assert!(
+        !tokenless_claim_with(
+            Some(Ok(Some(row(Some("SIP:trunk@192.0.2.1:5060;x=1"))))),
+            true
+        )
+        .await,
+        "equivalent but not identical spelling"
+    );
+    assert!(!tokenless_claim_with(Some(Err("down".to_string())), true).await);
+    assert!(!tokenless_claim_with(Some(Ok(None)), false).await);
+}
+
+#[tokio::test]
+async fn a_tokenless_claim_goes_when_the_source_shows_no_equivalent_contact() {
+    assert!(tokenless_claim_with(Some(Ok(Some(row(None)))), true).await);
+    assert!(
+        tokenless_claim_with(Some(Ok(Some(row(Some("sip:trunk@192.0.2.1:5090"))))), true).await
+    );
+    assert!(tokenless_claim_with(Some(Ok(None)), true).await);
+    assert!(tokenless_claim_with(None, true).await);
+}
+
+/// An escaped spelling of the token parameter's name is the token parameter.
+#[tokio::test]
+async fn a_foreign_token_behind_an_escaped_parameter_name_is_never_cleared() {
+    let manager = Arc::new(test_support::manager().with_instance_id("node-a".to_string()));
+    test_support::install_egress(&manager);
+    test_support::attach_untracked_transactions(&manager);
+    manager.attach_binding_store(BindingStore::in_memory("node-a", 30));
+    let foreign = crate::registrant::contact::instance_token("node-b", AOR);
+    let contact = format!("sip:trunk@192.0.2.1:5060;%72node={foreign}");
+    assert_eq!(cleanup_of(&manager, &contact).deregistered, 0);
+}

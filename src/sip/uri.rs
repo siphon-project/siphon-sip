@@ -261,7 +261,7 @@ impl UriExtras {
 /// escape stays an escape, with its hex digits upper-cased, so a reserved
 /// character escaped is never the character unescaped. Octets, not text: an
 /// escape of a byte that is not UTF-8 stays distinct from another.
-fn comparable_octets(text: &str) -> Vec<u8> {
+pub(crate) fn comparable_octets(text: &str) -> Vec<u8> {
     let bytes = text.as_bytes();
     let mut octets = Vec::with_capacity(bytes.len());
     let mut index = 0;

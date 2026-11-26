@@ -216,13 +216,20 @@ pub(super) fn contacts_equivalent(left: &str, right: &str) -> bool {
     }
 }
 
-/// The token a Contact URI carries, if it has one (the parameter name is
-/// compared without case, RFC 3261 §19.1.4; so is the value, at the use).
-pub(super) fn contact_token_of(contact: &str) -> Option<&str> {
+/// The token a Contact URI carries, if it has one. The parameter name is read
+/// as RFC 3261 §19.1.4 compares it, after the decoding of escaped unreserved
+/// characters and without case (the same decoding as
+/// [`crate::sip::uri::SipUri::is_equivalent_to`]), so `%72node` is the token;
+/// the value is decoded the same way, and compared without case at the use.
+pub(super) fn contact_token_of(contact: &str) -> Option<String> {
     let rest = contact.split('?').next()?;
     rest.split(';').skip(1).find_map(|parameter| {
         let (name, value) = parameter.split_once('=')?;
-        name.eq_ignore_ascii_case(TOKEN_PARAMETER).then_some(value)
+        crate::sip::uri::comparable_octets(name)
+            .eq_ignore_ascii_case(TOKEN_PARAMETER.as_bytes())
+            .then(|| {
+                String::from_utf8_lossy(&crate::sip::uri::comparable_octets(value)).into_owned()
+            })
     })
 }
 
@@ -267,7 +274,8 @@ mod tests {
     #[test]
     fn a_contacts_token_is_read_from_its_parameters_only() {
         assert_eq!(
-            contact_token_of("sip:u@203.0.113.10:5060;transport=tcp;rnode=00ff00ff00ff00ff"),
+            contact_token_of("sip:u@203.0.113.10:5060;transport=tcp;rnode=00ff00ff00ff00ff")
+                .as_deref(),
             Some("00ff00ff00ff00ff")
         );
         assert_eq!(contact_token_of("sip:u@203.0.113.10:5060"), None);
@@ -282,13 +290,26 @@ mod case_tests {
     #[test]
     fn the_token_parameter_name_is_read_without_case() {
         assert_eq!(
-            contact_token_of("sip:u@h:5060;RNode=00ff00ff00ff00ff"),
+            contact_token_of("sip:u@h:5060;RNode=00ff00ff00ff00ff").as_deref(),
             Some("00ff00ff00ff00ff")
         );
         assert_eq!(
-            contact_token_of("sip:u@h:5060;transport=tcp;RNODE=aa"),
+            contact_token_of("sip:u@h:5060;transport=tcp;RNODE=aa").as_deref(),
             Some("aa")
         );
+    }
+
+    #[test]
+    fn the_token_parameter_name_is_read_after_unreserved_decoding() {
+        assert_eq!(
+            contact_token_of("sip:u@h:5060;%72node=00ff00ff00ff00ff").as_deref(),
+            Some("00ff00ff00ff00ff")
+        );
+        assert_eq!(
+            contact_token_of("sip:u@h:5060;%52NODE=00ff").as_deref(),
+            Some("00ff")
+        );
+        assert_eq!(contact_token_of("sip:u@h:5060;%2Fnode=00ff"), None);
     }
 
     #[test]
