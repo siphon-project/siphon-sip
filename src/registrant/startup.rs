@@ -503,6 +503,40 @@ impl RegistrantManager {
         }
     }
 
+    /// Whether the trunk source allows a tokened claim of `aor`'s binding.
+    ///
+    /// Another node registers a tokenless Contact for the AoR (the same binding
+    /// at the registrar when the address is shared, RFC 3261 §19.1.4) only from
+    /// a source row with an explicit `contact`, or on an older version. Its
+    /// record may not be in Redis yet, so the answer comes from the source, not
+    /// from what Redis shows: the AoR's live entry when this node lists it, else
+    /// the source's lookup by AoR. An explicit contact, a failed lookup, or a
+    /// source with no lookup (it cannot say) means no claim. An AoR the source
+    /// does not know, a row without a contact, or no source at all, allows it.
+    /// Mixed versions during a rolling upgrade remain a limit: upgrade every
+    /// node before relying on the clean-up behind a shared address.
+    async fn tokened_claim_allowed(&self, aor: &str) -> bool {
+        let blank = |contact: Option<&str>| contact.is_none_or(|contact| contact.trim().is_empty());
+        if let Some(live) = self.entries.get(aor) {
+            return blank(live.contact_uri.as_deref());
+        }
+        let Some(lookup) = self.restart.credential_lookup.get().cloned() else {
+            return true;
+        };
+        if !lookup.is_configured() {
+            debug!(%aor, "restart clean-up: the source has no lookup, a tokened binding is not claimed");
+            return false;
+        }
+        match lookup.lookup(aor).await {
+            Ok(None) => true,
+            Ok(Some(row)) => blank(row.contact.as_deref()),
+            Err(error) => {
+                warn!(%aor, %error, "restart clean-up: the source cannot say whether the AoR has an explicit contact, nothing is sent");
+                false
+            }
+        }
+    }
+
     async fn startup_deregistration_may_go(&self, call_id: &str) -> bool {
         if self.startup_deregistration_superseded(call_id) {
             return false;
@@ -523,6 +557,11 @@ impl RegistrantManager {
             return false;
         };
         if !self.contact_is_held_here(&contact, &aor, egress.defaults()) {
+            return false;
+        }
+        if super::contact::contact_token_of(&contact).is_some()
+            && !self.tokened_claim_allowed(&aor).await
+        {
             return false;
         }
         match store.others_holding(std::slice::from_ref(&aor)).await {

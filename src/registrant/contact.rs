@@ -200,9 +200,16 @@ fn fnv1a_64(bytes: impl IntoIterator<Item = u8>) -> u64 {
 /// Whether two Contact URIs name the same binding at a registrar (RFC 3261
 /// §19.1.4). Text that does not parse as a URI is compared as text.
 pub(super) fn contacts_equivalent(left: &str, right: &str) -> bool {
+    // The scheme is case-insensitive (RFC 3261 §19.1.1) but the parser only
+    // knows the lower-case ones, so the token before the first colon is
+    // lower-cased first.
+    let scheme_lowered = |text: &str| match text.split_once(':') {
+        Some((scheme, rest)) => format!("{}:{rest}", scheme.to_ascii_lowercase()),
+        None => text.to_string(),
+    };
     match (
-        crate::sip::parser::parse_uri_complete(left),
-        crate::sip::parser::parse_uri_complete(right),
+        crate::sip::parser::parse_uri_complete(&scheme_lowered(left)),
+        crate::sip::parser::parse_uri_complete(&scheme_lowered(right)),
     ) {
         (Ok(left), Ok(right)) => left.is_equivalent_to(&right),
         _ => left == right,

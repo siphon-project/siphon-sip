@@ -1191,3 +1191,109 @@ async fn this_nodes_token_in_upper_case_is_still_its_own() {
     let contact = format!("sip:trunk@203.0.113.10:5060;RNODE={own}");
     assert_eq!(cleanup_of(&manager, &contact).deregistered, 1);
 }
+
+// ---------------------------------------------------------------------------
+// A tokened claim and the trunk source: another node's tokenless Contact
+// ---------------------------------------------------------------------------
+
+/// A source that answers the lookup of every AoR the same way.
+struct SourceStub {
+    answer: Result<Option<crate::registrant::source::RegistrantRow>, String>,
+    configured: bool,
+}
+
+impl crate::registrant::source::CredentialLookup for SourceStub {
+    fn is_configured(&self) -> bool {
+        self.configured
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        _aor: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<crate::registrant::source::RegistrantRow>, String>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let answer = self.answer.clone();
+        Box::pin(async move { answer })
+    }
+}
+
+fn row(contact: Option<&str>) -> crate::registrant::source::RegistrantRow {
+    serde_json::from_value(serde_json::json!({
+        "aor": AOR,
+        "registrar": "sip:198.51.100.10:5060",
+        "username": "u",
+        "password": "p",
+        "contact": contact,
+    }))
+    .expect("a row")
+}
+
+/// The clean-up of a tokened binding of this node's on a shared address, with
+/// the source answering `answer`: whether its de-REGISTER may leave.
+async fn tokened_claim_with(
+    answer: Option<Result<Option<crate::registrant::source::RegistrantRow>, String>>,
+    configured: bool,
+) -> bool {
+    let (manager, _store) = token_manager("node-a");
+    if let Some(answer) = answer {
+        manager.set_credential_lookup(Arc::new(SourceStub { answer, configured }));
+    }
+    let report = cleanup_of(&manager, &tokened("node-a", "203.0.113.10:5060"));
+    assert_eq!(report.deregistered, 1);
+    !released(&manager).await.is_empty()
+}
+
+/// Another node registers a tokenless Contact only from a source row with an
+/// explicit contact (or on an older version): the trunk source says so, not
+/// Redis timing.
+#[tokio::test]
+async fn a_source_row_with_an_explicit_contact_blocks_the_tokened_claim() {
+    // The AoR is not listed here, the lookup knows it with an explicit contact.
+    assert!(!tokened_claim_with(Some(Ok(Some(row(Some("sip:u@203.0.113.10:5060"))))), true).await);
+}
+
+#[tokio::test]
+async fn a_generated_source_row_or_an_unknown_aor_allows_the_tokened_claim() {
+    assert!(tokened_claim_with(Some(Ok(Some(row(None)))), true).await);
+    assert!(tokened_claim_with(Some(Ok(Some(row(Some(" "))))), true).await);
+    assert!(tokened_claim_with(Some(Ok(None)), true).await);
+    // No source at all: what is configured is all there is.
+    assert!(tokened_claim_with(None, true).await);
+}
+
+#[tokio::test]
+async fn a_failed_or_missing_lookup_blocks_the_tokened_claim() {
+    assert!(!tokened_claim_with(Some(Err("down".to_string())), true).await);
+    // A source with no lookup cannot say whether the AoR has an explicit one.
+    assert!(!tokened_claim_with(Some(Ok(None)), false).await);
+}
+
+/// An AoR in this node's own list answers from the list: an explicit contact
+/// blocks, a generated one allows, without asking the lookup.
+#[tokio::test]
+async fn a_listed_aor_answers_from_its_live_entry() {
+    for (explicit, allowed) in [(Some("sip:u@198.51.100.7:5099"), false), (None, true)] {
+        let (manager, _store) = token_manager("node-a");
+        manager.set_credential_lookup(Arc::new(SourceStub {
+            answer: Err("must not be asked".to_string()),
+            configured: true,
+        }));
+        let mut entry = trunk(AOR);
+        entry.contact_uri = explicit.map(str::to_string);
+        manager.add(entry);
+        // On another host than the live entry's: an orphan, not an adoption.
+        let report = cleanup_of(&manager, &tokened("node-a", "198.51.100.99:5060"));
+        assert_eq!(report.deregistered, 1, "{explicit:?}");
+        assert_eq!(
+            !released(&manager).await.is_empty(),
+            allowed,
+            "{explicit:?}"
+        );
+    }
+}
