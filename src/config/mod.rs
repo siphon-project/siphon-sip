@@ -75,7 +75,7 @@ pub use listen::{
 pub use media::{
     CodecFlagsConfig, MediaBackendKind, MediaConfig, MediaProfileConfig, NgFlagsConfig,
     RtpEngineEventsConfig, RtpEngineInstanceConfig, RtpEngineSetConfig, RtpProxyConfig,
-    RtpProxyInstanceConfig, SiphonRtpConfig, SiphonRtpInstanceConfig,
+    RtpProxyInstanceConfig, SiphonRtpConfig, SiphonRtpInstanceConfig, WebrtcMode,
 };
 pub use observability::{
     HepConfig, HepTransport, LogConfig, LogFormat, LogLevel, MetricsConfig, PrometheusConfig,

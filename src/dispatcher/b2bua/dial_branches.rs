@@ -167,6 +167,18 @@ pub fn control_dial_branches_for_failure(
         .collect()
 }
 
+/// The transport a binding was registered over: the one its REGISTER arrived
+/// on, else the one its Contact URI names (`;transport=ws`, RFC 7118 §5) for a
+/// binding stored without a source.
+fn binding_transport(contact: &crate::registrar::Contact) -> Option<crate::transport::Transport> {
+    contact.source_transport.or_else(|| {
+        contact
+            .uri
+            .get_param("transport")
+            .and_then(crate::transport::Transport::from_scheme)
+    })
+}
+
 /// Resolve an AoR to one dial target per registered contact, each carrying its
 /// own flow and Path route set.
 ///
@@ -214,6 +226,7 @@ pub fn dial_targets_for_aor(aor: &str) -> Result<Vec<DialTarget>, DialError> {
                 next_hop: None,
                 flow,
                 route,
+                binding_transport: binding_transport(&contact),
                 headers: std::collections::HashMap::new(),
                 aor: Some(registered.clone()),
                 ..Default::default()

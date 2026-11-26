@@ -26,6 +26,7 @@ pub(crate) mod test_conference_engine;
 pub(crate) mod test_engine;
 #[cfg(test)]
 pub(crate) mod test_native_engine;
+pub mod webrtc_auto;
 pub mod ws_uri;
 
 pub use backend::{reap_orphaned_sessions, MediaBackend};

@@ -20,6 +20,11 @@ pub struct DialTarget {
     pub flow: Option<crate::script::api::registrar::PyFlow>,
     /// Route set for this branch, from the binding's Path (RFC 3327 §5.3).
     pub route: Vec<String>,
+    /// The transport the contact registered over, for a target resolved from a
+    /// registered AoR ([`dial_targets_for_aor`]); `None` for a URI dialled as
+    /// written. A media profile's `webrtc: auto` offer half turns WebRTC for a
+    /// branch whose binding is `ws`/`wss` (RFC 7118).
+    pub binding_transport: Option<crate::transport::Transport>,
     /// Per-target headers, layered over the command's.
     pub headers: std::collections::HashMap<String, String>,
     /// Calling identity for this branch alone, overriding the dial's own.

@@ -2265,6 +2265,7 @@ mod tests {
     #[test]
     fn profile_flags_from_ng_maps_every_field() {
         let ng = NgFlags {
+            webrtc_auto: false,
             transport_protocol: Some("RTP/SAVPF".into()),
             codec: Default::default(),
             ice: Some("force".into()),

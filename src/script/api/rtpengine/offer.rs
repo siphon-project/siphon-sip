@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use pyo3::prelude::*;
 use tracing::debug;
 
-use crate::rtpengine::profile::NgFlags;
+use crate::rtpengine::profile::{NgFlags, ProfileRegistry};
 use crate::rtpengine::session::{MediaSession, MediaSessionStore};
 use crate::rtpengine::{CallScope, MediaBackend};
 use crate::sip::message::SipMessage;
@@ -28,6 +28,52 @@ use super::{
     extract_delete_params, extract_message, extract_offer_params, extract_raw_sdp,
     extract_source_ip, PyCall, PyReply, PyRequest,
 };
+
+/// The profile an `offer` anchors the call with: `requested`, with a
+/// `webrtc: auto` half resolved.
+///
+/// An auto half is decided once, on the offer that anchors the call; a later
+/// offer keeps what the call was anchored with. The script anchors before it
+/// forks, so only the half facing the offerer can be decided here (from its
+/// SDP): the half facing the callee applies as written, and a ring that must
+/// reach a browser and a desk phone together is placed through the control
+/// plane's per-contact `dial`.
+pub(super) fn anchoring_profile(
+    registry: &ProfileRegistry,
+    anchored: Option<&MediaSession>,
+    requested: &str,
+    offer_sdp: &[u8],
+) -> String {
+    match anchored {
+        Some(session) if registry.base_name(&session.profile) == requested => {
+            session.profile.clone()
+        }
+        _ => registry.resolve_webrtc(
+            requested,
+            false,
+            crate::rtpengine::webrtc_auto::offer_is_webrtc(offer_sdp),
+        ),
+    }
+}
+
+/// The profile the call was anchored with when a script names, on the answer
+/// side, the base profile that anchoring resolved a `webrtc: auto` half of.
+///
+/// `rtpengine.offer(call, profile="extension")` records the resolved name
+/// (`extension#webrtc-answer` for a browser caller); a script that repeats
+/// `profile="extension"` on the answer means the same profile, not the
+/// as-written one the offer decided against.
+pub(super) fn anchored_variant(
+    registry: &ProfileRegistry,
+    sessions: &MediaSessionStore,
+    call_id: &str,
+    name: String,
+) -> String {
+    match sessions.get(call_id) {
+        Some(session) if registry.base_name(&session.profile) == name => session.profile,
+        _ => name,
+    }
+}
 
 /// What an `offer` call hands the engine, from either mode.
 pub(super) struct OfferInput {

@@ -29,6 +29,15 @@ use crate::dispatcher::*;
 /// target, and return the profile the call's own media session is anchored
 /// with: the first target's. `None` when no branch is anchored.
 ///
+/// A profile with a `webrtc: auto` half is resolved per branch
+/// ([`crate::rtpengine::ProfileRegistry::resolve_webrtc`]): the half facing a
+/// forked contact turns WebRTC when the target's binding registered over
+/// `ws`/`wss`, and the half facing the caller when `caller_webrtc` (the
+/// caller's offer is UDP/TLS/RTP/SAVPF with ICE and a fingerprint). The branch
+/// then carries the resolved name, so it is grouped, allocated, answered and
+/// settled as any other profile, and an `{aor}` ringing a browser and a desk
+/// phone gets one allocation of each kind from one profile.
+///
 /// A dial anchors all of its branches or none of them. A branch left on the
 /// caller's own SDP beside anchored ones would answer the caller with the
 /// phone's own media while the others answer it with the relay's, so a mix is
@@ -36,9 +45,33 @@ use crate::dispatcher::*;
 pub(super) fn resolve_branch_profiles(
     targets: &mut [DialTarget],
     shaping: &DialShaping,
+    caller_offer: &[u8],
+    state: &DispatcherState,
+) -> Result<Option<String>, DialError> {
+    resolve_profiles_with(
+        targets,
+        shaping,
+        state.rtpengine_profiles.as_deref(),
+        crate::rtpengine::webrtc_auto::offer_is_webrtc(caller_offer),
+    )
+}
+
+/// [`resolve_branch_profiles`] against a registry and a verdict on the
+/// caller's offer.
+fn resolve_profiles_with(
+    targets: &mut [DialTarget],
+    shaping: &DialShaping,
+    registry: Option<&crate::rtpengine::ProfileRegistry>,
+    caller_webrtc: bool,
 ) -> Result<Option<String>, DialError> {
     for target in targets.iter_mut() {
         target.profile = target.shaping_over(shaping).profile;
+        if let (Some(registry), Some(name)) = (registry, target.profile.as_deref()) {
+            let contact_webrtc = target
+                .binding_transport
+                .is_some_and(crate::rtpengine::webrtc_auto::transport_is_webrtc);
+            target.profile = Some(registry.resolve_webrtc(name, contact_webrtc, caller_webrtc));
+        }
     }
     let anchored = targets
         .iter()
@@ -290,7 +323,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            resolve_branch_profiles(&mut targets, &dial).unwrap(),
+            resolve_profiles_with(&mut targets, &dial, None, false).unwrap(),
             Some("latching".to_string()),
             "the first target's profile anchors the call's own session"
         );
@@ -305,7 +338,7 @@ mod tests {
             target("sip:201@198.51.100.7", Some("latching")),
         ];
         assert_eq!(
-            resolve_branch_profiles(&mut targets, &DialShaping::default()).unwrap(),
+            resolve_profiles_with(&mut targets, &DialShaping::default(), None, false).unwrap(),
             Some("sdes_srtp".to_string())
         );
     }
@@ -314,7 +347,7 @@ mod tests {
     fn a_dial_naming_no_profile_anywhere_anchors_nothing() {
         let mut targets = vec![target("sip:201@198.51.100.7", None)];
         assert_eq!(
-            resolve_branch_profiles(&mut targets, &DialShaping::default()).unwrap(),
+            resolve_profiles_with(&mut targets, &DialShaping::default(), None, false).unwrap(),
             None
         );
         assert_eq!(targets[0].profile, None);
@@ -327,10 +360,106 @@ mod tests {
             target("sip:+15550100@trunk.example.com", Some("sdes_srtp")),
         ];
         assert!(matches!(
-            resolve_branch_profiles(&mut targets, &DialShaping::default()),
+            resolve_profiles_with(&mut targets, &DialShaping::default(), None, false),
             Err(DialError::InvalidMedia(_))
         ));
     }
+
+    // ---- `webrtc: auto`, resolved per forked contact ----
+
+    /// A desk-phone profile whose `offer` half (toward each contact) and
+    /// `answer` half (toward the caller) are both `webrtc: auto`.
+    fn extension_profiles() -> Arc<crate::rtpengine::ProfileRegistry> {
+        use crate::config::{MediaProfileConfig, NgFlagsConfig, WebrtcMode};
+        let half = |protocol: &str| NgFlagsConfig {
+            transport_protocol: Some(protocol.into()),
+            ice: Some("remove".into()),
+            dtls: Some("off".into()),
+            rtcp_mux: vec!["demux".into()],
+            replace: vec!["origin".into()],
+            webrtc: Some(WebrtcMode::Auto),
+            ..NgFlagsConfig::default()
+        };
+        let custom = std::collections::HashMap::from([(
+            "extension".to_string(),
+            MediaProfileConfig {
+                offer: half("RTP/AVP"),
+                answer: half("RTP/AVP"),
+            },
+        )]);
+        Arc::new(crate::rtpengine::ProfileRegistry::from_config(&custom))
+    }
+
+    fn bound(uri: &str, transport: Option<Transport>) -> DialTarget {
+        DialTarget {
+            binding_transport: transport,
+            ..target(uri, None)
+        }
+    }
+
+    fn extension_dial() -> DialShaping {
+        DialShaping {
+            profile: Some("extension".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn each_contact_takes_the_profile_its_binding_transport_calls_for() {
+        let registry = extension_profiles();
+        let mut targets = vec![
+            bound("sip:201@198.51.100.7", Some(Transport::Udp)),
+            bound("sip:201@198.51.100.8", Some(Transport::WebSocketSecure)),
+            bound("sip:201@198.51.100.9", Some(Transport::WebSocket)),
+            bound("sip:201@198.51.100.10", Some(Transport::Tls)),
+            bound("sip:201@198.51.100.11", Some(Transport::Tcp)),
+            bound("sip:201@198.51.100.12", None),
+        ];
+        let primary =
+            resolve_profiles_with(&mut targets, &extension_dial(), Some(&registry), false).unwrap();
+        let profiles: Vec<_> = targets
+            .iter()
+            .map(|target| target.profile.clone().unwrap())
+            .collect();
+        assert_eq!(primary.as_deref(), Some("extension"));
+        assert_eq!(profiles[0], "extension");
+        assert_eq!(profiles[1], "extension#webrtc-offer");
+        assert_eq!(profiles[2], "extension#webrtc-offer");
+        assert_eq!(profiles[3], "extension");
+        assert_eq!(profiles[4], "extension");
+        assert_eq!(
+            profiles[5], "extension",
+            "a URI dialled as written has no binding"
+        );
+    }
+
+    #[test]
+    fn a_webrtc_caller_turns_the_answer_half_for_every_branch() {
+        let registry = extension_profiles();
+        let mut targets = vec![
+            bound("sip:201@198.51.100.7", Some(Transport::Udp)),
+            bound("sip:201@198.51.100.8", Some(Transport::WebSocketSecure)),
+        ];
+        resolve_profiles_with(&mut targets, &extension_dial(), Some(&registry), true).unwrap();
+        assert_eq!(
+            targets[0].profile.as_deref(),
+            Some("extension#webrtc-answer")
+        );
+        assert_eq!(targets[1].profile.as_deref(), Some("extension#webrtc-both"));
+    }
+
+    #[test]
+    fn a_target_profile_without_auto_halves_is_untouched_by_a_webrtc_binding() {
+        let registry = extension_profiles();
+        let mut targets = vec![DialTarget {
+            profile: Some("srtp_to_rtp".to_string()),
+            ..bound("sip:201@198.51.100.8", Some(Transport::WebSocketSecure))
+        }];
+        resolve_profiles_with(&mut targets, &DialShaping::default(), Some(&registry), true)
+            .unwrap();
+        assert_eq!(targets[0].profile.as_deref(), Some("srtp_to_rtp"));
+    }
+
     // ---- End to end, against a media engine in the test process ----
 
     use crate::dispatcher::test_dispatcher::test_dispatcher;
@@ -769,6 +898,310 @@ mod tests {
         .expect("both allocations of every dial deleted");
         assert_eq!(engine.commands("offer").len(), 40);
     }
+
+    // ---- One `{aor}` ring reaching a browser and a desk phone ----
+
+    use crate::rtpengine::test_native_engine::{NativeCommand, NativeTestEngine};
+
+    const BROWSER: &str = "198.51.100.9:5060";
+
+    /// What a browser offers: DTLS-SRTP over ICE.
+    const BROWSER_OFFER: &str = concat!(
+        "v=0\r\n",
+        "o=- 1 1 IN IP4 198.51.100.40\r\n",
+        "s=-\r\n",
+        "c=IN IP4 198.51.100.40\r\n",
+        "t=0 0\r\n",
+        "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+        "a=ice-ufrag:abcd\r\n",
+        "a=ice-pwd:0123456789abcdef01234567\r\n",
+        "a=fingerprint:sha-256 AA:BB:CC:DD\r\n",
+        "a=setup:actpass\r\n",
+    );
+
+    async fn native_dispatcher(
+        engine: &NativeTestEngine,
+        caller_offer: &str,
+    ) -> (
+        crate::dispatcher::test_dispatcher::TestDispatcher,
+        Arc<crate::rtpengine::MediaSessionStore>,
+        String,
+    ) {
+        let mut dispatcher = test_dispatcher();
+        dispatcher.state.rtpengine_set = Some(engine.backend());
+        let sessions = Arc::new(crate::rtpengine::MediaSessionStore::new());
+        dispatcher.state.rtpengine_sessions = Some(Arc::clone(&sessions));
+        dispatcher.state.rtpengine_profiles = Some(extension_profiles());
+        let call_id = park(&dispatcher.state);
+        let mut invite = caller_invite();
+        invite.body = caller_offer.as_bytes().to_vec();
+        invite
+            .headers
+            .set("Content-Length", caller_offer.len().to_string());
+        dispatcher
+            .state
+            .call_actors
+            .set_a_leg_invite(&call_id, Arc::new(std::sync::Mutex::new(invite)));
+        (dispatcher, sessions, call_id)
+    }
+
+    /// The browser first, so its allocation is the call's own session and the
+    /// desk phone's the held one: the winner may be either.
+    fn browser_and_desk_phone() -> Vec<DialTarget> {
+        vec![
+            bound(
+                &format!("sip:201@{BROWSER}"),
+                Some(Transport::WebSocketSecure),
+            ),
+            bound(&format!("sip:201@{DESK_PHONE}"), Some(Transport::Udp)),
+        ]
+    }
+
+    fn ring(state: &DispatcherState, targets: Vec<DialTarget>) -> Result<bool, DialError> {
+        b2bua_dial_call_with_state(
+            SIP_CALL_ID,
+            targets,
+            true,
+            30,
+            &[],
+            &extension_dial(),
+            state,
+        )
+    }
+
+    fn media_line(invite: &SipMessage) -> String {
+        String::from_utf8_lossy(&invite.body)
+            .lines()
+            .find(|line| line.starts_with("m=audio"))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The engine call each offer was made on, by whether it asked for WebRTC.
+    fn offers_by_flavour(engine: &NativeTestEngine) -> (NativeCommand, NativeCommand) {
+        let offers = engine.commands("offer");
+        assert_eq!(offers.len(), 2, "one allocation per flavour: {offers:?}");
+        let webrtc = |command: &&NativeCommand| {
+            command
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.transport_protocol.as_deref())
+                == Some("UDP/TLS/RTP/SAVPF")
+        };
+        let browser = offers.iter().find(webrtc).cloned().expect("a WebRTC offer");
+        let plain = offers
+            .iter()
+            .find(|command| !webrtc(command))
+            .cloned()
+            .expect("a plain offer");
+        (browser, plain)
+    }
+
+    async fn native_deleted(engine: &NativeTestEngine, engine_call_id: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !engine
+                .commands("delete")
+                .iter()
+                .any(|command| command.call_id == engine_call_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("engine call {engine_call_id} was never deleted"));
+    }
+
+    /// The point of `webrtc: auto`: one profile, one dial, and each branch is
+    /// offered the SDP its contact can take. The browser's allocation forces
+    /// ICE and requires RTCP multiplexing over `UDP/TLS/RTP/SAVPF`; the desk
+    /// phone's stays plain RTP with ICE removed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_dial_offers_a_browser_and_a_desk_phone_each_its_own_flavour() {
+        let engine = NativeTestEngine::start().await;
+        let (dispatcher, _sessions, _call) = native_dispatcher(&engine, OFFER).await;
+
+        assert!(ring(&dispatcher.state, browser_and_desk_phone()).unwrap());
+
+        let (browser_offer, plain_offer) = offers_by_flavour(&engine);
+        assert_ne!(browser_offer.call_id, plain_offer.call_id);
+        let browser_profile = browser_offer.profile.expect("the profile it carried");
+        assert_eq!(browser_profile.ice.as_deref(), Some("force"));
+        assert_eq!(browser_profile.rtcp_mux, vec!["require"]);
+        assert_ne!(browser_profile.dtls.as_deref(), Some("off"));
+        let plain_profile = plain_offer.profile.expect("the profile it carried");
+        assert_eq!(plain_profile.transport_protocol.as_deref(), Some("RTP/AVP"));
+        assert_eq!(plain_profile.ice.as_deref(), Some("remove"));
+        assert_eq!(plain_profile.dtls.as_deref(), Some("off"));
+        assert_eq!(plain_profile.rtcp_mux, vec!["demux"]);
+
+        let invites = sent_invites(&dispatcher);
+        assert!(
+            media_line(&invites[&BROWSER.parse().unwrap()]).contains("UDP/TLS/RTP/SAVPF"),
+            "the browser's INVITE carries the WebRTC offer"
+        );
+        let desk_line = media_line(&invites[&DESK_PHONE.parse().unwrap()]);
+        assert!(desk_line.contains("RTP/AVP"), "{desk_line}");
+        assert!(!desk_line.contains("SAVPF"), "{desk_line}");
+    }
+
+    /// The browser answering: its allocation becomes the call's media, the
+    /// call is recorded under the resolved profile, and the desk phone's
+    /// allocation is deleted from the engine.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_browser_answering_settles_on_its_allocation_and_frees_the_desk_phones() {
+        let engine = NativeTestEngine::start().await;
+        let (dispatcher, sessions, call_id) = native_dispatcher(&engine, OFFER).await;
+        assert!(ring(&dispatcher.state, browser_and_desk_phone()).unwrap());
+        let (browser_offer, plain_offer) = offers_by_flavour(&engine);
+        let invites = sent_invites(&dispatcher);
+        let browser = &invites[&BROWSER.parse().unwrap()];
+
+        let mut answered = answer(browser, 200, "browser", BROWSER);
+        assert!(handle_b2bua_response(
+            &call_id,
+            &via_branch(browser),
+            &mut answered,
+            200,
+            BROWSER.parse().unwrap(),
+            &dispatcher.state
+        ));
+
+        let answers = engine.commands("answer");
+        let last = answers.last().expect("the browser's answer");
+        assert_eq!(last.call_id, browser_offer.call_id);
+        let own = sessions.get(SIP_CALL_ID).expect("the call's session");
+        assert_eq!(own.rtpengine_id(), browser_offer.call_id);
+        assert_eq!(own.profile, "extension#webrtc-offer");
+        assert_eq!(own.to_tag.as_deref(), Some("browser"));
+        assert_eq!(sessions.dial_branch_calls(), 0);
+        native_deleted(&engine, &plain_offer.call_id).await;
+        assert!(
+            !engine
+                .commands("delete")
+                .iter()
+                .any(|command| command.call_id == browser_offer.call_id),
+            "the winner's media stays up"
+        );
+    }
+
+    /// The desk phone answering a ring the browser also got: the call settles
+    /// on the plain allocation, as written, and the browser's is deleted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_desk_phone_answering_settles_on_the_plain_profile_and_frees_the_browsers() {
+        let engine = NativeTestEngine::start().await;
+        let (dispatcher, sessions, call_id) = native_dispatcher(&engine, OFFER).await;
+        assert!(ring(&dispatcher.state, browser_and_desk_phone()).unwrap());
+        let (browser_offer, plain_offer) = offers_by_flavour(&engine);
+        let invites = sent_invites(&dispatcher);
+        let desk = &invites[&DESK_PHONE.parse().unwrap()];
+
+        let mut answered = answer(desk, 200, "desk", DESK_PHONE);
+        assert!(handle_b2bua_response(
+            &call_id,
+            &via_branch(desk),
+            &mut answered,
+            200,
+            DESK_PHONE.parse().unwrap(),
+            &dispatcher.state
+        ));
+
+        let own = sessions.get(SIP_CALL_ID).expect("the call's session");
+        assert_eq!(own.rtpengine_id(), plain_offer.call_id);
+        assert_eq!(own.profile, "extension");
+        assert_eq!(sessions.dial_branch_calls(), 0);
+        native_deleted(&engine, &browser_offer.call_id).await;
+    }
+
+    /// A caller that offers WebRTC is answered WebRTC whichever branch wins:
+    /// the `answer` half is decided by the caller's offer, and the desk phone's
+    /// branch keeps its plain offer half.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_webrtc_caller_is_answered_with_the_webrtc_answer_half() {
+        let engine = NativeTestEngine::start().await;
+        let (dispatcher, _sessions, call_id) = native_dispatcher(&engine, BROWSER_OFFER).await;
+        assert!(ring(
+            &dispatcher.state,
+            vec![bound(
+                &format!("sip:201@{DESK_PHONE}"),
+                Some(Transport::Udp)
+            )]
+        )
+        .unwrap());
+        let offers = engine.commands("offer");
+        assert_eq!(offers.len(), 1);
+        assert_eq!(
+            offers[0]
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.transport_protocol.as_deref()),
+            Some("RTP/AVP"),
+            "the phone is offered plain RTP"
+        );
+        let invites = sent_invites(&dispatcher);
+        let desk = &invites[&DESK_PHONE.parse().unwrap()];
+        let mut answered = answer(desk, 200, "desk", DESK_PHONE);
+        assert!(handle_b2bua_response(
+            &call_id,
+            &via_branch(desk),
+            &mut answered,
+            200,
+            DESK_PHONE.parse().unwrap(),
+            &dispatcher.state
+        ));
+        let answers = engine.commands("answer");
+        let toward_caller = answers
+            .last()
+            .and_then(|command| command.profile.clone())
+            .expect("the answer's profile");
+        assert_eq!(
+            toward_caller.transport_protocol.as_deref(),
+            Some("UDP/TLS/RTP/SAVPF")
+        );
+        assert_eq!(toward_caller.ice.as_deref(), Some("force"));
+        assert_eq!(toward_caller.rtcp_mux, vec!["require"]);
+    }
+
+    /// Per-module leak gate: a fork across both kinds that fails releases
+    /// both allocations, every time, and the engine and the store drain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_mixed_flavour_dials_drain_the_store_and_the_engine() {
+        let engine = NativeTestEngine::start().await;
+        let (dispatcher, sessions, parked) = native_dispatcher(&engine, OFFER).await;
+        dispatcher.state.call_actors.remove_call(&parked);
+        for _ in 0..20 {
+            let call_id = park(&dispatcher.state);
+            assert!(ring(&dispatcher.state, browser_and_desk_phone()).unwrap());
+            let _ = sent_invites(&dispatcher);
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions.dial_branch_calls(), 1);
+            assert!(report_control_dial_failure(
+                &call_id,
+                480,
+                "Temporarily Unavailable",
+                false,
+                &dispatcher.state
+            ));
+            assert_eq!(sessions.len(), 0);
+            assert_eq!(sessions.dial_branch_calls(), 0);
+            dispatcher.state.call_actors.remove_call(&call_id);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while engine.commands("delete").len() < 40 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both allocations of every dial deleted");
+        assert_eq!(engine.commands("offer").len(), 40);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while engine.held_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the engine holds nothing");
+    }
+
     /// The caller giving up while the branches ring releases every allocation
     /// the dial made: no BYE will ever come to release them.
     #[tokio::test(flavor = "multi_thread")]

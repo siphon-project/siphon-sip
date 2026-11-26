@@ -1097,7 +1097,8 @@ pub(crate) fn b2bua_dial_call_with_state(
 
     // Each branch's media profile, its own over the dial's: one allocation per
     // profile, the first the call's own session (see `dial_media`).
-    let primary_profile = super::dial_media::resolve_branch_profiles(&mut targets, shaping)?;
+    let primary_profile =
+        super::dial_media::resolve_branch_profiles(&mut targets, shaping, &template.body, state)?;
     if let Some(primary) = primary_profile.as_deref() {
         let dial_profile = shaping.profile.as_deref();
         let anchored = super::dial_media::anchor_dial_media(

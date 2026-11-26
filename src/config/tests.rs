@@ -2632,6 +2632,72 @@ fn rejects_echo_tuning_on_backends_that_cannot_express_it() {
 }
 
 #[test]
+fn parses_media_profile_webrtc_auto_on_either_half() {
+    let yaml = ws_profile_yaml(
+        RTPENGINE_BACKEND,
+        "      offer:\n        webrtc: auto\n        transport_protocol: \"RTP/AVP\"\n      \
+         answer:\n        webrtc: auto\n",
+    );
+    let config = Config::from_str(&yaml).unwrap();
+    let media = config.media.unwrap();
+    let profile = media.profiles.get("voice_ai_custom").unwrap();
+    assert_eq!(profile.offer.webrtc, Some(crate::config::WebrtcMode::Auto));
+    assert_eq!(profile.answer.webrtc, Some(crate::config::WebrtcMode::Auto));
+}
+
+#[test]
+fn media_profile_webrtc_defaults_unset() {
+    let yaml = ws_profile_yaml(
+        RTPENGINE_BACKEND,
+        "      offer:\n        replace: [\"origin\"]\n      answer: {}\n",
+    );
+    let media = Config::from_str(&yaml).unwrap().media.unwrap();
+    let profile = media.profiles.get("voice_ai_custom").unwrap();
+    assert!(profile.offer.webrtc.is_none());
+    assert!(profile.answer.webrtc.is_none());
+}
+
+/// `webrtc: on` would read as "always WebRTC", which is `transport_protocol`.
+/// Only `auto` exists, and anything else fails the load naming the key.
+#[test]
+fn rejects_media_profile_webrtc_other_than_auto() {
+    for value in ["on", "true", "force", "\"\""] {
+        let yaml = ws_profile_yaml(
+            RTPENGINE_BACKEND,
+            &format!("      offer:\n        webrtc: {value}\n      answer: {{}}\n"),
+        );
+        let error = Config::from_str(&yaml).expect_err("only `auto` is a webrtc mode");
+        assert!(
+            error.to_string().contains("auto"),
+            "{value}: the error should name the one valid value: {error}"
+        );
+    }
+}
+
+/// The WebRTC set requires `rtcp-mux`, which rtpproxy cannot express: refused
+/// at load rather than a browser leg that is offered something it rejects.
+#[test]
+fn rejects_media_profile_webrtc_auto_on_rtpproxy() {
+    let yaml = ws_profile_yaml(
+        RTPPROXY_BACKEND,
+        "      offer:\n        webrtc: auto\n      answer: {}\n",
+    );
+    let error = Config::from_str(&yaml).expect_err("rtpproxy cannot honour webrtc: auto");
+    let message = error.to_string();
+    assert!(message.contains("webrtc"), "{message}");
+    assert!(message.contains("rtpproxy"), "{message}");
+}
+
+#[test]
+fn accepts_media_profile_webrtc_auto_on_siphon_rtp() {
+    let yaml = ws_profile_yaml(
+        SIPHON_RTP_BACKEND,
+        "      offer:\n        webrtc: auto\n      answer: {}\n",
+    );
+    Config::from_str(&yaml).expect("the native engine honours the WebRTC set");
+}
+
+#[test]
 fn rejects_media_profile_bad_rtcp_mux_token() {
     let yaml = ws_profile_yaml(
         SIPHON_RTP_BACKEND,

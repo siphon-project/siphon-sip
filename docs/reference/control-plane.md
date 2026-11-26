@@ -1903,6 +1903,22 @@ branch on one profile and an answer from a branch on another reach it with
 different session descriptions, exactly as the raw SDP of two phones does on an
 unanchored fork.
 
+**One extension, a browser and a desk phone.** An `{aor}` target applies its
+one `profile` to every contact it forks to, so a profile whose halves carry
+`webrtc: auto` (see [media profiles](../cookbook/media-rtp.md#one-profile-for-a-browser-and-a-desk-phone-webrtc-auto))
+is resolved per contact. A contact whose binding registered over `ws` or `wss`
+is offered the WebRTC form of the profile's `offer` half (`UDP/TLS/RTP/SAVPF`,
+ICE forced, DTLS, `rtcp-mux` required) and every other contact is offered the
+half as written, each from an allocation of its own, so one ring reaches both
+and the Path and connection reuse of each binding are untouched. The `answer`
+half, which shapes what the caller is sent, turns WebRTC when the caller's own
+offer is `UDP/TLS/RTP/SAVPF` with `a=ice-ufrag` and `a=fingerprint`. Whichever
+branch answers settles the call on its allocation, and the others are released
+as above. A URI target has no binding, so it is always offered the half as
+written. `on_answer: "bridge"` dials, `originate` and a script's
+`rtpengine.offer` (which anchors once, before any fork) decide only the half
+facing the offerer; they apply the `offer` half as written.
+
 `strategy` is `parallel` (default) or `sequential`; `timeout` is the ring
 timeout in seconds (default 30). Dialling a call that is already answered is
 `invalid_state` — answering first is what the verb exists to avoid, since it

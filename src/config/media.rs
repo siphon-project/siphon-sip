@@ -109,6 +109,11 @@ impl MediaBackendKind {
         }
 
         if matches!(self, Self::Rtpproxy) {
+            // The WebRTC set this half takes toward a browser needs
+            // `rtcp-mux: require`, which rtpproxy cannot express.
+            if flags.webrtc.is_some() {
+                unsupported.push("webrtc");
+            }
             if flags.received_from {
                 unsupported.push("received_from");
             }
@@ -763,9 +768,33 @@ impl CodecFlagsConfig {
     }
 }
 
+/// The value of a media profile half's `webrtc:` key.
+///
+/// Only `auto` exists: the half is written for an ordinary peer and becomes
+/// WebRTC where the party it faces is a browser (see
+/// [`crate::rtpengine::webrtc_auto`]). Anything else is a config error, so a
+/// half that was meant to be WebRTC unconditionally is not silently read as
+/// "as written" — that is what `transport_protocol: UDP/TLS/RTP/SAVPF` says.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebrtcMode {
+    /// Decide per party: WebSocket binding, or an offer with ICE and DTLS.
+    Auto,
+}
+
 /// NG protocol flags for one direction (offer or answer).
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct NgFlagsConfig {
+    /// `auto`: this half applies as written, except toward a WebRTC party,
+    /// where it takes `UDP/TLS/RTP/SAVPF`, ICE `force`, DTLS and
+    /// `rtcp_mux: [require]` in place of whatever it sets for those. The
+    /// `offer` half faces each forked contact and is decided from the
+    /// transport that contact registered over (`ws`/`wss`); the `answer` half
+    /// faces the caller and is decided from the caller's offer
+    /// (`UDP/TLS/RTP/SAVPF` with `a=ice-ufrag` and `a=fingerprint`). Not
+    /// honoured by `rtpproxy`, which has no `rtcp-mux`.
+    #[serde(default)]
+    pub webrtc: Option<WebrtcMode>,
     /// Transport protocol override (e.g. "RTP/AVP", "RTP/SAVPF").
     pub transport_protocol: Option<String>,
     /// Codec manipulation — see [`CodecFlagsConfig`]. Honoured by rtpengine and
