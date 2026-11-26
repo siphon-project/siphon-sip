@@ -3308,8 +3308,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sip"
-version = "1.18.0"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#63e15079a9c37a898126cc9f925054b4ce238e42"
+version = "1.19.0"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#834d73ebef5e39870d38f7c22be8c77f78751b88"
 dependencies = [
  "aes",
  "arc-swap",

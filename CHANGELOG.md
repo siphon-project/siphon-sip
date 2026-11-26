@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.19.1] — 2026-11-26
+
 ### Fixed
 
 - The outbound registrant put the listener's bind address, `0.0.0.0` on a wildcard listener, in a REGISTER's Via sent-by and default Contact even with `advertised_address` set (per transport, `advertised_addrs`, then the global one). Behind a 1:1 NAT a registrar that honours the Contact as sent could not reach the node, and the Contact stored for the restart clean-up named the wildcard, so a hard-killed node's bindings were left to expire. A wildcard listener now names the advertised address as configured, a host name or an IP literal, on its port (RFC 3261 §20.42, §19.1), else the routable local address, the way the proxy's own Via does; a specific bind address is unchanged. A challenged REGISTER, a refresh and a de-REGISTER now carry the same Contact as the first one (the dispatcher rebuilt the addressing from its own resolved local address and could drop the advertised host name).
