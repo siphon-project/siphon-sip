@@ -58,6 +58,8 @@ mod recording;
 mod scope;
 mod split;
 mod tee;
+#[cfg(test)]
+mod unknown_reason_tests;
 mod waiters;
 mod x3_at_offer;
 use connection::connection_manager;
