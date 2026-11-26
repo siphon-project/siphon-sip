@@ -329,3 +329,42 @@ async fn a_bad_rate_or_an_unknown_profile_is_a_value_error_before_anything_is_se
     }
     assert!(engine.commands().is_empty(), "{:?}", engine.commands());
 }
+
+/// After a bridge or a transfer the call lives on an engine call of its own
+/// while the store key stays the SIP Call-ID: the verbs go to the engine id,
+/// which is what the hook's `(call_id, from_tag)` detach has to reach too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_verbs_address_the_engine_call_the_session_lives_on() {
+    let engine = FakeEngine::start(lists_ws_split, Vec::new()).await;
+    let backend = engine.backend();
+    let sessions = Arc::new(MediaSessionStore::new());
+    let mut moved = session("call-1@example.com", "tag-a");
+    moved.rtpengine_call_id = "pair-1".to_string();
+    sessions.insert(moved);
+
+    let attached = run(
+        bound_to(&backend, &sessions),
+        "attach_ws_split",
+        Some(URI),
+        vec![],
+    )
+    .await;
+    assert!(matches!(attached, Outcome::Done), "{attached:?}");
+    let detached = run(
+        bound_to(&backend, &sessions),
+        "detach_ws_split",
+        None,
+        vec![],
+    )
+    .await;
+    assert!(matches!(detached, Outcome::Done), "{detached:?}");
+
+    assert_eq!(engine.frames("attach_ws_split")[0]["call_id"], "pair-1");
+    assert_eq!(engine.frames("detach_ws_split")[0]["call_id"], "pair-1");
+    assert!(
+        !sessions
+            .get("call-1@example.com")
+            .expect("session")
+            .ws_split_attached
+    );
+}

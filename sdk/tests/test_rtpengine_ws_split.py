@@ -159,7 +159,6 @@ class TestEvents:
             ("ws_error", True),
             ("renegotiated", True),
             ("restored", True),
-            ("a_reason_from_a_newer_engine", True),
             ("detached", False),
             ("call_deleted", False),
         ],
@@ -276,3 +275,74 @@ def _participant(call_id, from_tag):
     from siphon_sdk.call import Call
 
     return (call_id, from_tag)
+
+
+class TestEngineStateFollowsTheCall:
+    def test_a_deleted_call_cannot_be_split_again(self, engine):
+        engine.anchor_call("call-1@example.com")
+        attach(engine)
+        asyncio.run(engine.delete_call("call-1@example.com"))
+        with pytest.raises(RuntimeError, match="unknown call"):
+            attach(engine)
+
+    def test_a_split_over_a_takeover_is_refused(self, engine):
+        engine.anchor_call("call-1@example.com")
+        asyncio.run(
+            engine.attach_ws_bridge(("call-1@example.com", "tag-a"), "wss://ai.example.net/s")
+        )
+        with pytest.raises(RuntimeError) as raised:
+            attach(engine)
+        assert raised.value.token == "ws-split-already-bridged"
+        asyncio.run(engine.detach_ws_bridge(("call-1@example.com", "tag-a")))
+        assert attach(engine) is True
+
+    def test_a_takeover_goes_with_the_call(self, engine):
+        engine.anchor_call("call-1@example.com")
+        asyncio.run(
+            engine.attach_ws_bridge(("call-1@example.com", "tag-a"), "wss://ai.example.net/s")
+        )
+        asyncio.run(engine.delete_call("call-1@example.com"))
+        engine.anchor_call("call-1@example.com")
+        assert attach(engine) is True
+
+
+class TestScope:
+    def test_two_scoped_legs_of_one_call_id_each_hold_a_split(self, engine):
+        engine.anchor_call("call-1@example.com", scope="in")
+        engine.anchor_call("call-1@example.com", scope="out")
+        assert attach(engine, scope="in") is True
+        assert attach(engine, scope="out") is True
+        detach_scoped = asyncio.run(
+            engine.detach_ws_split(("call-1@example.com", "tag-a"), scope="out")
+        )
+        assert detach_scoped is True
+        held = [split["scope"] for split in engine.splits.values()]
+        assert held == ["in"]
+
+    def test_the_hooks_of_a_scoped_leg_are_given_its_scope(self, engine):
+        seen = []
+
+        @engine.on_ws_split_ended
+        def down(call_id, from_tag, stream_id, reason, scope=None):
+            seen.append((reason, scope))
+
+        @engine.on_ws_split_started
+        def up(call_id, from_tag, stream_id, ws_uri, sample_rate, scope=None):
+            seen.append(("started", scope))
+
+        engine.anchor_call("call-1@example.com", scope="in")
+        attach(engine, scope="in")
+        engine.fire_ws_split_ended(
+            "call-1@example.com", "tag-a", reason="ws_error", scope="in"
+        )
+        assert seen == [("started", "in"), ("ws_error", "in")]
+
+    def test_a_scoped_end_leaves_the_unscoped_split_held(self, engine):
+        engine.anchor_call("call-1@example.com")
+        engine.anchor_call("call-1@example.com", scope="out")
+        attach(engine)
+        attach(engine, scope="out")
+        engine.fire_ws_split_ended(
+            "call-1@example.com", "tag-a", reason="detached", scope="out"
+        )
+        assert [split["scope"] for split in engine.splits.values()] == [None]

@@ -701,9 +701,10 @@ pub struct WsSplitEnded {
     pub stream_id: String,
     /// Why it ended, as the engine spells it: `detached`, `ws_closed`,
     /// `ws_stopped`, `ws_error`, `call_deleted`, `renegotiated` or `restored`.
-    /// The engine's reason enum is `#[non_exhaustive]`, so a reason a newer
-    /// engine adds arrives as its own spelling rather than being folded into
-    /// one this build knows.
+    /// The reason is kept as a string so a controller sees the engine's own
+    /// spelling. With siphon-rtp-proto 0.29 the reason enum is closed on the
+    /// wire: an end whose reason is not one of these fails to decode and is
+    /// not delivered at all (see `unknown_split_end_reason_is_not_delivered`).
     pub reason: String,
 }
 

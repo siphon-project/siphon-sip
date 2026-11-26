@@ -6232,7 +6232,7 @@ class MockRtpEngine(_WsSplitMixin):
                 profile = "rtp_passthrough"
         self.operations.append(("answer", profile))
         self.media_scopes.append(("answer", scope))
-        self._track_answered(_resolve_media_target(call if call is not None else reply)[0])
+        self._track_answered(_resolve_media_target(call if call is not None else reply)[0], scope=scope)
         self.ws_uris.append(("answer", self._resolve_ws_uri(ws_uri, call or reply)))
         self.media_overrides.append(("answer", _media_overrides(
             beep_detection, beep_cadence_guard_ms, ws_sample_rate,
@@ -6356,7 +6356,7 @@ class MockRtpEngine(_WsSplitMixin):
         answered_call_id, _ = _resolve_media_target(call)
         if answered_call_id:
             self._anchored_legs.setdefault(answered_call_id, set()).add(scope)
-        self._track_answered(answered_call_id, locally=True)
+        self._track_answered(answered_call_id, locally=True, scope=scope)
         self.ws_uris.append(("answer_local", resolved_ws_uri))
         self.media_overrides.append(("answer_local", _media_overrides(
             beep_detection, beep_cadence_guard_ms, ws_sample_rate,
@@ -6398,7 +6398,7 @@ class MockRtpEngine(_WsSplitMixin):
         self.media_scopes.append(("delete", scope))
         call_id, _ = _resolve_media_target(request)
         self._forget_legs(call_id, scope)
-        self._end_splits_of(call_id)
+        self._forget_call(call_id, scope)
         seated = self.conference_seat(call_id) if call_id else None
         if seated is not None:
             self._leave_seat(*seated)
@@ -6448,7 +6448,7 @@ class MockRtpEngine(_WsSplitMixin):
         scope = _media_scope(scope, (), "delete_call")
         self.media_scopes.append(("delete_call", scope))
         self._forget_legs(call_id, scope)
-        self._end_splits_of(call_id)
+        self._forget_call(call_id, scope)
         seated = self.conference_seat(call_id)
         if seated is not None:
             self._leave_seat(*seated)
@@ -8091,6 +8091,7 @@ class MockRtpEngine(_WsSplitMixin):
         ws_uri = self._expand_ws_uri(ws_uri, target)
         call_id, from_tag = _resolve_media_target(target)
         scope = self._leg_scope(scope, target, call_id, "attach_ws_bridge")
+        self._record_takeover(call_id, scope, True)
         self.operations.append(("attach_ws_bridge", ws_uri))
         self.media_calls.append({
             "op": "attach_ws_bridge",
@@ -8133,6 +8134,7 @@ class MockRtpEngine(_WsSplitMixin):
         """
         call_id, from_tag = _resolve_media_target(target)
         scope = self._leg_scope(scope, target, call_id, "detach_ws_bridge")
+        self._record_takeover(call_id, scope, False)
         self.operations.append(("detach_ws_bridge", None))
         self.media_calls.append({
             "op": "detach_ws_bridge",

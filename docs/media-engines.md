@@ -129,8 +129,12 @@ except RuntimeError as exc:
 await rtpengine.detach_ws_split(call)   # the parties hear each other again
 ```
 
-The coroutine resolves once the engine has dialled the server, sent `start` and
-isolated both parties. `sample_rate` is 8000, 16000, 24000 or 48000 Hz (16000
+The coroutine resolves when the engine has *accepted* the attach, which is
+before `on_ws_split_started` and does not mean the bot connected: a bot that
+drops during the handshake gives a successful attach, then `started`, then
+`on_ws_split_ended` with `ws_error`, and the call isolated. Always register
+`on_ws_split_ended`. The engine ignores `from_tag` when it picks the parties:
+channel 0 is always the offerer, channel 1 the answerer. `sample_rate` is 8000, 16000, 24000 or 48000 Hz (16000
 when left out); anything else is a `ValueError` and nothing is sent.
 `offerer_profile` / `answerer_profile` name a media profile whose `answer`
 half sets what runs on that party's uplink. The engine applies only
@@ -169,8 +173,9 @@ async def split_down(call_id, from_tag, stream_id, reason):
 `@rtpengine.on_ws_split_started(call_id, from_tag, stream_id, ws_uri,
 sample_rate)` is the matching start. `call_id` is the SIP Call-ID of the
 offerer's dialog. The reasons are `detached`, `ws_closed`, `ws_stopped`,
-`ws_error`, `call_deleted`, `renegotiated` and `restored`; a reason a newer
-engine adds arrives as its own string. `detach_ws_split` is idempotent and is
+`ws_error`, `call_deleted`, `renegotiated` and `restored`. (With the
+control protocol of siphon-rtp 0.29 an end carrying any other reason cannot be
+decoded and is not delivered.) `detach_ws_split` is idempotent and is
 safe to call from inside the hook. A leg that is bridged again has its split
 taken off first, so the new pairing is not left isolated.
 

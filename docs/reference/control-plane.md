@@ -468,7 +468,7 @@ same way every other verb does — never a hang:
   (`sip_call_id` is `null` for an answerer siphon holds no dialog for).
   `WsSplitEnded {from_tag, stream_id, reason, isolated}` carries the engine's
   reason verbatim (`detached`, `ws_closed`, `ws_stopped`, `ws_error`,
-  `call_deleted`, `renegotiated`, `restored`, or a string a newer engine adds).
+  `call_deleted`, `renegotiated` or `restored`; an end with any other reason is not delivered by the engine protocol of siphon-rtp 0.29).
   **`isolated` is true after every end but `detached` and `call_deleted`: the
   parties are still cut off from each other, and stay so until the app sends
   `stream_stop {mode: "split"}`.** Exactly one `WsSplitEnded` per

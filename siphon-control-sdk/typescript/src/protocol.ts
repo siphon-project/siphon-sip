@@ -929,8 +929,8 @@ export interface WsSplitEndedPayload {
   stream_id: string;
   /**
    * The engine's reason, verbatim: `detached`, `ws_closed`, `ws_stopped`,
-   * `ws_error`, `call_deleted`, `renegotiated` or `restored`, or a string a
-   * newer engine adds.
+   * `ws_error`, `call_deleted`, `renegotiated` or `restored`. An end with any
+   * other reason is not delivered (siphon-rtp 0.29's protocol cannot decode it).
    */
   reason: string;
   isolated: boolean;

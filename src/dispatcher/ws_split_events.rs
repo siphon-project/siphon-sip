@@ -10,12 +10,38 @@
 use super::*;
 use crate::rtpengine::CallScope;
 
+/// The session store an event belongs to: the node's own, or the one of the
+/// per-call scope the leg was anchored under (the engine reports such a leg
+/// as `<call-id>;<scope>`, split by the event loop into the Call-ID and the
+/// scope). `None` for a scope nothing was ever anchored under.
+fn event_store(
+    state: &DispatcherState,
+    scope: Option<&CallScope>,
+) -> Option<Arc<crate::rtpengine::MediaSessionStore>> {
+    let root = state.rtpengine_sessions.as_ref()?;
+    match scope {
+        None => Some(Arc::clone(root)),
+        Some(scope) => root.scoped_existing(scope),
+    }
+}
+
 /// The SIP Call-ID of the offerer's dialog: channel 0 of the split. Falls back
 /// to the engine's own call-id for a tag that names no party, so a handler
-/// still learns which call the split was on.
-fn offerer_call_id(state: &DispatcherState, engine_call_id: &str, from_tag: &str) -> String {
-    engine_event_channel(state, engine_call_id, from_tag)
-        .unwrap_or_else(|| engine_call_id.to_string())
+/// still learns which call the split was on. A scoped leg is looked up in its
+/// own scope's store, not the node's.
+fn offerer_call_id(
+    state: &DispatcherState,
+    scope: Option<&CallScope>,
+    engine_call_id: &str,
+    from_tag: &str,
+) -> String {
+    let mapped = match scope {
+        None => engine_event_channel(state, engine_call_id, from_tag),
+        Some(_) => {
+            event_store(state, scope).and_then(|store| store.event_party(engine_call_id, from_tag))
+        }
+    };
+    mapped.unwrap_or_else(|| engine_call_id.to_string())
 }
 
 pub(super) async fn on_ws_split_started(
@@ -31,13 +57,16 @@ pub(super) async fn on_ws_split_started(
         sample_rate = started.sample_rate,
         "media engine started a split bridge"
     );
-    let call_id = offerer_call_id(state, &started.call_id, &started.from_tag);
+    let call_id = offerer_call_id(state, scope.as_ref(), &started.call_id, &started.from_tag);
     // The call is isolated from here until a detach, whoever attached it: a
     // bridge plan on this leg has to take it off first.
-    if let Some(store) = state.rtpengine_sessions.as_ref() {
+    if let Some(store) = event_store(state, scope.as_ref()) {
         store.set_ws_split_attached(&call_id, true);
     }
-    publish_ws_split_started(state, &started);
+    // A scoped leg is a proxy's, which has no channel on the control rail.
+    if scope.is_none() {
+        publish_ws_split_started(state, &started);
+    }
     let engine = Arc::clone(&state.engine);
     if engine
         .state()
@@ -95,7 +124,7 @@ pub(super) async fn on_ws_split_ended(
     ended: crate::rtpengine::events::WsSplitEnded,
     scope: Option<CallScope>,
 ) {
-    let call_id = offerer_call_id(state, &ended.call_id, &ended.from_tag);
+    let call_id = offerer_call_id(state, scope.as_ref(), &ended.call_id, &ended.from_tag);
     if ended.restores_direct_audio() {
         tracing::debug!(
             call_id = %call_id,
@@ -119,10 +148,12 @@ pub(super) async fn on_ws_split_ended(
     }
     // Isolation outlives every end but a detach and the call going: the leg
     // stays flagged so a bridge plan still sends its detach.
-    if let Some(store) = state.rtpengine_sessions.as_ref() {
+    if let Some(store) = event_store(state, scope.as_ref()) {
         store.set_ws_split_attached(&call_id, !ended.restores_direct_audio());
     }
-    publish_ws_split_ended(state, &ended);
+    if scope.is_none() {
+        publish_ws_split_ended(state, &ended);
+    }
     let engine = Arc::clone(&state.engine);
     if engine
         .state()

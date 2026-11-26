@@ -3050,10 +3050,22 @@ mod tests {
         }
     }
 
-    /// A reason a newer engine adds is still "the split ended", and still
-    /// leaves the call isolated: it must never read as an orderly detach.
+    /// With siphon-rtp-proto 0.29 the end reason is a closed enum on the wire:
+    /// an end carrying a reason outside the seven does not decode as an event,
+    /// so it never reaches a hook (the connection skips it). Documented here,
+    /// not worked around: a reason the engine adds needs the proto crate to
+    /// learn it. What a string does to the call is still stated: anything but
+    /// `detached` and `call_deleted` leaves it isolated.
     #[test]
-    fn an_unknown_split_end_reason_passes_through_and_leaves_the_call_isolated() {
+    fn an_unknown_split_end_reason_is_not_decoded_and_so_not_delivered() {
+        let known = r#"{"event":"ws_split_ended","call_id":"c","from_tag":"t","stream_id":"split-c","reason":"ws_error"}"#;
+        assert!(serde_json::from_str::<Event>(known).is_ok());
+        let unknown = known.replace("ws_error", "a_future_reason");
+        assert!(
+            serde_json::from_str::<Event>(&unknown).is_err(),
+            "proto 0.29 decodes no other reason; if this starts to pass, the reason is deliverable"
+        );
+
         let ended = crate::rtpengine::events::WsSplitEnded {
             call_id: "c".into(),
             from_tag: "t".into(),
@@ -3061,10 +3073,6 @@ mod tests {
             reason: "a_future_reason".to_string(),
         };
         assert!(!ended.restores_direct_audio());
-        assert_eq!(
-            events::ws_split_end_reason_name(siphon_rtp_proto::WsSplitEndReason::WsError),
-            "ws_error"
-        );
     }
 
     /// `carry_received_from` is siphon-side policy, not a wire field: on its own

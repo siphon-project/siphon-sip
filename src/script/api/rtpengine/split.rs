@@ -46,6 +46,21 @@ pub(super) fn party_profile(
         })
 }
 
+/// The engine call-id a split verb addresses for the call stored under
+/// `call_id`: the session's own, when a bridge or a siphon-terminated transfer
+/// put the pair on an engine call of its own while the store key stayed the SIP
+/// Call-ID (`offer` and `answer` address it the same way). `None` when it is the
+/// Call-ID itself, which the call's leg then names (with its scope).
+pub(super) fn moved_engine_call_id(
+    sessions: &crate::rtpengine::MediaSessionStore,
+    call_id: &str,
+) -> Option<String> {
+    sessions
+        .get(call_id)
+        .map(|session| session.rtpengine_id().to_string())
+        .filter(|engine_id| engine_id != call_id)
+}
+
 /// What a split verb's failure is to the script: a `RuntimeError` reading
 /// `rtpengine.<verb> failed: <reason>`, carrying the engine's refusal token
 /// (`ws-split-renegotiation`, `ws-split-already-bridged`, ...) as its `token`

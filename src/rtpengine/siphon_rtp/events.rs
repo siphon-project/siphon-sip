@@ -426,10 +426,11 @@ pub(super) fn ws_bridge_end_reason_from_proto(reason: ProtoWsBridgeEndReason) ->
 
 /// A split's end reason as the engine spells it on the wire.
 ///
-/// `WsSplitEndReason` is `#[non_exhaustive]` upstream, and a reason a newer
-/// engine adds still serialises as its own snake_case name, so the name is read
-/// off the type's wire form rather than from a `match` whose wildcard would have
-/// to invent one. The wire form is what a script and a controller are told.
+/// The name is read off the type's wire form rather than from a `match`
+/// whose wildcard would have to invent one; the wire form is what a script and
+/// a controller are told. `WsSplitEndReason` is `#[non_exhaustive]` upstream,
+/// but with siphon-rtp-proto 0.29 it is closed on the wire: an event carrying a
+/// reason outside the seven is not decoded, so it never gets here.
 pub(crate) fn ws_split_end_reason_name(reason: siphon_rtp_proto::WsSplitEndReason) -> String {
     match serde_json::to_value(reason) {
         Ok(serde_json::Value::String(name)) => name,

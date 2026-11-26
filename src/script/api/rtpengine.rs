@@ -2674,9 +2674,13 @@ impl PyRtpEngine {
     /// This is the shape of live translation: each party hears a bot, not the
     /// other.
     ///
-    /// The coroutine resolves once the engine has dialled the server, sent
-    /// ``start`` and isolated both parties, i.e. the split is in place (the
-    /// ``on_ws_split_started`` event reports the same moment).  It raises
+    /// The coroutine resolves when the engine has **accepted** the attach, which
+    /// is before ``on_ws_split_started`` fires and does not mean the bot
+    /// connected: a bot that drops during the handshake gives a successful
+    /// attach, then ``started``, then ``on_ws_split_ended`` with ``ws_error``
+    /// (and the call isolated), so always register ``on_ws_split_ended``.  The
+    /// engine ignores the call's ``from_tag`` when it picks the parties: channel
+    /// 0 is always the offerer and channel 1 the answerer.  It raises
     /// ``RuntimeError`` when the engine refuses, leaving the call as it was.
     /// The exception's ``token`` attribute carries the engine's refusal token
     /// (``ws-split-not-answered``, ``ws-split-answer-local``,
@@ -2741,11 +2745,12 @@ impl PyRtpEngine {
         let answerer =
             split::party_profile(&self.registry, "answerer", answerer_profile.as_deref())?;
         let sessions = scope::store_for(&self.sessions, leg.scope())?;
+        let moved_to = split::moved_engine_call_id(&sessions, &call_id);
         let client = Arc::clone(&self.client);
 
         crate::script::awaitable(python, async move {
             leg.run(client.attach_ws_split(
-                leg.call_id(),
+                moved_to.as_deref().unwrap_or_else(|| leg.call_id()),
                 &from_tag,
                 &ws_uri,
                 sample_rate,
@@ -2754,6 +2759,10 @@ impl PyRtpEngine {
             ))
             .await
             .map_err(|error| split::verb_failure("attach_ws_split", &error))?;
+            // The engine's `ok` comes before `ws_split_started`, and the events
+            // are what keep the flag true: this is only the earlier word of the
+            // two. A stale `true` costs an idempotent detach at bridge time; a
+            // stale `false` would skip one it needs.
             sessions.set_ws_split_attached(&call_id, true);
             debug!(
                 call_id = %call_id,
@@ -2795,12 +2804,16 @@ impl PyRtpEngine {
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
         let leg = self.leg(scope, Some(target), &call_id, "detach_ws_split")?;
         let sessions = scope::store_for(&self.sessions, leg.scope())?;
+        let moved_to = split::moved_engine_call_id(&sessions, &call_id);
         let client = Arc::clone(&self.client);
 
         crate::script::awaitable(python, async move {
-            leg.run(client.detach_ws_split(leg.call_id(), &from_tag))
-                .await
-                .map_err(|error| split::verb_failure("detach_ws_split", &error))?;
+            leg.run(client.detach_ws_split(
+                moved_to.as_deref().unwrap_or_else(|| leg.call_id()),
+                &from_tag,
+            ))
+            .await
+            .map_err(|error| split::verb_failure("detach_ws_split", &error))?;
             sessions.set_ws_split_attached(&call_id, false);
             debug!(
                 call_id = %call_id,
@@ -3155,8 +3168,9 @@ impl PyRtpEngine {
     ///
     /// Fires exactly once per started split, for any reason.  ``reason`` is
     /// one of ``detached``, ``ws_closed``, ``ws_stopped``, ``ws_error``,
-    /// ``call_deleted``, ``renegotiated`` or ``restored``; a reason a newer
-    /// engine adds arrives as its own string.
+    /// ``call_deleted``, ``renegotiated`` or ``restored``.  With the control
+    /// protocol of siphon-rtp 0.29 an end carrying any other reason cannot be
+    /// decoded and is not delivered.
     ///
     /// **After any end other than ``detached`` and ``call_deleted`` the call is
     /// still isolated and silent in both directions**, whatever the reason: the

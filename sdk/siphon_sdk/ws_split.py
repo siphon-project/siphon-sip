@@ -85,36 +85,88 @@ class _WsSplitMixin:
         self._ws_split_ended_handlers: list[dict[str, Any]] = []
         self._ws_split_supported = True
         self._ws_split_refusals: list[str] = []
+        # The engine keys a call by its Call-ID and, for a leg a proxy
+        # anchored under a per-call scope, the scope as well.
         self._admitted_calls: set[str] = set()
         self._answered_calls: set[str] = set()
         self._answered_locally: set[str] = set()
+        self._takeovers: set[str] = set()
+
+    @staticmethod
+    def _call_key(call_id: Optional[str], scope: Optional[str]) -> str:
+        """The engine's key for a call: the Call-ID, with the scope after a
+        ``;`` for a leg anchored under one (the ``splits`` key too)."""
+        return f"{call_id};{scope}" if scope is not None else (call_id or "")
 
     # -- the engine's view of a call ------------------------------------
 
-    def anchor_call(self, call_id: str, answered_locally: bool = False) -> None:
+    def anchor_call(self, call_id: str, answered_locally: bool = False,
+                    scope: Optional[str] = None) -> None:
         """Test helper: the engine holds ``call_id`` as an answered two-party
         call, as an ``offer`` and its ``answer`` leave it. With
         ``answered_locally`` it is a call the engine answered itself
-        (``answer_local``), which has no second party to split."""
-        self._admitted_calls.add(call_id)
-        self._answered_calls.add(call_id)
+        (``answer_local``), which has no second party to split. With ``scope``
+        it is the leg a proxy anchored under that per-call scope."""
+        key = self._call_key(call_id, scope)
+        self._admitted_calls.add(key)
+        self._answered_calls.add(key)
         if answered_locally:
-            self._answered_locally.add(call_id)
+            self._answered_locally.add(key)
 
-    def _track_answered(self, call_id: Optional[str], locally: bool = False) -> None:
+    def _track_answered(self, call_id: Optional[str], locally: bool = False,
+                        scope: Optional[str] = None) -> None:
         """What ``answer`` / ``answer_local`` leave the engine holding."""
         if not call_id:
             return
-        self._answered_calls.add(call_id)
+        key = self._call_key(call_id, scope)
+        self._answered_calls.add(key)
         if locally:
-            self._answered_locally.add(call_id)
+            self._answered_locally.add(key)
 
-    def _engine_holds(self, call_id: Optional[str]) -> bool:
+    def _engine_holds(self, call_id: Optional[str], scope: Optional[str]) -> bool:
+        key = self._call_key(call_id, scope)
         return bool(call_id) and (
-            call_id in self._admitted_calls
-            or call_id in self._anchored_legs  # type: ignore[attr-defined]
-            or call_id in self._answered_calls
+            key in self._admitted_calls
+            or key in self._answered_calls
+            or scope in self._anchored_legs.get(call_id, set())  # type: ignore[attr-defined]
         )
+
+    def _forget_call(self, call_id: Optional[str], scope: Optional[str]) -> None:
+        """A delete ends what the engine held for the call (every leg without
+        a scope): its split, its takeover and the call itself."""
+        for key in [key for key in self._known_keys() if self._of_call(key, call_id, scope)]:
+            split = self.splits.pop(key, None)
+            self._admitted_calls.discard(key)
+            self._answered_calls.discard(key)
+            self._answered_locally.discard(key)
+            self._takeovers.discard(key)
+            if split is not None and not split["ended"]:
+                self._deliver_ws_split_ended(
+                    split["call_id"], split["from_tag"], split["stream_id"],
+                    "call_deleted", split["scope"],
+                )
+
+    def _known_keys(self) -> set[str]:
+        return (
+            set(self.splits) | self._admitted_calls | self._answered_calls
+            | self._answered_locally | self._takeovers
+        )
+
+    @staticmethod
+    def _of_call(key: str, call_id: Optional[str], scope: Optional[str]) -> bool:
+        if scope is not None:
+            return key == f"{call_id};{scope}"
+        return key == call_id or key.startswith(f"{call_id};")
+
+    def _record_takeover(self, call_id: Optional[str], scope: Optional[str],
+                         attached: bool) -> None:
+        """``attach_ws_bridge`` / ``detach_ws_bridge`` leave a takeover the
+        engine refuses a split over."""
+        key = self._call_key(call_id, scope)
+        if attached:
+            self._takeovers.add(key)
+        else:
+            self._takeovers.discard(key)
 
     # -- test knobs -------------------------------------------------------
 
@@ -140,6 +192,7 @@ class _WsSplitMixin:
         self._admitted_calls.clear()
         self._answered_calls.clear()
         self._answered_locally.clear()
+        self._takeovers.clear()
 
     # -- verbs ------------------------------------------------------------
 
@@ -164,8 +217,14 @@ class _WsSplitMixin:
         This is the shape of live translation: each party hears a bot, not the
         other.
 
-        Resolves once the engine has dialled the server, sent ``start`` and
-        isolated both parties. Raises ``RuntimeError`` when the engine refuses,
+        Resolves when the engine has **accepted** the attach, which is before
+        ``on_ws_split_started`` fires and does not mean the bot connected: a bot
+        that drops during the handshake gives a successful attach, then
+        ``started``, then ``on_ws_split_ended`` with ``ws_error`` (and the call
+        isolated), so always register ``on_ws_split_ended``. The engine ignores
+        the call's ``from_tag`` when it picks the parties: channel 0 is always
+        the offerer and channel 1 the answerer. Raises ``RuntimeError`` when the
+        engine refuses,
         leaving the call as it was; the exception's ``token`` attribute carries
         the engine's refusal token so a script branches on it without parsing
         the text: ``ws-split-not-answered``, ``ws-split-answer-local``,
@@ -212,7 +271,7 @@ class _WsSplitMixin:
                 else:
                     raise
         """
-        from siphon_sdk.mock_module import _media_scope, _resolve_media_target
+        from siphon_sdk.mock_module import _resolve_media_target
 
         ws_uri = self._expand_ws_uri(ws_uri, target)  # type: ignore[attr-defined]
         call_id, from_tag = _resolve_media_target(target)
@@ -222,35 +281,36 @@ class _WsSplitMixin:
                 f"sample_rate: ws split sample_rate {sample_rate} Hz is not one of "
                 "8000, 16000, 24000 or 48000"
             )
-        _media_scope(scope, (target,) if target is not None else (), "attach_ws_split")
+        scope = self._leg_scope(scope, target, call_id, "attach_ws_split")  # type: ignore[attr-defined]
+        key = self._call_key(call_id, scope)
         if not self._ws_split_supported:
             raise _refusal_unsupported("attach_ws_split")
         if self._ws_split_refusals:
             token = self._ws_split_refusals.pop(0)
             raise _refusal("attach_ws_split", token, "refused for the test")
-        if not self._engine_holds(call_id):
+        if not self._engine_holds(call_id, scope):
             raise _refusal("attach_ws_split", None, f"unknown call: {call_id}")
         # The engine's order: a seat, a call it answered itself, a call that
-        # already has a split, then one nobody has answered.
+        # already has a split or a takeover, then one nobody has answered.
         if self.conference_seat(call_id or "") is not None:  # type: ignore[attr-defined]
             raise _refusal(
                 "attach_ws_split", "ws-split-seated",
                 "the call's leg is seated in a conference room",
             )
-        if call_id in self._answered_locally:
+        if key in self._answered_locally:
             raise _refusal(
                 "attach_ws_split", "ws-split-answer-local",
                 "the engine answered this call itself",
             )
-        if call_id in self.splits:
+        if key in self.splits or key in self._takeovers:
             raise _refusal(
                 "attach_ws_split", "ws-split-already-bridged",
                 "the call already has a WebSocket takeover or a split",
             )
         offered_only = (
-            call_id in self._anchored_legs  # type: ignore[attr-defined]
-            and call_id not in self._answered_calls
-            and call_id not in self._admitted_calls
+            scope in self._anchored_legs.get(call_id, set())  # type: ignore[attr-defined]
+            and key not in self._answered_calls
+            and key not in self._admitted_calls
         )
         if offered_only:
             raise _refusal(
@@ -259,7 +319,9 @@ class _WsSplitMixin:
             )
 
         rate = 16000 if sample_rate is None else sample_rate
-        self.splits[call_id] = {  # type: ignore[index]
+        self.splits[key] = {
+            "call_id": call_id,
+            "scope": scope,
             "from_tag": from_tag,
             "stream_id": f"split-{call_id}",
             "ws_uri": ws_uri,
@@ -280,7 +342,9 @@ class _WsSplitMixin:
             "offerer_profile": offerer_profile,
             "answerer_profile": answerer_profile,
         })
-        self._deliver_ws_split_started(call_id, from_tag, f"split-{call_id}", ws_uri, rate)
+        self._deliver_ws_split_started(
+            call_id, from_tag, f"split-{call_id}", ws_uri, rate, scope  # type: ignore[arg-type]
+        )
         return True
 
     async def detach_ws_split(self, target: Any, scope: Optional[str] = None) -> bool:
@@ -308,13 +372,14 @@ class _WsSplitMixin:
 
             await rtpengine.detach_ws_split(call)   # parties hear each other again
         """
-        from siphon_sdk.mock_module import _media_scope, _resolve_media_target
+        from siphon_sdk.mock_module import _resolve_media_target
 
         call_id, from_tag = _resolve_media_target(target)
-        _media_scope(scope, (target,) if target is not None else (), "detach_ws_split")
+        scope = self._leg_scope(scope, target, call_id, "detach_ws_split")  # type: ignore[attr-defined]
+        key = self._call_key(call_id, scope)
         if not self._ws_split_supported:
             raise _refusal_unsupported("detach_ws_split")
-        if not self._engine_holds(call_id) and call_id not in self.splits:
+        if not self._engine_holds(call_id, scope) and key not in self.splits:
             raise _refusal("detach_ws_split", None, f"unknown call: {call_id}")
         self.operations.append(("detach_ws_split", None))  # type: ignore[attr-defined]
         self.media_calls.append({  # type: ignore[attr-defined]
@@ -322,21 +387,13 @@ class _WsSplitMixin:
             "call_id": call_id,
             "from_tag": from_tag,
         })
-        split = self.splits.pop(call_id, None)  # type: ignore[arg-type]
+        split = self.splits.pop(key, None)
         if split is not None and not split["ended"]:
             # An end already reported is not reported twice.
             self._deliver_ws_split_ended(
-                call_id, split["from_tag"], split["stream_id"], "detached"  # type: ignore[arg-type]
+                call_id, split["from_tag"], split["stream_id"], "detached", scope  # type: ignore[arg-type]
             )
         return True
-
-    def _end_splits_of(self, call_id: Optional[str]) -> None:
-        """The call went: its split goes with it, reported ``call_deleted``."""
-        split = self.splits.pop(call_id, None) if call_id else None
-        if split is not None and not split["ended"]:
-            self._deliver_ws_split_ended(
-                call_id, split["from_tag"], split["stream_id"], "call_deleted"  # type: ignore[arg-type]
-            )
 
     # -- events -----------------------------------------------------------
 
@@ -378,8 +435,9 @@ class _WsSplitMixin:
 
         Fires exactly once per started split, for any reason. ``reason`` is
         one of ``detached``, ``ws_closed``, ``ws_stopped``, ``ws_error``,
-        ``call_deleted``, ``renegotiated`` or ``restored``; a reason a newer
-        engine adds arrives as its own string.
+        ``call_deleted``, ``renegotiated`` or ``restored``. With the control
+        protocol of siphon-rtp 0.29 an end carrying any other reason cannot be
+        decoded and is not delivered.
 
         **After any end other than ``detached`` and ``call_deleted`` the call
         is still isolated and silent in both directions**, whatever the reason:
@@ -413,7 +471,8 @@ class _WsSplitMixin:
         return decorator
 
     def _run_ws_split_handlers(self, handlers: list[dict[str, Any]], call_id: str,
-                               from_tag: str, arguments: tuple) -> int:
+                               from_tag: str, arguments: tuple,
+                               scope: Optional[str] = None) -> int:
         from siphon_sdk.mock_module import _call_media_handler, _run_to_completion
 
         fired = 0
@@ -422,33 +481,39 @@ class _WsSplitMixin:
                 continue
             if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
                 continue
-            result = _call_media_handler(entry["fn"], arguments, None)
+            result = _call_media_handler(entry["fn"], arguments, scope)
             if inspect.isawaitable(result):
                 _run_to_completion(result)
             fired += 1
         return fired
 
     def _deliver_ws_split_started(self, call_id: str, from_tag: str, stream_id: str,
-                                  ws_uri: str, sample_rate: int) -> int:
+                                  ws_uri: str, sample_rate: int,
+                                  scope: Optional[str] = None) -> int:
         return self._run_ws_split_handlers(
             self._ws_split_started_handlers, call_id, from_tag,
-            (call_id, from_tag, stream_id, ws_uri, sample_rate),
+            (call_id, from_tag, stream_id, ws_uri, sample_rate), scope,
         )
 
     def _deliver_ws_split_ended(self, call_id: str, from_tag: str, stream_id: str,
-                                reason: str) -> int:
+                                reason: str, scope: Optional[str] = None) -> int:
         return self._run_ws_split_handlers(
             self._ws_split_ended_handlers, call_id, from_tag,
-            (call_id, from_tag, stream_id, reason),
+            (call_id, from_tag, stream_id, reason), scope,
         )
 
     def fire_ws_split_started(self, call_id: str, from_tag: str, stream_id: str,
-                              ws_uri: str, sample_rate: int = 16000) -> int:
+                              ws_uri: str, sample_rate: int = 16000,
+                              scope: Optional[str] = None) -> int:
         """Test helper: the engine reports a split started that this mock did
         not attach (a controller's ``stream_start``, say). The call is then
         held isolated as the engine would hold it. Returns the number of
-        handlers that matched (and were invoked)."""
-        self.splits[call_id] = {
+        handlers that matched (and were invoked). ``scope`` is the per-call
+        scope of the leg, for a proxy that anchored two legs of one Call-ID."""
+        key = self._call_key(call_id, scope)
+        self.splits[key] = {
+            "call_id": call_id,
+            "scope": scope,
             "from_tag": from_tag,
             "stream_id": stream_id,
             "ws_uri": ws_uri,
@@ -459,10 +524,12 @@ class _WsSplitMixin:
             "ended": False,
             "end_reason": None,
         }
-        return self._deliver_ws_split_started(call_id, from_tag, stream_id, ws_uri, sample_rate)
+        return self._deliver_ws_split_started(
+            call_id, from_tag, stream_id, ws_uri, sample_rate, scope
+        )
 
     def fire_ws_split_ended(self, call_id: str, from_tag: str, stream_id: Optional[str] = None,
-                            reason: str = "ws_closed") -> int:
+                            reason: str = "ws_closed", scope: Optional[str] = None) -> int:
         """Test helper: the engine reports the split on ``call_id`` ended for
         ``reason``. Returns the number of handlers that matched (and were
         invoked).
@@ -480,9 +547,13 @@ class _WsSplitMixin:
             from_tag: The offerer's tag.
             stream_id: The split's stream id; the one it started with by default.
             reason: ``detached``, ``ws_closed``, ``ws_stopped``, ``ws_error``,
-                ``call_deleted``, ``renegotiated``, ``restored`` or any string.
+                ``call_deleted``, ``renegotiated`` or ``restored``. (With
+                siphon-rtp-proto 0.29 a reason outside this list never reaches a
+                script: the engine's event fails to decode.)
+            scope: The per-call scope of the leg, when it has one.
         """
-        split = self.splits.get(call_id)
+        key = self._call_key(call_id, scope)
+        split = self.splits.get(key)
         if split is None:
             raise RuntimeError(
                 f"no split is held on {call_id}: an end is only reported for a split "
@@ -495,11 +566,11 @@ class _WsSplitMixin:
             )
         stream_id = stream_id or split["stream_id"]
         if reason in _RESTORING_REASONS:
-            self.splits.pop(call_id)
+            self.splits.pop(key)
         else:
             split["ended"] = True
             split["end_reason"] = reason
-        return self._deliver_ws_split_ended(call_id, from_tag, stream_id, reason)
+        return self._deliver_ws_split_ended(call_id, from_tag, stream_id, reason, scope)
 
 
 def _refusal_unsupported(verb: str) -> RuntimeError:

@@ -145,7 +145,6 @@ async fn each_end_reason_reaches_the_handler_under_the_sip_call_id() {
         ("call_deleted", false),
         ("renegotiated", true),
         ("restored", true),
-        ("a_future_reason", true),
     ] {
         events
             .send(RtpEngineEvent::WsSplitEnded(ended(reason)))
@@ -396,4 +395,85 @@ async fn a_split_is_detached_before_a_leg_is_bridged_again() {
         !flagged(&state),
         "the engine's detached end clears the flag"
     );
+}
+
+/// One Call-ID can hold an unscoped split and a scoped leg's: an event of the
+/// scoped leg (engine call-id `<call-id>;<scope>`) moves the scoped session's
+/// flag and never the unscoped one's, whose bridge plan would otherwise skip
+/// the detach it needs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scoped_legs_events_move_its_own_flag_not_the_unscoped_ones() {
+    let store = Arc::new(MediaSessionStore::new());
+    let session = |tag: &str| MediaSession {
+        call_id: "shared@example.com".to_string(),
+        rtpengine_call_id: String::new(),
+        from_tag: tag.to_string(),
+        to_tag: None,
+        profile: "rtp_passthrough".to_string(),
+        ws_uri: None,
+        ws_tee: None,
+        ws_bridge_attached: false,
+        ws_split_attached: false,
+        bridge_sides: None,
+        created_at: std::time::Instant::now(),
+    };
+    store.insert(session("tag-a"));
+    let scope = crate::rtpengine::CallScope::per_call("out").expect("a scope");
+    let scoped = store.scoped(&scope).expect("the scope's store");
+    scoped.insert(session("tag-b"));
+    let mut dispatcher = super::test_dispatcher::test_dispatcher_with_script(SCRIPT);
+    dispatcher.state.rtpengine_sessions = Some(Arc::clone(&store));
+    let state = Arc::new(dispatcher.state);
+    let (events, receiver) = tokio::sync::mpsc::channel(8);
+    spawn_rtpengine_events(&state, receiver);
+    let event = |call_id: &str, from_tag: &str| WsSplitStarted {
+        call_id: call_id.to_string(),
+        from_tag: from_tag.to_string(),
+        stream_id: "split-shared".to_string(),
+        ws_uri: "wss://bot.example.net/call".to_string(),
+        sample_rate: 16_000,
+    };
+    let end = |call_id: &str, from_tag: &str, reason: &str| WsSplitEnded {
+        call_id: call_id.to_string(),
+        from_tag: from_tag.to_string(),
+        stream_id: "split-shared".to_string(),
+        reason: reason.to_string(),
+    };
+    let flags = || {
+        (
+            store
+                .get("shared@example.com")
+                .expect("unscoped")
+                .ws_split_attached,
+            scoped
+                .get("shared@example.com")
+                .expect("scoped")
+                .ws_split_attached,
+        )
+    };
+    let mut handled = 0;
+    for (sent, expected) in [
+        (
+            RtpEngineEvent::WsSplitStarted(event("shared@example.com", "tag-a")),
+            (true, false),
+        ),
+        (
+            RtpEngineEvent::WsSplitStarted(event("shared@example.com;out", "tag-b")),
+            (true, true),
+        ),
+        (
+            RtpEngineEvent::WsSplitEnded(end("shared@example.com;out", "tag-b", "detached")),
+            (true, false),
+        ),
+    ] {
+        events.send(sent).await.expect("the event loop is running");
+        handled += 1;
+        for _ in 0..200 {
+            if flags() == expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(flags(), expected, "after event {handled}");
+    }
 }

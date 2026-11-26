@@ -65,8 +65,8 @@ pub struct WsSplitEndedPayload {
     #[serde(default)]
     pub stream_id: String,
     /// The engine's reason, verbatim: `detached`, `ws_closed`, `ws_stopped`,
-    /// `ws_error`, `call_deleted`, `renegotiated` or `restored`, or a string a
-    /// newer engine adds.
+    /// `ws_error`, `call_deleted`, `renegotiated` or `restored`. An end with any
+    /// other reason is not delivered (siphon-rtp 0.29's protocol cannot decode it).
     #[serde(default)]
     pub reason: String,
     /// Whether the parties are **still isolated and silent**: true after every
@@ -104,11 +104,11 @@ mod tests {
         let ended: WsSplitEndedPayload = serde_json::from_value(serde_json::json!({
             "from_tag": "tag-a",
             "stream_id": "split-pair-1",
-            "reason": "a_reason_from_a_newer_engine",
+            "reason": "renegotiated",
             "isolated": true,
         }))
         .expect("ended payload");
         assert!(ended.isolated);
-        assert_eq!(ended.reason, "a_reason_from_a_newer_engine");
+        assert_eq!(ended.reason, "renegotiated");
     }
 }

@@ -32,10 +32,13 @@ impl SiphonRtpClient {
     /// of which the engine applies only `noise_suppression` and refuses the
     /// rest.
     ///
-    /// Resolves once the engine has dialled the server, sent `start` and
-    /// isolated both parties: the split is then in place. A refusal is the
+    /// Resolves when the engine has accepted the attach. That is **before**
+    /// `ws_split_started`, and it does not mean the bot connected: a bot that
+    /// drops during the handshake gives `ok`, then `started`, then `ended` with
+    /// `ws_error`, so a caller has to watch the end event. A refusal is the
     /// engine's reason, `attach_ws_split: <token>: <text>`, and leaves the call
-    /// as it was.
+    /// as it was. The engine ignores `from_tag` when it picks the parties:
+    /// channel 0 is always the offerer and channel 1 the answerer.
     pub async fn attach_ws_split(
         &self,
         call_id: &str,

@@ -1548,7 +1548,7 @@ class _RtpEngineNamespace:
 
         Fires exactly once per started split. ``reason`` is one of ``detached``,
         ``ws_closed``, ``ws_stopped``, ``ws_error``, ``call_deleted``,
-        ``renegotiated`` or ``restored``, or a string a newer engine adds. After
+        ``renegotiated`` or ``restored``. After
         any end but ``detached`` and ``call_deleted`` the call stays isolated
         and silent until the script calls ``rtpengine.detach_ws_split``.
 
