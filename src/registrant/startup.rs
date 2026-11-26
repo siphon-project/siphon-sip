@@ -76,10 +76,14 @@ pub(super) struct RestartState {
     /// Restart de-REGISTERs built and waiting for the checks made just before
     /// they may go (see [`RegistrantManager::release_startup_deregistrations`]).
     pub(super) staged: std::sync::Mutex<Vec<super::BuiltRegister>>,
-    /// No REGISTER leaves until this node's advertised addresses are published
-    /// (see [`super::persist::AdvertisedView`]): set when a store is expected
-    /// and there is something to publish.
-    pub(super) advertised_gate: std::sync::atomic::AtomicBool,
+    /// When REGISTERs stop waiting for this node's advertised addresses to be
+    /// published (see [`super::persist::AdvertisedView`]): set when a store is
+    /// expected and there is something to publish, cleared by the publish.
+    pub(super) advertised_gate: std::sync::Mutex<Option<Instant>>,
+    /// A REGISTER left before the addresses were published (the wait ran out).
+    /// Sticky for the life of the process: see
+    /// [`RegistrantManager::awaiting_advertised_publication`].
+    pub(super) registered_unpublished: std::sync::atomic::AtomicBool,
     /// When the advertised addresses were last published.
     pub(super) advertised_published: std::sync::Mutex<Option<Instant>>,
     /// The advertised IPs this node publishes and no other node does, as of the
@@ -89,6 +93,11 @@ pub(super) struct RestartState {
 
 /// How long before an advertised-address entry expires it is published again.
 const ADVERTISED_REPUBLISH: Duration = Duration::from_secs(100);
+
+/// How long REGISTERs wait for this node's advertised addresses to be
+/// published before they go anyway: a Redis outage at boot must not keep the
+/// trunks down.
+pub(super) const ADVERTISED_PUBLISH_WAIT: Duration = Duration::from_secs(5);
 
 /// What one start-up cleanup did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -105,17 +114,44 @@ pub struct CleanupReport {
 }
 
 impl RegistrantManager {
-    /// Hold every REGISTER back until the advertised addresses are published.
-    /// Called once, when the loop starts, if a store is expected and the node
-    /// advertises an IP literal.
-    pub(super) fn gate_registrations_on_advertised(&self) {
-        self.restart.advertised_gate.store(true, Ordering::SeqCst);
+    /// Hold REGISTERs back for `wait` or until the advertised addresses are
+    /// published, whichever comes first. Called once, when the loop starts, if
+    /// a store is expected and the node advertises an IP literal.
+    pub(super) fn gate_registrations_on_advertised(&self, wait: Duration) {
+        let deadline = Instant::now() + wait;
+        match self.restart.advertised_gate.lock() {
+            Ok(mut gate) => *gate = Some(deadline),
+            Err(poisoned) => *poisoned.into_inner() = Some(deadline),
+        }
     }
 
-    /// Whether a REGISTER must wait for the advertised addresses to be
-    /// published.
+    /// Whether a REGISTER must still wait for the advertised addresses to be
+    /// published. Once the wait has run out the REGISTER goes, and the node
+    /// remembers it did so unpublished for the rest of the process: another
+    /// node's clean-up could not tell this node's Contact from its own while
+    /// that REGISTER was out, and a later publish does not change that. Its own
+    /// clean-up then counts no advertised address as its own (concrete listener
+    /// sockets still count, a host name never does); it keeps republishing so
+    /// that other nodes see the address.
     pub(super) fn awaiting_advertised_publication(&self) -> bool {
-        self.restart.advertised_gate.load(Ordering::SeqCst)
+        let deadline = match self.restart.advertised_gate.lock() {
+            Ok(gate) => *gate,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        let Some(deadline) = deadline else {
+            return false;
+        };
+        if Instant::now() < deadline {
+            return true;
+        }
+        if !self
+            .restart
+            .registered_unpublished
+            .swap(true, Ordering::SeqCst)
+        {
+            warn!("registrant: the advertised addresses are not published yet, registering anyway; this node's clean-up will not count an advertised address as its own");
+        }
+        false
     }
 
     /// Publish this node's advertised IP literals to `store` when they are due
@@ -144,7 +180,10 @@ impl RegistrantManager {
                     Ok(mut last) => *last = Some(Instant::now()),
                     Err(poisoned) => *poisoned.into_inner() = Some(Instant::now()),
                 }
-                self.restart.advertised_gate.store(false, Ordering::SeqCst);
+                match self.restart.advertised_gate.lock() {
+                    Ok(mut gate) => *gate = None,
+                    Err(poisoned) => *poisoned.into_inner() = None,
+                }
             }
             Err(error) => {
                 warn!(%error, "registrant: the advertised addresses cannot be published, REGISTERs wait");
@@ -160,6 +199,17 @@ impl RegistrantManager {
         store: &BindingStore,
         defaults: EgressDefaults<'_>,
     ) -> Result<(), String> {
+        // A REGISTER of this node was out before its addresses were published:
+        // nothing read now can show the Contact on it is not another node's.
+        if self.restart.registered_unpublished.load(Ordering::SeqCst) {
+            match self.restart.owned_advertised.lock() {
+                Ok(mut held) => held.clear(),
+                Err(poisoned) => poisoned.into_inner().clear(),
+            }
+            return Err(
+                "this node registered before publishing its advertised addresses".to_string(),
+            );
+        }
         let owned = match store.advertised_view().await {
             Ok(view) => match view.own {
                 Some(own) => Ok(defaults

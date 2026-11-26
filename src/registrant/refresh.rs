@@ -94,7 +94,7 @@ pub async fn registration_loop(manager: Arc<RegistrantManager>, context: Registr
     // (see `lifecycle`), which attaches its layer as it starts.
     manager.transactions_attached().await;
     if super::persist::store_expected() && !egress.defaults().advertised_literals().is_empty() {
-        manager.gate_registrations_on_advertised();
+        manager.gate_registrations_on_advertised(super::startup::ADVERTISED_PUBLISH_WAIT);
     }
 
     loop {

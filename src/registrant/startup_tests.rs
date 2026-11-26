@@ -1144,27 +1144,61 @@ async fn the_stored_records_are_read_before_a_live_binding_overwrites_them() {
 }
 
 /// With a store expected and an IP literal advertised, no REGISTER is built
-/// until the addresses are published; a store that cannot take the write keeps
-/// the gate shut.
+/// until the addresses are published, or the wait runs out.
 #[tokio::test]
-async fn no_register_leaves_before_the_advertised_addresses_are_published() {
+async fn a_register_waits_for_the_advertised_addresses_up_to_the_bound() {
     let store = BindingStore::in_memory("node-a", 30);
     let (manager, listen, advertised) = wildcard_with_advertised_on(Arc::clone(&store));
     let defaults = advertised_defaults(&listen, &advertised);
     manager.add(trunk(AOR));
-    manager.gate_registrations_on_advertised();
-    assert!(manager.build_register(AOR, defaults, 600).is_none());
-
-    let unwritable = BindingStore::inert("node-a");
-    manager.maintain_advertised(&unwritable).await;
+    manager.gate_registrations_on_advertised(Duration::from_secs(3600));
     assert!(manager.build_register(AOR, defaults, 600).is_none());
 
     manager.maintain_advertised(&store).await;
     assert!(manager.build_register(AOR, defaults, 600).is_some());
     let view = store.advertised_view().await.expect("readable");
-    assert_eq!(
-        view.own,
-        Some(HashSet::from(["203.0.113.10".to_string()])),
-        "published once, before the REGISTER"
+    assert_eq!(view.own, Some(HashSet::from(["203.0.113.10".to_string()])));
+}
+
+/// Redis unreachable at boot: the REGISTER goes once the wait has run out.
+#[tokio::test]
+async fn an_unreachable_store_does_not_keep_the_register_back_past_the_bound() {
+    let unwritable = BindingStore::inert("node-a");
+    let (manager, listen, advertised) = wildcard_with_advertised_on(Arc::clone(&unwritable));
+    let defaults = advertised_defaults(&listen, &advertised);
+    manager.add(trunk(AOR));
+    manager.gate_registrations_on_advertised(Duration::from_millis(50));
+    manager.maintain_advertised(&unwritable).await;
+    assert!(manager.build_register(AOR, defaults, 600).is_none());
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    assert!(manager.build_register(AOR, defaults, 600).is_some());
+}
+
+/// A node that registered before it published does not claim its advertised
+/// Contact in its clean-up, even when a later publish succeeds and no other
+/// node advertises the address.
+#[tokio::test]
+async fn a_node_that_registered_unpublished_does_not_claim_its_advertised_contact() {
+    let store = BindingStore::in_memory("node-a", 30);
+    let (manager, listen, advertised) = wildcard_with_advertised_on(Arc::clone(&store));
+    let defaults = advertised_defaults(&listen, &advertised);
+    const OTHER: &str = "sip:other@carrier.example";
+    manager.add(trunk(OTHER));
+    manager.gate_registrations_on_advertised(Duration::ZERO);
+    assert!(manager.build_register(OTHER, defaults, 600).is_some());
+
+    publish_and_read(&manager, &store, defaults).await;
+    let report = manager.startup_cleanup(
+        vec![advertised_record("sip:trunk@203.0.113.10:5060")],
+        defaults,
     );
+
+    assert_eq!(report.deregistered, 0);
+    assert_eq!(report.dropped, 1);
+    assert!(released(&manager).await.is_empty());
+    // It still publishes, for the other nodes to see.
+    let view = store.advertised_view().await.expect("readable");
+    assert_eq!(view.own, Some(HashSet::from(["203.0.113.10".to_string()])));
 }
