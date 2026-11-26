@@ -310,8 +310,8 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 | `stop` | sip | — | stop the announcement currently playing |
 | `dtmf` | sip | `{digits, duration_ms?, volume_dbm0?, pause_ms?, to_tag?}` | inject DTMF digits toward the A-leg |
 | `hold` / `unhold` | sip | — | silence the call's media on the engine, in both directions, and restore it; a media gate, not a SIP hold |
-| `stream_start` | sip | `{ws_uri, mode?, direction?, channels?, sample_rate?, profile?, media_flags?}` | attach a WebSocket audio tee (`mode: tee`, the default) or takeover bridge (`mode: bridge`) (siphon-rtp backend only). `media_flags` go with a bridge and its `profile` (see [per-call media flags](#per-call-media-flags)) |
-| `stream_stop` | sip | `{mode?}` | detach the WebSocket audio tee (`mode: tee`, the default) or bridge |
+| `stream_start` | sip | `{ws_uri, mode?, direction?, channels?, sample_rate?, profile?, media_flags?, offerer_profile?, answerer_profile?}` | attach a WebSocket audio tee (`mode: tee`, the default), takeover bridge (`mode: bridge`) or split (`mode: split`) (siphon-rtp backend only). `media_flags` go with a bridge and its `profile` (see [per-call media flags](#per-call-media-flags)); a split takes `sample_rate`, `offerer_profile` and `answerer_profile` (see [the split bridge](#the-split-bridge)) |
+| `stream_stop` | sip | `{mode?}` | detach the WebSocket audio tee (`mode: tee`, the default), bridge or split |
 | `set_var` / `get_var` | — | `{key, value?}` | per-call variables (drain with the call) |
 | `resync` | — | — | re-attach + enumerate this app's owned calls |
 | `registrations` | — | `{after?, limit?}` | the registered AoRs with their contacts, a page at a time in AoR order, and the `seq` the set is current to; for an app subscribed to `registration` (otherwise `forbidden`). See [registration state](#registration-state-registrationchanged-and-registrations) |
@@ -442,6 +442,37 @@ same way every other verb does — never a hang:
   `bad_request` with `reason: tee`. An absent `mode` means `tee`,
   but the SDKs always send it, so a controller that asked for a tee never gets
   a takeover from a server whose default differs.
+- <a id="the-split-bridge"></a>`stream_start {mode: "split"}` is the **split bridge**: both legs of an
+  answered two-party call stream to one duplex stereo WebSocket (channel 0 the
+  offerer, channel 1 the answerer) and the parties are isolated from each other
+  until `stream_stop {mode: "split"}`, with no re-INVITE. For live translation.
+  Args: `ws_uri`, `sample_rate` (8000, 16000, 24000 or 48000; anything else is
+  `bad_request`, and the engine's default, 16000, when left out),
+  `offerer_profile` / `answerer_profile` (the name of a media profile whose
+  `noise_suppression` runs on that party's uplink; the engine refuses a profile
+  that asks for more, and an unknown name is `bad_request`). `direction`,
+  `channels`, `profile` and `media_flags` are refused on a split. It needs an
+  engine whose `node_info` lists `ws_split`; one that does not answers
+  `unsupported_verb` and nothing is sent. An engine refusal is `invalid_state`
+  (`bad_request` for `ws-split-profile` and `ws-split-sample-rate`) with the
+  engine's text whole and its token in `details.token`:
+  `ws-split-not-answered`, `ws-split-answer-local`, `ws-split-seated`,
+  `ws-split-already-bridged`, `ws-split-secondary-source`,
+  `ws-split-renegotiation`. `stream_stop {mode: "split"}` is idempotent. A leg
+  that is bridged again has its split taken off first, so the new pairing is not
+  left isolated. A split a script attached is detached by the same step.
+  `WsSplitStarted {from_tag, stream_id, ws_uri, sample_rate, channels}` goes to
+  the channel of the offerer; `channels` is
+  `[{"channel": 0, "party": "offerer", "sip_call_id": …}, {"channel": 1,
+  "party": "answerer", "sip_call_id": …}]`, naming the SIP party on each channel
+  (`sip_call_id` is `null` for an answerer siphon holds no dialog for).
+  `WsSplitEnded {from_tag, stream_id, reason, isolated}` carries the engine's
+  reason verbatim (`detached`, `ws_closed`, `ws_stopped`, `ws_error`,
+  `call_deleted`, `renegotiated` or `restored`; an end with any other reason is not delivered by the engine protocol of siphon-rtp 0.29).
+  **`isolated` is true after every end but `detached` and `call_deleted`: the
+  parties are still cut off from each other, and stay so until the app sends
+  `stream_stop {mode: "split"}`.** Exactly one `WsSplitEnded` per
+  `WsSplitStarted`.
 - **WebSocket URI placeholders.** A `ws_uri` may name `{call_id}`,
   `{from_tag}`, `{from_user}` and `{to_user}`, and siphon expands them before
   the engine sees the URI, the same way on every path: `stream_start` (either

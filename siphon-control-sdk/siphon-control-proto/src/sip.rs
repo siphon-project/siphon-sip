@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::split::{WsSplitChannel, WsSplitEndedPayload, WsSplitStartedPayload};
+
 pub use crate::app_event::{
     DialogDirection, DialogIdentity, DialogState, DialogStateChangedPayload, OutboundRegistration,
     OutboundRegistrationsReply, RegistrantChangedPayload, Registration, RegistrationChangedPayload,
@@ -285,6 +287,17 @@ pub enum SipEvent {
     /// `detached`) followed by a fresh started. Any reason other than
     /// `detached` leaves a live call with no media far side.
     WsBridgeEnded,
+    /// A **split bridge** started on this channel
+    /// ([`WsSplitStartedPayload`]): both legs of the call stream to one duplex
+    /// stereo WebSocket and the parties are isolated from each other. Goes to
+    /// the channel of the offerer (channel 0 of the stream); the payload names
+    /// the SIP party on each channel.
+    WsSplitStarted,
+    /// A split bridge ended ([`WsSplitEndedPayload`]). Exactly one per
+    /// `WsSplitStarted`. After any reason but `detached` and `call_deleted`
+    /// the call is **still isolated and silent** until the app sends
+    /// `stream_stop` with mode `split`.
+    WsSplitEnded,
     /// The media engine's summary of a media session it ended on this channel
     /// ([`MediaSummaryPayload`]): per-leg counters and measured quality. On an
     /// ordinary hang-up it arrives **after** `StasisEnd`, within 30 s, under the
@@ -350,6 +363,8 @@ impl SipEvent {
             SipEvent::WsTeeEnded => "WsTeeEnded",
             SipEvent::WsBridgeStarted => "WsBridgeStarted",
             SipEvent::WsBridgeEnded => "WsBridgeEnded",
+            SipEvent::WsSplitStarted => "WsSplitStarted",
+            SipEvent::WsSplitEnded => "WsSplitEnded",
             SipEvent::MediaSummary => "MediaSummary",
             SipEvent::MediaStarted => "MediaStarted",
             SipEvent::DialBranch => "DialBranch",
@@ -388,6 +403,8 @@ impl From<&str> for SipEvent {
             "WsTeeEnded" => SipEvent::WsTeeEnded,
             "WsBridgeStarted" => SipEvent::WsBridgeStarted,
             "WsBridgeEnded" => SipEvent::WsBridgeEnded,
+            "WsSplitStarted" => SipEvent::WsSplitStarted,
+            "WsSplitEnded" => SipEvent::WsSplitEnded,
             "MediaSummary" => SipEvent::MediaSummary,
             "MediaStarted" => SipEvent::MediaStarted,
             "DialBranch" => SipEvent::DialBranch,
@@ -1916,6 +1933,8 @@ mod tests {
             ("WsTeeEnded", SipEvent::WsTeeEnded),
             ("WsBridgeStarted", SipEvent::WsBridgeStarted),
             ("WsBridgeEnded", SipEvent::WsBridgeEnded),
+            ("WsSplitStarted", SipEvent::WsSplitStarted),
+            ("WsSplitEnded", SipEvent::WsSplitEnded),
             ("MediaSummary", SipEvent::MediaSummary),
             ("MediaStarted", SipEvent::MediaStarted),
         ] {

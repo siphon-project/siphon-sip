@@ -49,6 +49,15 @@ pub struct MediaSession {
     /// call's whole media path and the engine refuses to detach it, which is
     /// why the two are tracked apart rather than as one "has a bridge" flag.
     pub ws_bridge_attached: bool,
+    /// Whether a **split bridge** (`attach_ws_split`) is on this session: both
+    /// parties streamed to one duplex WebSocket and isolated from each other.
+    ///
+    /// Tracked apart from [`MediaSession::ws_bridge_attached`] because the two
+    /// need different detaches and the wrong one does not undo the other. It
+    /// stays set after a split that ended for any reason but `detached` and
+    /// `call_deleted`: the engine leaves such a call isolated and silent until
+    /// a detach, so a bridge plan still has to send one.
+    pub ws_split_attached: bool,
     /// For a session whose two parties were paired by something other than
     /// one dial (a formed controller bridge, a leg replacement, a `Replaces`
     /// takeover), which flags shape the SDP the engine sends each party and
@@ -281,6 +290,7 @@ mod media_session_tests {
             ws_uri: None,
             ws_tee: None,
             ws_bridge_attached: false,
+            ws_split_attached: false,
             bridge_sides: None,
             created_at: Instant::now(),
         }
@@ -734,6 +744,42 @@ impl MediaSessionStore {
         }
     }
 
+    /// Record that a **split bridge** is on a session, or that it was detached
+    /// (or ended in a way that gave the parties their audio back).
+    pub fn set_ws_split_attached(&self, call_id: &str, attached: bool) {
+        if let Some(mut entry) = self.sessions.get_mut(call_id) {
+            entry.ws_split_attached = attached;
+        }
+    }
+
+    /// The SIP Call-IDs of the two parties of engine call `engine_call_id`
+    /// in the order a split's channels carry them: the offerer (the party
+    /// whose engine tag is `from_tag`) first, the answerer second.
+    ///
+    /// A bridged pair records both parties. Any other engine call is the
+    /// offerer's own dialog, and the answerer's dialog is not something the
+    /// store knows, so it is `None` rather than a guess.
+    pub fn split_channels(&self, engine_call_id: &str, from_tag: &str) -> (String, Option<String>) {
+        let Some(recorded) = self.parties.get(engine_call_id) else {
+            return (engine_call_id.to_string(), None);
+        };
+        let offerer = recorded
+            .parties
+            .iter()
+            .find(|party| party.tag.as_deref() == Some(from_tag));
+        match (offerer, recorded.parties.as_slice()) {
+            (Some(offerer), parties) => (
+                offerer.sip_call_id.clone(),
+                parties
+                    .iter()
+                    .find(|party| party.sip_call_id != offerer.sip_call_id)
+                    .map(|party| party.sip_call_id.clone()),
+            ),
+            (None, [only]) => (only.sip_call_id.clone(), None),
+            (None, _) => (engine_call_id.to_string(), None),
+        }
+    }
+
     /// Remove sessions older than `max_age`.
     pub fn sweep_stale(&self, max_age: std::time::Duration) {
         let cutoff = Instant::now() - max_age;
@@ -811,6 +857,7 @@ mod tests {
             ws_uri: None,
             ws_tee: None,
             ws_bridge_attached: false,
+            ws_split_attached: false,
             bridge_sides: None,
             created_at: Instant::now(),
         }
@@ -1040,5 +1087,60 @@ mod tests {
 
         store.set_ws_bridge_attached("call-1", false);
         assert!(!store.get("call-1").expect("session").ws_bridge_attached);
+    }
+
+    /// A split is tracked apart from a takeover, and goes with the session.
+    #[test]
+    fn a_split_is_flagged_apart_from_a_takeover_and_drains_with_its_session() {
+        let store = MediaSessionStore::new();
+        store.insert(make_session("call-1"));
+        assert!(!store.get("call-1").expect("session").ws_split_attached);
+
+        store.set_ws_split_attached("call-1", true);
+        let session = store.get("call-1").expect("session");
+        assert!(session.ws_split_attached);
+        assert!(!session.ws_bridge_attached, "a split is not a takeover");
+
+        store.set_ws_split_attached("call-1", false);
+        assert!(!store.get("call-1").expect("session").ws_split_attached);
+
+        // Per-call state: removing the session leaves nothing behind.
+        store.set_ws_split_attached("call-1", true);
+        store.remove("call-1");
+        assert!(store.get("call-1").is_none());
+        store.set_ws_split_attached("call-1", true);
+        assert!(
+            store.get("call-1").is_none(),
+            "no flag outlives its session"
+        );
+    }
+
+    /// Channel 0 is the offerer's dialog, channel 1 the answerer's.
+    #[test]
+    fn a_splits_channels_name_the_offerer_first() {
+        let store = MediaSessionStore::new();
+        let mut session = make_session("anchor");
+        session.rtpengine_call_id = "pair-1".to_string();
+        session.from_tag = "tag-a".to_string();
+        store.insert(session);
+        store.record_parties(
+            "anchor",
+            "pair-1",
+            &[("anchor", Some("tag-a")), ("peer", Some("tag-b"))],
+        );
+        assert_eq!(
+            store.split_channels("pair-1", "tag-a"),
+            ("anchor".to_string(), Some("peer".to_string()))
+        );
+        // The other party's tag as offerer: channel 0 is that party.
+        assert_eq!(
+            store.split_channels("pair-1", "tag-b"),
+            ("peer".to_string(), Some("anchor".to_string()))
+        );
+        // An engine call nothing paired is its own offerer's dialog.
+        assert_eq!(
+            store.split_channels("lone-call", "tag-a"),
+            ("lone-call".to_string(), None)
+        );
     }
 }

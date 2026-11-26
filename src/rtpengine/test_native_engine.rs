@@ -46,6 +46,10 @@ use tokio::net::TcpListener;
 
 use super::MediaBackend;
 
+mod split;
+use split::SplitModel;
+pub(crate) use split::NATIVE_ENGINE_WS_SPLIT;
+
 /// The SDP answer the engine returns for every `answer_local`: its own address,
 /// so a test can tell the engine's answer from any SDP a peer sent.
 pub(crate) const NATIVE_ENGINE_ANSWER: &str = concat!(
@@ -172,6 +176,9 @@ pub(crate) struct NativeCommand {
     /// The delivery an `attach_x3` asked for, or the one a `detach_x3` named
     /// with all three selectors. `None` on a detach of the whole call.
     pub(crate) x3_delivery: Option<crate::rtpengine::events::X3Delivery>,
+    /// The `sample_rate` an `attach_ws_split` asked for; `None` when it named
+    /// none or the command is another.
+    pub(crate) sample_rate: Option<u32>,
 }
 
 /// What a recorded command carried, before the engine decides on it.
@@ -186,6 +193,7 @@ struct Recorded {
     sources: Vec<String>,
     channels: Option<String>,
     x3_delivery: Option<crate::rtpengine::events::X3Delivery>,
+    sample_rate: Option<u32>,
 }
 
 /// What the engine makes of a command on a call `offer_far` grew (or the
@@ -285,6 +293,7 @@ impl Recorded {
             scope,
             profile: self.profile,
             x3_delivery: self.x3_delivery,
+            sample_rate: self.sample_rate,
         }
     }
 
@@ -300,6 +309,7 @@ impl Recorded {
             sources: Vec::new(),
             channels: None,
             x3_delivery: None,
+            sample_rate: None,
         }
     }
 }
@@ -884,6 +894,35 @@ async fn held_answer(command: &Command, gates: &mut [tokio::sync::watch::Receive
     let _ = gate.wait_for(|open| *open).await;
 }
 
+/// The next request on `stream` and the `scope` its frame carries, or `None`
+/// once the client has gone or sent what is not a request.
+async fn next_request(
+    stream: &mut tokio::net::TcpStream,
+    buffer: &mut Vec<u8>,
+) -> Option<(Request, Option<String>)> {
+    let mut chunk = [0u8; 4096];
+    loop {
+        match frame::decode::<serde_json::Value>(buffer) {
+            Ok(Some((value, consumed))) => {
+                buffer.drain(..consumed);
+                let scope = value
+                    .get("scope")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                return serde_json::from_value::<Request>(value)
+                    .ok()
+                    .map(|request| (request, scope));
+            }
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+        }
+    }
+}
+
 /// The `play_id` the engine hands the first playback it accepts; each later one
 /// gets the next.
 pub(crate) const NATIVE_ENGINE_FIRST_PLAY_ID: u64 = 7001;
@@ -894,6 +933,7 @@ pub(crate) struct NativeTestEngine {
     commands: Arc<Mutex<Vec<NativeCommand>>>,
     live: LiveCalls,
     x3: Arc<X3Model>,
+    split: Arc<SplitModel>,
     /// Gates on the answers of `answer_local`, `delete` and `attach_x3`, in
     /// that order. Open (the default) answers; closed holds every answer until
     /// it opens, so a test can act while a command is provably out: report an
@@ -949,6 +989,16 @@ impl NativeTestEngine {
         NativeTestEngine::start_with_features(&features).await
     }
 
+    /// [`NativeTestEngine::start`] for a siphon-rtp 0.29.0, which lists
+    /// `ws_split`: it takes `attach_ws_split` / `detach_ws_split` on a call it
+    /// holds and keeps the events it would have sent
+    /// ([`NativeTestEngine::take_split_events`]).
+    pub(crate) async fn start_with_ws_split() -> NativeTestEngine {
+        let mut features = NATIVE_ENGINE_FEATURES.to_vec();
+        features.push(NATIVE_ENGINE_WS_SPLIT);
+        NativeTestEngine::start_with_features(&features).await
+    }
+
     /// [`NativeTestEngine::start`] for an engine whose `node_info` lists
     /// `features`: one from before a verb leaves the verb's feature out.
     pub(crate) async fn start_with_features(features: &[&str]) -> NativeTestEngine {
@@ -968,6 +1018,8 @@ impl NativeTestEngine {
         let local: LiveCalls = Arc::new(Mutex::new(HashSet::new()));
         let x3 = Arc::new(X3Model::listing(&features));
         let x3_model = Arc::clone(&x3);
+        let split = Arc::new(SplitModel::default());
+        let split_model = Arc::clone(&split);
         let (answers, answers_open) = tokio::sync::watch::channel(true);
         let (deletes, deletes_open) = tokio::sync::watch::channel(true);
         let (attaches, attaches_open) = tokio::sync::watch::channel(true);
@@ -982,6 +1034,7 @@ impl NativeTestEngine {
                 let grown = Arc::clone(&grown);
                 let local = Arc::clone(&local);
                 let x3 = Arc::clone(&x3_model);
+                let split = Arc::clone(&split_model);
                 let next_play_id = Arc::clone(&next_play_id);
                 let mut gates = [
                     answers_open.clone(),
@@ -990,29 +1043,8 @@ impl NativeTestEngine {
                 ];
                 tokio::spawn(async move {
                     let mut buffer = Vec::new();
-                    let mut chunk = [0u8; 4096];
                     loop {
-                        let request = loop {
-                            match frame::decode::<serde_json::Value>(&buffer) {
-                                Ok(Some((value, consumed))) => {
-                                    buffer.drain(..consumed);
-                                    let scope = value
-                                        .get("scope")
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(str::to_string);
-                                    match serde_json::from_value::<Request>(value) {
-                                        Ok(request) => break Some((request, scope)),
-                                        Err(_) => break None,
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(_) => break None,
-                            }
-                            match stream.read(&mut chunk).await {
-                                Ok(0) | Err(_) => break None,
-                                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-                            }
-                        };
+                        let request = next_request(&mut stream, &mut buffer).await;
                         let Some((request, scope)) = request else {
                             return;
                         };
@@ -1035,7 +1067,8 @@ impl NativeTestEngine {
                             .as_ref()
                             .and_then(|grown| grown.refusal.clone())
                             .or_else(|| seat_refusal(&request.command))
-                            .or_else(|| x3.refusal(&request.command, &scope, &local, &grown));
+                            .or_else(|| x3.refusal(&request.command, &scope, &local, &grown))
+                            .or_else(|| split.refusal(&request.command, &scope));
                         let on_seat = x3.names_seat(&request.command);
                         if let Ok(mut local) = local.lock() {
                             match &request.command {
@@ -1186,6 +1219,10 @@ impl NativeTestEngine {
                             Command::ConferenceSeat { .. }
                             | Command::ConferenceJoin { .. }
                             | Command::ConferenceLeave { .. } => seat_command(&request.command),
+                            // A split on a call the engine holds.
+                            Command::AttachWsSplit(_) | Command::DetachWsSplit(_) => {
+                                (SplitModel::record(&request.command), None, false, true)
+                            }
                             // A recording or a tee, or nothing the engine records.
                             _ => recording_command(&request.command),
                         };
@@ -1209,6 +1246,7 @@ impl NativeTestEngine {
                             recording_id_for(&request.command, refused, &next_play_id);
                         if !refused && refusal.is_none() {
                             x3.accepted(&request.command, &scope);
+                            split.accepted(&request.command, &scope);
                         }
                         let unknown_call = record
                             .as_ref()
@@ -1256,6 +1294,7 @@ impl NativeTestEngine {
             commands,
             live,
             x3,
+            split,
             gates: [answers, deletes, attaches],
         }
     }
@@ -1272,6 +1311,30 @@ impl NativeTestEngine {
             .into_iter()
             .map(crate::rtpengine::events::RtpEngineEvent::X3Ended)
             .collect()
+    }
+
+    /// The `ws_split_started` and `ws_split_ended` the engine would have sent
+    /// since this was last asked, oldest first.
+    pub(crate) fn take_split_events(&self) -> Vec<crate::rtpengine::events::RtpEngineEvent> {
+        self.split.take_events()
+    }
+
+    /// End the split on the unscoped `call_id` as the engine would on its own
+    /// (`reason`: the bot closed the socket, a failure): reported once, and the
+    /// call stays isolated until a detach.
+    pub(crate) fn end_split(&self, call_id: &str, reason: siphon_rtp_proto::WsSplitEndReason) {
+        self.split.end(&None, call_id, reason);
+    }
+
+    /// Refuse the next `attach_ws_split` with `token`
+    /// (`ws-split-renegotiation`, ...).
+    pub(crate) fn refuse_next_split(&self, token: &str) {
+        self.split.refuse_next(token);
+    }
+
+    /// How many calls the engine holds isolated by a split.
+    pub(crate) fn split_count(&self) -> usize {
+        self.split.count()
     }
 
     /// How many content deliveries the engine holds.

@@ -104,6 +104,7 @@ mod timers;
 mod uac_transactions;
 #[cfg(test)]
 mod unprotected_response_tests;
+mod ws_split_events;
 pub(crate) mod x2_outbound;
 mod x3_delivery;
 
@@ -486,6 +487,8 @@ mod unacked_answer_tests;
 #[cfg(test)]
 mod undialled_replacement_tests;
 #[cfg(test)]
+mod ws_split_events_tests;
+#[cfg(test)]
 mod ws_uri_expansion_tests;
 
 // The imperative call-control surface the scripting, admin and control-plane
@@ -495,12 +498,12 @@ mod ws_uri_expansion_tests;
 pub use b2bua::{
     b2bua_accept_refer_call, b2bua_answer_call, b2bua_answer_call_anchored, b2bua_bridge_calls,
     b2bua_cancel_originated_call, b2bua_early_media_sdp, b2bua_local_tag,
-    b2bua_media_set_ws_bridge_attached, b2bua_media_set_ws_tee, b2bua_media_target,
-    b2bua_originate, b2bua_originate_dial, b2bua_originate_prepare, b2bua_progress_call,
-    b2bua_progress_call_anchored, b2bua_refer_call, b2bua_reject_call, b2bua_reject_refer_call,
-    b2bua_replace_peer, b2bua_route_call, b2bua_terminate_call, b2bua_unbridge_call,
-    BridgeAccepted, BridgeParams, OriginateError, OriginateMedia, OriginateParams,
-    PreparedOriginate, RouteError, RouteTarget,
+    b2bua_media_set_ws_bridge_attached, b2bua_media_set_ws_split_attached, b2bua_media_set_ws_tee,
+    b2bua_media_target, b2bua_originate, b2bua_originate_dial, b2bua_originate_prepare,
+    b2bua_progress_call, b2bua_progress_call_anchored, b2bua_refer_call, b2bua_reject_call,
+    b2bua_reject_refer_call, b2bua_replace_peer, b2bua_route_call, b2bua_terminate_call,
+    b2bua_unbridge_call, BridgeAccepted, BridgeParams, OriginateError, OriginateMedia,
+    OriginateParams, PreparedOriginate, RouteError, RouteTarget,
 };
 // Crate-internal, not published: only the SIP control adapter calls these, so
 // they are deliberately not part of `siphon::dispatcher`'s API. Counted by
@@ -577,6 +580,7 @@ use target::*;
 use tasks::*;
 use timers::*;
 use uac_transactions::*;
+use ws_split_events::*;
 
 /// RTPEngine wiring produced by [`init_rtpengine`]: the media-control backend
 /// (rtpengine NG or native siphon-rtp), the media session store, and the

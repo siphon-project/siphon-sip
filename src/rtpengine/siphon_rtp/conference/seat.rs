@@ -16,7 +16,8 @@
 
 use siphon_rtp_proto::{CmdResult, Command, ConferenceDtmf, ConferenceRole};
 
-use super::super::{expect_ok, per_call, result_kind, SiphonRtpClient, SiphonRtpClientSet};
+use super::super::node_features::require_feature;
+use super::super::{expect_ok, per_call, SiphonRtpClient, SiphonRtpClientSet};
 use super::room_affinity_key;
 use crate::rtpengine::error::RtpEngineError;
 
@@ -65,36 +66,6 @@ pub(crate) fn require_conference_dtmf(result: CmdResult) -> Result<(), RtpEngine
         "conference seat dtmf forwarding",
         "siphon-rtp (an engine that does not list conference_dtmf)",
     )
-}
-
-/// Whether a `node_info` answer lists `feature`; refused as `operation` not
-/// implemented by `backend` when it does not, so nothing is sent.
-fn require_feature(
-    result: CmdResult,
-    feature: &str,
-    operation: &'static str,
-    backend: &'static str,
-) -> Result<(), RtpEngineError> {
-    match result {
-        CmdResult::NodeInfo { node } if node.features.iter().any(|listed| listed == feature) => {
-            Ok(())
-        }
-        CmdResult::NodeInfo { node } => {
-            tracing::warn!(
-                version = %node.version,
-                "{operation} asked for, but the media engine does not list \
-                 '{feature}' in node_info features"
-            );
-            Err(RtpEngineError::Unsupported { operation, backend })
-        }
-        CmdResult::Error { reason } => Err(RtpEngineError::EngineError(format!(
-            "node_info refused while checking for {feature}: {reason}"
-        ))),
-        other => Err(RtpEngineError::Protocol(format!(
-            "unexpected '{}' response for node_info",
-            result_kind(&other)
-        ))),
-    }
 }
 
 impl SiphonRtpClient {

@@ -202,6 +202,62 @@ pub(super) fn publish_ws_bridge_ended(
     );
 }
 
+/// A split bridge started, on the channel of the offerer's dialog (channel 0).
+///
+/// `channels` names which SIP party each channel of the stream carries, since
+/// the engine only knows "offerer" and "answerer" and which leg siphon made
+/// the offerer is not something a controller can see: channel 0 is the
+/// offerer, the party whose engine tag is `from_tag`; channel 1 the answerer.
+/// The answerer's `sip_call_id` is `null` when siphon holds no dialog for it
+/// (a call that is not a bridged pair).
+pub(super) fn publish_ws_split_started(
+    state: &DispatcherState,
+    started: &crate::rtpengine::events::WsSplitStarted,
+) {
+    let (offerer, answerer) = match state.rtpengine_sessions.as_ref() {
+        Some(store) => store.split_channels(&started.call_id, &started.from_tag),
+        None => (started.call_id.clone(), None),
+    };
+    publish_engine_event(
+        state,
+        &started.call_id,
+        &started.from_tag,
+        "WsSplitStarted",
+        serde_json::json!({
+            "from_tag": started.from_tag,
+            "stream_id": started.stream_id,
+            "ws_uri": started.ws_uri,
+            "sample_rate": started.sample_rate,
+            "channels": [
+                {"channel": 0, "party": "offerer", "sip_call_id": offerer},
+                {"channel": 1, "party": "answerer", "sip_call_id": answerer},
+            ],
+        }),
+    );
+}
+
+/// A split bridge ended, with the engine's reason verbatim. `isolated` says
+/// whether the parties are still cut off from each other: true after every
+/// end but `detached` and `call_deleted`, which a controller acts on with a
+/// `stream_stop {mode: "split"}`.
+pub(super) fn publish_ws_split_ended(
+    state: &DispatcherState,
+    ended: &crate::rtpengine::events::WsSplitEnded,
+) {
+    publish_engine_event(
+        state,
+        &ended.call_id,
+        &ended.from_tag,
+        "WsSplitEnded",
+        serde_json::json!({
+            "from_tag": ended.from_tag,
+            "stream_id": ended.stream_id,
+            "reason": ended.reason,
+            "isolated": !ended.restores_direct_audio(),
+        }),
+    );
+}
+
 /// The control plane's `MediaStarted` payload: which engine leg media started
 /// on, the engine call's tags, where the first packet came from and where the
 /// SDP said it would. `nat_rewritten` is present only when the engine reported

@@ -1207,6 +1207,19 @@ class _RtpEngineNamespace:
     async def detach_ws_tee(self, target):
         raise NotImplementedError("rtpengine.detach_ws_tee() not available — no media.rtpengine in config")
 
+    async def attach_ws_bridge(self, target, ws_uri, profile=None, scope=None):
+        raise NotImplementedError("rtpengine.attach_ws_bridge() not available — no media.rtpengine in config")
+
+    async def detach_ws_bridge(self, target, scope=None):
+        raise NotImplementedError("rtpengine.detach_ws_bridge() not available — no media.rtpengine in config")
+
+    async def attach_ws_split(self, target, ws_uri, sample_rate=None, offerer_profile=None,
+                              answerer_profile=None, scope=None):
+        raise NotImplementedError("rtpengine.attach_ws_split() not available — no media.rtpengine in config")
+
+    async def detach_ws_split(self, target, scope=None):
+        raise NotImplementedError("rtpengine.detach_ws_split() not available — no media.rtpengine in config")
+
     async def play_overlay(self, target, file=None, blob=None, db_id=None, tone=None, url=None,
                            repeat=None, start_ms=None, duration_ms=None, gain_decibels=None,
                            to_tag=None):
@@ -1449,6 +1462,109 @@ class _RtpEngineNamespace:
             is_async = _asyncio.iscoroutinefunction(fn)
             metadata = {"call_id": call_id, "from_tag": from_tag}
             _registry.register("rtpengine.on_ws_tee_ended", None, fn, is_async, metadata)
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def on_ws_bridge_started(self, func_or_none=None, *, call_id=None, from_tag=None):
+        """Register a handler for WebSocket takeover bridge started events.
+
+        Fires once the engine has dialled the bridge's server and the leg's far
+        side is that server; ``stream_id`` correlates this event with the media
+        stream.
+
+        Usage:
+            @rtpengine.on_ws_bridge_started
+            def handle_any(call_id, from_tag, stream_id, ws_uri, sample_rate):
+                ...
+
+            @rtpengine.on_ws_bridge_started(call_id="abc")
+            def handle_specific(call_id, from_tag, stream_id, ws_uri, sample_rate):
+                ...
+        """
+        def decorator(fn):
+            is_async = _asyncio.iscoroutinefunction(fn)
+            metadata = {"call_id": call_id, "from_tag": from_tag}
+            _registry.register("rtpengine.on_ws_bridge_started", None, fn, is_async, metadata)
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def on_ws_bridge_ended(self, func_or_none=None, *, call_id=None, from_tag=None):
+        """Register a handler for WebSocket takeover bridge ended events.
+
+        Fires exactly once per started bridge. ``reason`` is one of
+        ``detached``, ``server_closed``, ``server_stopped``, ``call_ended`` or
+        ``transport_error``; anything but ``detached`` and ``call_ended`` leaves
+        a live call with no media far side.
+
+        Usage:
+            @rtpengine.on_ws_bridge_ended
+            def handle_any(call_id, from_tag, stream_id, reason):
+                ...
+
+            @rtpengine.on_ws_bridge_ended(call_id="abc")
+            def handle_specific(call_id, from_tag, stream_id, reason):
+                ...
+        """
+        def decorator(fn):
+            is_async = _asyncio.iscoroutinefunction(fn)
+            metadata = {"call_id": call_id, "from_tag": from_tag}
+            _registry.register("rtpengine.on_ws_bridge_ended", None, fn, is_async, metadata)
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def on_ws_split_started(self, func_or_none=None, *, call_id=None, from_tag=None):
+        """Register a handler for split bridge started events.
+
+        Fires once the engine has dialled the split's server and isolated the
+        two parties; channel 0 of the stream is the offerer, channel 1 the
+        answerer. ``call_id`` is the SIP Call-ID of the offerer's dialog.
+
+        Usage:
+            @rtpengine.on_ws_split_started
+            def handle_any(call_id, from_tag, stream_id, ws_uri, sample_rate):
+                ...
+
+            @rtpengine.on_ws_split_started(call_id="abc")
+            def handle_specific(call_id, from_tag, stream_id, ws_uri, sample_rate):
+                ...
+        """
+        def decorator(fn):
+            is_async = _asyncio.iscoroutinefunction(fn)
+            metadata = {"call_id": call_id, "from_tag": from_tag}
+            _registry.register("rtpengine.on_ws_split_started", None, fn, is_async, metadata)
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def on_ws_split_ended(self, func_or_none=None, *, call_id=None, from_tag=None):
+        """Register a handler for split bridge ended events.
+
+        Fires exactly once per started split. ``reason`` is one of ``detached``,
+        ``ws_closed``, ``ws_stopped``, ``ws_error``, ``call_deleted``,
+        ``renegotiated`` or ``restored``. After
+        any end but ``detached`` and ``call_deleted`` the call stays isolated
+        and silent until the script calls ``rtpengine.detach_ws_split``.
+
+        Usage:
+            @rtpengine.on_ws_split_ended
+            def handle_any(call_id, from_tag, stream_id, reason):
+                ...
+
+            @rtpengine.on_ws_split_ended(call_id="abc")
+            def handle_specific(call_id, from_tag, stream_id, reason):
+                ...
+        """
+        def decorator(fn):
+            is_async = _asyncio.iscoroutinefunction(fn)
+            metadata = {"call_id": call_id, "from_tag": from_tag}
+            _registry.register("rtpengine.on_ws_split_ended", None, fn, is_async, metadata)
             return fn
         if func_or_none is not None:
             return decorator(func_or_none)

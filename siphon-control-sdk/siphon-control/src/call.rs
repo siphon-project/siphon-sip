@@ -963,7 +963,7 @@ impl Call {
 
     /// Attach a WebSocket audio stream to ``ws_uri``.
     ///
-    /// ``mode`` picks one of two opposite operations:
+    /// ``mode`` picks one of three operations:
     ///
     /// - ``"tee"`` (default) is additive: a copy of the call's decoded audio
     ///   streams to ``ws_uri`` while the call keeps relaying. Use it for
@@ -971,6 +971,21 @@ impl Call {
     /// - ``"bridge"`` is a takeover: the WebSocket server becomes the leg's far
     ///   side and the call's own media path is unwired. On a leg that already
     ///   has a bridge it re-points in place.
+    /// - ``"split"`` streams both legs of an answered two-party call to one
+    ///   duplex stereo socket and isolates the parties from each other: channel
+    ///   0 is the offerer, channel 1 the answerer, and each party hears only
+    ///   what the server sends on its channel. This is live translation. It
+    ///   needs an engine that lists ``ws_split`` (``ControlError`` with
+    ///   ``code == "unsupported_verb"`` otherwise). ``sample_rate`` is 8000,
+    ///   16000, 24000 or 48000 here, and ``offerer_profile`` /
+    ///   ``answerer_profile`` name the media profile whose ``noise_suppression``
+    ///   runs on that party's uplink (the engine refuses a profile that asks
+    ///   for more). An engine refusal arrives as ``ControlError`` with its token
+    ///   (``ws-split-not-answered``, ``ws-split-answer-local``,
+    ///   ``ws-split-seated``, ``ws-split-already-bridged``, ...) in the details.
+    ///   The ``WsSplitStarted`` event names the SIP party on each channel, and
+    ///   after a ``WsSplitEnded`` whose ``isolated`` is true the call stays
+    ///   isolated and silent until ``await call.stream_stop(mode="split")``.
     ///
     /// ``mode`` always goes on the wire, ``"tee"`` included, so a server whose
     /// default moved can never turn a transcription into a takeover.
@@ -1000,7 +1015,9 @@ impl Call {
     ///                             direction="caller", sample_rate=16000)
     ///     await call.stream_start("wss://ai.example/agent", mode="bridge",
     ///                             profile="voice_ai")
-    #[pyo3(signature = (ws_uri, direction=None, channels=None, *, mode="tee", sample_rate=None, profile=None, media_flags=None))]
+    ///     await call.stream_start("wss://translate.example/call", mode="split",
+    ///                             sample_rate=16000, offerer_profile="denoise")
+    #[pyo3(signature = (ws_uri, direction=None, channels=None, *, mode="tee", sample_rate=None, profile=None, media_flags=None, offerer_profile=None, answerer_profile=None))]
     #[allow(clippy::too_many_arguments)]
     fn stream_start<'py>(
         &self,
@@ -1012,6 +1029,8 @@ impl Call {
         sample_rate: Option<u32>,
         profile: Option<String>,
         media_flags: Option<Bound<'py, PyAny>>,
+        offerer_profile: Option<String>,
+        answerer_profile: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let options = StreamOptions {
             mode: extract_stream_mode(mode)?,
@@ -1020,6 +1039,8 @@ impl Call {
             sample_rate,
             profile,
             media_flags: optional_media_flags(media_flags.as_ref())?,
+            offerer_profile,
+            answerer_profile,
         };
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -1034,7 +1055,10 @@ impl Call {
     ///
     /// A tee detach is idempotent. A bridge detach is not: the engine refuses
     /// one where there is no relay to hand the call back to, and that raises
-    /// ``ControlError`` rather than leaving a live call with no audio path.
+    /// ``ControlError`` rather than leaving a live call with no audio path. A
+    /// split detach puts the direct path back between the parties without a
+    /// re-INVITE and is idempotent; it is also how a split that ended on its own
+    /// (``WsSplitEnded`` with ``isolated`` true) is released.
     #[pyo3(signature = (*, mode="tee"))]
     fn stream_stop<'py>(&self, py: Python<'py>, mode: &str) -> PyResult<Bound<'py, PyAny>> {
         let mode = extract_stream_mode(mode)?;

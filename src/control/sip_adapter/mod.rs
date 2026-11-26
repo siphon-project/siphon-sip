@@ -26,6 +26,9 @@ mod media_flags;
 mod media_flags_tests;
 mod originate;
 mod routing;
+mod split;
+#[cfg(test)]
+mod split_tests;
 #[cfg(test)]
 mod tests;
 mod transfer;
@@ -149,10 +152,10 @@ impl ControlAdapter for SipControlAdapter {
                 verb("dtmf", "Inject DTMF digits toward the A-leg (args: digits, duration_ms, volume_dbm0, pause_ms, to_tag)"),
                 verb("hold", "Silence the call's media in both directions on the media engine. A media gate, not a SIP hold: nothing is sent on either dialog, so no phone shows a held call, and it is refused invalid_state with reason media_not_processed on a call the engine only relays (it applies to one it transcodes, records or streams). To hold one party of a bridge with a sendonly re-offer, use unbridge"),
                 verb("unhold", "Restore the call's media after a hold"),
-                verb("stream_start", "Stream the call's audio to a WebSocket server — siphon-rtp backend only (args: ws_uri, mode=tee|bridge, and for tee: direction, channels, sample_rate). mode=tee streams a copy while the call keeps relaying; mode=bridge is a takeover that makes the server the leg's far side, and re-points in place if one is already attached"),
+                verb("stream_start", "Stream the call's audio to a WebSocket server — siphon-rtp backend only (args: ws_uri, mode=tee|bridge|split, and for tee: direction, channels, sample_rate). mode=tee streams a copy while the call keeps relaying; mode=bridge is a takeover that makes the server the leg's far side, and re-points in place if one is already attached; mode=split streams both legs of an answered two-party call to one duplex stereo socket and isolates the parties from each other (args: sample_rate 8000, 16000, 24000 or 48000, offerer_profile, answerer_profile, each the name of a media profile whose noise_suppression runs on that party's uplink). Channel 0 is the offerer, channel 1 the answerer, and WsSplitStarted names the SIP party on each. mode=split needs an engine that lists ws_split (unsupported_verb otherwise) and an engine refusal comes back with its token (ws-split-not-answered, ws-split-answer-local, ws-split-seated, ws-split-already-bridged, ...) in details.token. After a WsSplitEnded that is not detached or call_deleted the call stays isolated and silent until stream_stop mode=split"),
                 verb("record_start", "Record the call's decoded audio to a file, replying with the recording_id a later record_stop and the RecordingFinished event carry (args: format=wav|ogg_opus, bitrate_bps (ogg_opus only), direction=ingress|egress|both, channels=mono|stereo, max_duration_ms, silence_ms, path). max_duration_ms and silence_ms are the two stop conditions a voicemail greeting announces, and RecordingFinished fires only once the file is closed — so an app can attach it to an email without racing a half-written one. siphon-rtp only"),
                 verb("record_stop", "Stop a recording (args: recording_id; absent stops every recording on the call)"),
-                verb("stream_stop", "Stop streaming the call's audio (args: mode=tee|bridge). A tee stop is idempotent; a bridge stop is refused where there is no relay to return the call to"),
+                verb("stream_stop", "Stop streaming the call's audio (args: mode=tee|bridge|split). A tee stop is idempotent; a bridge stop is refused where there is no relay to return the call to; a split stop puts the direct path back between the parties without a re-INVITE and is idempotent"),
             ],
             events: vec![
                 "StasisStart".to_string(),
@@ -243,6 +246,13 @@ impl ControlAdapter for SipControlAdapter {
                 // WsBridgeStarted, and a re-point is an ended+started pair.
                 "WsBridgeStarted".to_string(),
                 "WsBridgeEnded".to_string(),
+                // The lifecycle of a `stream_start` with `mode: split`:
+                // exactly one WsSplitEnded per WsSplitStarted. After an end
+                // that is not `detached` or `call_deleted` the call is still
+                // isolated and silent until a `stream_stop`, so a controller
+                // that is not told of it leaves two people on a dead line.
+                "WsSplitStarted".to_string(),
+                "WsSplitEnded".to_string(),
                 // The tee's lifecycle, on the same rail and for the same
                 // reason. A dead tee is less severe than a dead bridge — the
                 // call keeps relaying and only the consumer loses its copy —

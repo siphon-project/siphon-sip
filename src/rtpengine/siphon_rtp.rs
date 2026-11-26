@@ -52,13 +52,17 @@ mod connection;
 mod events;
 mod far_leg;
 mod identity;
+mod node_features;
 mod per_call;
 mod recording;
 mod scope;
+mod split;
 mod tee;
 mod waiters;
 mod x3_at_offer;
 use connection::connection_manager;
+#[cfg(test)]
+pub(crate) use events::ws_split_end_reason_name;
 #[cfg(test)]
 use events::{
     convert_event, convert_leg_summary, play_end_reason_from_proto, ws_bridge_end_reason_from_proto,
@@ -2989,6 +2993,86 @@ mod tests {
             }
             other => panic!("expected a bridge-started event, got {other:?}"),
         }
+    }
+
+    /// A split's start names the call, the tag, the stream and the shape the
+    /// engine settled on.
+    #[test]
+    fn split_started_carries_the_negotiated_wire_shape() {
+        let mapped = convert_event(Event::WsSplitStarted(siphon_rtp_proto::WsSplitStarted {
+            call_id: "c".into(),
+            from_tag: "t".into(),
+            stream_id: "split-c".into(),
+            ws_uri: "wss://bot.example.net/s".into(),
+            sample_rate: 24_000,
+        }));
+        match mapped {
+            RtpEngineEvent::WsSplitStarted(started) => {
+                assert_eq!(started.call_id, "c");
+                assert_eq!(started.from_tag, "t");
+                assert_eq!(started.stream_id, "split-c");
+                assert_eq!(started.ws_uri, "wss://bot.example.net/s");
+                assert_eq!(started.sample_rate, 24_000);
+            }
+            other => panic!("expected a split-started event, got {other:?}"),
+        }
+    }
+
+    /// Every reason the engine documents reaches the script as its wire
+    /// spelling, and only `detached` and `call_deleted` give the parties their
+    /// direct audio back.
+    #[test]
+    fn every_split_end_reason_keeps_its_wire_spelling() {
+        use siphon_rtp_proto::WsSplitEndReason;
+        for (reason, spelling, restores_audio) in [
+            (WsSplitEndReason::Detached, "detached", true),
+            (WsSplitEndReason::WsClosed, "ws_closed", false),
+            (WsSplitEndReason::WsStopped, "ws_stopped", false),
+            (WsSplitEndReason::WsError, "ws_error", false),
+            (WsSplitEndReason::CallDeleted, "call_deleted", true),
+            (WsSplitEndReason::Renegotiated, "renegotiated", false),
+            (WsSplitEndReason::Restored, "restored", false),
+        ] {
+            let mapped = convert_event(Event::WsSplitEnded(siphon_rtp_proto::WsSplitEnded {
+                call_id: "c".into(),
+                from_tag: "t".into(),
+                stream_id: "split-c".into(),
+                reason,
+            }));
+            match mapped {
+                RtpEngineEvent::WsSplitEnded(ended) => {
+                    assert_eq!(ended.reason, spelling);
+                    assert_eq!(ended.stream_id, "split-c");
+                    assert_eq!(ended.restores_direct_audio(), restores_audio, "{spelling}");
+                }
+                other => panic!("expected a split-ended event, got {other:?}"),
+            }
+        }
+    }
+
+    /// With siphon-rtp-proto 0.29 the end reason is a closed enum on the wire:
+    /// an end carrying a reason outside the seven does not decode as an event,
+    /// so it never reaches a hook (the connection skips it). Documented here,
+    /// not worked around: a reason the engine adds needs the proto crate to
+    /// learn it. What a string does to the call is still stated: anything but
+    /// `detached` and `call_deleted` leaves it isolated.
+    #[test]
+    fn an_unknown_split_end_reason_is_not_decoded_and_so_not_delivered() {
+        let known = r#"{"event":"ws_split_ended","call_id":"c","from_tag":"t","stream_id":"split-c","reason":"ws_error"}"#;
+        assert!(serde_json::from_str::<Event>(known).is_ok());
+        let unknown = known.replace("ws_error", "a_future_reason");
+        assert!(
+            serde_json::from_str::<Event>(&unknown).is_err(),
+            "proto 0.29 decodes no other reason; if this starts to pass, the reason is deliverable"
+        );
+
+        let ended = crate::rtpengine::events::WsSplitEnded {
+            call_id: "c".into(),
+            from_tag: "t".into(),
+            stream_id: "split-c".into(),
+            reason: "a_future_reason".to_string(),
+        };
+        assert!(!ended.restores_direct_audio());
     }
 
     /// `carry_received_from` is siphon-side policy, not a wire field: on its own

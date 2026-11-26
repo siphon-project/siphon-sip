@@ -403,7 +403,7 @@ pub(crate) fn extract_record_format(format: Option<String>) -> PyResult<Option<R
 pub(crate) fn extract_stream_mode(mode: &str) -> PyResult<StreamMode> {
     StreamMode::from_name(mode).ok_or_else(|| {
         PyValueError::new_err(format!(
-            "stream mode must be \"tee\" or \"bridge\", not {mode:?}"
+            "stream mode must be \"tee\", \"bridge\" or \"split\", not {mode:?}"
         ))
     })
 }

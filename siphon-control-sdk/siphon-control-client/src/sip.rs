@@ -424,11 +424,16 @@ impl CallEvent {
     /// True for a tee whose audio stopped reaching the consumer mid-call, and
     /// for a bridge — where it is graver, because a bridge is the call's media
     /// path, so both parties are now up and hearing nothing. `detached` and
-    /// `call_ended` are the only orderly ends of either.
+    /// `call_ended` are the only orderly ends of either. A split is the same
+    /// as a bridge: `detached` and `call_deleted` are its only orderly ends,
+    /// and after any other the parties stay isolated until it is detached.
     pub fn is_unexpected_stream_end(&self) -> bool {
         match self.kind {
             SipEvent::WsTeeEnded => self.ws_tee_ended().is_some_and(|end| end.unexpected),
             SipEvent::WsBridgeEnded => self.ws_bridge_ended().is_some_and(|end| end.unexpected),
+            // A split that ended for any reason but a detach or the call
+            // going leaves both parties up and isolated from each other.
+            SipEvent::WsSplitEnded => self.ws_split_ended().is_some_and(|end| end.isolated),
             _ => false,
         }
     }
@@ -2852,11 +2857,103 @@ mod tests {
         assert_eq!(calls[2].args, json!({ "mode": "tee" }));
     }
 
+    #[tokio::test]
+    async fn stream_start_with_a_split_sends_its_rate_and_party_profiles() {
+        let recorder = recorder(json!({ "channel": "ch1", "state": "split" }));
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let call = make_call(transport);
+        call.stream_start_with(
+            "wss://bot.example.net/call",
+            StreamOptions::split()
+                .sample_rate(24_000)
+                .offerer_profile("denoise")
+                .answerer_profile("denoise"),
+        )
+        .await
+        .expect("stream_start");
+        assert_eq!(
+            lock(&recorder.calls)[0].args,
+            json!({
+                "ws_uri": "wss://bot.example.net/call",
+                "mode": "split",
+                "sample_rate": 24_000,
+                "offerer_profile": "denoise",
+                "answerer_profile": "denoise",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_split_names_only_its_mode() {
+        let recorder = recorder(json!({ "channel": "ch1", "state": "split" }));
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let call = make_call(transport);
+        call.stream_start_with("wss://bot.example.net/call", StreamOptions::split())
+            .await
+            .expect("stream_start");
+        call.stream_stop_with(StreamMode::Split)
+            .await
+            .expect("stream_stop");
+        let calls = lock(&recorder.calls).clone();
+        assert_eq!(
+            calls[0].args,
+            json!({ "ws_uri": "wss://bot.example.net/call", "mode": "split" })
+        );
+        assert_eq!(calls[1].verb, "stream_stop");
+        assert_eq!(calls[1].args, json!({ "mode": "split" }));
+    }
+
+    fn call_event(name: &str, payload: serde_json::Value) -> CallEvent {
+        CallEvent::from_frame(EventFrame::new(
+            name,
+            "ch1",
+            "ivr-app",
+            "call-uuid",
+            "sip@host",
+            payload,
+        ))
+    }
+
+    #[test]
+    fn the_split_events_have_typed_accessors_and_an_isolated_end_is_unexpected() {
+        let started = call_event(
+            "WsSplitStarted",
+            json!({
+                "from_tag": "tag-a", "stream_id": "split-1",
+                "ws_uri": "wss://bot.example.net/call", "sample_rate": 16000,
+                "channels": [
+                    {"channel": 0, "party": "offerer", "sip_call_id": "caller@example.com"},
+                    {"channel": 1, "party": "answerer", "sip_call_id": "phone@example.com"},
+                ],
+            }),
+        );
+        let payload = started.ws_split_started().expect("typed");
+        assert_eq!(payload.sip_call_id_of(1), Some("phone@example.com"));
+        assert!(started.ws_split_ended().is_none());
+        assert!(!started.is_unexpected_stream_end());
+
+        for (reason, isolated) in [
+            ("detached", false),
+            ("call_deleted", false),
+            ("ws_closed", true),
+        ] {
+            let ended = call_event(
+                "WsSplitEnded",
+                json!({"from_tag": "tag-a", "stream_id": "split-1", "reason": reason,
+                       "isolated": isolated}),
+            );
+            assert_eq!(ended.ws_split_ended().expect("typed").reason, reason);
+            assert_eq!(ended.is_unexpected_stream_end(), isolated, "{reason}");
+        }
+    }
+
     #[test]
     fn stream_selectors_parse_their_wire_names() {
         assert_eq!(StreamMode::default(), StreamMode::Tee);
         assert_eq!(StreamMode::from_name("BRIDGE"), Some(StreamMode::Bridge));
         assert_eq!(StreamMode::from_name("tee"), Some(StreamMode::Tee));
+        assert_eq!(StreamMode::from_name("Split"), Some(StreamMode::Split));
+        assert_eq!(StreamMode::Split.as_str(), "split");
         assert_eq!(StreamMode::from_name("takeover"), None);
         assert_eq!(StreamMode::Bridge.as_str(), "bridge");
         assert_eq!(

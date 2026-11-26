@@ -31,6 +31,7 @@ from siphon_sdk.cdr import CallDetailRecord
 from siphon_sdk.lcr import Route
 from siphon_sdk.smpp import MockSmpp
 from siphon_sdk.http import MockHttp
+from siphon_sdk.ws_split import _WsSplitMixin
 
 
 def _strip_nameaddr(value: str) -> str:
@@ -5742,7 +5743,7 @@ def _resolve_play_source(
     return "db-id"
 
 
-class MockRtpEngine:
+class MockRtpEngine(_WsSplitMixin):
     """Mock RTPEngine namespace — records media operations for assertions.
 
     Example::
@@ -5828,6 +5829,7 @@ class MockRtpEngine:
         self._conference_dtmf_supported: bool = True
         self._conference_seat_refusal: Optional[str] = None
         self._active_speaker_handlers: list[dict[str, Any]] = []
+        self._ws_split_init()
         self.media_scopes: list[tuple[str, Optional[str]]] = []
         """``(operation, scope)`` per media verb (offer, answer, delete, delete_call,
         and every verb that addresses a call's media): the per-call scope the verb
@@ -6230,7 +6232,15 @@ class MockRtpEngine:
                 profile = "rtp_passthrough"
         self.operations.append(("answer", profile))
         self.media_scopes.append(("answer", scope))
-        self.ws_uris.append(("answer", self._resolve_ws_uri(ws_uri, call or reply)))
+        self._track_answered(_resolve_media_target(call if call is not None else reply)[0], scope=scope)
+        resolved_ws_uri = self._resolve_ws_uri(ws_uri, call or reply)
+        self.ws_uris.append(("answer", resolved_ws_uri))
+        if resolved_ws_uri is not None:
+            # A takeover negotiated at offer/answer: the engine refuses a split
+            # over it, and it goes with the call like an attached one.
+            self._record_takeover(
+                _resolve_media_target(call if call is not None else reply)[0], scope, True
+            )
         self.media_overrides.append(("answer", _media_overrides(
             beep_detection, beep_cadence_guard_ms, ws_sample_rate,
             ws_tee_sample_rate, ws_vad_engine, ws_vad_min_speech_ms,
@@ -6353,6 +6363,7 @@ class MockRtpEngine:
         answered_call_id, _ = _resolve_media_target(call)
         if answered_call_id:
             self._anchored_legs.setdefault(answered_call_id, set()).add(scope)
+        self._track_answered(answered_call_id, locally=True, scope=scope)
         self.ws_uris.append(("answer_local", resolved_ws_uri))
         self.media_overrides.append(("answer_local", _media_overrides(
             beep_detection, beep_cadence_guard_ms, ws_sample_rate,
@@ -6394,6 +6405,7 @@ class MockRtpEngine:
         self.media_scopes.append(("delete", scope))
         call_id, _ = _resolve_media_target(request)
         self._forget_legs(call_id, scope)
+        self._forget_call(call_id, scope)
         seated = self.conference_seat(call_id) if call_id else None
         if seated is not None:
             self._leave_seat(*seated)
@@ -6443,6 +6455,7 @@ class MockRtpEngine:
         scope = _media_scope(scope, (), "delete_call")
         self.media_scopes.append(("delete_call", scope))
         self._forget_legs(call_id, scope)
+        self._forget_call(call_id, scope)
         seated = self.conference_seat(call_id)
         if seated is not None:
             self._leave_seat(*seated)
@@ -8085,6 +8098,7 @@ class MockRtpEngine:
         ws_uri = self._expand_ws_uri(ws_uri, target)
         call_id, from_tag = _resolve_media_target(target)
         scope = self._leg_scope(scope, target, call_id, "attach_ws_bridge")
+        self._record_takeover(call_id, scope, True)
         self.operations.append(("attach_ws_bridge", ws_uri))
         self.media_calls.append({
             "op": "attach_ws_bridge",
@@ -8127,6 +8141,7 @@ class MockRtpEngine:
         """
         call_id, from_tag = _resolve_media_target(target)
         scope = self._leg_scope(scope, target, call_id, "detach_ws_bridge")
+        self._record_takeover(call_id, scope, False)
         self.operations.append(("detach_ws_bridge", None))
         self.media_calls.append({
             "op": "detach_ws_bridge",
@@ -8872,6 +8887,9 @@ class MockRtpEngine:
         self._conference_seat_supported = True
         self._conference_dtmf_supported = True
         self._conference_seat_refusal = None
+        self._anchored_legs.clear()
+        self.ws_uris.clear()
+        self._ws_split_clear()
 
 
 # ---------------------------------------------------------------------------

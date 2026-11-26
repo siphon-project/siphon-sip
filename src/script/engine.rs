@@ -230,6 +230,25 @@ pub enum HandlerKind {
         call_id: Option<String>,
         from_tag: Option<String>,
     },
+    /// `@rtpengine.on_ws_split_started`: a **split bridge** began on a live
+    /// call: both parties are streamed to one duplex WebSocket and isolated
+    /// from each other.
+    ///
+    /// ``call_id`` (the SIP Call-ID) and ``from_tag`` are optional filters.
+    RtpEngineOnWsSplitStarted {
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    },
+    /// `@rtpengine.on_ws_split_ended`: a split bridge stopped, for any reason.
+    /// Emitted exactly once per started split. After any end but `detached`
+    /// and `call_deleted` the call stays isolated and silent until the script
+    /// detaches it.
+    ///
+    /// ``call_id`` (the SIP Call-ID) and ``from_tag`` are optional filters.
+    RtpEngineOnWsSplitEnded {
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    },
     /// `@rtpengine.on_beep` — a record tone (the "voicemail beep") was detected
     /// on a leg armed with `beep_detection`, the media half of
     /// answering-machine detection. Fires once per leg per call.
@@ -1045,6 +1064,17 @@ fn get_or_create_registry(python: Python<'_>) -> Result<Bound<'_, PyAny>> {
     Ok(registry.into_any())
 }
 
+/// The optional `call_id` / `from_tag` filters of a media-event handler,
+/// read from the metadata dict its decorator registered.
+fn event_id_filters(metadata: Option<&Bound<'_, PyAny>>) -> (Option<String>, Option<String>) {
+    let read = |key: &str| -> Option<String> {
+        metadata
+            .and_then(|meta| meta.get_item(key).ok())
+            .and_then(|value| value.extract().ok())
+    };
+    (read("call_id"), read("from_tag"))
+}
+
 /// Read the handlers list from the Python registry and convert to Rust types.
 fn extract_handlers(python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<Vec<HandlerEntry>> {
     let entries = registry
@@ -1171,58 +1201,23 @@ fn extract_handlers(python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<V
                 }
             }
             "rtpengine.on_dtmf" => {
-                let call_id: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("call_id").ok())
-                    .and_then(|v| v.extract().ok());
-                let from_tag: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("from_tag").ok())
-                    .and_then(|v| v.extract().ok());
+                let (call_id, from_tag) = event_id_filters(metadata.as_ref());
                 HandlerKind::RtpEngineOnDtmf { call_id, from_tag }
             }
             "rtpengine.on_media_timeout" => {
-                let call_id: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("call_id").ok())
-                    .and_then(|v| v.extract().ok());
-                let from_tag: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("from_tag").ok())
-                    .and_then(|v| v.extract().ok());
+                let (call_id, from_tag) = event_id_filters(metadata.as_ref());
                 HandlerKind::RtpEngineOnMediaTimeout { call_id, from_tag }
             }
             "rtpengine.on_ws_tee_started" => {
-                let call_id: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("call_id").ok())
-                    .and_then(|v| v.extract().ok());
-                let from_tag: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("from_tag").ok())
-                    .and_then(|v| v.extract().ok());
+                let (call_id, from_tag) = event_id_filters(metadata.as_ref());
                 HandlerKind::RtpEngineOnWsTeeStarted { call_id, from_tag }
             }
             "rtpengine.on_text" => {
-                let call_id: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("call_id").ok())
-                    .and_then(|v| v.extract().ok());
-                let from_tag: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("from_tag").ok())
-                    .and_then(|v| v.extract().ok());
+                let (call_id, from_tag) = event_id_filters(metadata.as_ref());
                 HandlerKind::RtpEngineOnText { call_id, from_tag }
             }
             "rtpengine.on_beep" => {
-                let call_id: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("call_id").ok())
-                    .and_then(|v| v.extract().ok());
-                let from_tag: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("from_tag").ok())
-                    .and_then(|v| v.extract().ok());
+                let (call_id, from_tag) = event_id_filters(metadata.as_ref());
                 HandlerKind::RtpEngineOnBeep { call_id, from_tag }
             }
             "rtpengine.on_active_speaker" => {
@@ -1235,70 +1230,36 @@ fn extract_handlers(python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<V
                 HandlerKind::RtpEngineOnActiveSpeaker { conference_id }
             }
             "rtpengine.on_media_started" => {
-                let call_id: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("call_id").ok())
-                    .and_then(|v| v.extract().ok());
-                let from_tag: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("from_tag").ok())
-                    .and_then(|v| v.extract().ok());
+                let (call_id, from_tag) = event_id_filters(metadata.as_ref());
                 HandlerKind::RtpEngineOnMediaStarted { call_id, from_tag }
             }
             "rtpengine.on_ws_tee_ended" => {
-                let call_id: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("call_id").ok())
-                    .and_then(|v| v.extract().ok());
-                let from_tag: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("from_tag").ok())
-                    .and_then(|v| v.extract().ok());
+                let (call_id, from_tag) = event_id_filters(metadata.as_ref());
                 HandlerKind::RtpEngineOnWsTeeEnded { call_id, from_tag }
             }
             "rtpengine.on_recording_finished" => {
-                let call_id: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("call_id").ok())
-                    .and_then(|v| v.extract().ok());
-                let from_tag: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("from_tag").ok())
-                    .and_then(|v| v.extract().ok());
+                let (call_id, from_tag) = event_id_filters(metadata.as_ref());
                 HandlerKind::RtpEngineOnRecordingFinished { call_id, from_tag }
             }
             "rtpengine.on_play_finished" => {
-                let call_id: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("call_id").ok())
-                    .and_then(|v| v.extract().ok());
-                let from_tag: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("from_tag").ok())
-                    .and_then(|v| v.extract().ok());
+                let (call_id, from_tag) = event_id_filters(metadata.as_ref());
                 HandlerKind::RtpEngineOnPlayFinished { call_id, from_tag }
             }
             "rtpengine.on_ws_bridge_started" => {
-                let call_id: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("call_id").ok())
-                    .and_then(|v| v.extract().ok());
-                let from_tag: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("from_tag").ok())
-                    .and_then(|v| v.extract().ok());
+                let (call_id, from_tag) = event_id_filters(metadata.as_ref());
                 HandlerKind::RtpEngineOnWsBridgeStarted { call_id, from_tag }
             }
             "rtpengine.on_ws_bridge_ended" => {
-                let call_id: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("call_id").ok())
-                    .and_then(|v| v.extract().ok());
-                let from_tag: Option<String> = metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get_item("from_tag").ok())
-                    .and_then(|v| v.extract().ok());
+                let (call_id, from_tag) = event_id_filters(metadata.as_ref());
                 HandlerKind::RtpEngineOnWsBridgeEnded { call_id, from_tag }
+            }
+            "rtpengine.on_ws_split_started" => {
+                let (call_id, from_tag) = event_id_filters(metadata.as_ref());
+                HandlerKind::RtpEngineOnWsSplitStarted { call_id, from_tag }
+            }
+            "rtpengine.on_ws_split_ended" => {
+                let (call_id, from_tag) = event_id_filters(metadata.as_ref());
+                HandlerKind::RtpEngineOnWsSplitEnded { call_id, from_tag }
             }
             other => HandlerKind::Custom {
                 kind: other.to_owned(),
