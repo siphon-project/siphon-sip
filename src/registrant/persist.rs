@@ -235,6 +235,9 @@ struct Shared {
     in_flight: AtomicUsize,
     notify: Notify,
     closed: AtomicBool,
+    /// The published advertised addresses of the in-memory backend.
+    #[cfg(test)]
+    adverts: Mutex<HashMap<String, String>>,
 }
 
 /// The persisted bindings of one instance.
@@ -425,6 +428,8 @@ impl BindingStore {
                 in_flight: AtomicUsize::new(0),
                 notify: Notify::new(),
                 closed: AtomicBool::new(false),
+                #[cfg(test)]
+                adverts: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -769,6 +774,19 @@ fn glob_escape(text: &str) -> String {
 /// connect long after it, so neither can hand the other a reference directly.
 static PUBLISHED: OnceLock<Arc<BindingStore>> = OnceLock::new();
 
+static STORE_EXPECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Say a store will be published (the Redis backend is configured), possibly
+/// after boot: what must be published before a REGISTER leaves waits for it.
+pub fn expect_store() {
+    STORE_EXPECTED.store(true, Ordering::SeqCst);
+}
+
+/// Whether a store is expected.
+pub fn store_expected() -> bool {
+    STORE_EXPECTED.load(Ordering::SeqCst)
+}
+
 /// Publish the store (the registrar's Redis backend, once it is connected).
 pub fn publish_store(store: Arc<BindingStore>) {
     if PUBLISHED.set(store).is_err() {
@@ -780,6 +798,9 @@ pub fn publish_store(store: Arc<BindingStore>) {
 pub fn published_store() -> Option<Arc<BindingStore>> {
     PUBLISHED.get().cloned()
 }
+
+mod advertised;
+pub use advertised::AdvertisedView;
 
 #[cfg(test)]
 #[path = "persist_tests.rs"]

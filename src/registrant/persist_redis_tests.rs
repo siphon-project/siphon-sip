@@ -2,7 +2,10 @@
 //!
 //! Run only when `SIPHON_TEST_REDIS_URL` names a server; skipped otherwise.
 
+use std::collections::HashSet;
 use std::time::Duration;
+
+use super::advertised::ADVERTISED_TTL_SECS;
 
 use super::*;
 use crate::redis_target::RedisConnection;
@@ -291,4 +294,42 @@ async fn an_unreadable_record_of_another_instance_is_an_error_not_an_absence() {
         .await
         .expect("HSET");
     assert!(node_a.others_holding(&[aor.to_string()]).await.is_ok());
+}
+
+#[tokio::test]
+async fn published_addresses_are_read_back_per_node_and_expire() {
+    let Some(connection) = connection().await else {
+        return;
+    };
+    let prefix = unique_prefix("advertised");
+    let node_a = BindingStore::redis(connection.clone(), "node-a".to_string(), prefix.clone(), 30);
+    let node_b = BindingStore::redis(connection.clone(), "node-b".to_string(), prefix.clone(), 30);
+    let missing = node_a.advertised_view().await.expect("readable");
+    assert_eq!(missing.own, None);
+
+    node_a
+        .publish_advertised(&["203.0.113.10".to_string()])
+        .await
+        .expect("published");
+    node_b
+        .publish_advertised(&["203.0.113.10".to_string(), "203.0.113.11".to_string()])
+        .await
+        .expect("published");
+
+    let view = node_a.advertised_view().await.expect("readable");
+    assert_eq!(view.own, Some(HashSet::from(["203.0.113.10".to_string()])));
+    assert_eq!(
+        view.others,
+        HashSet::from(["203.0.113.10".to_string(), "203.0.113.11".to_string()])
+    );
+    // The entry carries a TTL, so a dead node's does not outlive it for long.
+    let mut raw = connection.clone();
+    let ttl: i64 = redis::cmd("TTL")
+        .arg(format!("{prefix}~advertised~node-a"))
+        .query_async(&mut raw)
+        .await
+        .expect("ttl");
+    assert!(ttl > 0 && ttl <= ADVERTISED_TTL_SECS as i64, "ttl {ttl}");
+    // Its records are not mistaken for an advertised entry, nor the reverse.
+    assert!(node_a.load().await.expect("loaded").is_empty());
 }

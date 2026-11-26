@@ -197,3 +197,82 @@ async fn the_stored_contact_is_the_one_that_went_on_the_wire() {
     assert_eq!(stored.contact, "sip:trunk@203.0.113.10:5060");
     assert!(contact(&built).contains(&stored.contact));
 }
+
+/// RFC 3261 §20.42 and §19.1 allow a host name in sent-by and in a Contact: an
+/// advertised FQDN is what goes on the wire, with the listener's port, while
+/// the socket address stays an address.
+#[test]
+fn an_advertised_host_name_is_what_the_via_and_contact_carry() {
+    for transport in [Transport::Udp, Transport::Tcp] {
+        let built = build(
+            transport,
+            &wildcards(),
+            &HashMap::new(),
+            Some("sbc.example.org"),
+        );
+        assert!(
+            via(&built).contains(" sbc.example.org:5060;"),
+            "{}",
+            via(&built)
+        );
+        assert!(
+            contact(&built).contains("sip:trunk@sbc.example.org:5060"),
+            "{}",
+            contact(&built)
+        );
+        assert!(!built.sent_by.ip().is_unspecified());
+    }
+}
+
+#[test]
+fn a_per_transport_host_name_wins_over_a_global_ip_literal() {
+    let per_transport = HashMap::from([(Transport::Udp, "sbc.example.org".to_string())]);
+    let built = build(
+        Transport::Udp,
+        &wildcards(),
+        &per_transport,
+        Some("203.0.113.10"),
+    );
+    assert!(
+        contact(&built).contains("sip:trunk@sbc.example.org:5060"),
+        "{}",
+        contact(&built)
+    );
+    assert!(
+        via(&built).contains(" sbc.example.org:5060;"),
+        "{}",
+        via(&built)
+    );
+    // Another transport without one of its own takes the global address.
+    let built = build(
+        Transport::Tcp,
+        &wildcards(),
+        &per_transport,
+        Some("203.0.113.10"),
+    );
+    assert!(
+        contact(&built).contains("203.0.113.10:5060"),
+        "{}",
+        contact(&built)
+    );
+}
+
+#[tokio::test]
+async fn the_stored_contact_carries_the_advertised_host_name_as_sent() {
+    let manager = test_support::manager();
+    let store = super::persist::BindingStore::in_memory("node-a", 30);
+    manager.attach_binding_store(std::sync::Arc::clone(&store));
+    manager.add(trunk(AOR));
+    let listen = wildcards();
+    let merged = HashMap::new();
+    let defaults = EgressDefaults::new(addr("0.0.0.0:5060"), &listen)
+        .with_advertised(&merged, Some("sbc.example.org"));
+    let built = manager
+        .build_register(AOR, defaults, 600)
+        .expect("a REGISTER");
+    manager.handle_success(AOR, 600);
+
+    let stored = store.load().await.expect("loaded").pop().expect("a record");
+    assert_eq!(stored.contact, "sip:trunk@sbc.example.org:5060");
+    assert!(contact(&built).contains(&stored.contact));
+}

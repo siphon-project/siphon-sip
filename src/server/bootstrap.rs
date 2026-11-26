@@ -324,6 +324,7 @@ pub(super) async fn init_registrant_bindings(
     redis: &crate::config::RedisBackendConfig,
     instance_id: String,
 ) {
+    crate::registrant::persist::expect_store();
     let target = redis.target.clone();
     let key_prefix = redis.registrant_key_prefix.clone();
     let ttl_slack_secs = u64::from(redis.ttl_slack_secs);

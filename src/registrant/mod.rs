@@ -1421,7 +1421,11 @@ const IMS_ALLOW_METHODS: &str =
 /// Build a default Contact URI from the entry's username, effective address, and transport.
 ///
 /// Appends `;transport=<proto>` for non-UDP transports (UDP is the default per RFC 3261).
-fn default_contact_uri(username: &str, address: SocketAddr, transport: Transport) -> String {
+fn default_contact_uri(
+    username: &str,
+    address: impl std::fmt::Display,
+    transport: Transport,
+) -> String {
     let transport_param = match transport {
         Transport::Udp => "",
         Transport::Tcp => ";transport=tcp",

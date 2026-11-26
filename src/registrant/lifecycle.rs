@@ -84,7 +84,9 @@ impl RegistrantManager {
         if refused {
             debug!(aor = %aor, "registrant shutting down: REGISTER not started");
         }
-        refused
+        // Another node's clean-up must be able to tell this node's Contact from
+        // its own before a REGISTER carries it (see `persist::AdvertisedView`).
+        refused || (expires > 0 && self.awaiting_advertised_publication())
     }
 
     /// Whether the registration of `aor` whose dialog is `call_id` may still

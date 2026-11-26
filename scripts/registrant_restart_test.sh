@@ -165,11 +165,11 @@ start_registrar first
 start_siphon first
 await_registrar first 40 || fail "the registrar never saw the trunk's REGISTER"
 
-key="$(redis-cli -p "${REDIS_PORT}" --scan --pattern 'siphon:registrant:*' | head -1)"
+key="$(redis-cli -p "${REDIS_PORT}" --scan --pattern "siphon:registrant:${INSTANCE}:*" | head -1)"
 for _ in $(seq 50); do
   [[ -n "${key}" ]] && break
   sleep 0.1
-  key="$(redis-cli -p "${REDIS_PORT}" --scan --pattern 'siphon:registrant:*' | head -1)"
+  key="$(redis-cli -p "${REDIS_PORT}" --scan --pattern "siphon:registrant:${INSTANCE}:*" | head -1)"
 done
 [[ -n "${key}" ]] || fail "no binding record in Redis after the registration"
 echo "[*] record: ${key}"
@@ -182,6 +182,12 @@ if [[ -n "${DEFAULT_CONTACT:-}" ]]; then secrets=(secret123); fi
 for secret in "${secrets[@]}"; do
   if grep -q "${secret}" <<<"${record}"; then fail "the Redis record holds '${secret}'"; fi
 done
+
+if [[ -n "${WILDCARD_ADVERTISED:-}" ]]; then
+  published="$(redis-cli -p "${REDIS_PORT}" get "siphon:registrant:~advertised~${INSTANCE}")"
+  [[ "${published}" == "${ADVERTISED}" ]] \
+    || fail "the node did not publish its advertised address (got '${published}')"
+fi
 
 echo "[*] SIGKILL: no shutdown, no de-REGISTER"
 kill -9 "${SIPHON_PID}"
