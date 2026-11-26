@@ -56,6 +56,34 @@ pub(super) fn resolve_branch_profiles(
     )
 }
 
+/// The profile an originated leg to `target` is anchored with, `webrtc: auto`
+/// resolved for the contact it rings.
+///
+/// `originate {aor}` and a bridging `dial` place each contact as a call of its
+/// own with a media session of its own, so each leg is anchored per contact
+/// already. Both halves of the profile then describe that one contact: the
+/// `answer` half answers an offerless leg's 2xx offer, and the `offer` half
+/// shapes an early offer or the bridge's offer to the phone. A contact that
+/// registered over `ws`/`wss` therefore turns every `webrtc: auto` half
+/// WebRTC, and any other contact (or a URI dialled as written) leaves the
+/// profile as written. A leg that carries an offer of its own is not anchored
+/// by a profile and is left alone.
+pub(super) fn resolve_leg_profile(
+    params: &mut OriginateParams,
+    target: &DialTarget,
+    state: &DispatcherState,
+) {
+    let (Some(registry), OriginateMedia::Anchor { profile, .. }) =
+        (state.rtpengine_profiles.as_deref(), &mut params.media)
+    else {
+        return;
+    };
+    let webrtc = target
+        .binding_transport
+        .is_some_and(crate::rtpengine::webrtc_auto::transport_is_webrtc);
+    *profile = registry.resolve_webrtc(profile, webrtc, webrtc);
+}
+
 /// [`resolve_branch_profiles`] against a registry and a verdict on the
 /// caller's offer.
 fn resolve_profiles_with(

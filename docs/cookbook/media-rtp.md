@@ -342,7 +342,9 @@ Which party decides each half:
 | `offer` | each forked contact | the contact's binding registered over `ws` or `wss` (RFC 7118) |
 | `answer` | the offerer (the caller) | its offer is `UDP/TLS/RTP/SAVPF` with `a=ice-ufrag` and `a=fingerprint` |
 
-A control-plane `dial` to an `{aor}` decides the `offer` half per contact, so one
+A control-plane `dial` to an `{aor}` decides the `offer` half per contact (and
+`originate {aor}` and `dial {on_answer: "bridge"}`, which anchor each contact as
+a call of its own, turn every auto half WebRTC for a `ws`/`wss` contact), so one
 ring reaches a browser and a desk phone with a single profile: each is offered
 SDP of its own kind from its own engine allocation, the branch that answers
 settles the call, and the other allocation is released (see

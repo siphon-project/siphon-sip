@@ -1915,9 +1915,19 @@ half, which shapes what the caller is sent, turns WebRTC when the caller's own
 offer is `UDP/TLS/RTP/SAVPF` with `a=ice-ufrag` and `a=fingerprint`. Whichever
 branch answers settles the call on its allocation, and the others are released
 as above. A URI target has no binding, so it is always offered the half as
-written. `on_answer: "bridge"` dials, `originate` and a script's
-`rtpengine.offer` (which anchors once, before any fork) decide only the half
-facing the offerer; they apply the `offer` half as written.
+written. A script's `rtpengine.offer` anchors once, before any fork, so it
+decides only the half facing the offerer and applies the `offer` half as
+written.
+
+`originate {aor}` and `dial {on_answer: "bridge"}` place each contact as a call
+of its own with a media session of its own, so they resolve per contact too, a
+little differently: the profile there describes the one phone a leg faces, so a
+contact whose binding registered over `ws` or `wss` turns **every**
+`webrtc: auto` half WebRTC (the `answer` half that answers an offerless leg's
+2xx offer, and the `offer` half of an `offer: "early"` leg or of the bridge's
+offer to the phone), and any other contact keeps the profile as written. The
+leg is recorded under the resolved profile name. A URI target has no binding
+and is always anchored as written.
 
 `strategy` is `parallel` (default) or `sequential`; `timeout` is the ring
 timeout in seconds (default 30). Dialling a call that is already answered is

@@ -47,7 +47,7 @@ entry, but a working config keeps working.
   takes `UDP/TLS/RTP/SAVPF`, ICE `force`, DTLS and `rtcp_mux: [require]` in
   place of what it sets for those, and toward anyone else it applies as written.
   The `offer` half is decided per forked contact by the transport its binding
-  registered over (`ws`/`wss`), so a control-plane `dial` to an `{aor}` with one
+  registered over (`ws`/`wss`), so a control-plane `dial` to an `{aor}` (and `originate {aor}` and `dial {on_answer: "bridge"}`, which turn every auto half WebRTC for a `ws`/`wss` contact) with one
   profile rings a browser and a desk phone together, each offered SDP of its own
   kind from its own allocation (the answering branch settles the call, the
   others are released). The `answer` half is decided by the caller's offer

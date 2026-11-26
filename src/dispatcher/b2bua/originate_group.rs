@@ -1225,7 +1225,8 @@ fn place_leg(
     legs: &LegsToPlace,
 ) -> Option<DialBranch> {
     let sink = &legs.sink;
-    let params = leg_params(&legs.params, target);
+    let mut params = leg_params(&legs.params, target);
+    super::dial_media::resolve_leg_profile(&mut params, target, state);
     let route = OriginateRoute {
         request_uri: Some(target.uri.clone()),
         flow: target.flow.clone(),

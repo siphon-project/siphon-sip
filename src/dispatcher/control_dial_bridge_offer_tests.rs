@@ -12,7 +12,8 @@ use super::dial_bridge_test_harness::{
     sent_until, wait_drained, Caller, CALLER,
 };
 use super::originate_test_harness::{
-    drain, phone_offer, phone_response, phone_sends, phone_tries, requests_to, socket,
+    drain, extension_profiles, phone_offer, phone_response, phone_sends, phone_tries,
+    register_over, requests_to, socket,
 };
 use super::*;
 use crate::rtpengine::test_native_engine::NativeTestEngine;
@@ -571,4 +572,277 @@ async fn a_bridge_the_caller_refuses_releases_the_phone_and_its_allocation() {
     );
     assert!(eventually(|| state.dial_bridges.ringing_count() == 0).await);
     assert_drained(state);
+}
+
+// ---- `webrtc: auto`, resolved per contact ----
+
+const BROWSER: &str = "198.51.100.181:5060";
+const DESK_PHONE: &str = "198.51.100.182:5060";
+
+/// A rig whose media profiles include `extension`, with both halves
+/// `webrtc: auto`.
+async fn rig_with_extension(name: &str) -> Rig {
+    let engine = NativeTestEngine::start().await;
+    let mut dispatcher = bridging_dispatcher(&engine);
+    dispatcher.state.rtpengine_profiles = Some(extension_profiles());
+    let caller = answered_caller(&dispatcher, &format!("{name}@192.0.2.10"));
+    let channel = format!("caller-{name}");
+    let controller = controller_owning(name, dispatcher, &caller, &channel, "hangup");
+    Rig {
+        engine,
+        controller,
+        caller,
+        channel,
+    }
+}
+
+fn register_browser_and_desk_phone(extension: &str) -> String {
+    let aor = format!("sip:{extension}@siphon.example.com");
+    register_over(
+        &aor,
+        &format!("sip:{extension}@{BROWSER}"),
+        Transport::WebSocketSecure,
+    );
+    register_over(
+        &aor,
+        &format!("sip:{extension}@{DESK_PHONE}"),
+        Transport::Udp,
+    );
+    aor
+}
+
+/// One bridging dial to an extension's AoR rings a browser and a desk phone
+/// with one profile: the browser's INVITE carries the WebRTC form of the
+/// offer and the desk phone's the plain one, each from its own allocation.
+/// The browser answering joins its allocation to the caller, and the desk
+/// phone's allocation is deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bridge_dial_offers_a_browser_and_a_desk_phone_their_own_flavour() {
+    let aor = register_browser_and_desk_phone("wb3301");
+    let rig = rig_with_extension("webrtc-bridge-win").await;
+    let state = &rig.controller.dispatcher.state;
+    let engine = &rig.engine;
+    crate::control::channel_event_capture::watch(&rig.caller.call_id);
+
+    let (reply, _) = dial(
+        &rig.controller,
+        &rig.channel,
+        serde_json::json!({
+            "on_answer": "bridge",
+            "offer": "early",
+            "profile": "extension",
+            "targets": [{ "aor": aor }],
+        }),
+    )
+    .await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+
+    let sent = drain(&rig.controller.dispatcher.udp);
+    let browser = invite_to(&sent, BROWSER);
+    let desk = invite_to(&sent, DESK_PHONE);
+    let offers = engine.commands("offer");
+    assert_eq!(offers.len(), 2, "one allocation per leg");
+    let flavour = |command: &crate::rtpengine::test_native_engine::NativeCommand| {
+        command
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.transport_protocol.clone())
+    };
+    let webrtc = offers
+        .iter()
+        .find(|command| flavour(command).as_deref() == Some("UDP/TLS/RTP/SAVPF"))
+        .expect("a WebRTC allocation");
+    let webrtc_profile = webrtc.profile.as_ref().expect("a profile");
+    assert_eq!(webrtc_profile.ice.as_deref(), Some("force"));
+    assert_eq!(webrtc_profile.rtcp_mux, vec!["require"]);
+    assert!(offers
+        .iter()
+        .any(|command| flavour(command).as_deref() == Some("RTP/AVP")));
+    assert!(
+        body_text(&browser).contains("m=audio 52000 UDP/TLS/RTP/SAVPF"),
+        "{}",
+        body_text(&browser)
+    );
+    assert!(
+        body_text(&desk).contains("m=audio 52000 RTP/AVP 0 101"),
+        "{}",
+        body_text(&desk)
+    );
+    let browser_allocation = allocation_of(state, &browser);
+    let desk_allocation = allocation_of(state, &desk);
+    assert_eq!(browser_allocation, webrtc.call_id);
+    assert_ne!(browser_allocation, desk_allocation);
+    phone_tries(state, DESK_PHONE, &desk);
+
+    phone_sends(
+        state,
+        socket(BROWSER),
+        &phone_response(
+            &browser,
+            200,
+            "OK",
+            "browser-tag",
+            &format!("sip:wb3301@{BROWSER}"),
+            Some(&phone_offer("198.51.100.181")),
+        ),
+    );
+    let sent = sent_until(&rig.controller.dispatcher.udp, |sent| {
+        !reinvites_to(sent, CALLER).is_empty()
+    })
+    .await;
+    let to_caller = reinvites_to(&sent, CALLER).remove(0);
+    phone_sends(
+        state,
+        socket(CALLER),
+        &in_dialog_response(
+            &to_caller,
+            200,
+            "OK",
+            "sip:15550100001@192.0.2.10:5060",
+            Some(&phone_offer("192.0.2.10")),
+        ),
+    );
+    let _ = events_through(&rig.controller, "DialAnswered").await;
+    let pair = sessions(state).get(&rig.caller.call_id).expect("the pair");
+    assert_eq!(pair.rtpengine_id(), browser_allocation);
+    assert_eq!(pair.to_tag.as_deref(), Some("browser-tag"));
+    assert!(
+        eventually(|| !engine.holds(&desk_allocation) && !engine.holds(&rig.caller.call_id)).await
+    );
+    assert!(
+        engine.holds(&browser_allocation),
+        "the pair's media stays up"
+    );
+    assert_eq!(engine.held_count(), 1);
+    wait_drained(state).await;
+}
+
+/// The same ring with an offerless bridge dial (the default): the phone's 2xx
+/// offer is answered with its own contact's flavour of the profile.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offerless_bridge_dial_answers_the_winner_with_its_contacts_flavour() {
+    let aor = register_browser_and_desk_phone("wb3302");
+    let rig = rig_with_extension("webrtc-bridge-delayed").await;
+    let state = &rig.controller.dispatcher.state;
+
+    let (reply, _) = dial(
+        &rig.controller,
+        &rig.channel,
+        serde_json::json!({
+            "on_answer": "bridge",
+            "profile": "extension",
+            "targets": [{ "aor": aor }],
+        }),
+    )
+    .await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    let sent = drain(&rig.controller.dispatcher.udp);
+    let browser = invite_to(&sent, BROWSER);
+    let desk = invite_to(&sent, DESK_PHONE);
+    assert!(browser.body.is_empty() && desk.body.is_empty());
+    phone_tries(state, DESK_PHONE, &desk);
+    phone_sends(
+        state,
+        socket(BROWSER),
+        &phone_response(
+            &browser,
+            200,
+            "OK",
+            "browser-tag",
+            &format!("sip:wb3302@{BROWSER}"),
+            Some(&phone_offer("198.51.100.181")),
+        ),
+    );
+    assert!(eventually(|| !rig.engine.commands("answer_local").is_empty()).await);
+    let answers = rig.engine.commands("answer_local");
+    let profile = answers
+        .iter()
+        .find(|command| command.call_id == call_id_of(&browser))
+        .and_then(|command| command.profile.clone())
+        .expect("the browser's answer");
+    assert_eq!(
+        profile.transport_protocol.as_deref(),
+        Some("UDP/TLS/RTP/SAVPF")
+    );
+    assert_eq!(profile.ice.as_deref(), Some("force"));
+    assert_eq!(
+        sessions(state)
+            .get(&call_id_of(&browser))
+            .expect("the browser leg's session")
+            .profile,
+        "extension#webrtc-both"
+    );
+}
+
+/// Leak gate for the mixed-flavour ring: every way it ends without a bridge
+/// leaves the engine holding the caller's own session alone, the store the
+/// caller alone, and nothing of the dial behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_flavour_early_offers_drain_to_baseline() {
+    let aor = register_browser_and_desk_phone("wb3303");
+    for round in 0..3 {
+        for ending in [
+            Ending::Rejected,
+            Ending::RingTimeout,
+            Ending::ControllerCancel,
+        ] {
+            let rig = rig_with_extension(&format!("webrtc-drain-{round}-{ending:?}")).await;
+            let state = &rig.controller.dispatcher.state;
+            let (reply, _) = dial(
+                &rig.controller,
+                &rig.channel,
+                serde_json::json!({
+                    "on_answer": "bridge",
+                    "offer": "early",
+                    "profile": "extension",
+                    "timeout": 5,
+                    "targets": [{ "aor": aor }],
+                }),
+            )
+            .await;
+            assert_eq!(reply["status"], "ok", "{reply}");
+            let sent = drain(&rig.controller.dispatcher.udp);
+            let invites = [invite_to(&sent, BROWSER), invite_to(&sent, DESK_PHONE)];
+            assert_eq!(rig.engine.held_count(), 3, "the caller and two allocations");
+            for (phone, invite) in [BROWSER, DESK_PHONE].iter().zip(&invites) {
+                phone_tries(state, phone, invite);
+            }
+            match ending {
+                Ending::Rejected => {
+                    for (phone, invite) in [BROWSER, DESK_PHONE].iter().zip(&invites) {
+                        phone_sends(
+                            state,
+                            socket(phone),
+                            &phone_response(invite, 486, "Busy Here", "busy", "sip:p@x", None),
+                        );
+                    }
+                }
+                Ending::RingTimeout => check_b2bua_answer_timeouts_at(
+                    state,
+                    std::time::Instant::now() + std::time::Duration::from_secs(6),
+                ),
+                _ => {
+                    let (reply, _) = command(
+                        &rig.controller,
+                        "cancel_dial",
+                        &rig.channel,
+                        serde_json::json!({}),
+                    )
+                    .await;
+                    assert_eq!(reply["status"], "ok", "{reply}");
+                }
+            }
+            assert!(
+                eventually(|| rig.engine.held_count() == 1).await,
+                "{ending:?}: the engine still holds {} calls",
+                rig.engine.held_count()
+            );
+            assert_eq!(sessions(state).len(), 1, "{ending:?}: the store");
+            assert!(
+                eventually(|| state.dial_bridges.ringing_count() == 0).await,
+                "{ending:?}: the dial let go"
+            );
+            assert_drained(state);
+        }
+    }
 }

@@ -8,9 +8,9 @@
 use std::sync::{Arc, Mutex};
 
 use super::originate_test_harness::{
-    anchored_dispatcher, anchored_params, drain, phone_offer, phone_response, phone_sends,
-    phone_tries, pinned_ingress_profiles, requests_to, socket, with_stream_egress, Sent,
-    PINNED_INGRESS,
+    anchored_dispatcher, anchored_params, drain, extension_profiles, phone_offer, phone_response,
+    phone_sends, phone_tries, pinned_ingress_profiles, register_over, requests_to, socket,
+    with_stream_egress, Sent, PINNED_INGRESS,
 };
 use super::test_dispatcher::TestDispatcher;
 use super::*;
@@ -1225,4 +1225,167 @@ async fn the_answer_is_reported_once_the_leg_is_answered_and_a_late_180_cannot_u
         Some(crate::b2bua::actor::CallState::Answered),
         "a straggling 180 leaves the leg answered"
     );
+}
+
+// ---- `webrtc: auto`, resolved per contact ----
+
+/// What the engine was asked to answer a phone's 2xx offer with.
+fn answer_local_profile(engine: &NativeTestEngine) -> siphon_rtp_proto::ProfileFlags {
+    let answers = engine.commands("answer_local");
+    assert_eq!(answers.len(), 1, "only the winner is anchored");
+    answers[0].profile.clone().expect("the profile it carried")
+}
+
+/// `originate {aor}` with one profile reaches a browser (registered over WSS)
+/// and a desk phone: whichever answers first is anchored with its own flavour
+/// of the profile, recorded under its resolved name, and the other leg is
+/// CANCELled with nothing allocated for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_originate_aor_anchors_the_winner_with_its_contacts_flavour() {
+    const BROWSER: &str = "198.51.100.51:5060";
+    const DESK: &str = "198.51.100.52:5060";
+    for (index, browser_wins) in [true, false].into_iter().enumerate() {
+        let aor = format!("sip:wa30{index}@siphon.example.com");
+        register_over(
+            &aor,
+            &format!("sip:wa30{index}@{BROWSER}"),
+            Transport::WebSocketSecure,
+        );
+        register_over(&aor, &format!("sip:wa30{index}@{DESK}"), Transport::Udp);
+        let engine = NativeTestEngine::start().await;
+        let mut dispatcher = anchored_dispatcher(&engine);
+        dispatcher.state.rtpengine_profiles = Some(extension_profiles());
+        let mut params = anchored_params(&aor);
+        params.media = OriginateMedia::Anchor {
+            profile: "extension".to_string(),
+            ws_uri: None,
+        };
+        let (_group, _recorder) = ring_with(
+            &dispatcher.state,
+            &aor,
+            params,
+            OriginateGroupStrategy::Parallel,
+            30,
+        );
+        let sent = drain(&dispatcher.udp);
+        let browser_invite = invite_to(&sent, BROWSER);
+        let desk_invite = invite_to(&sent, DESK);
+        let (winner, winner_at, loser, loser_at, winner_host) = if browser_wins {
+            (browser_invite, BROWSER, desk_invite, DESK, "198.51.100.51")
+        } else {
+            (desk_invite, DESK, browser_invite, BROWSER, "198.51.100.52")
+        };
+        // The loser has taken its INVITE, so it can be CANCELled (RFC 3261 §9.1).
+        phone_tries(&dispatcher.state, loser_at, &loser);
+        phone_sends(
+            &dispatcher.state,
+            socket(winner_at),
+            &phone_response(
+                &winner,
+                200,
+                "OK",
+                "winner-tag",
+                &format!("sip:wa30{index}@{winner_at}"),
+                Some(&phone_offer(winner_host)),
+            ),
+        );
+        let sent = drain(&dispatcher.udp);
+        assert_eq!(
+            requests_to(&sent, socket(loser_at), Method::Cancel).len(),
+            1
+        );
+        let profile = answer_local_profile(&engine);
+        if browser_wins {
+            assert_eq!(
+                profile.transport_protocol.as_deref(),
+                Some("UDP/TLS/RTP/SAVPF")
+            );
+            assert_eq!(profile.ice.as_deref(), Some("force"));
+            assert_eq!(profile.rtcp_mux, vec!["require"]);
+        } else {
+            assert_eq!(profile.transport_protocol.as_deref(), Some("RTP/AVP"));
+            assert_eq!(profile.ice.as_deref(), Some("remove"));
+            assert_eq!(profile.rtcp_mux, vec!["demux"]);
+        }
+        let sessions = dispatcher
+            .state
+            .rtpengine_sessions
+            .as_ref()
+            .expect("a media store");
+        let winner_call = winner.headers.call_id().cloned().expect("a Call-ID");
+        assert_eq!(
+            sessions
+                .get(&winner_call)
+                .expect("the winner's session")
+                .profile,
+            if browser_wins {
+                "extension#webrtc-both"
+            } else {
+                "extension"
+            }
+        );
+        assert_eq!(sessions.len(), 1, "nothing is held for the loser");
+    }
+}
+
+/// Leak gate: rings across both kinds of contact that nobody answers leave no
+/// group, leg or media session behind, iteration after iteration.
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_originate_rings_across_both_flavours_drain_to_baseline() {
+    const BROWSER: &str = "198.51.100.53:5060";
+    const DESK: &str = "198.51.100.54:5060";
+    let aor = "sip:wa310@siphon.example.com";
+    register_over(
+        aor,
+        &format!("sip:wa310@{BROWSER}"),
+        Transport::WebSocketSecure,
+    );
+    register_over(aor, &format!("sip:wa310@{DESK}"), Transport::Udp);
+    let engine = NativeTestEngine::start().await;
+    let mut dispatcher = anchored_dispatcher(&engine);
+    dispatcher.state.rtpengine_profiles = Some(extension_profiles());
+    for _ in 0..10 {
+        let mut params = anchored_params(aor);
+        params.media = OriginateMedia::Anchor {
+            profile: "extension".to_string(),
+            ws_uri: None,
+        };
+        let (_group, _recorder) = ring_with(
+            &dispatcher.state,
+            aor,
+            params,
+            OriginateGroupStrategy::Parallel,
+            30,
+        );
+        let sent = drain(&dispatcher.udp);
+        for (invite, at) in [
+            (invite_to(&sent, BROWSER), BROWSER),
+            (invite_to(&sent, DESK), DESK),
+        ] {
+            phone_sends(
+                &dispatcher.state,
+                socket(at),
+                &phone_response(
+                    &invite,
+                    486,
+                    "Busy Here",
+                    "busy",
+                    &format!("sip:wa310@{at}"),
+                    None,
+                ),
+            );
+        }
+        let _ = drain(&dispatcher.udp);
+        assert_drained(&dispatcher);
+        assert_eq!(
+            dispatcher
+                .state
+                .rtpengine_sessions
+                .as_ref()
+                .map(|sessions| sessions.len()),
+            Some(0),
+            "no media session survives a ring nobody answered"
+        );
+    }
+    assert!(engine.commands("answer_local").is_empty());
 }
