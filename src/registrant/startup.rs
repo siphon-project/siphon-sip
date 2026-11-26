@@ -262,7 +262,9 @@ impl RegistrantManager {
                     store.remove_if(&record.aor, &record.call_id);
                     report.dropped += 1;
                 }
-                Outcome::Orphan if !Self::contact_is_held_here(&record.contact, defaults) => {
+                Outcome::Orphan
+                    if !Self::contact_is_held_here(&record.contact, record.transport, defaults) =>
+                {
                     info!(
                         aor = %record.aor,
                         registrar = %record.registrar_uri,
@@ -302,13 +304,33 @@ impl RegistrantManager {
         })
     }
 
-    /// Whether `contact` names exactly a socket this node registers from: an
-    /// explicit IP and port equal to a specific (non-wildcard) listener or the
-    /// egress address. A wildcard, a name, a missing port or an address the node
-    /// merely could bind never qualifies: those bindings just expire. A registrar
-    /// keys a binding by its Contact (RFC 3261 §10.3), so an `Expires: 0` on a
-    /// Contact another node holds would delete its binding.
-    fn contact_is_held_here(contact: &str, defaults: EgressDefaults<'_>) -> bool {
+    /// Whether `contact` names exactly a socket this node registers from. A
+    /// registrar keys a binding by its Contact (RFC 3261 §10.3), so an
+    /// `Expires: 0` on a Contact another node holds would delete its binding.
+    /// Two shapes qualify, both needing an explicit IP and port:
+    ///
+    /// - a specific (non-wildcard) listener or the egress address: an address
+    ///   one node owns;
+    /// - the node's advertised IP literal for `transport` (per-transport, else
+    ///   global) on that transport's listener port: what a wildcard listener
+    ///   puts in its Contact (see [`EgressDefaults::sent_by_of`]), so what this
+    ///   node's own REGISTER carried. Only an IP literal: a name is how a fleet
+    ///   shares one front (DNS, a balancer), and proves nothing about whose
+    ///   Contact it is.
+    ///
+    /// An advertised IP is per node when each node is given its own. If every
+    /// node were given the same literal, its Contacts would be identical across
+    /// nodes and this check alone would claim another node's; the second
+    /// guard, `others_holding` (no other instance records the same AoR and
+    /// Contact, checked again right before the de-REGISTER leaves, and an
+    /// unreadable store sends nothing), is what stops that while the other node
+    /// is registered. A wildcard, a name, a missing port or an address the node
+    /// merely could bind never qualifies on its own: those bindings expire.
+    fn contact_is_held_here(
+        contact: &str,
+        transport: crate::transport::Transport,
+        defaults: EgressDefaults<'_>,
+    ) -> bool {
         let Some((host, Some(port))) = contact_host_port(contact) else {
             return false;
         };
@@ -319,7 +341,19 @@ impl RegistrantManager {
             return false;
         }
         let socket = std::net::SocketAddr::new(address, port);
-        defaults.local_addr == socket || defaults.listen_addrs.values().any(|l| *l == socket)
+        if defaults.local_addr == socket || defaults.listen_addrs.values().any(|l| *l == socket) {
+            return true;
+        }
+        let advertised = defaults
+            .advertised_addrs
+            .and_then(|addrs| addrs.get(&transport).map(String::as_str))
+            .or(defaults.advertised_address)
+            .and_then(|value| value.parse::<std::net::IpAddr>().ok());
+        advertised == Some(address)
+            && defaults
+                .listen_addrs
+                .get(&transport)
+                .is_some_and(|listener| listener.port() == port)
     }
 
     /// What a stored binding is to the live entries.
@@ -477,13 +511,14 @@ impl RegistrantManager {
         if self.startup_deregistration_superseded(call_id) {
             return false;
         }
-        let Some((aor, contact)) =
+        let Some((aor, contact, transport)) =
             self.draining_deregistrations
                 .get(call_id)
                 .and_then(|draining| {
                     Some((
                         draining.entry.aor.clone(),
                         draining.entry.contact_uri.clone()?,
+                        draining.entry.transport,
                     ))
                 })
         else {
@@ -492,7 +527,7 @@ impl RegistrantManager {
         let (Some(egress), Some(store)) = (self.egress.get(), self.restart.bindings.get()) else {
             return false;
         };
-        if !Self::contact_is_held_here(&contact, egress.defaults()) {
+        if !Self::contact_is_held_here(&contact, transport, egress.defaults()) {
             return false;
         }
         match store.others_holding(std::slice::from_ref(&aor)).await {

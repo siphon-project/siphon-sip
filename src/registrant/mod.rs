@@ -802,6 +802,7 @@ impl RegistrantEgress {
     /// The process-wide addressing an entry without a `local_addr` uses.
     fn defaults(&self) -> EgressDefaults<'_> {
         EgressDefaults::new(self.local_addr, &self.listen_addrs)
+            .with_advertised(&self.advertised_addrs, self.advertised_address.as_deref())
     }
 }
 

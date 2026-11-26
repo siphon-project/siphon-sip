@@ -22,6 +22,11 @@ pub struct EgressDefaults<'a> {
     /// The UE side of a process-address entry's IPsec SAs (the dispatcher's
     /// resolved local address).
     pub ue_ip: IpAddr,
+    /// `advertised_addrs`: the per-transport advertised addresses, merged by
+    /// the caller with the global one or not. Empty when none are set.
+    pub advertised_addrs: Option<&'a HashMap<Transport, String>>,
+    /// The global `advertised_address`.
+    pub advertised_address: Option<&'a str>,
 }
 
 impl<'a> EgressDefaults<'a> {
@@ -32,7 +37,40 @@ impl<'a> EgressDefaults<'a> {
             local_addr,
             listen_addrs,
             ue_ip: local_addr.ip(),
+            advertised_addrs: None,
+            advertised_address: None,
         }
+    }
+
+    /// The same defaults with the node's advertised addresses: a wildcard
+    /// listener names one of them, not itself, in a Via and Contact.
+    pub fn with_advertised(
+        mut self,
+        advertised_addrs: &'a HashMap<Transport, String>,
+        advertised_address: Option<&'a str>,
+    ) -> Self {
+        self.advertised_addrs = Some(advertised_addrs);
+        self.advertised_address = advertised_address;
+        self
+    }
+
+    /// The address a request leaving from `listener` (a socket of `transport`)
+    /// names in its Via sent-by and Contact (RFC 3261 §18.2.1, §20.42, §10.2.1):
+    /// the listener's own address when it is specific, else, for a wildcard,
+    /// the advertised address (per transport, then global) on the listener's
+    /// port, else the routable local address: the rule the proxy's own Via
+    /// follows, never `0.0.0.0` or `::` on the wire.
+    pub fn sent_by_of(&self, transport: Transport, listener: SocketAddr) -> SocketAddr {
+        if !listener.ip().is_unspecified() {
+            return listener;
+        }
+        let none = HashMap::new();
+        crate::uac::resolve_via_addr(
+            listener,
+            &transport,
+            self.advertised_addrs.unwrap_or(&none),
+            self.advertised_address,
+        )
     }
 
     /// The port an entry's plain (unprotected) SIP socket uses on its own
@@ -67,11 +105,16 @@ impl EntryEgress {
             // REGISTER could egress from a protected port while the Via said
             // 5060, breaking the 401 return path.
             None => Self {
-                sent_by: defaults
-                    .listen_addrs
-                    .get(&entry.transport)
-                    .copied()
-                    .unwrap_or(defaults.local_addr),
+                // The socket it leaves from stays the listener (`source`); what
+                // it names is the advertised address when that is a wildcard.
+                sent_by: defaults.sent_by_of(
+                    entry.transport,
+                    defaults
+                        .listen_addrs
+                        .get(&entry.transport)
+                        .copied()
+                        .unwrap_or(defaults.local_addr),
+                ),
                 source: (entry.transport == Transport::Udp).then(|| {
                     defaults
                         .listen_addrs
@@ -637,3 +680,7 @@ pub(super) fn empty_response(authorization: &str) -> String {
         None => authorization.to_string(),
     }
 }
+
+#[cfg(test)]
+#[path = "advertised_tests.rs"]
+mod advertised_tests;

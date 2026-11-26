@@ -692,6 +692,78 @@ async fn an_advertised_shared_host_does_not_make_a_contact_this_nodes() {
     assert!(released(&manager).await.is_empty());
 }
 
+/// A wildcard listener with an advertised address on no interface: the node's
+/// own Contact is that address on the listener's port.
+fn wildcard_with_advertised() -> (
+    Arc<RegistrantManager>,
+    HashMap<Transport, std::net::SocketAddr>,
+    HashMap<Transport, String>,
+) {
+    let manager = Arc::new(test_support::manager());
+    let listen = HashMap::from([(Transport::Udp, "0.0.0.0:5060".parse().expect("addr"))]);
+    let advertised = HashMap::from([(Transport::Udp, "203.0.113.10".to_string())]);
+    manager.set_egress(crate::registrant::RegistrantEgress {
+        local_addr: "0.0.0.0:5060".parse().expect("addr"),
+        listen_addrs: listen.clone(),
+        advertised_addrs: advertised.clone(),
+        advertised_address: Some("203.0.113.10".to_string()),
+        hep_sender: None,
+    });
+    test_support::attach_untracked_transactions(&manager);
+    let store = BindingStore::in_memory("node-a", 30);
+    manager.attach_binding_store(store);
+    (manager, listen, advertised)
+}
+
+/// The Contact a wildcard node registers with is its advertised address on the
+/// listener port: a hard-killed node's binding is de-registered, not left.
+#[tokio::test]
+async fn an_advertised_address_on_the_listener_port_is_this_nodes_contact() {
+    let (manager, listen, advertised) = wildcard_with_advertised();
+    let mut stored = record(AOR);
+    stored.contact = "sip:trunk@203.0.113.10:5060".to_string();
+
+    let defaults = EgressDefaults::new("0.0.0.0:5060".parse().expect("addr"), &listen)
+        .with_advertised(&advertised, Some("203.0.113.10"));
+    let report = manager.startup_cleanup(vec![stored], defaults);
+
+    assert_eq!(report.deregistered, 1);
+    assert_eq!(released(&manager).await.len(), 1);
+}
+
+/// The advertised address on a port the node does not listen on, or another
+/// address altogether, is not proof.
+#[tokio::test]
+async fn an_advertised_address_on_another_port_or_another_address_is_not_this_nodes() {
+    let (manager, listen, advertised) = wildcard_with_advertised();
+    for contact in ["sip:trunk@203.0.113.10:5099", "sip:trunk@203.0.113.11:5060"] {
+        let mut stored = record(AOR);
+        stored.contact = contact.to_string();
+        let defaults = EgressDefaults::new("0.0.0.0:5060".parse().expect("addr"), &listen)
+            .with_advertised(&advertised, Some("203.0.113.10"));
+        let report = manager.startup_cleanup(vec![stored], defaults);
+        assert_eq!(report.dropped, 1, "{contact}");
+    }
+    assert!(released(&manager).await.is_empty());
+}
+
+/// Every node advertising the same literal makes every node's Contact the
+/// same: the other node's record of it stops the de-REGISTER.
+#[tokio::test]
+async fn another_node_holding_the_shared_advertised_contact_stops_the_de_register() {
+    let (manager, listen, advertised) = wildcard_with_advertised();
+    let store = manager.restart.bindings.get().expect("a store").clone();
+    let mut stored = record(AOR);
+    stored.contact = "sip:trunk@203.0.113.10:5060".to_string();
+    store.save(stored.clone());
+    let defaults = EgressDefaults::new("0.0.0.0:5060".parse().expect("addr"), &listen)
+        .with_advertised(&advertised, Some("203.0.113.10"));
+    manager.startup_cleanup(vec![stored], defaults);
+    store.save_as_instance(other_instance_record("sip:trunk@203.0.113.10:5060"));
+
+    assert!(released(&manager).await.is_empty());
+}
+
 fn other_instance_record(contact: &str) -> BindingRecord {
     let mut other = record(AOR);
     other.instance = "node-b".to_string();

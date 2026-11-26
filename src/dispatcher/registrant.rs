@@ -181,7 +181,8 @@ fn handle_answer(
             // it at once, over the SA set the answer just settled.
             if deregistration == Deregistration::Owed {
                 let defaults =
-                    crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs);
+                    crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs)
+                        .with_advertised(&state.advertised_addrs, None);
                 if let Some(built) = registrant.take_owed_deregistration(&aor, defaults) {
                     send_registrant_request(registrant, &aor, &built, state);
                 }
@@ -227,7 +228,8 @@ fn handle_answer(
                 // carrier-trunk entries use password digest. The IMS challenge
                 // always arrives as a 401 (WWW-Authenticate).
                 let defaults =
-                    crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs);
+                    crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs)
+                        .with_advertised(&state.advertised_addrs, None);
                 let built = if is_aka {
                     registrant.build_register_aka(
                         &aor,
@@ -304,7 +306,8 @@ pub(super) fn handle_registrant_ipsec_challenge(
     let verify = registrant.security_server_value(aor);
     let built = registrant.build_register_aka(
         aor,
-        crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs),
+        crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs)
+            .with_advertised(&state.advertised_addrs, None),
         challenge,
         registrant.challenge_expires(aor),
         verify.as_deref(),
@@ -518,7 +521,8 @@ fn handle_removed_entry_answer(
         .then(|| message.headers.get(header_name))
         .flatten()
         .and_then(|raw| crate::auth::parse_challenge(raw));
-    let defaults = crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs);
+    let defaults = crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs)
+        .with_advertised(&state.advertised_addrs, None);
     let answer = registrant.answer_removed_deregistration(
         call_id,
         crate::registrant::cseq_number(message),
