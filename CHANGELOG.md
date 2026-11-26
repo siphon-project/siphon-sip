@@ -69,6 +69,17 @@ entry, but a working config keeps working.
 ### Changed
 
 - Pairs with siphon-rtp 0.29.0 and moves the control protocol crate (`siphon-rtp-proto`) from 0.27.0 to the 0.29 line. Nothing in the proto crate changed shape for existing verbs and events: the only additions are the split verbs and events. What 0.28 and 0.29 change in the engine, for an operator upgrading it alongside: its SRTP sender refuses to send an index it has already sent under a key (RFC 3711 section 9.1) and refuses to wrap the SRTCP index, and its bridge flows renumber a plain source whose sequence restarts or jumps, so a restarting or jumping peer is renumbered rather than turned into an outage; this applies to every encrypted call on the engine; the engine's daemon config is YAML (`.toml` still reads, with a deprecation warning); a WebSocket takeover bridge is announced (`ws_bridge_started`) only once the leg is redirected to it, and a refused redirect now fails the verb and leaves the call relaying; and an SRTCP send-index ledger cap (`srtcp_ledger_max_entries`, default 100000) refuses a new key rather than evict one.
+### Added
+
+- Control plane: a `dial` with a media `profile` now connects a caller whose INVITE carries no SDP (a delayed offer, RFC 3261 section 13.2.1). The phones are rung offerless, the answering phone's offer is anchored under the profile's `answer` half and the engine's offer goes in the caller's 2xx, and the caller's ACK answer completes it through the engine into the phone's ACK. An ACK with no answer, or none within 64*T1, ends the call and frees the media. Previously the dial was refused with "dial profile requires a caller SDP offer".
+
+### Fixed
+
+- A re-INVITE with no SDP from the caller of a media-anchored two-leg call is answered from the session in force toward the caller instead of being relayed offerless: the callee's 2xx offer was handed to the media engine as an answer to nothing, and the caller's ACK answer went nowhere.
+
+### Changed
+
+- Control plane: an anchored `answer` on an INVITE with no SDP is still refused (`unavailable`), now with a message that says why: the media engine has no engine-originated offer for a single-leg call.
 
 ## [1.18.0] — 2026-11-26
 

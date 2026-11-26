@@ -2524,6 +2524,10 @@ async fn answer_first_prepare_requires_sdp_offer() {
     )
     .unwrap_err();
     assert!(error.contains("SDP offer"), "got: {error}");
+    assert!(
+        error.contains("engine-originated offer"),
+        "the refusal says why, got: {error}"
+    );
 }
 
 /// Save a stream P-CSCF cache binding directly against a bare `Registrar`,

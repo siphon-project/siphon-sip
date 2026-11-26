@@ -1,5 +1,6 @@
 //! An inbound re-INVITE on a bridged call: glare, the offer/answer it drives
 //! across the bridge, and the media re-anchor behind it.
+use super::bridge_relay::answer_refresh;
 use crate::b2bua::reoffer::{AnswerExtras, ReofferDecision};
 use crate::dispatcher::*;
 
@@ -208,6 +209,23 @@ pub fn handle_b2bua_reinvite(
             in_force,
             state,
         );
+        return;
+    }
+
+    // A refresh with no SDP (RFC 4028 §10, RFC 3261 §14.2) on a call the media
+    // engine anchors is answered from the session in force toward the caller,
+    // as on a bridged leg, and goes no further. Relayed offerless, the callee's
+    // 2xx would bring an offer that the engine takes for an answer to nothing,
+    // and the caller's answer in its ACK would have nowhere to go.
+    if from_a_leg
+        && message.body.is_empty()
+        && a_leg.dialog.last_sent_sdp.is_some()
+        && state
+            .rtpengine_sessions
+            .as_ref()
+            .is_some_and(|sessions| sessions.get(&a_leg.dialog.call_id).is_some())
+    {
+        answer_refresh(&inbound, &message, &call_id, true, state);
         return;
     }
 

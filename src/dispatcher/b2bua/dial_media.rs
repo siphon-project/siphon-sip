@@ -161,6 +161,16 @@ pub(super) fn anchor_dial_media(
     )
     .map_err(DialError::Media)?;
 
+    // A caller that sent no SDP has no offer to anchor: the phone's 2xx makes
+    // it, and is anchored when it arrives (`control_dial_media_answer`).
+    if sdp_in_body(message_content_type(template), &template.body).is_none() {
+        return expect_delayed_offer(
+            internal_call_id,
+            std::iter::once(primary).chain(others.iter().copied()),
+            primary,
+            state,
+        );
+    }
     let source_ip = state
         .call_actors
         .get_call(internal_call_id)

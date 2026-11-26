@@ -191,6 +191,8 @@ mod control_dial_bridge_tests;
 #[cfg(test)]
 mod control_dial_contact_host_tests;
 #[cfg(test)]
+mod control_dial_delayed_offer_tests;
+#[cfg(test)]
 mod control_dial_identity_tests;
 #[cfg(test)]
 mod control_dial_reroute_after_progress_tests;

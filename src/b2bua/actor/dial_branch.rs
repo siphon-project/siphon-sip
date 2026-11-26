@@ -115,6 +115,11 @@ pub struct DialMedia {
     /// The anchored offer of each profile other than the call's own media
     /// session's, by profile name.
     pub branch_offers: Vec<(String, Vec<u8>)>,
+    /// Set when the caller's INVITE carried no SDP (RFC 3261 §13.2.1): the
+    /// profile the call's own session is anchored with, which is allocated from
+    /// the answering phone's offer in its 2xx rather than from the caller's
+    /// offer before the dial. `None` for a dial that anchored the caller's offer.
+    pub delayed_offer_profile: Option<String>,
 }
 
 impl DialMedia {

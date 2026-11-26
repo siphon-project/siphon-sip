@@ -102,18 +102,7 @@ fn allocate_dial_media(
     flags.stamp_received_from(source_ip);
     // The engine call-id is minted below, so the caller's dialog is named.
     flags.stamp_sip_call_id(call_id);
-    for half in [&flags, &profile.answer] {
-        let unsupported = backend.unsupported_flags(half);
-        if !unsupported.is_empty() {
-            return Err(format!(
-                "media backend cannot honour profile flags: {}",
-                unsupported.join(", ")
-            ));
-        }
-        if half.ws_uri.is_some() || half.ws_tee.is_some() {
-            return Err("dial profiles cannot attach a WebSocket bridge or tee".into());
-        }
-    }
+    refuse_unusable_halves(backend, [&flags, &profile.answer])?;
     // A later voicemail anchor uses the SIP Call-ID. A late deletion of this
     // failed attempt must never delete that newly allocated media session.
     let engine_call_id = crate::b2bua::actor::generate_call_id();
@@ -140,6 +129,171 @@ fn allocate_dial_media(
             created_at: std::time::Instant::now(),
         },
     ))
+}
+
+/// A dial profile's halves the engine cannot honour, or that ask for a
+/// WebSocket bridge or tee, which a two-party dial has no far side for.
+fn refuse_unusable_halves(
+    backend: &crate::rtpengine::MediaBackend,
+    halves: [&crate::rtpengine::NgFlags; 2],
+) -> Result<(), String> {
+    for half in halves {
+        let unsupported = backend.unsupported_flags(half);
+        if !unsupported.is_empty() {
+            return Err(format!(
+                "media backend cannot honour profile flags: {}",
+                unsupported.join(", ")
+            ));
+        }
+        if half.ws_uri.is_some() || half.ws_tee.is_some() {
+            return Err("dial profiles cannot attach a WebSocket bridge or tee".into());
+        }
+    }
+    Ok(())
+}
+
+/// Prepare a connecting dial for a caller whose INVITE carries no SDP (RFC
+/// 3261 §13.2.1): there is no offer to anchor before the phones ring, so
+/// nothing is allocated. The call is marked as a profiled dial that expects its
+/// offer from the phone that answers, and `profiles` are checked to exist and
+/// to be usable now, so a profile that could never anchor refuses the dial
+/// before anything rings. `Ok(false)` when the call went away.
+pub(crate) fn expect_delayed_offer<'a>(
+    call_id: &str,
+    profiles: impl Iterator<Item = &'a str>,
+    primary: &str,
+    state: &DispatcherState,
+) -> Result<bool, DialError> {
+    let backend = state
+        .rtpengine_set
+        .as_ref()
+        .ok_or_else(|| DialError::Media("dial profile requires a media backend".into()))?;
+    let registry = state
+        .rtpengine_profiles
+        .as_ref()
+        .ok_or_else(|| DialError::Media("dial profile requires media profiles".into()))?;
+    let sessions = state
+        .rtpengine_sessions
+        .as_ref()
+        .ok_or_else(|| DialError::Media("dial profile requires a media session store".into()))?;
+    for name in profiles {
+        let profile = registry
+            .get(name)
+            .ok_or_else(|| DialError::Media(format!("unknown media profile '{name}'")))?;
+        refuse_unusable_halves(backend, [&profile.offer, &profile.answer])
+            .map_err(DialError::Media)?;
+    }
+    let Some(mut call) = state.call_actors.get_call_mut(call_id) else {
+        return Ok(false);
+    };
+    if sessions.get(&call.a_leg.dialog.call_id).is_some() {
+        return Err(DialError::Media(
+            "dial profile cannot replace an existing media session".into(),
+        ));
+    }
+    call.control_dial_media = true;
+    call.control_dial_offer = None;
+    call.dial_media = crate::b2bua::actor::DialMedia {
+        delayed_offer_profile: Some(primary.to_string()),
+        ..Default::default()
+    };
+    Ok(true)
+}
+
+/// A phone's response on a dial whose caller offered nothing: the phone's own
+/// offer, which the caller is to be given the engine's version of.
+///
+/// A 2xx's offer is anchored from the phone's side under the profile's `answer`
+/// half (the half that faces the caller), on an engine call of its own, and the
+/// media session is recorded with the phone as offerer and no answerer yet. The
+/// caller's ACK completes it (`send_delayed_offer_ack`).
+///
+/// A provisional's offer cannot be taken. Unreliable, it is dropped and the
+/// provisional carries on as plain ringing. Reliable, the phone is waiting on an
+/// answer in the PRACK that a caller which has not yet made its offer cannot
+/// give (RFC 3262 §5), so the dial fails like any media failure.
+fn delayed_offer_answer(
+    branch_profile: Option<String>,
+    fallback_profile: &str,
+    sip_call_id: &str,
+    response: &mut SipMessage,
+    source_ip: std::net::IpAddr,
+    state: &DispatcherState,
+) -> Result<(), String> {
+    let final_response = response.status_code().is_some_and(|code| code >= 200);
+    if response.body.is_empty() {
+        return if final_response {
+            Err("dial final response has no SDP offer for a caller that sent none".into())
+        } else {
+            Ok(())
+        };
+    }
+    if !final_response {
+        if crate::sip::headers::rseq::requires_100rel(&response.headers) {
+            return Err(
+                "the phone offered in a reliable provisional, which a caller that has made no offer cannot answer"
+                    .into(),
+            );
+        }
+        response.body.clear();
+        response.headers.remove("Content-Type");
+        response.headers.set("Content-Length", "0".to_string());
+        return Ok(());
+    }
+    let backend = state
+        .rtpengine_set
+        .as_ref()
+        .ok_or("dial media backend is gone")?;
+    let sessions = state
+        .rtpengine_sessions
+        .as_ref()
+        .ok_or("dial media store is gone")?;
+    if sessions.get(sip_call_id).is_some() {
+        return Err("dial profile cannot replace an existing media session".into());
+    }
+    let profile_name = branch_profile.unwrap_or_else(|| fallback_profile.to_string());
+    let profile = state
+        .rtpengine_profiles
+        .as_ref()
+        .and_then(|profiles| profiles.get(&profile_name))
+        .ok_or("dial media profile is gone")?;
+    let to_tag = response
+        .headers
+        .to()
+        .and_then(|value| crate::sip::headers::nameaddr::NameAddr::parse(value).ok())
+        .and_then(|value| value.tag)
+        .ok_or("dial offer has no To tag")?;
+    let mut flags = profile.answer.clone();
+    flags.stamp_received_from(source_ip);
+    flags.stamp_sip_call_id_of(response);
+    refuse_unusable_halves(backend, [&flags, &profile.offer])?;
+    // An engine call-id of its own: a late delete of this attempt must never
+    // delete a media session anchored under the SIP Call-ID later.
+    let engine_call_id = crate::b2bua::actor::generate_call_id();
+    let body = crate::script::blocking::block_on_released(backend.offer(
+        &engine_call_id,
+        &to_tag,
+        &response.body,
+        &flags,
+    ))
+    .map_err(|error| format!("dial media offer failed: {error}"))?;
+    sessions.insert(crate::rtpengine::MediaSession {
+        call_id: sip_call_id.to_string(),
+        rtpengine_call_id: engine_call_id,
+        from_tag: to_tag,
+        to_tag: None,
+        profile: profile_name,
+        ws_uri: None,
+        ws_tee: None,
+        ws_bridge_attached: false,
+        bridge_sides: None,
+        created_at: std::time::Instant::now(),
+    });
+    response.body = body;
+    response
+        .headers
+        .set("Content-Length", response.body.len().to_string());
+    Ok(())
 }
 
 /// Rewrite a dialled phone's early/final answer for the caller using the
@@ -171,7 +325,18 @@ pub fn control_dial_media_answer(
     }
     let sip_call_id = call.a_leg.dialog.call_id.clone();
     let branch_profile = call.dial_branch_media_profile(branch);
+    let delayed_offer_profile = call.dial_media.delayed_offer_profile.clone();
     drop(call);
+    if let Some(fallback_profile) = delayed_offer_profile {
+        return delayed_offer_answer(
+            branch_profile,
+            &fallback_profile,
+            &sip_call_id,
+            response,
+            source_ip,
+            state,
+        );
+    }
     let sessions = state
         .rtpengine_sessions
         .as_ref()

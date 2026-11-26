@@ -510,7 +510,16 @@ pub fn answer_first_prepare(
 
     let offer_sdp = String::from_utf8_lossy(&invite.body).into_owned();
     if offer_sdp.trim().is_empty() {
-        return Err("answer-first requires an SDP offer on the INVITE; none present".to_string());
+        // RFC 3261 §13.2.1: an INVITE with no SDP wants the offer in the 2xx. The
+        // engine can answer an offer (`answer_local`) but has no verb that makes
+        // an offer of its own for a single-leg call, so there is nothing to put
+        // in that 2xx.
+        return Err(
+            "answer-first needs an SDP offer on the INVITE, and this one carries none: the media \
+             engine's protocol has no engine-originated offer for a single-leg call, so a delayed \
+             offer (RFC 3261 §13.2.1) cannot be answered anchored"
+                .to_string(),
+        );
     }
 
     Ok(AnswerFirstPlan {
