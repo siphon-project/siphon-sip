@@ -355,6 +355,12 @@ as written; a later `rtpengine.answer(reply, profile="extension")` follows what
 the offer anchored. `webrtc` takes `auto` only, and `rtpproxy` fails the config
 load because the WebRTC set needs `rtcp-mux`.
 
+`#` is reserved in a profile name: the resolved forms are `base#webrtc-offer`,
+`-answer` and `-both`. A config that names a profile with one fails to load, and
+a control verb's `profile` (`dial`, `originate`, `bridge`, recording) or a
+script's `rtpengine` `profile=` cannot select a resolved form directly (a script
+gets a `ValueError`). Name the base profile; siphon picks the form.
+
 ### IPv4 and IPv6 interworking
 
 `address_family` pins the family the engine allocates its **own** relay endpoints

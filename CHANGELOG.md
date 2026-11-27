@@ -37,7 +37,9 @@ entry, but a working config keeps working.
   caller's offer is judged on its first live audio section, with session-level
   `a=ice-ufrag` and `a=fingerprint` inherited. `#` is reserved in a media
   profile name and refused at config load, since the resolved forms are named
-  `base#webrtc-offer`, `-answer` and `-both`.
+  `base#webrtc-offer`, `-answer` and `-both`; a `profile` typed on a control verb
+  or a script's `rtpengine` call cannot name one either. URI parameter names now
+  match case-insensitively (`;Transport=WS`, `;LR`).
 
 ## [1.19.1] — 2026-11-26
 
