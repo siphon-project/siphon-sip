@@ -1426,3 +1426,66 @@ fn a_contact_naming_websocket_is_webrtc_however_its_register_arrived() {
         assert_eq!(is_webrtc, uri.contains("transport=WS"), "{uri}");
     }
 }
+
+/// A browser caller is anchored under `extension#webrtc-answer`, and a bridge
+/// dial with no `profile` of its own inherits that resolved name for the
+/// group. State carried over is not a typed name, so it is not refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_inheriting_a_resolved_profile_name_rings() {
+    const PHONE: &str = "198.51.100.71:5060";
+    let aor = "sip:wa330@siphon.example.com";
+    register_over(aor, &format!("sip:wa330@{PHONE}"), Transport::Udp);
+    let engine = NativeTestEngine::start().await;
+    let mut dispatcher = anchored_dispatcher(&engine);
+    dispatcher.state.rtpengine_profiles = Some(extension_profiles());
+    let mut params = anchored_params(aor);
+    params.media = OriginateMedia::Anchor {
+        profile: "extension#webrtc-answer".to_string(),
+        ws_uri: None,
+    };
+    let (_group, _recorder) = ring_with(
+        &dispatcher.state,
+        aor,
+        params,
+        OriginateGroupStrategy::Parallel,
+        30,
+    );
+    let sent = drain(&dispatcher.udp);
+    invite_to(&sent, PHONE);
+}
+
+/// A profile a target names is a typed name: a generated form is refused
+/// before any leg is placed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_target_naming_a_generated_profile_is_refused() {
+    let aor = "sip:wa331@siphon.example.com";
+    register_over(aor, "sip:wa331@198.51.100.72:5060", Transport::Udp);
+    let engine = NativeTestEngine::start().await;
+    let mut dispatcher = anchored_dispatcher(&engine);
+    dispatcher.state.rtpengine_profiles = Some(extension_profiles());
+    let mut params = anchored_params(aor);
+    params.media = OriginateMedia::Anchor {
+        profile: "extension".to_string(),
+        ws_uri: None,
+    };
+    let mut targets = dial_targets_for_aor(aor).expect("the AoR has contacts");
+    targets[0].profile = Some("extension#webrtc-both".to_string());
+    let error = create_originate_group(
+        &dispatcher.state,
+        OriginateGroupSpec {
+            params,
+            targets,
+            strategy: OriginateGroupStrategy::Parallel,
+            total_timeout_secs: 30,
+            answers: OriginateGroupAnswers::First,
+            early_offer: None,
+            media_flags: None,
+        },
+        Arc::new(Recorder::default()) as Arc<dyn OriginateGroupSink>,
+    )
+    .expect_err("a generated name is not selectable");
+    assert!(
+        error.to_string().contains("extension#webrtc-both"),
+        "{error}"
+    );
+}

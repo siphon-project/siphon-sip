@@ -488,6 +488,23 @@ mod tests {
         }
     }
 
+    /// A profile a single target names is typed too: the dial's own is a
+    /// defined one, the target's override is a generated form.
+    #[test]
+    fn a_target_cannot_name_a_generated_variant() {
+        let registry = extension_profiles();
+        let mut targets = vec![DialTarget {
+            profile: Some("extension#webrtc-both".to_string()),
+            ..bound("sip:201@198.51.100.7", Some(Transport::Udp))
+        }];
+        let error = resolve_profiles_with(&mut targets, &extension_dial(), Some(&registry), false)
+            .expect_err("a generated name is not selectable");
+        assert!(
+            error.to_string().contains("extension#webrtc-both"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn a_webrtc_caller_turns_the_answer_half_for_every_branch() {
         let registry = extension_profiles();

@@ -930,18 +930,24 @@ pub fn create_originate_group(
     // The shared shape of every leg is checked once here, not per leg: a
     // media plan this deployment cannot serve fails the command, never a call.
     if let OriginateMedia::Anchor { profile, .. } = &spec.params.media {
-        // The group's profile is the one a controller named: a generated
-        // `base#webrtc-...` form is chosen per contact below, never named.
-        if state
-            .rtpengine_profiles
-            .as_ref()
-            .is_some_and(|registry| !registry.is_defined(profile))
+        // The group's own profile may be the resolved name a bridge dial
+        // inherits from its caller's media session, so it is looked up, not
+        // gated as typed.
+        originate_validate_anchor(profile, state)?;
+    }
+    // A profile a target names is a typed name: a generated `base#webrtc-...`
+    // form is chosen per contact below, never named.
+    if let Some(registry) = state.rtpengine_profiles.as_ref() {
+        if let Some(name) = spec
+            .targets
+            .iter()
+            .filter_map(|target| target.profile.as_deref())
+            .find(|name| !registry.is_defined(name))
         {
             return Err(OriginateError::Unsupported(format!(
-                "unknown media profile '{profile}' for originate"
+                "unknown media profile '{name}' for originate"
             )));
         }
-        originate_validate_anchor(profile, state)?;
     }
     let group_id = format!("originate-group-{}", uuid::Uuid::new_v4().simple());
     state.originate_groups.insert(

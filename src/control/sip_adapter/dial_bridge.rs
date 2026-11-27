@@ -202,6 +202,19 @@ pub(super) fn dial_bridge(
         request.timeout_secs,
         request.targets.len(),
     );
+    // A profile the controller typed must be one that is defined; the caller's
+    // own (resolved) one, inherited when none is named, is looked up as is.
+    if let (Some(registry), Some(name)) = (
+        state.rtpengine_profiles.as_ref(),
+        request.shaping.profile.as_deref(),
+    ) {
+        if !registry.is_defined(name) {
+            return ControlResult::error(
+                ControlErrorCode::BadRequest,
+                format!("unknown media profile '{name}'"),
+            );
+        }
+    }
     let target_count = request.targets.len();
     // What a phone whose target names no `offer` of its own is sent.
     let offer = request.offer.unwrap_or_default();
