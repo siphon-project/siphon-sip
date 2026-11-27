@@ -743,7 +743,7 @@ pub fn originate_validate_anchor(
             "originate media anchoring requires media profiles, none configured".to_string(),
         ));
     };
-    originate_anchor_rejection(backend.kind(), registry.is_defined(profile), profile)
+    originate_anchor_rejection(backend.kind(), registry.get(profile).is_some(), profile)
         .map_or(Ok(()), Err)
 }
 

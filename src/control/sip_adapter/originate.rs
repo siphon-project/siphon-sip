@@ -670,6 +670,11 @@ pub(super) fn parse_originate_media(
             "originate args.content_type needs args.body — args.media=true sends an offerless INVITE"
                 .to_string(),
         ),
+        (None, true) if args.get("profile").and_then(|value| value.as_str()).is_some_and(|name| name.contains('#')) => Err(
+            "originate args.profile names no media profile: '#' is reserved for the forms a \
+             `webrtc: auto` profile resolves to"
+                .to_string(),
+        ),
         (None, true) => Ok(crate::dispatcher::OriginateMedia::Anchor {
             profile: match args.get("profile") {
                 None | Some(serde_json::Value::Null) => "rtp_passthrough",

@@ -930,6 +930,17 @@ pub fn create_originate_group(
     // The shared shape of every leg is checked once here, not per leg: a
     // media plan this deployment cannot serve fails the command, never a call.
     if let OriginateMedia::Anchor { profile, .. } = &spec.params.media {
+        // The group's profile is the one a controller named: a generated
+        // `base#webrtc-...` form is chosen per contact below, never named.
+        if state
+            .rtpengine_profiles
+            .as_ref()
+            .is_some_and(|registry| !registry.is_defined(profile))
+        {
+            return Err(OriginateError::Unsupported(format!(
+                "unknown media profile '{profile}' for originate"
+            )));
+        }
         originate_validate_anchor(profile, state)?;
     }
     let group_id = format!("originate-group-{}", uuid::Uuid::new_v4().simple());
