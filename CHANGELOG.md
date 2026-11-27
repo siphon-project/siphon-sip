@@ -33,6 +33,8 @@ entry, but a working config keeps working.
   profile name and refused at config load, since the resolved forms are named
   `base#webrtc-offer`, `-answer` and `-both`; a `profile` typed on a control verb
   or a script's `rtpengine` call cannot name one either.
+- Control plane: an anchored `answer` (and `call.handover(answer=True)`) now answers a caller whose INVITE carries no SDP (a delayed offer, RFC 3261 section 13.2.1). The media engine makes the offer (`offer_local`), siphon puts it in the 2xx, and the caller's answer in its ACK completes the engine call. A `ws_uri` rides in the offer and the engine dials the bot with the answer, so the takeover is attached once. An ACK with no SDP, an answer the engine refuses, or no ACK within 64*T1 ends the call with a BYE and deletes the engine call. Control verbs that need the engine call (the media verbs and `dial`) wait for the ACK, up to 64*T1, before they run. Needs a siphon-rtp 0.30 or later; an older engine still gets `unavailable`, with the call left parked. Anchored early media on such an INVITE stays refused.
+- Control plane: a `dial` with a media `profile` now connects a caller whose INVITE carries no SDP (a delayed offer, RFC 3261 section 13.2.1). The phones are rung offerless, the answering phone's offer is anchored under the profile's `answer` half and the engine's offer goes in the caller's 2xx, and the caller's ACK answer completes it through the engine into the phone's ACK. An ACK with no answer, or none within 64*T1, ends the call and frees the media. Previously the dial was refused with "dial profile requires a caller SDP offer".
 
 ### Fixed
 
@@ -40,20 +42,6 @@ entry, but a working config keeps working.
   RFC 3966 §3), so `;Transport=WS`, `;LR` and `;Phone-Context=` are read like
   their lowercase forms, and editing a parameter on a `tel:` URI with a
   mixed-case `phone-context` no longer fails to read back.
-
-## [1.19.2] — 2026-11-27
-
-### Fixed
-
-- The restart clean-up no longer clears another node's binding at a registrar that keeps one binding per AoR. Before it de-registers a binding the last process left, siphon sends a fetch (a REGISTER with no Contact and no Expires, same Call-ID, next CSeq, RFC 3261 §10.2.3) and sends `Expires: 0` only when the 2xx lists this node's stored Contact (compared as SIP URIs). A registrar that replaces the AoR's binding on every REGISTER had already dropped this node's binding when another node registered, and the `Expires: 0` cleared the live one until that node's next refresh. A 2xx listing only other Contacts or none, a refusal or Timer F leaves the binding to expire and drops the record; a fetch and its de-REGISTER are one attempt, and a challenge to either is answered from the source's lookup. **Known limit:** on such a registrar another node can still register between the fetch and the de-REGISTER.
-- Name-addr headers (From, To, Contact, P-Asserted-Identity and the rest) are parsed with quoted strings respected (RFC 3261 §25.1, quoted-pairs included). A `<`, `,` or `;` inside a quoted display name or a quoted parameter value no longer picks the wrong URI, splits one entry into two, or cuts a parameter short.
-### Added
-
-- Control plane: an anchored `answer` (and `call.handover(answer=True)`) now answers a caller whose INVITE carries no SDP (a delayed offer, RFC 3261 section 13.2.1). The media engine makes the offer (`offer_local`), siphon puts it in the 2xx, and the caller's answer in its ACK completes the engine call. A `ws_uri` rides in the offer and the engine dials the bot with the answer, so the takeover is attached once. An ACK with no SDP, an answer the engine refuses, or no ACK within 64*T1 ends the call with a BYE and deletes the engine call. Control verbs that need the engine call (the media verbs and `dial`) wait for the ACK, up to 64*T1, before they run. Needs a siphon-rtp 0.30 or later; an older engine still gets `unavailable`, with the call left parked. Anchored early media on such an INVITE stays refused.
-- Control plane: a `dial` with a media `profile` now connects a caller whose INVITE carries no SDP (a delayed offer, RFC 3261 section 13.2.1). The phones are rung offerless, the answering phone's offer is anchored under the profile's `answer` half and the engine's offer goes in the caller's 2xx, and the caller's ACK answer completes it through the engine into the phone's ACK. An ACK with no answer, or none within 64*T1, ends the call and frees the media. Previously the dial was refused with "dial profile requires a caller SDP offer".
-
-### Fixed
-
 - A re-INVITE with no SDP from the caller of a media-anchored two-leg call is answered from the session in force toward the caller instead of being relayed offerless: the callee's 2xx offer was handed to the media engine as an answer to nothing, and the caller's ACK answer went nowhere. That answer now reaches the engine, so media the caller moved in it is followed, and an ACK with no SDP ends the call.
 
 ### Changed
