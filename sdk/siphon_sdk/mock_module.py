@@ -5743,6 +5743,21 @@ def _resolve_play_source(
     return "db-id"
 
 
+def _check_typed_profile(profile: Optional[str]) -> None:
+    """Refuse a ``profile=`` that names a generated ``base#webrtc-...`` form.
+
+    ``#`` is reserved in a profile name: ``base#webrtc-offer``, ``-answer`` and
+    ``-both`` are what siphon resolves a ``webrtc: auto`` profile to, and a
+    script names the base. The runtime raises ``ValueError``, and so does the
+    mock, before it records anything.
+    """
+    if profile is not None and "#" in profile:
+        raise ValueError(
+            f"unknown RTP profile '{profile}': '#' is reserved for the forms a "
+            "webrtc: auto profile resolves to; name the base profile"
+        )
+
+
 class MockRtpEngine(_WsSplitMixin):
     """Mock RTPEngine namespace — records media operations for assertions.
 
@@ -6048,6 +6063,7 @@ class MockRtpEngine(_WsSplitMixin):
             # arrived in another dialog, then hand its answer back raw.
             sdp = await rtpengine.offer((call_id, far_tag), sdp=new_sdp)
         """
+        _check_typed_profile(profile)
         # Validate before recording anything: the runtime refuses these before
         # a command reaches the engine.
         scope = _media_scope(scope, (request,), "offer")
@@ -6196,6 +6212,7 @@ class MockRtpEngine(_WsSplitMixin):
                 sdp = await rtpengine.answer(call, sdp=far_sdp)
                 call.answer(200, "OK", body=sdp, content_type="application/sdp")
         """
+        _check_typed_profile(profile)
         # Validate before recording anything: the runtime refuses these before
         # a command reaches the engine.
         scope = _media_scope(scope, (reply, call), "answer")
@@ -6332,6 +6349,7 @@ class MockRtpEngine(_WsSplitMixin):
                     call.answer(200, "OK", body=sdp, content_type="application/sdp")
                     await rtpengine.play_media(call, file="/prompts/welcome.wav")
         """
+        _check_typed_profile(profile)
         scope = _media_scope(scope, (call,), "answer_local")
         self.media_scopes.append(("answer_local", scope))
         if profile is None and scope is not None:
@@ -7181,6 +7199,7 @@ class MockRtpEngine(_WsSplitMixin):
                 sdp = await rtpengine.conference_join("room-1", call)
                 call.answer(200, "OK", body=sdp, content_type="application/sdp")
         """
+        _check_typed_profile(profile)
         if not conference_id:
             raise ValueError("rtpengine.conference_join(conference_id) is empty")
         seat_role = self._conference_role(role, target, whisper_target)
@@ -7400,6 +7419,7 @@ class MockRtpEngine(_WsSplitMixin):
             # in @b2bua.on_answer(call, reply):
             await rtpengine.conference_answer(room, (call.call_id, tag), reply.body)
         """
+        _check_typed_profile(profile)
         if not conference_id:
             raise ValueError("rtpengine.conference_offer(conference_id) is empty")
         if not seat_tag or not re.fullmatch(r"[A-Za-z0-9.!%*_+`'~-]+", seat_tag):
@@ -7849,6 +7869,7 @@ class MockRtpEngine(_WsSplitMixin):
         Returns:
             The subscriber SDP as ``bytes``.
         """
+        _check_typed_profile(profile)
         scope = self._leg_scope(scope, None, call_id, "subscribe_request")
         self.operations.append(("subscribe_request", to_tag))
         self.media_calls.append({
@@ -7881,6 +7902,7 @@ class MockRtpEngine(_WsSplitMixin):
         only one is anchored, else the node's call. ``ValueError`` when
         invalid, or on a B2BUA ``Call``.
         """
+        _check_typed_profile(profile)
         scope = self._leg_scope(scope, None, call_id, "subscribe_answer")
         self.operations.append(("subscribe_answer", to_tag))
         self.media_calls.append({
