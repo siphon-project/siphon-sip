@@ -65,7 +65,7 @@ impl RouteEntry {
 
     /// Check if this route entry has the `lr` (loose-routing) URI parameter.
     pub fn is_loose_route(&self) -> bool {
-        self.uri.params.iter().any(|(name, _)| name == "lr")
+        self.uri.get_param("lr").is_some()
     }
 }
 
@@ -374,6 +374,12 @@ mod tests {
         }
         let error = route_parts("<sip:a.example.com;lr>, <not a uri>").expect_err("refused");
         assert!(error.contains("\"<not a uri>\""), "{error}");
+    }
+
+    #[test]
+    fn a_loose_route_parameter_is_matched_in_any_case() {
+        let entry = RouteEntry::parse("<sip:proxy.example.com;LR>").unwrap();
+        assert!(entry.is_loose_route());
     }
 
     #[test]
