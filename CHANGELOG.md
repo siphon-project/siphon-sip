@@ -13,6 +13,10 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Deprecated
+
+- `RegistrantManager::answer_removed_deregistration` is deprecated in favour of `answer_removed_registration`, which also takes the response's `Contact` headers and `Expires`. The old function gets no Contacts, so it cannot read the answer to the fetch that now precedes a digest de-REGISTER: on such a fetch's 2xx it ends the exchange without sending `Expires: 0` (the binding expires on its own) and logs a warning once per process. Its behaviour on a de-REGISTER that has no fetch before it (IMS entries) is unchanged.
+
 ### Fixed
 
 - Graceful shutdown, a live removal and a source update that moves a binding no longer clear another node's binding at a registrar that keeps one binding per AoR. They fetch first (a REGISTER with no Contact and no Expires on the binding's Call-ID, RFC 3261 §10.2.3), the same way the restart clean-up does, and send `Expires: 0` only when the 2xx lists this node's own Contact. Anything else (other Contacts only, none, a refusal, Timer F) leaves the binding to expire. A challenge to the fetch or the de-REGISTER is answered with the entry's own credentials. Shutdown stays inside its existing answer bound: a fetch that has no answer by then sends no `Expires: 0`. IMS AKA / IPsec entries are unchanged. **Known limit:** on such a registrar another node can still register between the fetch and the de-REGISTER.

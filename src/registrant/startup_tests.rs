@@ -1,6 +1,9 @@
 //! Clearing the bindings a killed process left: what is stored, what a restart
 //! makes of it, and that nothing it tracks outlives it.
 
+// The deprecated `answer_removed_deregistration` is still what these drive.
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1382,4 +1385,37 @@ async fn a_foreign_token_behind_an_escaped_parameter_name_is_never_cleared() {
     let foreign = crate::registrant::contact::instance_token("node-b", AOR);
     let contact = format!("sip:trunk@192.0.2.1:5060;%72node={foreign}");
     assert_eq!(cleanup_of(&manager, &contact).deregistered, 0);
+}
+
+/// The deprecated answer function is given no Contacts, so it cannot read a
+/// fetch's 2xx: it ends the exchange without `Expires: 0` and says so once.
+#[test]
+fn the_deprecated_answer_ends_a_fetch_without_a_de_register_and_warns() {
+    let manager = test_support::manager();
+    test_support::install_egress(&manager);
+    manager.add(trunk("sip:trunk@carrier.example"));
+    manager.handle_success("sip:trunk@carrier.example", 3600);
+    manager.remove("sip:trunk@carrier.example");
+    let fetch = manager
+        .take_pending_deregistrations()
+        .pop()
+        .expect("the fetch");
+    let call_id = fetch.message.headers.get("Call-ID").cloned().expect("id");
+    let listen = HashMap::new();
+
+    let answer = manager.answer_removed_deregistration(
+        &call_id,
+        cseq_number(&fetch.message),
+        200,
+        None,
+        EgressDefaults::new("192.0.2.1:5060".parse().expect("addr"), &listen),
+    );
+
+    assert!(
+        matches!(answer, crate::registrant::RemovedAnswer::Finished),
+        "{answer:?}"
+    );
+    assert!(manager.take_pending_deregistrations().is_empty());
+    assert_eq!(manager.removed_deregistrations_pending(), 0);
+    assert!(crate::registrant::removed::deprecated_answer_noticed());
 }

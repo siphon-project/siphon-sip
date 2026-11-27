@@ -100,6 +100,16 @@ pub enum RemovedAnswer {
     Lookup(Box<CredentialRequest>),
 }
 
+static DEPRECATED_ANSWER_NOTICE: std::sync::Once = std::sync::Once::new();
+static DEPRECATED_ANSWER_NOTICED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the deprecated-answer warning was logged by this process.
+#[cfg(test)]
+pub(crate) fn deprecated_answer_noticed() -> bool {
+    DEPRECATED_ANSWER_NOTICED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// The CSeq number of `message`.
 pub fn cseq_number(message: &SipMessage) -> Option<u32> {
     message
@@ -369,6 +379,16 @@ impl RegistrantManager {
     /// answered once, with `challenge` (`true`: proxy authentication), as
     /// `Expires: 0` on the same Call-ID with the next CSeq; a second one, any
     /// other failure or a 2xx ends the de-registration.
+    ///
+    /// **Deprecated.** It is given no `Contact` headers, so it cannot read the
+    /// answer to the fetch that now precedes a digest de-REGISTER (RFC 3261
+    /// §10.2.3). On such a fetch's 2xx it ends the exchange without sending
+    /// `Expires: 0` (the safe side: the binding expires on its own) and logs a
+    /// warning once per process. Use [`answer_removed_registration`](Self::answer_removed_registration).
+    /// On a de-REGISTER that is not preceded by a fetch it behaves as before.
+    #[deprecated(
+        note = "cannot read a fetch's answer, so it never sends Expires: 0 after one; use answer_removed_registration with the response's Contact headers"
+    )]
     pub fn answer_removed_deregistration(
         &self,
         call_id: &str,
@@ -377,6 +397,23 @@ impl RegistrantManager {
         challenge: Option<(&DigestChallenge, bool)>,
         defaults: EgressDefaults<'_>,
     ) -> RemovedAnswer {
+        let undecidable = (200..300).contains(&status_code)
+            && self
+                .draining_deregistrations
+                .get(call_id)
+                .is_some_and(|draining| draining.fetching && response_cseq == Some(draining.cseq));
+        if undecidable {
+            DEPRECATED_ANSWER_NOTICE.call_once(|| {
+                DEPRECATED_ANSWER_NOTICED.store(true, std::sync::atomic::Ordering::SeqCst);
+                warn!(
+                    "answer_removed_deregistration cannot read the answer to the fetch before a \
+                     de-REGISTER, so it sends no Expires: 0; use answer_removed_registration \
+                     with the response's Contact headers"
+                );
+            });
+            self.conclude_draining(call_id, Some(0));
+            return RemovedAnswer::Finished;
+        }
         self.answer_removed_registration(
             call_id,
             response_cseq,
