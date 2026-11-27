@@ -161,6 +161,16 @@ pub(super) fn anchor_dial_media(
     )
     .map_err(DialError::Media)?;
 
+    // A caller that sent no SDP has no offer to anchor: the phone's 2xx makes
+    // it, and is anchored when it arrives (`control_dial_media_answer`).
+    if sdp_in_body(message_content_type(template), &template.body).is_none() {
+        return expect_delayed_offer(
+            internal_call_id,
+            std::iter::once(primary).chain(others.iter().copied()),
+            primary,
+            state,
+        );
+    }
     let source_ip = state
         .call_actors
         .get_call(internal_call_id)
@@ -321,6 +331,41 @@ pub fn release_dial_branch_media(sip_call_id: &str, state: &DispatcherState) {
         return;
     };
     delete_engine_sessions(sessions.take_dial_branches(sip_call_id), state);
+}
+
+/// Record the media session the engine has just made for `internal_call_id`,
+/// unless that call ended while the engine was making it.
+///
+/// A teardown claims the call first and only then takes its sessions, so one
+/// that lands while an engine round trip is out finds no session to take. The
+/// session is therefore recorded first and the call checked afterwards: either
+/// the teardown has not yet taken sessions and takes this one, or it has
+/// claimed already and this releases the engine call itself. A CANCEL claims
+/// the call too (`cancel_claimed`), answers the INVITE 487 and removes the call
+/// later, so a call being cancelled counts as ended. `false` when the
+/// call had ended and the session was released.
+pub(super) fn commit_media_session(
+    state: &DispatcherState,
+    internal_call_id: &str,
+    session: crate::rtpengine::MediaSession,
+) -> bool {
+    let Some(sessions) = state.rtpengine_sessions.as_ref() else {
+        return false;
+    };
+    let key = session.call_id.clone();
+    sessions.insert(session);
+    let ended = state
+        .call_actors
+        .get_call(internal_call_id)
+        .is_none_or(|call| call.teardown_claimed || call.cancel_claimed);
+    if !ended {
+        return true;
+    }
+    if let Some(session) = sessions.remove(&key) {
+        warn!(call_id = %key, "the call ended while the media engine was allocating for it; releasing the allocation");
+        delete_engine_sessions(vec![session], state);
+    }
+    false
 }
 
 fn delete_engine_sessions(sessions: Vec<crate::rtpengine::MediaSession>, state: &DispatcherState) {

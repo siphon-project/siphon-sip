@@ -90,6 +90,7 @@ pub(super) fn convert_event(event: Event) -> RtpEngineEvent {
             reason: match reason {
                 siphon_rtp_proto::MediaTimeoutReason::NoMedia => "no_media",
                 siphon_rtp_proto::MediaTimeoutReason::HeldTooLong => "held_too_long",
+                siphon_rtp_proto::MediaTimeoutReason::Unknown => "unknown",
                 // The reason set can grow; an unrecognised one is still a
                 // timeout, and naming it that is better than refusing to build.
                 _ => "unknown",
@@ -292,7 +293,7 @@ pub(super) fn convert_event(event: Event) -> RtpEngineEvent {
             // `X3EndReason` is `#[non_exhaustive]`, so it is rendered rather
             // than mirrored: a reason this build has not heard of still means
             // delivery stopped, and the counts are what the record needs.
-            reason: format!("{reason:?}"),
+            reason: x3_end_reason_name(reason),
             // Only a controller-driven detach is an orderly end. A reason this
             // build does not recognise is treated as *not* orderly, because
             // assuming otherwise would silently downgrade a new failure mode
@@ -345,6 +346,15 @@ pub(super) fn convert_event(event: Event) -> RtpEngineEvent {
     }
 }
 
+/// An X3 end reason as a string for scripts and controllers: the variant
+/// name, with a reason the proto crate could not name rendered `unknown`.
+fn x3_end_reason_name(reason: X3EndReason) -> String {
+    match reason {
+        X3EndReason::Unknown => "unknown".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
 /// Map the proto tee end-reason onto siphon's own enum.
 ///
 /// `WsTeeEndReason` is `#[non_exhaustive]` upstream. The wildcard maps to
@@ -361,6 +371,9 @@ pub(super) fn ws_tee_end_reason_from_proto(reason: ProtoWsTeeEndReason) -> WsTee
         ProtoWsTeeEndReason::ServerStopped => WsTeeEndReason::ServerStopped,
         ProtoWsTeeEndReason::CallEnded => WsTeeEndReason::CallEnded,
         ProtoWsTeeEndReason::TransportError => WsTeeEndReason::TransportError,
+        // A reason the proto crate itself could not name: still handed to the
+        // script, as "unknown", and still counted unexpected.
+        ProtoWsTeeEndReason::Unknown => WsTeeEndReason::Other("unknown"),
         _ => WsTeeEndReason::TransportError,
     }
 }
@@ -389,6 +402,7 @@ pub(super) fn recording_end_reason_from_proto(
         RecordingEndReason::Silence => "silence",
         RecordingEndReason::CallEnded => "call_ended",
         RecordingEndReason::Error => "error",
+        RecordingEndReason::Unknown => "unknown",
         _ => "unknown",
     }
 }
@@ -399,6 +413,8 @@ pub(super) fn play_end_reason_from_proto(reason: PlayEndReason) -> SiphonPlayEnd
         PlayEndReason::Stopped => SiphonPlayEndReason::Stopped,
         PlayEndReason::Superseded => SiphonPlayEndReason::Superseded,
         PlayEndReason::Error => SiphonPlayEndReason::Error,
+        // Not `Completed`: an unnamed ending was not heard in full.
+        PlayEndReason::Unknown => SiphonPlayEndReason::Other("unknown"),
         _ => SiphonPlayEndReason::Error,
     }
 }
@@ -420,6 +436,7 @@ pub(super) fn ws_bridge_end_reason_from_proto(reason: ProtoWsBridgeEndReason) ->
         ProtoWsBridgeEndReason::ServerStopped => WsBridgeEndReason::ServerStopped,
         ProtoWsBridgeEndReason::CallEnded => WsBridgeEndReason::CallEnded,
         ProtoWsBridgeEndReason::TransportError => WsBridgeEndReason::TransportError,
+        ProtoWsBridgeEndReason::Unknown => WsBridgeEndReason::Other("unknown"),
         _ => WsBridgeEndReason::TransportError,
     }
 }
@@ -429,8 +446,8 @@ pub(super) fn ws_bridge_end_reason_from_proto(reason: ProtoWsBridgeEndReason) ->
 /// The name is read off the type's wire form rather than from a `match`
 /// whose wildcard would have to invent one; the wire form is what a script and
 /// a controller are told. `WsSplitEndReason` is `#[non_exhaustive]` upstream,
-/// but with siphon-rtp-proto 0.29 it is closed on the wire: an event carrying a
-/// reason outside the seven is not decoded, so it never gets here.
+/// and since 0.30 an unrecognised reason decodes to `Unknown`, which serialises as
+/// `unknown`.
 pub(crate) fn ws_split_end_reason_name(reason: siphon_rtp_proto::WsSplitEndReason) -> String {
     match serde_json::to_value(reason) {
         Ok(serde_json::Value::String(name)) => name,

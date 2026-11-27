@@ -2508,12 +2508,15 @@ async fn answer_first_prepare_unknown_profile() {
     assert!(error.contains("unknown media profile"), "got: {error}");
 }
 
+/// An INVITE with no SDP (RFC 3261 §13.2.1) has no offer to answer: the plan
+/// carries an empty one, which is what sends the answer down the delayed-offer
+/// path (the engine makes the offer for the 2xx).
 #[tokio::test]
-async fn answer_first_prepare_requires_sdp_offer() {
+async fn answer_first_prepare_leaves_the_offer_empty_for_an_invite_with_no_sdp() {
     let backend = siphon_rtp_backend();
     let registry = crate::rtpengine::ProfileRegistry::new();
     let invite = invite_with_offer(b""); // no offer body
-    let error = answer_first_prepare(
+    let plan = answer_first_prepare(
         &invite,
         local_ip(),
         &backend,
@@ -2522,8 +2525,8 @@ async fn answer_first_prepare_requires_sdp_offer() {
         Some("wss://ai"),
         None,
     )
-    .unwrap_err();
-    assert!(error.contains("SDP offer"), "got: {error}");
+    .expect("the plan is made");
+    assert!(plan.offer_sdp.is_empty());
 }
 
 /// Save a stream P-CSCF cache binding directly against a bare `Registrar`,

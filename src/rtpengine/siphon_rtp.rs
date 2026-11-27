@@ -53,11 +53,14 @@ mod events;
 mod far_leg;
 mod identity;
 mod node_features;
+mod offer_local;
 mod per_call;
 mod recording;
 mod scope;
 mod split;
 mod tee;
+#[cfg(test)]
+mod unknown_reason_tests;
 mod waiters;
 mod x3_at_offer;
 use connection::connection_manager;
@@ -3051,28 +3054,20 @@ mod tests {
         }
     }
 
-    /// With siphon-rtp-proto 0.29 the end reason is a closed enum on the wire:
-    /// an end carrying a reason outside the seven does not decode as an event,
-    /// so it never reaches a hook (the connection skips it). Documented here,
-    /// not worked around: a reason the engine adds needs the proto crate to
-    /// learn it. What a string does to the call is still stated: anything but
+    /// With siphon-rtp-proto 0.30 an end reason the build does not know
+    /// decodes to `Unknown`, so the event still arrives and the hook is told
+    /// `unknown`. What a string does to the call is still stated: anything but
     /// `detached` and `call_deleted` leaves it isolated.
     #[test]
-    fn an_unknown_split_end_reason_is_not_decoded_and_so_not_delivered() {
+    fn an_unknown_split_end_reason_is_delivered_as_unknown() {
         let known = r#"{"event":"ws_split_ended","call_id":"c","from_tag":"t","stream_id":"split-c","reason":"ws_error"}"#;
         assert!(serde_json::from_str::<Event>(known).is_ok());
         let unknown = known.replace("ws_error", "a_future_reason");
-        assert!(
-            serde_json::from_str::<Event>(&unknown).is_err(),
-            "proto 0.29 decodes no other reason; if this starts to pass, the reason is deliverable"
-        );
-
-        let ended = crate::rtpengine::events::WsSplitEnded {
-            call_id: "c".into(),
-            from_tag: "t".into(),
-            stream_id: "split-c".into(),
-            reason: "a_future_reason".to_string(),
+        let event = serde_json::from_str::<Event>(&unknown).expect("an unknown reason decodes");
+        let RtpEngineEvent::WsSplitEnded(ended) = convert_event(event) else {
+            panic!("a split-ended event");
         };
+        assert_eq!(ended.reason, "unknown");
         assert!(!ended.restores_direct_audio());
     }
 

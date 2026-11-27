@@ -344,6 +344,24 @@ impl SiphonRtpClientSet {
         }
     }
 
+    /// [`Self::reoffer_in`] without the replacement: a re-offer the engine can
+    /// take only by rebuilding the call (a changed codec) is its error, not a
+    /// new call on new ports. For a party that was already told its ports, whose
+    /// answer cannot be given other ones.
+    pub async fn reoffer_in_place(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        sdp: &[u8],
+        flags: &NgFlags,
+    ) -> Result<Vec<u8>, RtpEngineError> {
+        let framed = framed(None);
+        let scope = framed.as_ref();
+        self.select_key(&scoped_key(call_id, scope))
+            .reoffer_in(scope, call_id, from_tag, sdp, flags)
+            .await
+    }
+
     /// Send an `answer` under `scope` to the affinity-bound instance.
     pub async fn answer_in(
         &self,

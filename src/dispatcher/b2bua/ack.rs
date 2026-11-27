@@ -362,6 +362,11 @@ pub fn register_unacked_answer(
 ) -> Arc<UnackedAnswer> {
     let timers = crate::transaction::timer::TimerConfig::default();
     let unacked = Arc::new(UnackedAnswer {
+        cseq: response
+            .headers
+            .cseq()
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|number| number.parse().ok()),
         cancel: tokio::sync::Notify::new(),
         deadline: tokio::time::Instant::now() + timers.t1 * 64,
         internal_call_id: internal_call_id.to_string(),
@@ -581,13 +586,13 @@ pub fn reject_unanchorable_offer(
 /// caller broke the offer/answer exchange (RFC 3264 §4 puts the answer to an
 /// offer in a 2xx into the ACK). Not 16: nothing about this ending was normal,
 /// and no party hung up. The text says which rule was broken.
-const NO_ANSWER_IN_ACK_REASON: &str = q850_reason!(111, "No SDP answer in ACK");
+pub(super) const NO_ANSWER_IN_ACK_REASON: &str = q850_reason!(111, "No SDP answer in ACK");
 
 /// What a call ended because the media engine refused the caller's answer to an
 /// anchored delayed offer carries on its BYEs. Q.850 cause 47, "resource
 /// unavailable, unspecified": the media resource the call is anchored on could
 /// not complete the session.
-const MEDIA_ANCHOR_FAILED_REASON: &str = q850_reason!(47, "Media anchor failed");
+pub(super) const MEDIA_ANCHOR_FAILED_REASON: &str = q850_reason!(47, "Media anchor failed");
 
 /// An SDP answer that declines every stream `offer` makes (RFC 3264 §6): one
 /// `m=` line for each offered one, in the same order, with port 0 and the first
@@ -679,18 +684,32 @@ pub fn stamp_b_leg_origin(
 /// removes itself, so an ACK processed first always wins. No-op if none is armed
 /// (the ACK for a non-2xx).
 pub fn absorb_b2bua_ack(dialog_call_id: &str, ack: &SipMessage, state: &DispatcherState) -> bool {
-    let acked_now = match state.uas_2xx_retransmits.remove(dialog_call_id) {
+    // Only the ACK of the INVITE the 2xx answers takes its entry: a late
+    // duplicate ACK of an earlier INVITE names the same dialog and would
+    // otherwise cancel the retransmission and 64*T1 deadline of a later
+    // exchange (a refresh), leaving it waiting for an ACK nobody is owed.
+    let ack_cseq = super::refresh_answer::cseq_number(ack);
+    let acked_now = match state
+        .uas_2xx_retransmits
+        .remove_if(dialog_call_id, |_, unacked| {
+            unacked.cseq.is_none() || unacked.cseq == ack_cseq
+        }) {
         Some((_, unacked)) => {
             unacked.cancel.notify_one();
             true
         }
         None => false,
     };
+    // An entry still there is another exchange's: this ACK is not for it, and
+    // releases nothing held for it.
+    let another_exchange = !acked_now && state.uas_2xx_retransmits.contains_key(dialog_call_id);
     if let Some(internal_id) = state.call_actors.find_by_message(ack) {
         // The leg carrying this dialog is confirmed, whichever slot a takeover
         // has moved it to.
+        let mut is_a_leg_dialog = false;
         if let Some(mut call) = state.call_actors.get_call_mut(&internal_id) {
             if call.a_leg.dialog.call_id == dialog_call_id {
+                is_a_leg_dialog = true;
                 call.a_leg.initial_acked = true;
             } else if let Some(leg) = call
                 .b_legs
@@ -701,6 +720,11 @@ pub fn absorb_b2bua_ack(dialog_call_id: &str, ack: &SipMessage, state: &Dispatch
             }
         }
         send_delayed_offer_ack(&internal_id, ack, state);
+        // The ACK to a 2xx that carried the engine's own offer brings the answer.
+        if is_a_leg_dialog {
+            super::local_offer::complete_local_offer(&internal_id, ack, state);
+            super::refresh_answer::complete_refresh_answer(&internal_id, ack, state);
+        }
         // A teardown that began while this ACK was on its way may have held the
         // BYE for it (RFC 3261 §15): it goes out now, right after the ACK. Only
         // the ACK that took the answer can find one.
@@ -712,7 +736,7 @@ pub fn absorb_b2bua_ack(dialog_call_id: &str, ack: &SipMessage, state: &Dispatch
     }
     // The dialog has ended while its 2xx waited for this ACK, and its BYE was held
     // for it (RFC 3261 §15): the ACK sends it.
-    if release_held_bye(dialog_call_id, state) || acked_now {
+    if (!another_exchange && release_held_bye(dialog_call_id, state)) || acked_now {
         debug!(sip_call_id = %dialog_call_id, "B2BUA: ACK for a dialog that has ended");
         return true;
     }

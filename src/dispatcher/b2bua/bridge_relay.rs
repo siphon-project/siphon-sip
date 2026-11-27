@@ -285,7 +285,7 @@ pub fn relay_bridged_offer(
 
 /// A session refresh on a bridged leg: answered from the session in force on
 /// it, touching neither the engine nor the other party.
-fn answer_refresh(
+pub(super) fn answer_refresh(
     inbound: &InboundMessage,
     message: &SipMessage,
     call_id: &str,

@@ -13,6 +13,24 @@ use super::*;
 
 // ---------------------------------------------------------------------------
 
+impl CallActor {
+    /// Set the actor handle for a B-leg.
+    pub fn set_b_leg_handle(&mut self, index: usize, handle: LegHandle) {
+        if index < self.b_leg_handles.len() {
+            self.b_leg_handles[index] = Some(handle);
+        }
+    }
+
+    /// Send `Shutdown` to all active B-leg actor handles.
+    pub fn shutdown_actors(&self) {
+        for handle in self.b_leg_handles.iter().flatten() {
+            let _ = handle.tx.try_send(LegMessage::Shutdown);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 /// Messages sent to a leg actor's mailbox (for async mode).
 ///
 /// `large_enum_variant` is intentionally allowed: `SipInbound` is the hot,

@@ -788,6 +788,48 @@ impl MediaBackend {
         }
     }
 
+    /// Single-leg UAS **offer**: the engine's own SDP offer for a call whose
+    /// INVITE carried no SDP (RFC 3261 §13.2.1), to go in the 2xx. The caller's
+    /// answer, from its ACK, completes it through
+    /// [`Self::complete_offer_local`]. Native `siphon-rtp` backend only, and
+    /// only an engine that lists `offer_local` in its `node_info` features.
+    pub async fn offer_local(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        flags: &NgFlags,
+    ) -> Result<String, RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => client.offer_local(call_id, from_tag, flags).await,
+            Self::RtpEngine(_) | Self::RtpProxy(_) => Err(RtpEngineError::Protocol(
+                "offer_local is only supported by the native siphon-rtp backend".to_string(),
+            )),
+        }
+    }
+
+    /// Complete an [`Self::offer_local`] with the caller's answer: `from_tag`
+    /// is the caller's tag and `to_tag` the one the 2xx carried. A refused
+    /// answer leaves the engine call pending, so the caller of this deletes it.
+    pub async fn complete_offer_local(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        to_tag: &str,
+        sdp: &[u8],
+        flags: &NgFlags,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => {
+                client
+                    .complete_offer_local(call_id, from_tag, to_tag, sdp, flags)
+                    .await
+            }
+            Self::RtpEngine(_) | Self::RtpProxy(_) => Err(RtpEngineError::Protocol(
+                "offer_local is only supported by the native siphon-rtp backend".to_string(),
+            )),
+        }
+    }
+
     /// Grow a call the engine answered itself (`answer_local`) into a relay
     /// toward a far party: the engine binds a far leg behind the caller's
     /// answer and returns the SDP offer for it. The callee's SDP then completes
@@ -920,6 +962,23 @@ impl MediaBackend {
             Self::RtpEngine(set) => set.offer(call_id, from_tag, sdp, flags).await,
             Self::SiphonRtp(client) => client.reoffer(call_id, from_tag, sdp, flags).await,
             Self::RtpProxy(client) => client.offer(call_id, from_tag, sdp, flags).await,
+        }
+    }
+
+    /// [`Self::reoffer`] for a party that was already told its ports and cannot
+    /// be given others: the native engine's replacement of a call whose codec
+    /// changed (new ports, attachments dropped) is refused as an error instead.
+    /// The other backends re-offer as they always do.
+    pub async fn reoffer_in_place(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        sdp: &[u8],
+        flags: &NgFlags,
+    ) -> Result<Vec<u8>, RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => client.reoffer_in_place(call_id, from_tag, sdp, flags).await,
+            _ => self.reoffer(call_id, from_tag, sdp, flags).await,
         }
     }
 

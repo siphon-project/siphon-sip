@@ -70,6 +70,14 @@ toward the caller. There is no second SIP leg. This is the voice-AI
 answer-the-call shape, usually paired with `rtpengine.answer_local(...)` and the
 built-in `voice_ai` profile.
 
+A caller whose INVITE carries no SDP (RFC 3261 §13.2.1) is answered the same way
+by the control plane's anchored `answer`, which needs a siphon-rtp 0.30 or later
+(`node_info` lists `offer_local`): the engine makes the offer for the 2xx and the
+caller's answer in its ACK completes the call. The `ws_uri` goes in that offer and
+the engine dials the bot when the answer arrives, so it is not attached again
+afterwards. An older engine refuses such an `answer` (`unavailable`), and anchored
+early media is not offered on such an INVITE at all.
+
 A bridge can also be attached to a call that is already **relaying**, rather
 than negotiated at offer/answer — the engine takes the live relay over, and
 gives it back on detach:

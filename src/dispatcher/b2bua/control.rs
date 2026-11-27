@@ -435,6 +435,10 @@ pub fn send_uas_response(
         return send_a_leg_provisional(internal_call_id, response, false, None, state);
     }
     if final_response && (200..300).contains(&code) {
+        // Claim the final answer before sending: after a CANCEL's 487, no 2xx.
+        if !state.call_actors.claim_final_answer(internal_call_id) {
+            return false;
+        }
         // An answer siphon gives the caller itself is the session description in
         // force on the caller's dialog, under the `o=` it went out with. A
         // provisional's early media is not, until a 2xx confirms it. The 2xx answers

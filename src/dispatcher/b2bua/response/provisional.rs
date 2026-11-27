@@ -95,7 +95,7 @@ pub fn b_leg_provisional(
         // the control plane dialled its SDP is the media answer, and
         // `@b2bua.on_early_media` below lets a script put it through the media
         // engine before it is relayed.
-        let has_sdp_body = !message.body.is_empty();
+        let mut has_sdp_body = !message.body.is_empty();
         if has_sdp_body {
             if let Err(error) =
                 control_dial_media_answer(call_id, branch, message, response_source.ip(), state)
@@ -108,11 +108,14 @@ pub fn b_leg_provisional(
                 report_control_dial_failure(call_id, 503, "Media negotiation failed", false, state);
                 return;
             }
+            // A phone's offer a caller that sent none cannot take is dropped
+            // there, leaving plain ringing.
+            has_sdp_body = !message.body.is_empty();
             // Behind siphon's own early answer, the callee's first SDP is the far
             // leg's answer. One the engine refuses connects nothing, and the
             // caller stays on the engine's pipeline until the callee's 2xx says
             // whether it means it.
-            if let Some(invite_arc) = &snapshot.a_leg_invite {
+            if let Some(invite_arc) = snapshot.a_leg_invite.as_ref().filter(|_| has_sdp_body) {
                 let invite = invite_arc.lock().ok().map(|guard| guard.clone());
                 if let Some(invite) = invite {
                     if let Err(error) =

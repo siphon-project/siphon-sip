@@ -79,6 +79,14 @@ pub fn handle_b2bua_reinvite(
         return;
     }
 
+    // An offer of the caller's own refresh is still outstanding: nothing else
+    // from the caller is an exchange until its answer has been applied.
+    if from_a_leg
+        && super::refresh_answer::answer_outstanding_refresh(&inbound, &message, &call_id, state)
+    {
+        return;
+    }
+
     // Flow refresh (RFC 5626 / RFC 3261 §12.2.2): the peer may have sent this
     // in-dialog re-INVITE on a new flow (TLS reconnect / NAT rebind). Re-anchor
     // the originating leg's transport + remote target on the arrival flow so the
@@ -208,6 +216,25 @@ pub fn handle_b2bua_reinvite(
             in_force,
             state,
         );
+        return;
+    }
+
+    // A refresh with no SDP (RFC 4028 §10, RFC 3261 §14.2) on a call the media
+    // engine anchors is answered from the session in force toward the caller,
+    // as on a bridged leg, and goes no further. Relayed offerless, the callee's
+    // 2xx would bring an offer that the engine takes for an answer to nothing,
+    // and the caller's answer in its ACK would have nowhere to go.
+    if from_a_leg
+        && message.body.is_empty()
+        && a_leg.dialog.last_sent_sdp.is_some()
+        && state
+            .rtpengine_sessions
+            .as_ref()
+            .is_some_and(|sessions| sessions.get(&a_leg.dialog.call_id).is_some())
+    {
+        // The 200 repeats the session in force, which makes it an offer: the
+        // caller's ACK answers it, and is read as such.
+        super::refresh_answer::answer_offerless_refresh(&inbound, &message, &call_id, state);
         return;
     }
 
@@ -1040,6 +1067,28 @@ pub fn send_one_legged_ok_with(
     extras: &AnswerExtras,
     state: &DispatcherState,
 ) -> SipMessage {
+    let response = build_one_legged_ok(inbound, message, call_id, body, extras, state);
+    send_message_from(
+        response.clone(),
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        Some(inbound.local_addr),
+        state,
+    );
+    response
+}
+
+/// The `200` [`send_one_legged_ok_with`] sends, built and not sent: the
+/// caller of an offerless refresh puts it under retransmission first.
+pub(super) fn build_one_legged_ok(
+    inbound: &InboundMessage,
+    message: &SipMessage,
+    call_id: &str,
+    body: Vec<u8>,
+    extras: &AnswerExtras,
+    state: &DispatcherState,
+) -> SipMessage {
     let mut response = build_response(
         message,
         200,
@@ -1075,14 +1124,6 @@ pub fn send_one_legged_ok_with(
             error!(call_id = %call_id, "B2BUA: the answer could not be framed: {why}");
         }
     }
-    send_message_from(
-        response.clone(),
-        inbound.transport,
-        inbound.remote_addr,
-        inbound.connection_id,
-        Some(inbound.local_addr),
-        state,
-    );
     response
 }
 
@@ -1121,6 +1162,50 @@ pub fn reoffer_through_media_engine(
     offerer_sip_call_id: &str,
     offer: &[u8],
 ) -> ReofferOutcome {
+    reoffer_through_engine(
+        state,
+        a_leg_call_id,
+        from_a_leg,
+        received_from,
+        offerer_sip_call_id,
+        offer,
+        false,
+    )
+}
+
+/// [`reoffer_through_media_engine`] for an offer that is an *answer* to one
+/// the party already holds the ports of (the ACK to an offerless refresh's
+/// `200`): an engine that could take it only by replacing the session fails it
+/// instead, as a replacement would leave that party signalled with the old
+/// ports.
+pub fn reoffer_in_place_through_media_engine(
+    state: &DispatcherState,
+    a_leg_call_id: &str,
+    from_a_leg: bool,
+    received_from: std::net::IpAddr,
+    offerer_sip_call_id: &str,
+    offer: &[u8],
+) -> ReofferOutcome {
+    reoffer_through_engine(
+        state,
+        a_leg_call_id,
+        from_a_leg,
+        received_from,
+        offerer_sip_call_id,
+        offer,
+        true,
+    )
+}
+
+fn reoffer_through_engine(
+    state: &DispatcherState,
+    a_leg_call_id: &str,
+    from_a_leg: bool,
+    received_from: std::net::IpAddr,
+    offerer_sip_call_id: &str,
+    offer: &[u8],
+    in_place: bool,
+) -> ReofferOutcome {
     let (Some(rtpengine_set), Some(media_sessions), Some(profiles)) = (
         &state.rtpengine_set,
         &state.rtpengine_sessions,
@@ -1150,12 +1235,22 @@ pub fn reoffer_through_media_engine(
         .party_ingress(from_a_leg)
         .stamp_ingress(&mut offer_flags, profiles, received_from);
     offer_flags.stamp_sip_call_id(offerer_sip_call_id);
-    match crate::script::blocking::block_on_released(rtpengine_set.reoffer(
-        session.rtpengine_id(),
-        offer_tag,
-        offer,
-        &offer_flags,
-    )) {
+    let reoffered = if in_place {
+        crate::script::blocking::block_on_released(rtpengine_set.reoffer_in_place(
+            session.rtpengine_id(),
+            offer_tag,
+            offer,
+            &offer_flags,
+        ))
+    } else {
+        crate::script::blocking::block_on_released(rtpengine_set.reoffer(
+            session.rtpengine_id(),
+            offer_tag,
+            offer,
+            &offer_flags,
+        ))
+    };
+    match reoffered {
         Ok(rewritten) => ReofferOutcome::Rewritten(rewritten),
         Err(error) => ReofferOutcome::Failed(error.to_string()),
     }

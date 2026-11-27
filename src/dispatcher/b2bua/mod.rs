@@ -44,6 +44,7 @@ mod info_outbound;
 mod invite;
 mod late_prack_offer;
 mod leg_offer;
+mod local_offer;
 mod on_failure;
 mod originate;
 mod originate_auth;
@@ -57,6 +58,9 @@ mod refer;
 mod refer_answered;
 mod refer_controller;
 mod refer_outbound;
+mod refresh_answer;
+#[cfg(test)]
+pub(crate) use refresh_answer::on_marker_published;
 mod refresh_offer_relay;
 mod reinvite_in;
 mod reinvite_out;

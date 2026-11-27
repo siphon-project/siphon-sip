@@ -90,6 +90,9 @@ impl ControlAdapter for SipControlAdapter {
         // Media verbs bind to the async MediaBackend, so they run on the async
         // path; every other verb is a synchronous decision over the B2BUA rail.
         Box::pin(async move {
+            if let Some(refusal) = hold_for_delayed_answer(&command).await {
+                return refusal;
+            }
             if command.verb == MODULE_VERB {
                 // Module-level: it creates the channel rather than addressing one.
                 on_python_executor(move || originate(command)).await
@@ -369,6 +372,39 @@ fn controlled_channel(command: &AdapterCommand) -> Result<ChannelRef, ControlRes
         store.mark_controller_acted(&channel.call_actor_id);
     }
     Ok(channel)
+}
+
+/// How long a verb waits for the caller's answer to the engine's offer: the
+/// 64*T1 the 2xx is retransmitted for (RFC 3261 §17.1.1.1), plus a second.
+const DELAYED_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(33);
+
+/// Hold a verb that needs the call's engine call until the caller has answered
+/// the offer the engine made for its 2xx (an `answer` on an INVITE with no SDP,
+/// RFC 3261 §13.2.1). The engine takes nothing but the answer and a delete
+/// before that (`offer-local-pending`), so a controller that answers and then
+/// plays, records or dials is sequenced after the ACK instead of refused.
+/// `None` when it need not wait, or the wait is over: the call is then answered
+/// or gone, and the verb finds out which.
+async fn hold_for_delayed_answer(command: &AdapterCommand) -> Option<ControlResult> {
+    if !(is_media_verb(&command.verb) || command.verb == "dial") {
+        return None;
+    }
+    let ResolvedTarget::Channel(channel) = &command.target else {
+        return None;
+    };
+    let mut answered = crate::b2bua::actor::global_call_store()?
+        .pending_local_offer_wait(&channel.call_actor_id)?;
+    // The sender is dropped when the answer is applied or the call ends, which
+    // is what ends the wait; nothing is ever sent on it.
+    match tokio::time::timeout(DELAYED_ANSWER_WAIT, answered.changed()).await {
+        Ok(_) => None,
+        Err(_) => Some(ControlResult::error(
+            ControlErrorCode::InvalidState,
+            "the caller has not answered the media engine's offer (its INVITE carried no SDP, \
+             and its ACK has not brought the answer)"
+                .to_string(),
+        )),
+    }
 }
 
 /// Dispatch one synchronous SIP verb (the imperative B2BUA rail is non-blocking)

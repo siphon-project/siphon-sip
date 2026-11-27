@@ -191,6 +191,8 @@ mod control_dial_bridge_tests;
 #[cfg(test)]
 mod control_dial_contact_host_tests;
 #[cfg(test)]
+mod control_dial_delayed_offer_tests;
+#[cfg(test)]
 mod control_dial_identity_tests;
 #[cfg(test)]
 mod control_dial_reroute_after_progress_tests;
@@ -217,7 +219,11 @@ mod control_unbridge_reoffer_tests;
 #[cfg(test)]
 mod delayed_offer_ack_tests;
 #[cfg(test)]
+mod delayed_offer_answer_tests;
+#[cfg(test)]
 mod delayed_offer_ingress_tests;
+#[cfg(test)]
+mod delayed_offer_race_tests;
 #[cfg(test)]
 mod dial_bridge_test_harness;
 #[cfg(test)]
@@ -362,6 +368,12 @@ mod public_api_surface;
 mod recording_finished_event_tests;
 #[cfg(test)]
 mod refer_answer_tests;
+#[cfg(test)]
+mod refresh_codec_change_tests;
+#[cfg(test)]
+mod refresh_glare_tests;
+#[cfg(test)]
+mod refresh_retransmit_tests;
 #[cfg(test)]
 mod register_exchange_tests;
 #[cfg(test)]
