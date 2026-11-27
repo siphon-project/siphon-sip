@@ -92,6 +92,13 @@ fn resolve_profiles_with(
     registry: Option<&crate::rtpengine::ProfileRegistry>,
     caller_webrtc: bool,
 ) -> Result<Option<String>, DialError> {
+    // The dial's own `profile` is a typed name even when every target
+    // overrides it, so it is checked on its own, before any override applies.
+    if let (Some(registry), Some(name)) = (registry, shaping.profile.as_deref()) {
+        if !registry.is_defined(name) {
+            return Err(DialError::Media(format!("unknown media profile '{name}'")));
+        }
+    }
     for target in targets.iter_mut() {
         target.profile = target.shaping_over(shaping).profile;
         if let (Some(registry), Some(name)) = (registry, target.profile.as_deref()) {
@@ -490,6 +497,27 @@ mod tests {
 
     /// A profile a single target names is typed too: the dial's own is a
     /// defined one, the target's override is a generated form.
+    /// Every target names a valid profile of its own, so the dial's is never
+    /// applied; it is still a typed name and is refused.
+    #[test]
+    fn a_dial_level_generated_name_is_refused_even_when_every_target_overrides_it() {
+        let registry = extension_profiles();
+        let mut targets = vec![DialTarget {
+            profile: Some("extension".to_string()),
+            ..bound("sip:201@198.51.100.7", Some(Transport::Udp))
+        }];
+        let shaping = DialShaping {
+            profile: Some("extension#webrtc-answer".to_string()),
+            ..Default::default()
+        };
+        let error = resolve_profiles_with(&mut targets, &shaping, Some(&registry), false)
+            .expect_err("a generated name is not selectable");
+        assert!(
+            error.to_string().contains("extension#webrtc-answer"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn a_target_cannot_name_a_generated_variant() {
         let registry = extension_profiles();
