@@ -783,6 +783,7 @@ async fn a_2xx_never_acked_ends_the_recording_with_a_bye() {
     state.uas_2xx_retransmits.insert(
         call_id.to_string(),
         Arc::new(UnackedAnswer {
+            cseq: None,
             cancel: tokio::sync::Notify::new(),
             deadline: tokio::time::Instant::now() - Duration::from_millis(1),
             internal_call_id: armed.internal_call_id.clone(),

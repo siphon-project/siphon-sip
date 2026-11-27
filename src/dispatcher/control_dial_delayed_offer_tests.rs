@@ -462,6 +462,7 @@ async fn a_caller_that_never_acks_ends_the_call_at_timer_h_and_frees_the_media()
         dial.state.uas_2xx_retransmits.insert(
             key,
             Arc::new(UnackedAnswer {
+                cseq: None,
                 cancel: tokio::sync::Notify::new(),
                 deadline: tokio::time::Instant::now() - std::time::Duration::from_secs(1),
                 internal_call_id: armed.internal_call_id.clone(),

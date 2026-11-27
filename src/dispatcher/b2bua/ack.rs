@@ -362,6 +362,11 @@ pub fn register_unacked_answer(
 ) -> Arc<UnackedAnswer> {
     let timers = crate::transaction::timer::TimerConfig::default();
     let unacked = Arc::new(UnackedAnswer {
+        cseq: response
+            .headers
+            .cseq()
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|number| number.parse().ok()),
         cancel: tokio::sync::Notify::new(),
         deadline: tokio::time::Instant::now() + timers.t1 * 64,
         internal_call_id: internal_call_id.to_string(),
@@ -679,13 +684,25 @@ pub fn stamp_b_leg_origin(
 /// removes itself, so an ACK processed first always wins. No-op if none is armed
 /// (the ACK for a non-2xx).
 pub fn absorb_b2bua_ack(dialog_call_id: &str, ack: &SipMessage, state: &DispatcherState) -> bool {
-    let acked_now = match state.uas_2xx_retransmits.remove(dialog_call_id) {
+    // Only the ACK of the INVITE the 2xx answers takes its entry: a late
+    // duplicate ACK of an earlier INVITE names the same dialog and would
+    // otherwise cancel the retransmission and 64*T1 deadline of a later
+    // exchange (a refresh), leaving it waiting for an ACK nobody is owed.
+    let ack_cseq = super::refresh_answer::cseq_number(ack);
+    let acked_now = match state
+        .uas_2xx_retransmits
+        .remove_if(dialog_call_id, |_, unacked| {
+            unacked.cseq.is_none() || unacked.cseq == ack_cseq
+        }) {
         Some((_, unacked)) => {
             unacked.cancel.notify_one();
             true
         }
         None => false,
     };
+    // An entry still there is another exchange's: this ACK is not for it, and
+    // releases nothing held for it.
+    let another_exchange = !acked_now && state.uas_2xx_retransmits.contains_key(dialog_call_id);
     if let Some(internal_id) = state.call_actors.find_by_message(ack) {
         // The leg carrying this dialog is confirmed, whichever slot a takeover
         // has moved it to.
@@ -719,7 +736,7 @@ pub fn absorb_b2bua_ack(dialog_call_id: &str, ack: &SipMessage, state: &Dispatch
     }
     // The dialog has ended while its 2xx waited for this ACK, and its BYE was held
     // for it (RFC 3261 §15): the ACK sends it.
-    if release_held_bye(dialog_call_id, state) || acked_now {
+    if (!another_exchange && release_held_bye(dialog_call_id, state)) || acked_now {
         debug!(sip_call_id = %dialog_call_id, "B2BUA: ACK for a dialog that has ended");
         return true;
     }

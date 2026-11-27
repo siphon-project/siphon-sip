@@ -481,6 +481,10 @@ pub struct UnackedAnswer {
     /// the entry, or by a later 2xx armed for the same call. The retransmit loop
     /// selects on this; once notified it stops sending and exits.
     pub cancel: tokio::sync::Notify,
+    /// The CSeq of the INVITE this 2xx answers, which only its ACK carries
+    /// too: another ACK of the dialog (a late duplicate for an earlier INVITE)
+    /// does not take it. `None` matches any.
+    pub cseq: Option<u32>,
     /// 64×T1 after the 2xx was first sent. Past it, with the entry still in the
     /// store, the sweep ends the call. A tokio instant, so a paused test clock
     /// moves it.

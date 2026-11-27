@@ -54,6 +54,7 @@ async fn a_refresh_200_never_acked_ends_the_call_at_the_deadline() {
     // Push the registered 2xx past its deadline instead of waiting 32 s.
     let dialog = refreshed.headers.call_id().expect("a Call-ID").to_string();
     let expired = Arc::new(UnackedAnswer {
+        cseq: None,
         cancel: tokio::sync::Notify::new(),
         deadline: tokio::time::Instant::now() - std::time::Duration::from_secs(1),
         internal_call_id: dial.call_id.clone(),
@@ -74,6 +75,46 @@ async fn a_refresh_200_never_acked_ends_the_call_at_the_deadline() {
     dial.deleted(1).await;
     assert!(!dial.call_is_up());
     assert!(dial.state.uas_2xx_retransmits.is_empty());
+}
+
+/// A late duplicate ACK of the first INVITE (CSeq 1) names the dialog of the
+/// refresh outstanding (CSeq 3) but does not answer it: the refresh's 200 keeps
+/// being retransmitted and 64*T1 still ends the call.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_ack_leaves_the_refresh_retransmission_and_deadline_running() {
+    let (dial, _caller_200, refreshed) = refreshed_dial("3 INVITE").await;
+    let (inbound, stale) = dial.caller_request("ACK", "1 ACK", &refreshed, Some(CALLER_ANSWER));
+    handle_request(inbound, stale, "ACK".to_string(), &dial.state);
+    assert!(
+        !dial.state.uas_2xx_retransmits.is_empty(),
+        "the refresh's 200 is still waiting for its own ACK"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    assert!(
+        dial.wire()
+            .iter()
+            .any(|sent| sent.message.status_code() == Some(200)),
+        "the 200 is still retransmitted"
+    );
+
+    let dialog = refreshed.headers.call_id().expect("a Call-ID").to_string();
+    let expired = Arc::new(UnackedAnswer {
+        cseq: None,
+        cancel: tokio::sync::Notify::new(),
+        deadline: tokio::time::Instant::now() - std::time::Duration::from_secs(1),
+        internal_call_id: dial.call_id.clone(),
+    });
+    dial.state
+        .uas_2xx_retransmits
+        .insert(dialog, expired)
+        .expect("still registered");
+    sweep_unacked_uas_2xx(&dial.state);
+    assert!(
+        to_caller(&dial.wire())
+            .iter()
+            .any(|sent| sent.is(Method::Bye)),
+        "64*T1 still ends the call"
+    );
 }
 
 /// The ACK that answers the refresh can reach another worker the moment its
