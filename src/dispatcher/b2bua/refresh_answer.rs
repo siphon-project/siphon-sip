@@ -48,6 +48,15 @@ pub(super) fn answer_offerless_refresh(
         &crate::b2bua::reoffer::AnswerExtras::default(),
         state,
     );
+    // The 200's entry for its ACK comes first, then the marker that lets the
+    // exchange be replayed and answered, then the send. Anything that can act
+    // on the marker (a retransmitted INVITE on another worker replaying the
+    // 200, and the ACK it draws) therefore finds the entry the ACK has to
+    // remove. The other way round, that ACK completes the exchange while there
+    // is no entry yet, and the entry registered after it is one nobody will ever
+    // acknowledge: the sweep would end a healthy call at 64*T1. Registered
+    // before anything is sent, a BYE for the dialog also waits for the ACK.
+    let unacked = register_unacked_answer(call_id, &response, state);
     if let Some(cseq) = cseq_number(message) {
         state.call_actors.expect_refresh_answer(
             call_id,
@@ -58,9 +67,8 @@ pub(super) fn answer_offerless_refresh(
             ),
         );
     }
-    // Registered before it is sent: from here a BYE for the dialog waits for
-    // the ACK, and the sweep holds the 200 to its deadline.
-    let unacked = register_unacked_answer(call_id, &response, state);
+    #[cfg(test)]
+    after_marker_published(call_id, state);
     send_message_from(
         response.clone(),
         inbound.transport,
@@ -208,5 +216,36 @@ pub(super) fn complete_refresh_answer(call_id: &str, ack: &SipMessage, state: &D
             warn!(call_id = %call_id, %error, "B2BUA: the media engine cannot take the caller's answer to the session refresh's offer on the session it advertised; ending the call");
             b2bua_terminate_call_inner(call_id, Some(MEDIA_ANCHOR_FAILED_REASON), "b2bua", state);
         }
+    }
+}
+
+/// What a test runs on the thread that has just published a refresh's marker,
+/// before it goes any further: the point another worker's retransmitted INVITE
+/// or the ACK could arrive at.
+#[cfg(test)]
+type MarkerHook = Box<dyn Fn(&DispatcherState) + Send + Sync>;
+
+#[cfg(test)]
+static MARKER_HOOKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, MarkerHook>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Run the hook a test set for `call_id`, once.
+#[cfg(test)]
+fn after_marker_published(call_id: &str, state: &DispatcherState) {
+    let hook = MARKER_HOOKS
+        .lock()
+        .ok()
+        .and_then(|mut hooks| hooks.remove(call_id));
+    if let Some(hook) = hook {
+        hook(state);
+    }
+}
+
+/// Set the hook [`after_marker_published`] runs for `call_id`.
+#[cfg(test)]
+pub(crate) fn on_marker_published(call_id: &str, hook: MarkerHook) {
+    if let Ok(mut hooks) = MARKER_HOOKS.lock() {
+        hooks.insert(call_id.to_string(), hook);
     }
 }

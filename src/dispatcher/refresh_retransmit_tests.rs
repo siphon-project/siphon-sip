@@ -3,7 +3,9 @@
 //! caller that never ACKs has its call ended (RFC 3261 §13.3.1.4), by the same
 //! machinery the initial 2xx uses.
 
-use super::control_dial_delayed_offer_tests::{refreshed_dial, to_caller, CALLER_ANSWER};
+use super::control_dial_delayed_offer_tests::{
+    refreshed_dial, relayed_200, to_caller, DelayedDial, CALLER_ANSWER, PHONE,
+};
 use super::*;
 
 /// Copies of the refresh's 200 reach the caller until its ACK stops them.
@@ -72,4 +74,38 @@ async fn a_refresh_200_never_acked_ends_the_call_at_the_deadline() {
     dial.deleted(1).await;
     assert!(!dial.call_is_up());
     assert!(dial.state.uas_2xx_retransmits.is_empty());
+}
+
+/// The ACK that answers the refresh can reach another worker the moment its
+/// marker is visible (a retransmitted INVITE replays the 200 from it). The
+/// 200's entry for that ACK is registered first, so the ACK removes it: no
+/// acknowledged exchange is left registered for the sweep to tear a healthy
+/// call down over.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ack_arriving_once_the_marker_is_visible_finds_the_registered_entry() {
+    let dial = DelayedDial::dial(&[PHONE], "rtp_to_srtp").await;
+    dial.phone_answers_with_an_offer();
+    let caller_200 = relayed_200(&dial.wire());
+    dial.caller_acks(&caller_200, Some(CALLER_ANSWER));
+    dial.wire();
+    let (inbound, ack) = dial.caller_request("ACK", "2 ACK", &caller_200, Some(CALLER_ANSWER));
+    let state = Arc::clone(&dial.state);
+    crate::dispatcher::on_marker_published(
+        &dial.call_id,
+        Box::new(move |_| {
+            handle_request(inbound.clone(), ack.clone(), "ACK".to_string(), &state);
+        }),
+    );
+    dial.refresh("2 INVITE", &caller_200);
+    assert!(
+        dial.state.uas_2xx_retransmits.is_empty(),
+        "the ACK took the entry; nothing is left to be swept"
+    );
+    assert!(dial
+        .state
+        .call_actors
+        .get_call(&dial.call_id)
+        .is_some_and(|call| call.pending_refresh_answer.is_none()));
+    sweep_unacked_uas_2xx(&dial.state);
+    assert!(dial.call_is_up());
 }

@@ -18,7 +18,7 @@ use crate::rtpengine::test_engine::TestEngine;
 
 const CALLER: &str = "192.0.2.10:5060";
 const CALLER_CALL_ID: &str = "delayed-dial@example.com";
-const PHONE: &str = "198.51.100.7:5060";
+pub(super) const PHONE: &str = "198.51.100.7:5060";
 const PHONE_OFFER: &str = concat!(
     "v=0\r\n",
     "o=phone 7 7 IN IP4 198.51.100.7\r\n",
