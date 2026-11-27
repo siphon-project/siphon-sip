@@ -49,7 +49,14 @@ pub(super) fn answer_offerless_refresh(
         state,
     );
     if let Some(cseq) = cseq_number(message) {
-        state.call_actors.expect_refresh_answer(call_id, cseq);
+        state.call_actors.expect_refresh_answer(
+            call_id,
+            crate::b2bua::actor::PendingRefreshAnswer::new(
+                cseq,
+                top_via_branch(message).unwrap_or_default(),
+                response.clone(),
+            ),
+        );
     }
     // Registered before it is sent: from here a BYE for the dialog waits for
     // the ACK, and the sweep holds the 200 to its deadline.
@@ -71,6 +78,50 @@ pub(super) fn answer_offerless_refresh(
         Some(inbound.local_addr),
         state,
     );
+}
+
+/// A re-INVITE from the caller while the offer its refresh's `200` made is
+/// still outstanding (RFC 3261 §14.1, §14.2): answered here, `491 Request
+/// Pending`, and never taken for an exchange of its own. `true` when it was
+/// answered. A re-INVITE from the callee meets the same exchange on the
+/// pending re-INVITE guard the ordinary path takes ([`expect_refresh_answer`]
+/// holds the caller's leg on it).
+pub(super) fn answer_outstanding_refresh(
+    inbound: &InboundMessage,
+    message: &SipMessage,
+    call_id: &str,
+    state: &DispatcherState,
+) -> bool {
+    if state.call_actors.refresh_in_progress(call_id).is_none() {
+        return false;
+    }
+    debug!(%call_id, "B2BUA: re-INVITE during an offerless refresh's offer: 491");
+    let response = build_response(
+        message,
+        491,
+        "Request Pending",
+        state.identity.load().server.as_deref(),
+        &[],
+    );
+    send_message_from(
+        response,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        Some(inbound.local_addr),
+        state,
+    );
+    true
+}
+
+/// The topmost Via branch of `message`, the transaction it belongs to.
+pub(super) fn top_via_branch(message: &SipMessage) -> Option<String> {
+    message
+        .headers
+        .get("Via")
+        .and_then(|raw| Via::parse_multi(raw).ok())
+        .and_then(|vias| vias.into_iter().next())
+        .and_then(|via| via.branch)
 }
 
 /// The number in a request's `CSeq`.
@@ -96,7 +147,7 @@ pub(super) fn complete_refresh_answer(call_id: &str, ack: &SipMessage, state: &D
     let Some(cseq) = cseq_number(ack) else {
         return;
     };
-    if !state.call_actors.take_refresh_answer(call_id, cseq) {
+    if !state.call_actors.claim_refresh_answer(call_id, cseq) {
         return;
     }
     let Some(answer) = sdp_in_body(message_content_type(ack), &ack.body) else {
@@ -122,6 +173,7 @@ pub(super) fn complete_refresh_answer(call_id: &str, ack: &SipMessage, state: &D
     ) {
         ReofferOutcome::Rewritten(_) | ReofferOutcome::NotAnchored => {
             state.call_actors.set_leg_last_sdp(call_id, true, &answer);
+            state.call_actors.finish_refresh_answer(call_id);
         }
         ReofferOutcome::NoOfferTag | ReofferOutcome::Failed(_) => {
             warn!(call_id = %call_id, "B2BUA: the media engine refused the caller's answer to the session refresh's offer; ending the call");

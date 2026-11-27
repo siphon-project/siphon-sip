@@ -54,23 +54,42 @@ impl CallActorStore {
             .count()
     }
 
-    /// An offerless re-INVITE (CSeq `cseq`) was answered with the session in
-    /// force, which is an offer (RFC 3261 §14.1): its ACK carries the answer.
-    pub fn expect_refresh_answer(&self, call_id: &str, cseq: u32) {
+    /// An offerless re-INVITE was answered with the session in force, which is
+    /// an offer (RFC 3261 §14.1): its ACK carries the answer. The caller's leg
+    /// is held on the pending re-INVITE guard, the one a re-INVITE of the other
+    /// party and an offer of siphon's own toward the caller read, until
+    /// [`Self::finish_refresh_answer`].
+    pub fn expect_refresh_answer(&self, call_id: &str, pending: PendingRefreshAnswer) {
         if let Some(mut call) = self.get_call_mut(call_id) {
-            call.pending_refresh_answer = Some(cseq);
+            call.pending_refresh_answer = Some(pending);
+            call.a_leg.pending_reinvite = true;
         }
     }
 
+    /// The exchange outstanding on the call: its CSeq, Via branch and `200`.
+    pub fn refresh_in_progress(&self, call_id: &str) -> Option<PendingRefreshAnswer> {
+        self.get_call(call_id)?.pending_refresh_answer.clone()
+    }
+
     /// Claim the answer an ACK of CSeq `cseq` brings to such an offer, once.
-    pub fn take_refresh_answer(&self, call_id: &str, cseq: u32) -> bool {
+    pub fn claim_refresh_answer(&self, call_id: &str, cseq: u32) -> bool {
         self.get_call_mut(call_id).is_some_and(|mut call| {
-            if call.pending_refresh_answer == Some(cseq) {
-                call.pending_refresh_answer = None;
-                true
-            } else {
-                false
+            match call.pending_refresh_answer.as_mut() {
+                Some(pending) if pending.cseq == cseq && !pending.claimed => {
+                    pending.claimed = true;
+                    true
+                }
+                _ => false,
             }
         })
+    }
+
+    /// The answer has been applied (or refused): the dialog has no offer
+    /// outstanding, and the guard is released.
+    pub fn finish_refresh_answer(&self, call_id: &str) {
+        if let Some(mut call) = self.get_call_mut(call_id) {
+            call.pending_refresh_answer = None;
+            call.a_leg.pending_reinvite = false;
+        }
     }
 }

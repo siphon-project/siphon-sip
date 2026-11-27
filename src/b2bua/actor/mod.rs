@@ -67,7 +67,7 @@ pub use hunt::*;
 pub use invite_retransmission::*;
 pub use leg::*;
 pub use leg_actor::*;
-pub use local_offer::PendingLocalOffer;
+pub use local_offer::{PendingLocalOffer, PendingRefreshAnswer};
 pub use originate_anchor::*;
 pub use originate_offer::*;
 pub use originate_progress::*;

@@ -79,6 +79,14 @@ pub fn handle_b2bua_reinvite(
         return;
     }
 
+    // An offer of the caller's own refresh is still outstanding: nothing else
+    // from the caller is an exchange until its answer has been applied.
+    if from_a_leg
+        && super::refresh_answer::answer_outstanding_refresh(&inbound, &message, &call_id, state)
+    {
+        return;
+    }
+
     // Flow refresh (RFC 5626 / RFC 3261 §12.2.2): the peer may have sent this
     // in-dialog re-INVITE on a new flow (TLS reconnect / NAT rebind). Re-anchor
     // the originating leg's transport + remote target on the arrival flow so the

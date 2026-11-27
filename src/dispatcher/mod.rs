@@ -369,6 +369,8 @@ mod recording_finished_event_tests;
 #[cfg(test)]
 mod refer_answer_tests;
 #[cfg(test)]
+mod refresh_glare_tests;
+#[cfg(test)]
 mod refresh_retransmit_tests;
 #[cfg(test)]
 mod register_exchange_tests;

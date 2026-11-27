@@ -53,3 +53,34 @@ impl PendingLocalOffer {
         }
     }
 }
+
+/// The offer an offerless re-INVITE's `200` repeated (the session in force),
+/// from that `200` to the point the caller's ACK answer has been applied to
+/// the engine (RFC 3261 §14.1, RFC 3264 §4). The dialog has an offer
+/// outstanding for that long: the caller's leg is held on the pending
+/// re-INVITE guard, and a request of the same transaction replays `response`.
+#[derive(Debug, Clone)]
+pub struct PendingRefreshAnswer {
+    /// CSeq of the re-INVITE, which its ACK carries too.
+    pub cseq: u32,
+    /// Topmost Via branch of the re-INVITE: the transaction a retransmission
+    /// repeats.
+    pub branch: String,
+    /// The `200`, as sent, for a retransmitted INVITE.
+    pub response: crate::sip::message::SipMessage,
+    /// Set by the ACK that takes the answer, so a copy of it completes nothing
+    /// twice.
+    pub claimed: bool,
+}
+
+impl PendingRefreshAnswer {
+    /// An exchange awaiting its ACK.
+    pub fn new(cseq: u32, branch: String, response: crate::sip::message::SipMessage) -> Self {
+        Self {
+            cseq,
+            branch,
+            response,
+            claimed: false,
+        }
+    }
+}
