@@ -737,6 +737,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 const ORPHAN_CALL_ID: &str = "reg-before-the-kill";
 
+/// A registrar's 2xx to a fetch that lists the orphan's Contact.
+const OUR_CONTACT_LISTED: &str = "Contact: <sip:trunk@192.0.2.1:5060>;expires=120\r\n";
+
+/// A registrar's 2xx to a fetch that lists only another node's Contact.
+const OTHER_CONTACT_LISTED: &str = "Contact: <sip:trunk@198.51.100.77:5060>;expires=120\r\n";
+
 /// A source that knows (or does not know, or cannot answer for) one trunk.
 struct StubLookup {
     answer: Result<Option<RegistrantRow>, String>,
@@ -818,8 +824,9 @@ fn orphan_record() -> BindingRecord {
 }
 
 impl Setup {
-    /// A restart that finds one orphaned binding: its de-REGISTER, sent.
-    async fn startup_orphan(
+    /// A restart that finds one orphaned binding: its fetch (RFC 3261
+    /// §10.2.3), sent.
+    async fn startup_fetch(
         &self,
         lookup: Option<Arc<StubLookup>>,
     ) -> (Arc<BindingStore>, SipMessage) {
@@ -833,6 +840,18 @@ impl Setup {
             .registrant
             .startup_cleanup(vec![orphan_record()], self.defaults());
         assert_eq!(report.deregistered, 1);
+        self.registrant.release_startup_deregistrations().await;
+        (store, self.send_queued_deregistration())
+    }
+
+    /// A restart that finds one orphaned binding whose fetch lists this node's
+    /// Contact: the de-REGISTER that follows, sent.
+    async fn startup_orphan(
+        &self,
+        lookup: Option<Arc<StubLookup>>,
+    ) -> (Arc<BindingStore>, SipMessage) {
+        let (store, fetch) = self.startup_fetch(lookup).await;
+        self.answer(&fetch, "200 OK", OUR_CONTACT_LISTED);
         self.registrant.release_startup_deregistrations().await;
         (store, self.send_queued_deregistration())
     }
@@ -1102,4 +1121,257 @@ async fn a_challenged_register_keeps_the_contact_of_the_first_one() {
     );
     assert_eq!(header(&first_message, "Contact"), expected);
     assert_eq!(header(&retry, "Contact"), expected);
+}
+
+// --- the fetch before a restart's de-REGISTER (RFC 3261 §10.2.3) ---------------
+
+/// The restart's first request queries the registrar and changes nothing: no
+/// Contact, no Expires, the stored Call-ID, a CSeq past the stored one.
+#[tokio::test]
+async fn a_restarts_first_request_is_a_fetch_with_no_contact_and_no_expires() {
+    let setup = Setup::new();
+    let (_store, fetch) = setup.startup_fetch(None).await;
+
+    assert_eq!(fetch.method(), Some(&crate::sip::message::Method::Register));
+    assert!(fetch.headers.get("Contact").is_none());
+    assert!(fetch.headers.get("Expires").is_none());
+    assert!(header(&fetch, "Authorization").is_empty());
+    assert_eq!(header(&fetch, "Call-ID"), ORPHAN_CALL_ID);
+    assert!(cseq(&fetch) > orphan_record().next_cseq);
+}
+
+#[tokio::test]
+async fn a_fetch_listing_our_contact_is_followed_by_the_de_register_on_the_next_cseq() {
+    let setup = Setup::new();
+    let (store, fetch) = setup.startup_fetch(None).await;
+    setup.answer(&fetch, "200 OK", OUR_CONTACT_LISTED);
+    setup.registrant.release_startup_deregistrations().await;
+    let deregister = setup.send_queued_deregistration();
+
+    assert_eq!(header(&deregister, "Expires"), "0");
+    assert_eq!(header(&deregister, "Call-ID"), ORPHAN_CALL_ID);
+    assert_eq!(cseq(&deregister), cseq(&fetch) + 1);
+    assert!(header(&deregister, "Contact").contains("sip:trunk@192.0.2.1:5060"));
+    assert_eq!(setup.registrant.removed_deregistrations_pending(), 1);
+
+    setup.answer(&deregister, "200 OK", "Expires: 0\r\n");
+    assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
+    assert!(store.load().await.expect("loaded").is_empty());
+}
+
+/// A listed Contact that is the same URI spelled another way (case, parameter
+/// order, a bare form with header parameters) still counts as ours.
+#[tokio::test]
+async fn an_equivalent_listed_contact_still_counts_as_ours() {
+    for listed in [
+        "Contact: <SIP:trunk@192.0.2.1:5060>;expires=120\r\n",
+        "Contact: sip:trunk@192.0.2.1:5060;expires=120\r\n",
+        "Contact: <sip:trunk@198.51.100.77:5060>, <sip:trunk@192.0.2.1:5060>\r\n",
+    ] {
+        let setup = Setup::new();
+        let (_store, fetch) = setup.startup_fetch(None).await;
+        setup.answer(&fetch, "200 OK", listed);
+        setup.registrant.release_startup_deregistrations().await;
+        let deregister = setup.send_queued_deregistration();
+        assert_eq!(header(&deregister, "Expires"), "0", "{listed}");
+    }
+}
+
+/// The registrar keeps one binding per AoR and another node holds it: nothing
+/// is sent, the record is dropped, nothing stays tracked.
+#[tokio::test]
+async fn a_fetch_listing_only_another_contact_sends_no_de_register_and_drops_the_record() {
+    for listed in [OTHER_CONTACT_LISTED, ""] {
+        let setup = Setup::new();
+        let (store, fetch) = setup.startup_fetch(None).await;
+        setup.answer(&fetch, "200 OK", listed);
+        setup.registrant.release_startup_deregistrations().await;
+
+        assert!(
+            test_support::take_deregistrations(&setup.registrant).is_empty(),
+            "a de-REGISTER was queued over {listed:?}"
+        );
+        assert!(setup.dispatcher.udp.try_recv().is_err());
+        assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
+        assert!(store.load().await.expect("loaded").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_refused_or_unanswered_fetch_sends_no_de_register_and_drops_the_record() {
+    let setup = Setup::new();
+    let (store, fetch) = setup.startup_fetch(None).await;
+    setup.answer(&fetch, "503 Service Unavailable", "");
+    setup.registrant.release_startup_deregistrations().await;
+    assert!(test_support::take_deregistrations(&setup.registrant).is_empty());
+    assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
+    assert!(store.load().await.expect("loaded").is_empty());
+
+    let setup = Setup::new();
+    let (store, fetch) = setup.startup_fetch(None).await;
+    let timer_f = setup.timer(&fetch, TimerName::F).expect("Timer F");
+    setup.fire(timer_f);
+    wait_until_pending_is(&setup.registrant, 0).await;
+    setup.registrant.release_startup_deregistrations().await;
+    assert!(test_support::take_deregistrations(&setup.registrant).is_empty());
+    assert!(store.load().await.expect("loaded").is_empty());
+}
+
+/// A challenged fetch is answered from the lookup, still without Contact or
+/// Expires; its 2xx listing ours leads to a de-REGISTER that is challenged and
+/// answered the same way.
+#[tokio::test]
+async fn a_challenged_fetch_is_answered_from_the_lookup_and_the_de_register_too() {
+    let setup = Setup::new();
+    let (store, fetch) = setup
+        .startup_fetch(Some(StubLookup::knowing(
+            "looked-up-user",
+            "looked-up-password",
+        )))
+        .await;
+    setup.challenge(&fetch, "401 Unauthorized", "WWW-Authenticate");
+
+    let authenticated_fetch = setup.queued_after_lookup().await.expect("the answer");
+    assert!(header(&authenticated_fetch, "Authorization").contains("username=\"looked-up-user\""));
+    assert!(authenticated_fetch.headers.get("Contact").is_none());
+    assert!(authenticated_fetch.headers.get("Expires").is_none());
+    assert_eq!(header(&authenticated_fetch, "Call-ID"), ORPHAN_CALL_ID);
+    assert_eq!(cseq(&authenticated_fetch), cseq(&fetch) + 1);
+
+    setup.answer(&authenticated_fetch, "200 OK", OUR_CONTACT_LISTED);
+    let deregister = setup.queued_after_lookup().await.expect("the de-REGISTER");
+    assert_eq!(header(&deregister, "Expires"), "0");
+    assert_eq!(cseq(&deregister), cseq(&authenticated_fetch) + 1);
+
+    setup.challenge(&deregister, "401 Unauthorized", "WWW-Authenticate");
+    let authenticated = setup.queued_after_lookup().await.expect("the answer");
+    assert_eq!(header(&authenticated, "Expires"), "0");
+    assert!(header(&authenticated, "Authorization").contains("username=\"looked-up-user\""));
+    assert_eq!(cseq(&authenticated), cseq(&deregister) + 1);
+
+    setup.answer(&authenticated, "200 OK", "Expires: 0\r\n");
+    assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
+    assert!(store.load().await.expect("loaded").is_empty());
+}
+
+/// A fetch and the de-REGISTER after it are one attempt toward the bound.
+#[tokio::test]
+async fn a_fetch_and_its_de_register_count_as_one_attempt() {
+    let setup = Setup::new();
+    let (store, fetch) = setup.startup_fetch(None).await;
+    assert_eq!(store.load().await.expect("loaded")[0].attempts, 1);
+    setup.answer(&fetch, "200 OK", OUR_CONTACT_LISTED);
+    setup.registrant.release_startup_deregistrations().await;
+    let _ = setup.send_queued_deregistration();
+    assert_eq!(store.load().await.expect("loaded")[0].attempts, 1);
+}
+
+/// Project leak gate: the tracked requests, the staged queue, the transactions,
+/// the timers and the stored records are back where they began whichever way
+/// the fetch and the de-REGISTER end.
+#[tokio::test]
+async fn fetches_leave_nothing_behind_whichever_way_they_end() {
+    let setup = Setup::new();
+    let baseline_transactions = setup.transactions();
+    let baseline_timers = setup.dispatcher.state.timer_wheel.len();
+    let store = BindingStore::in_memory("node-a", 30);
+    setup.registrant.attach_binding_store(Arc::clone(&store));
+    setup
+        .registrant
+        .set_credential_lookup(StubLookup::knowing("user-a", "pw"));
+
+    for cycle in 0..40 {
+        store.save(orphan_record());
+        setup
+            .registrant
+            .startup_cleanup(vec![orphan_record()], setup.defaults());
+        setup.registrant.release_startup_deregistrations().await;
+        let fetch = setup.send_queued_deregistration();
+        match cycle % 5 {
+            0 => setup.answer(&fetch, "200 OK", OTHER_CONTACT_LISTED),
+            1 => setup.answer(&fetch, "200 OK", ""),
+            2 => setup.answer(&fetch, "500 Server Error", ""),
+            3 => {
+                setup.answer(&fetch, "200 OK", OUR_CONTACT_LISTED);
+                setup.registrant.release_startup_deregistrations().await;
+                let deregister = setup.send_queued_deregistration();
+                setup.answer(&deregister, "200 OK", "Expires: 0\r\n");
+            }
+            _ => {
+                let timer_f = setup.timer(&fetch, TimerName::F).expect("Timer F");
+                setup.fire(timer_f);
+                wait_until_pending_is(&setup.registrant, 0).await;
+            }
+        }
+        let _ = setup.dispatcher.udp.try_iter().count();
+    }
+    setup.fire(Instant::now() + 64 * T1);
+    wait_until_pending_is(&setup.registrant, 0).await;
+    setup.registrant.release_startup_deregistrations().await;
+
+    assert_eq!(setup.transactions(), baseline_transactions);
+    assert_eq!(setup.dispatcher.state.timer_wheel.len(), baseline_timers);
+    assert!(store.load().await.expect("loaded").is_empty());
+    assert_eq!(store.pending_writes(), 0);
+    assert!(test_support::take_deregistrations(&setup.registrant).is_empty());
+    assert!(setup.registrant.is_empty());
+}
+
+/// RFC 3261 §10.3 step 8: our Contact listed with an expiry of zero (its own
+/// parameter, or the answer's `Expires`) is not bound, whatever else is listed.
+#[tokio::test]
+async fn our_contact_listed_with_a_zero_expiry_does_not_authorize_the_de_register() {
+    for listed in [
+        "Contact: <sip:trunk@192.0.2.1:5060>;expires=0\r\nContact: <sip:trunk@198.51.100.77:5060>;expires=120\r\n",
+        "Expires: 0\r\nContact: <sip:trunk@192.0.2.1:5060>\r\n",
+    ] {
+        let setup = Setup::new();
+        let (store, fetch) = setup.startup_fetch(None).await;
+        setup.answer(&fetch, "200 OK", listed);
+        setup.registrant.release_startup_deregistrations().await;
+        assert!(
+            test_support::take_deregistrations(&setup.registrant).is_empty(),
+            "a de-REGISTER was queued over {listed:?}"
+        );
+        assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
+        assert!(store.load().await.expect("loaded").is_empty());
+    }
+}
+
+/// Our Contact quoted inside a peer's display name, or behind a quoted-pair, is
+/// not a listing of ours.
+#[tokio::test]
+async fn a_contact_inside_a_display_name_is_not_ours() {
+    for listed in [
+        "Contact: \"Old <sip:trunk@192.0.2.1:5060>\" <sip:trunk@198.51.100.77:5060>\r\n",
+        "Contact: \"A \\\", <sip:trunk@192.0.2.1:5060>\" <sip:trunk@198.51.100.77:5060>\r\n",
+    ] {
+        let setup = Setup::new();
+        let (_store, fetch) = setup.startup_fetch(None).await;
+        setup.answer(&fetch, "200 OK", listed);
+        setup.registrant.release_startup_deregistrations().await;
+        assert!(
+            test_support::take_deregistrations(&setup.registrant).is_empty(),
+            "a de-REGISTER was queued over {listed:?}"
+        );
+    }
+}
+
+/// A listed URI the parser does not consume to its end, and a bare Contact in
+/// an upper-case scheme with `expires=0`, are not a listing of ours.
+#[tokio::test]
+async fn a_partial_uri_or_an_expired_bare_contact_in_any_case_does_not_authorize_the_de_register() {
+    for listed in [
+        "Contact: <sip:trunk@192.0.2.1:5060/other>\r\n",
+        "Contact: SIP:trunk@192.0.2.1:5060;expires=0\r\nContact: <sip:trunk@198.51.100.77:5060>\r\n",
+    ] {
+        let setup = Setup::new();
+        let (_store, fetch) = setup.startup_fetch(None).await;
+        setup.answer(&fetch, "200 OK", listed);
+        setup.registrant.release_startup_deregistrations().await;
+        assert!(
+            test_support::take_deregistrations(&setup.registrant).is_empty(),
+            "a de-REGISTER was queued over {listed:?}"
+        );
+    }
 }

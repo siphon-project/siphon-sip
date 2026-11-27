@@ -34,8 +34,9 @@ impl NameAddr {
     pub fn parse(input: &str) -> Result<Self, String> {
         let input = input.trim();
 
-        let bracketed = input.contains('<');
-        let (display_name, uri_str, params_str) = if let Some(lt_pos) = input.find('<') {
+        let open_bracket = find_outside_quotes(input, '<');
+        let bracketed = open_bracket.is_some();
+        let (display_name, uri_str, params_str) = if let Some(lt_pos) = open_bracket {
             // Angle-bracket form: optional display name before '<'
             let display = input[..lt_pos].trim();
             let display_name = if display.is_empty() {
@@ -108,7 +109,7 @@ impl NameAddr {
         }
 
         // Parse semicolon-separated params from params_str
-        for param in params_str.split(';').filter(|s| !s.trim().is_empty()) {
+        for param in split_params(params_str).filter(|s| !s.trim().is_empty()) {
             let (name, value) = match param.split_once('=') {
                 Some((n, v)) => (n.trim().to_lowercase(), Some(v.trim().to_string())),
                 None => (param.trim().to_lowercase(), None),
@@ -224,15 +225,99 @@ pub fn contact_wildcard<S: AsRef<str>>(
     }
 }
 
-/// Split comma-separated values while respecting angle brackets.
+/// Split header parameters on every `;` outside a quoted string, so a quoted
+/// value that holds one (`note="x;expires=0"`) stays one parameter.
+pub(crate) fn split_params(input: &str) -> impl Iterator<Item = &str> {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut start = 0;
+    let mut cuts = Vec::new();
+    for (index, c) in input.char_indices() {
+        if in_quotes {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_quotes = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            in_quotes = true;
+        } else if c == ';' {
+            cuts.push(&input[start..index]);
+            start = index + 1;
+        }
+    }
+    cuts.push(&input[start..]);
+    cuts.into_iter()
+}
+
+/// One Contact-style entry cut into the text of its URI and the text of its
+/// header parameters, with no interpretation of either: `<uri>;params` (a
+/// display name before the `<` may hold anything, quoted), or, bare, the
+/// addr-spec up to the first `;` with every parameter after it the header's
+/// (RFC 3261 §20.10). `None` when a `<` has no `>`.
+pub(crate) fn split_entry(entry: &str) -> Option<(&str, &str)> {
+    let entry = entry.trim();
+    match find_outside_quotes(entry, '<') {
+        Some(open) => {
+            let close = open + 1 + entry[open + 1..].find('>')?;
+            Some((
+                entry[open + 1..close].trim(),
+                entry[close + 1..].trim().trim_start_matches(';'),
+            ))
+        }
+        None => Some(match entry.split_once(';') {
+            Some((uri, params)) => (uri.trim(), params),
+            None => (entry, ""),
+        }),
+    }
+}
+
+/// The byte offset of the first `target` outside a quoted string (RFC 3261
+/// §25.1: a backslash inside the quotes makes the next character a
+/// quoted-pair, so `\"` does not close the string).
+fn find_outside_quotes(input: &str, target: char) -> Option<usize> {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (index, c) in input.char_indices() {
+        if in_quotes {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_quotes = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            in_quotes = true;
+        } else if c == target {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Split comma-separated values while respecting angle brackets and quoted
+/// strings (quoted-pairs included).
 /// `"A" <sip:a@x>;tag=1, "B" <sip:b@y>;tag=2` → two parts.
-fn split_comma_respecting_angles(input: &str) -> Vec<&str> {
+pub(crate) fn split_comma_respecting_angles(input: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0u32;
     let mut start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
 
     for (i, c) in input.char_indices() {
+        if in_quotes {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_quotes = false,
+                _ => {}
+            }
+            continue;
+        }
         match c {
+            '"' => in_quotes = true,
             '<' => depth += 1,
             '>' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
@@ -261,6 +346,53 @@ fn split_comma_respecting_angles(input: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bracket_inside_a_quoted_display_name_is_not_the_uri() {
+        let na = NameAddr::parse("\"Old <sip:ours@192.0.2.1>\" <sip:peer@192.0.2.2>").unwrap();
+        assert_eq!(na.uri.host, "192.0.2.2");
+        assert_eq!(na.display_name.as_deref(), Some("Old <sip:ours@192.0.2.1>"));
+    }
+
+    #[test]
+    fn a_quoted_pair_does_not_close_the_display_name_or_split_the_list() {
+        let list = r#""A \" , <sip:x@192.0.2.9>" <sip:a@192.0.2.1>, "B" <sip:b@192.0.2.2>"#;
+        let entries = NameAddr::parse_multi(list).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].uri.host, "192.0.2.1");
+        assert_eq!(entries[1].uri.host, "192.0.2.2");
+    }
+
+    #[test]
+    fn a_semicolon_inside_a_quoted_parameter_value_does_not_split() {
+        let na =
+            NameAddr::parse(r#"<sip:ours@192.0.2.1>;expires=60;note="x;expires=0;y""#).unwrap();
+        assert_eq!(na.expires, Some(60));
+        assert_eq!(na.other_params.len(), 1);
+        let pieces: Vec<&str> = split_params(r#"a;b="c;d\";e";f"#).collect();
+        assert_eq!(pieces, vec!["a", r#"b="c;d\";e""#, "f"]);
+    }
+
+    #[test]
+    fn an_entry_is_cut_into_uri_and_header_parameters() {
+        assert_eq!(
+            split_entry(r#""A <sip:x@h>" <sip:u@h:5060;p=1>;expires=0"#),
+            Some(("sip:u@h:5060;p=1", "expires=0"))
+        );
+        assert_eq!(
+            split_entry("SIP:u@h:5060;expires=0"),
+            Some(("SIP:u@h:5060", "expires=0"))
+        );
+        assert_eq!(split_entry("sip:u@h"), Some(("sip:u@h", "")));
+        assert_eq!(split_entry("<sip:u@h"), None);
+    }
+
+    #[test]
+    fn a_comma_inside_quotes_does_not_split() {
+        let entries =
+            NameAddr::parse_multi(r#""Q, R" <sip:a@192.0.2.1>, <sip:b@192.0.2.2>"#).unwrap();
+        assert_eq!(entries.len(), 2);
+    }
 
     #[test]
     fn parse_display_name_and_tag() {

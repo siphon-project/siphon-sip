@@ -20,10 +20,19 @@
 //!   REGISTER refreshes the binding instead of adding a second one.
 //! - A live entry that already registered the same contact has replaced the
 //!   binding (§10.3: same contact, new Call-ID, is an update): left alone.
-//! - Anything else is an orphan: a de-REGISTER (`Expires: 0`, §10.2.2) on the
-//!   stored contact, the stored Call-ID and the next CSeq, queued as a removed
-//!   entry's is ([`super::removed`]), so its challenge, Timer F and the sweep
-//!   are handled there and the record is dropped at each way it ends.
+//! - Anything else is an orphan. A fetch (no Contact, no Expires, RFC 3261
+//!   §10.2.3) goes first, on the stored Call-ID and the next CSeq: a registrar
+//!   that keeps one binding per AoR has dropped this node's binding when
+//!   another node registered, and an `Expires: 0` then would clear the other
+//!   node's. Only when the fetch's 2xx lists this node's stored contact does
+//!   the de-REGISTER (`Expires: 0`, §10.2.2) follow, on the same Call-ID and the
+//!   CSeq after the fetch's. Anything else (other contacts only, none, a
+//!   failure, a non-2xx, Timer F) leaves the binding to expire and drops the
+//!   record. Both are queued as a removed entry's is ([`super::removed`]), so
+//!   challenges, Timer F and the sweep are handled there. A fetch and its
+//!   de-REGISTER are one attempt toward [`MAX_STARTUP_ATTEMPTS`].
+//!   Known limit: another node may still register, on a registrar that
+//!   replaces the binding, between the fetch and the de-REGISTER.
 //! - A binding of a row the source returned but siphon rejected counts as
 //!   still listed: it is left, which is the safe side.
 //!
@@ -393,8 +402,8 @@ impl RegistrantManager {
         Outcome::Carried
     }
 
-    /// Queue the de-REGISTER of the binding `record` describes. `false` when it
-    /// cannot be built.
+    /// Queue the fetch that precedes the de-REGISTER of the binding `record`
+    /// describes. `false` when it cannot be built.
     fn deregister_orphan(&self, record: &BindingRecord, defaults: EgressDefaults<'_>) -> bool {
         // What the challenge will be answered with is looked up, never stored:
         // these are placeholders no REGISTER is built from before the lookup.
@@ -411,11 +420,14 @@ impl RegistrantManager {
         copy.call_id = record.call_id.clone();
         copy.cseq = AtomicU32::new(record.next_cseq.saturating_add(CSEQ_HEADROOM));
         copy.origin = record.origin;
-        let Some(built) = self.build_unprotected_register(&mut copy, defaults, 0, None) else {
+        // The fetch first (RFC 3261 §10.2.3): the de-REGISTER follows only when
+        // the registrar still lists this node's Contact.
+        let Some(built) = self.build_unprotected_register_as(&mut copy, defaults, 0, None, true)
+        else {
             warn!(
                 aor = %record.aor,
                 registrar = %record.registrar_uri,
-                "restart clean-up: the de-REGISTER cannot be built, binding left to expire"
+                "restart clean-up: the fetch cannot be built, binding left to expire"
             );
             return false;
         };
@@ -423,7 +435,7 @@ impl RegistrantManager {
             aor = %record.aor,
             registrar = %record.registrar_uri,
             call_id = %record.call_id,
-            "restart clean-up: de-registering a binding the last process left"
+            "restart clean-up: fetching the bindings before de-registering the one the last process left"
         );
         self.queue_startup_deregistration(copy, built);
         true

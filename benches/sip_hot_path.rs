@@ -707,8 +707,31 @@ fn bench_register_exchange(c: &mut Criterion) {
     group.finish();
 }
 
+/// `NameAddr::parse` / `parse_multi`: a plain From, a quoted display name, a
+/// three-entry Contact list (comma folding and the quote scan run per message).
+fn bench_name_addr(criterion: &mut Criterion) {
+    use siphon::sip::headers::nameaddr::NameAddr;
+
+    let plain = "<sip:alice@atlanta.example.com>;tag=1928301774";
+    let quoted = "\"Alice, the Caller\" <sip:alice@atlanta.example.com>;tag=1928301774";
+    let contacts = "<sip:a@192.0.2.1:5060;transport=tcp>;expires=3600, \
+                    \"Bob\" <sip:b@192.0.2.2:5060>;q=0.5, <sip:c@192.0.2.3:5060>;expires=60";
+    let mut group = criterion.benchmark_group("name_addr");
+    group.bench_function("parse_plain_from", |bencher| {
+        bencher.iter(|| black_box(NameAddr::parse(black_box(plain))));
+    });
+    group.bench_function("parse_quoted_display_name", |bencher| {
+        bencher.iter(|| black_box(NameAddr::parse(black_box(quoted))));
+    });
+    group.bench_function("parse_multi_three_contacts", |bencher| {
+        bencher.iter(|| black_box(NameAddr::parse_multi(black_box(contacts))));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_name_addr,
     bench_register_exchange,
     bench_listener_identity,
     bench_parse,

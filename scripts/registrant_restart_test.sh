@@ -6,13 +6,21 @@
 # HTTP source, against a SIPp upstream registrar, in the order it happens in the
 # field: the trunk registers, siphon is killed with SIGKILL (no de-REGISTER),
 # and it restarts with the trunk no longer listed (its lease moved to another
-# node). The registrar must then receive an `Expires: 0` REGISTER on the old
-# Call-ID and Contact with a higher CSeq (RFC 3261 §10.2.2, §10.2.4), challenge
-# it (§22), and get the authorised retry (the credential comes from the
+# node). The registrar must then receive a fetch (no Contact, no Expires, RFC
+# 3261 §10.2.3) on the old Call-ID, and, its 2xx listing the node's Contact, an
+# `Expires: 0` REGISTER on the old Call-ID and Contact with a higher CSeq
+# (§10.2.2, §10.2.4); it challenges both (§22) and gets the authorised retries (the credential comes from the
 # source's lookup by AoR: nothing stores it, and SIPp verifies the digest against
 # the password, LOOKUP_PASSWORD=wrong makes the lookup serve a wrong one and the
 # test fail), which it accepts. The Redis record
 # of the binding must hold no credential, and be gone at the end.
+#
+# REPLACE_SEMANTICS=1 runs the other scenario instead: a registrar that keeps one
+# binding per AoR (scripts/registrant_replace_registrar.py). The node registers
+# and is killed, another node registers its own Contact (which replaces the
+# node's binding), and the node restarts: it must fetch, see only the other
+# node's Contact, send NO `Expires: 0`, and leave the other node's binding in
+# place.
 #
 #   scripts/registrant_restart_test.sh
 #   SIPHON_BIN=target/release/siphon scripts/registrant_restart_test.sh
@@ -132,9 +140,11 @@ start_siphon() {
 
 # A SIPp registrar running one scenario, in the background, tracing messages.
 start_registrar() {
-  sipp -sf "sipp/registrant_restart_$1.xml" -i 127.0.0.1 -p "${REGISTRAR_PORT}" -m 1 \
-    -nostdin -trace_msg -message_file "${WORK}/registrar-$1.msg" \
-    -trace_err -error_file "${WORK}/registrar-$1.err" >"${WORK}/sipp-$1.log" 2>&1 &
+  local scenario="$1"
+  shift
+  sipp -sf "sipp/registrant_restart_${scenario}.xml" -i 127.0.0.1 -p "${REGISTRAR_PORT}" -m 1 "$@" \
+    -nostdin -trace_msg -message_file "${WORK}/registrar-${scenario}.msg" \
+    -trace_err -error_file "${WORK}/registrar-${scenario}.err" >"${WORK}/sipp-${scenario}.log" 2>&1 &
   SIPP_PID=$!
 }
 
@@ -165,9 +175,22 @@ PY
 echo "=== A killed node's trunk binding is cleared when it restarts ==="
 
 echo "[*] first run: the trunk registers"
-start_registrar first
-start_siphon first
-await_registrar first 40 || fail "the registrar never saw the trunk's REGISTER"
+if [[ -n "${REPLACE_SEMANTICS:-}" ]]; then
+  python3 -I scripts/registrant_replace_registrar.py serve "${REGISTRAR_PORT}" "${WORK}/replace.log" \
+    line-user-7 secret123 &
+  SIPP_PID=$!
+  sleep 0.5
+  start_siphon first
+  for _ in $(seq 400); do
+    [[ -s "${WORK}/replace.log" ]] && break
+    sleep 0.1
+  done
+  [[ -s "${WORK}/replace.log" ]] || fail "the registrar never saw the trunk's REGISTER"
+else
+  start_registrar first
+  start_siphon first
+  await_registrar first 40 || fail "the registrar never saw the trunk's REGISTER"
+fi
 
 key="$(redis-cli -p "${REDIS_PORT}" --scan --pattern "siphon:registrant:${INSTANCE}:*" | head -1)"
 for _ in $(seq 50); do
@@ -193,26 +216,39 @@ wait "${SIPHON_PID}" 2>/dev/null || true
 SIPHON_PID=""
 redis-cli -p "${REDIS_PORT}" exists "${key}" | grep -q 1 || fail "the record is not in Redis after the kill"
 
+if [[ -z "${REPLACE_SEMANTICS:-}" ]]; then
 echo "[*] second run: the trunk is no longer listed (its lease moved)"
 echo unlisted > "${WORK}/state"
-start_registrar second
+first_contact="$(header_of "${WORK}/registrar-first.msg" Contact 1)"
+[[ -n "${first_contact}" ]] || fail "could not read the first Contact from the SIPp trace"
+start_registrar second -set listed_contact "${first_contact};expires=600"
 start_siphon second
 await_registrar second 60 \
-  || fail "the registrar did not see the de-REGISTER, its challenge answered, and accept it"
+  || fail "the registrar did not see the fetch and the de-REGISTER, their challenges answered, and accept it"
 
 first_call_id="$(header_of "${WORK}/registrar-first.msg" Call-ID 1)"
 first_cseq="$(header_of "${WORK}/registrar-first.msg" CSeq 1 | cut -d' ' -f1)"
-dereg_call_id="$(header_of "${WORK}/registrar-second.msg" Call-ID 1)"
-dereg_cseq="$(header_of "${WORK}/registrar-second.msg" CSeq 1 | cut -d' ' -f1)"
-retry_call_id="$(header_of "${WORK}/registrar-second.msg" Call-ID 2)"
-retry_cseq="$(header_of "${WORK}/registrar-second.msg" CSeq 2 | cut -d' ' -f1)"
+# Requests 1 and 2 are the fetch and its authorised retry, 3 and 4 the de-REGISTER and its.
+fetch_call_id="$(header_of "${WORK}/registrar-second.msg" Call-ID 1)"
+fetch_cseq="$(header_of "${WORK}/registrar-second.msg" CSeq 1 | cut -d' ' -f1)"
+dereg_call_id="$(header_of "${WORK}/registrar-second.msg" Call-ID 3)"
+dereg_cseq="$(header_of "${WORK}/registrar-second.msg" CSeq 3 | cut -d' ' -f1)"
+retry_call_id="$(header_of "${WORK}/registrar-second.msg" Call-ID 4)"
+retry_cseq="$(header_of "${WORK}/registrar-second.msg" CSeq 4 | cut -d' ' -f1)"
+for index in 1 2; do
+  [[ -z "$(header_of "${WORK}/registrar-second.msg" Contact "${index}")" ]] \
+    || fail "request ${index} (the fetch) carries a Contact"
+  [[ -z "$(header_of "${WORK}/registrar-second.msg" Expires "${index}")" ]] \
+    || fail "request ${index} (the fetch) carries an Expires"
+done
+[[ "${fetch_call_id}" == "${first_call_id}" ]] || fail "the fetch left the Call-ID"
 [[ -n "${first_call_id}" ]] || fail "could not read the first Call-ID from the SIPp trace"
 [[ "${dereg_call_id}" == "${first_call_id}" ]] \
   || fail "the de-REGISTER is on Call-ID ${dereg_call_id}, not the old ${first_call_id}"
 [[ "${retry_call_id}" == "${first_call_id}" ]] || fail "the authorised retry left the Call-ID"
 first_contact="$(header_of "${WORK}/registrar-first.msg" Contact 1)"
-dereg_contact="$(header_of "${WORK}/registrar-second.msg" Contact 1)"
-retry_contact="$(header_of "${WORK}/registrar-second.msg" Contact 2)"
+dereg_contact="$(header_of "${WORK}/registrar-second.msg" Contact 3)"
+retry_contact="$(header_of "${WORK}/registrar-second.msg" Contact 4)"
 [[ -n "${first_contact}" && "${dereg_contact}" == "${first_contact}" && "${retry_contact}" == "${first_contact}" ]] \
   || fail "the de-REGISTER Contacts (${dereg_contact} / ${retry_contact}) are not the registered one (${first_contact})"
 if [[ -n "${WILDCARD_ADVERTISED:-}" ]]; then
@@ -238,7 +274,8 @@ PY
     || fail "the Contact (${first_contact}) does not carry this instance's token ${token}"
   [[ "${first_contact}" != *"${INSTANCE}"* ]] || fail "the instance id is on the wire"
 fi
-(( dereg_cseq > first_cseq )) || fail "de-REGISTER CSeq ${dereg_cseq} does not outrank ${first_cseq}"
+(( fetch_cseq > first_cseq )) || fail "fetch CSeq ${fetch_cseq} does not outrank ${first_cseq}"
+(( dereg_cseq > fetch_cseq )) || fail "de-REGISTER CSeq ${dereg_cseq} does not outrank the fetch's ${fetch_cseq}"
 (( retry_cseq > dereg_cseq )) || fail "retry CSeq ${retry_cseq} does not outrank ${dereg_cseq}"
 grep -q "authorised=True" "${WORK}/state.requests" && grep -q "^/lookup" "${WORK}/state.requests" \
   || fail "siphon never asked the source's lookup"
@@ -250,4 +287,39 @@ done
 [[ "$(redis-cli -p "${REDIS_PORT}" exists "${key}")" == "0" ]] || fail "the Redis record is still there"
 grep -q "restart clean-up" "${WORK}"/siphon-second.log || fail "siphon never logged the clean-up"
 
-echo "PASS: Expires: 0 on Call-ID ${first_call_id} (CSeq ${first_cseq} -> ${dereg_cseq} -> ${retry_cseq}), challenge answered from the lookup, record gone"
+echo "PASS: fetch then Expires: 0 on Call-ID ${first_call_id} (CSeq ${first_cseq} -> ${fetch_cseq} -> ${dereg_cseq} -> ${retry_cseq}), challenges answered from the lookup, record gone"
+exit 0
+fi
+
+# --- REPLACE_SEMANTICS=1: the registrar keeps one binding per AoR ---------------
+echo "[*] second run: another node registered its own Contact meanwhile"
+OTHER_CONTACT="sip:trunk@198.51.100.77:5060;rnode=00000000deadbeef"
+python3 -I scripts/registrant_replace_registrar.py register "${REGISTRAR_PORT}" "${AOR}" \
+  "${OTHER_CONTACT}" line-user-7 secret123 || fail "the other node's REGISTER was refused"
+echo unlisted > "${WORK}/state"
+start_siphon second
+for _ in $(seq 150); do
+  [[ "$(redis-cli -p "${REDIS_PORT}" exists "${key}")" == "0" ]] && break
+  sleep 0.1
+done
+[[ "$(redis-cli -p "${REDIS_PORT}" exists "${key}")" == "0" ]] || fail "the Redis record is still there"
+grep -q "restart clean-up" "${WORK}"/siphon-second.log || fail "siphon never logged the clean-up"
+sleep 1
+
+python3 -I - "${WORK}/replace.log" "${OTHER_CONTACT}" <<'PY' || fail "the registrar's log does not show a safe restart clean-up"
+import json, sys
+log = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+other = sys.argv[2]
+# The first run's registration, the other node's, then what the restart sent.
+registers = [entry for entry in log if entry["contact"] is not None]
+fetches = [entry for entry in log if entry["contact"] is None]
+assert len(fetches) >= 1, f"no fetch reached the registrar: {log}"
+for fetch in fetches:
+    assert fetch["expires"] is None, f"the fetch carries an Expires: {fetch}"
+assert not any(entry["expires"] == "0" for entry in log), f"an Expires: 0 reached the registrar: {log}"
+assert log[-1]["binding_after"] == other, f"the other node's binding is gone: {log[-1]}"
+first_call_id = log[0]["call_id"]
+assert any(entry["call_id"] == first_call_id for entry in fetches), "the fetch is not on the old Call-ID"
+PY
+
+echo "PASS: the restart fetched, saw only the other node's Contact, sent no Expires: 0, and left its binding"
