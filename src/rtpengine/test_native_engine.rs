@@ -894,11 +894,14 @@ fn seat_refusal(command: &Command) -> Option<String> {
 }
 
 /// Wait while a test holds the answers of the command's kind: an
-/// `answer_local`'s, a `delete`'s, or an `attach_x3`'s.
+/// `answer_local`'s (or `offer_local`'s, or `offer`'s), a `delete`'s, or an
+/// `attach_x3`'s.
 async fn held_answer(command: &Command, gates: &mut [tokio::sync::watch::Receiver<bool>; 3]) {
     let [answers_open, deletes_open, attaches_open] = gates;
     let gate = match command {
-        Command::AnswerLocal { .. } => answers_open,
+        Command::AnswerLocal { .. } | Command::OfferLocal { .. } | Command::Offer { .. } => {
+            answers_open
+        }
         Command::Delete { .. } => deletes_open,
         Command::AttachX3 { .. } => attaches_open,
         _ => return,

@@ -223,6 +223,8 @@ mod delayed_offer_answer_tests;
 #[cfg(test)]
 mod delayed_offer_ingress_tests;
 #[cfg(test)]
+mod delayed_offer_race_tests;
+#[cfg(test)]
 mod dial_bridge_test_harness;
 #[cfg(test)]
 mod dialog_state_events_tests;

@@ -213,6 +213,7 @@ pub(crate) fn expect_delayed_offer<'a>(
 /// answer in the PRACK that a caller which has not yet made its offer cannot
 /// give (RFC 3262 §5), so the dial fails like any media failure.
 fn delayed_offer_answer(
+    internal_call_id: &str,
     branch_profile: Option<String>,
     fallback_profile: &str,
     sip_call_id: &str,
@@ -277,19 +278,27 @@ fn delayed_offer_answer(
         &flags,
     ))
     .map_err(|error| format!("dial media offer failed: {error}"))?;
-    sessions.insert(crate::rtpengine::MediaSession {
-        call_id: sip_call_id.to_string(),
-        rtpengine_call_id: engine_call_id,
-        from_tag: to_tag,
-        to_tag: None,
-        profile: profile_name,
-        ws_uri: None,
-        ws_tee: None,
-        ws_bridge_attached: false,
-        ws_split_attached: false,
-        bridge_sides: None,
-        created_at: std::time::Instant::now(),
-    });
+    // A teardown that landed while the engine made the offer has released the
+    // call and found no session: this one is released here instead.
+    if !super::dial_media::commit_media_session(
+        state,
+        internal_call_id,
+        crate::rtpengine::MediaSession {
+            call_id: sip_call_id.to_string(),
+            rtpengine_call_id: engine_call_id,
+            from_tag: to_tag,
+            to_tag: None,
+            profile: profile_name,
+            ws_uri: None,
+            ws_tee: None,
+            ws_bridge_attached: false,
+            ws_split_attached: false,
+            bridge_sides: None,
+            created_at: std::time::Instant::now(),
+        },
+    ) {
+        return Err("the call ended while its media was being allocated".into());
+    }
     response.body = body;
     response
         .headers
@@ -330,6 +339,7 @@ pub fn control_dial_media_answer(
     drop(call);
     if let Some(fallback_profile) = delayed_offer_profile {
         return delayed_offer_answer(
+            call_id,
             branch_profile,
             &fallback_profile,
             &sip_call_id,

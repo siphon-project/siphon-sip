@@ -87,8 +87,12 @@ pub(super) fn answer_first_delayed_offer(
     ))
     .map_err(offer_local_refusal)?;
 
-    if let Some(sessions) = state.rtpengine_sessions.as_ref() {
-        sessions.insert(crate::rtpengine::session::MediaSession {
+    // A teardown that landed while the engine made the offer has released the
+    // call and found no session: the allocation is released here instead.
+    if !super::dial_media::commit_media_session(
+        state,
+        call_id,
+        crate::rtpengine::session::MediaSession {
             rtpengine_call_id: plan.media_call_id.clone(),
             call_id: plan.media_call_id.clone(),
             from_tag: plan.from_tag.clone(),
@@ -100,7 +104,9 @@ pub(super) fn answer_first_delayed_offer(
             ws_split_attached: false,
             bridge_sides: None,
             created_at: std::time::Instant::now(),
-        });
+        },
+    ) {
+        return Err("the call ended while the media engine was making its offer".to_string());
     }
     // On the call before the 2xx leaves: the ACK can be back before this
     // returns.
