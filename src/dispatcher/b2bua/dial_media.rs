@@ -95,6 +95,12 @@ fn resolve_profiles_with(
     for target in targets.iter_mut() {
         target.profile = target.shaping_over(shaping).profile;
         if let (Some(registry), Some(name)) = (registry, target.profile.as_deref()) {
+            // A name the caller gave must be one that is defined: a generated
+            // `base#webrtc-...` form is picked by the resolution below, never
+            // named.
+            if !registry.is_defined(name) {
+                return Err(DialError::Media(format!("unknown media profile '{name}'")));
+            }
             let contact_webrtc = target
                 .binding_transport
                 .is_some_and(crate::rtpengine::webrtc_auto::transport_is_webrtc);
@@ -459,6 +465,27 @@ mod tests {
             profiles[5], "extension",
             "a URI dialled as written has no binding"
         );
+    }
+
+    /// `base#webrtc-offer` is what resolution makes of `base`, never something
+    /// a dial may name.
+    #[test]
+    fn a_dial_cannot_name_a_generated_variant() {
+        let registry = extension_profiles();
+        for name in [
+            "extension#webrtc-offer",
+            "extension#webrtc-answer",
+            "extension#webrtc-both",
+        ] {
+            let mut targets = vec![bound("sip:201@198.51.100.7", Some(Transport::Udp))];
+            let shaping = DialShaping {
+                profile: Some(name.to_string()),
+                ..Default::default()
+            };
+            let error = resolve_profiles_with(&mut targets, &shaping, Some(&registry), false)
+                .expect_err("a generated name is not selectable");
+            assert!(error.to_string().contains(name), "{error}");
+        }
     }
 
     #[test]

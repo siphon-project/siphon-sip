@@ -264,6 +264,15 @@ impl ProfileRegistry {
             .or_else(|| self.webrtc_variants.get(name).map(|(_, entry)| entry))
     }
 
+    /// Whether `name` is a profile an operator configured or siphon ships, as
+    /// opposed to a resolved form [`Self::resolve_webrtc`] generated. What a
+    /// caller names (a control verb's `profile`, a dial's `profile`) is checked
+    /// with this, so a generated name cannot be selected directly: the
+    /// resolution picks the flavour, not the caller.
+    pub fn is_defined(&self, name: &str) -> bool {
+        self.profiles.contains_key(name)
+    }
+
     /// The name of `name` with its `webrtc: auto` halves resolved for a call:
     /// `offer_webrtc` when the party the offer half faces is a WebRTC endpoint
     /// (a contact registered over `ws`/`wss`), `answer_webrtc` when the party
@@ -1850,6 +1859,34 @@ mod tests {
                 "{name} answer pins an address family"
             );
         }
+    }
+
+    #[test]
+    fn only_configured_and_builtin_names_are_defined_not_generated_variants() {
+        let half = NgFlagsConfig {
+            transport_protocol: Some("RTP/AVP".into()),
+            webrtc: Some(crate::config::WebrtcMode::Auto),
+            ..NgFlagsConfig::default()
+        };
+        let custom = HashMap::from([(
+            "extension".to_string(),
+            MediaProfileConfig {
+                offer: half.clone(),
+                answer: half,
+            },
+        )]);
+        let registry = ProfileRegistry::from_config(&custom);
+        assert!(registry.is_defined("extension"));
+        assert!(registry.is_defined("rtp_passthrough"));
+        for name in [
+            "extension#webrtc-offer",
+            "extension#webrtc-answer",
+            "extension#webrtc-both",
+        ] {
+            assert!(registry.get(name).is_some(), "{name} still resolves");
+            assert!(!registry.is_defined(name), "{name} is not selectable");
+        }
+        assert!(!registry.is_defined("missing"));
     }
 
     #[test]

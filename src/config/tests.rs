@@ -7097,3 +7097,22 @@ fn registrant_database_lookup_query_is_optional_and_needs_its_parameter() {
     .expect_err("a lookup that cannot select a trunk");
     assert!(error.to_string().contains("$1"), "{error}");
 }
+
+/// `base#webrtc-offer`, `-answer` and `-both` are the names a `webrtc: auto`
+/// profile resolves to, so a configured name with a `#` could shadow one. The
+/// character is reserved and the load names the profile.
+#[test]
+fn rejects_a_media_profile_name_containing_a_hash() {
+    for name in ["extension#webrtc-offer", "a#b", "#x"] {
+        let yaml = format!(
+            "listen:\n  udp:\n    - \"0.0.0.0:5060\"\ndomain:\n  local:\n    \
+             - \"example.com\"\nscript:\n  path: \"scripts/proxy_default.py\"\n\
+             media:\n{RTPENGINE_BACKEND}  profiles:\n    \"{name}\":\n      offer: {{}}\n      \
+             answer: {{}}\n"
+        );
+        let error = Config::from_str(&yaml).expect_err("`#` is reserved in a profile name");
+        let message = error.to_string();
+        assert!(message.contains(name), "{message}");
+        assert!(message.contains('#'), "{message}");
+    }
+}
