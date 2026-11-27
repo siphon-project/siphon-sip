@@ -8,9 +8,15 @@
      instead of dropping its own state and leaving this registrar offering
      calls to a trunk that is gone until the granted Expires runs out.
 
-     Both REGISTERs arrive on one Call-ID, because a de-registration belongs to
-     the registration it clears (§10.2.4) — which is also what this asserts by
-     receiving them in a single SIPp call. -->
+     Before the `Expires: 0`, siphon fetches the bindings (RFC 3261 §10.2.3: a
+     REGISTER with no Contact and no Expires) and clears its binding only when
+     the 2xx lists its own Contact, so it never clears another node's binding at
+     a registrar that keeps one binding per AoR. This registrar lists the
+     Contact the trunk registered.
+
+     All the REGISTERs arrive on one Call-ID, because a de-registration belongs
+     to the registration it clears (§10.2.4) — which is also what this asserts
+     by receiving them in a single SIPp call. -->
 <scenario name="Upstream registrar: a registration, then its de-registration">
 
   <!-- The initial REGISTER for the configured trunk. -->
@@ -24,6 +30,10 @@
       <!-- Referenced so sipp does not abort: it refuses a variable that is
            assigned and never used. -->
       <log message="initial REGISTER carried Expires [$initial_expires]" />
+      <!-- The Contact siphon registered, which the fetch's answer lists back. -->
+      <ereg regexp="sip:[^>;]*" search_in="hdr" header="Contact:"
+            check_it="true" assign_to="bound_contact" />
+      <log message="trunk registered [$bound_contact]" />
     </action>
   </recv>
 
@@ -36,20 +46,50 @@
       [last_To:];tag=[pid]SIPpTag01[call_number]
       [last_Call-ID:]
       [last_CSeq:]
-      Contact: <sip:trunk1@[local_ip]:[local_port]>;expires=3600
+      Contact: <[$bound_contact]>;expires=3600
       Expires: 3600
       Content-Length: 0
 
     ]]>
   </send>
 
-  <!-- The script removes the trunk once it is registered. That must put an
-       `Expires: 0` REGISTER on the wire, on the same Call-ID and a higher
-       CSeq. Before this was fixed, nothing arrived at all. -->
+  <!-- The script removes the trunk once it is registered. The first request
+       that puts on the wire is the fetch: same Call-ID, a higher CSeq, no
+       Contact and no Expires. -->
+  <recv request="REGISTER">
+    <action>
+      <ereg regexp="(Contact|Expires):" search_in="msg" check_it_inverse="true"
+            assign_to="fetch_headers" />
+      <log message="fetch carried no Contact or Expires [$fetch_headers]" />
+    </action>
+  </recv>
+
+  <!-- The 2xx lists the trunk's own Contact, so the binding is its to clear. -->
+  <send>
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <[$bound_contact]>;expires=3600
+      Expires: 3600
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Only then the `Expires: 0` REGISTER, on the same Call-ID and the CSeq
+       after the fetch's, naming the Contact that was bound. -->
   <recv request="REGISTER">
     <action>
       <ereg regexp="Expires: 0" search_in="msg" check_it="true"
             assign_to="dereg_expires" />
+      <ereg regexp="sip:[^>;]*" search_in="hdr" header="Contact:"
+            check_it="true" assign_to="dereg_contact" />
+      <log message="de-REGISTER of [$dereg_contact]" />
       <log message="de-REGISTER carried Expires [$dereg_expires]" />
     </action>
   </recv>
