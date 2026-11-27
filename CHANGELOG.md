@@ -19,6 +19,19 @@ entry, but a working config keeps working.
 
 - The restart clean-up no longer clears another node's binding at a registrar that keeps one binding per AoR. Before it de-registers a binding the last process left, siphon sends a fetch (a REGISTER with no Contact and no Expires, same Call-ID, next CSeq, RFC 3261 §10.2.3) and sends `Expires: 0` only when the 2xx lists this node's stored Contact (compared as SIP URIs). A registrar that replaces the AoR's binding on every REGISTER had already dropped this node's binding when another node registered, and the `Expires: 0` cleared the live one until that node's next refresh. A 2xx listing only other Contacts or none, a refusal or Timer F leaves the binding to expire and drops the record; a fetch and its de-REGISTER are one attempt, and a challenge to either is answered from the source's lookup. **Known limit:** on such a registrar another node can still register between the fetch and the de-REGISTER.
 - Name-addr headers (From, To, Contact, P-Asserted-Identity and the rest) are parsed with quoted strings respected (RFC 3261 §25.1, quoted-pairs included). A `<`, `,` or `;` inside a quoted display name or a quoted parameter value no longer picks the wrong URI, splits one entry into two, or cuts a parameter short.
+### Added
+
+- Media profiles: a half may declare `webrtc: auto`. Toward a WebRTC party it
+  takes `UDP/TLS/RTP/SAVPF`, ICE `force`, DTLS and `rtcp_mux: [require]` in
+  place of what it sets for those, and toward anyone else it applies as written.
+  The `offer` half is decided per forked contact by the transport its binding
+  registered over (`ws`/`wss`), so a control-plane `dial` to an `{aor}` (and `originate {aor}` and `dial {on_answer: "bridge"}`, which turn every auto half WebRTC for a `ws`/`wss` contact) with one
+  profile rings a browser and a desk phone together, each offered SDP of its own
+  kind from its own allocation (the answering branch settles the call, the
+  others are released). The `answer` half is decided by the caller's offer
+  (`UDP/TLS/RTP/SAVPF` with `a=ice-ufrag` and `a=fingerprint`), also on a
+  script's `rtpengine.offer()`, which anchors once and leaves the `offer` half as
+  written. `webrtc` takes `auto` only; `rtpproxy` refuses it at config load.
 
 ## [1.19.1] — 2026-11-26
 
@@ -41,19 +54,6 @@ entry, but a working config keeps working.
 ### Changed
 
 - Pairs with siphon-rtp 0.29.0 and moves the control protocol crate (`siphon-rtp-proto`) from 0.27.0 to the 0.29 line. Nothing in the proto crate changed shape for existing verbs and events: the only additions are the split verbs and events. What 0.28 and 0.29 change in the engine, for an operator upgrading it alongside: its SRTP sender refuses to send an index it has already sent under a key (RFC 3711 section 9.1) and refuses to wrap the SRTCP index, and its bridge flows renumber a plain source whose sequence restarts or jumps, so a restarting or jumping peer is renumbered rather than turned into an outage; this applies to every encrypted call on the engine; the engine's daemon config is YAML (`.toml` still reads, with a deprecation warning); a WebSocket takeover bridge is announced (`ws_bridge_started`) only once the leg is redirected to it, and a refused redirect now fails the verb and leaves the call relaying; and an SRTCP send-index ledger cap (`srtcp_ledger_max_entries`, default 100000) refuses a new key rather than evict one.
-### Added
-
-- Media profiles: a half may declare `webrtc: auto`. Toward a WebRTC party it
-  takes `UDP/TLS/RTP/SAVPF`, ICE `force`, DTLS and `rtcp_mux: [require]` in
-  place of what it sets for those, and toward anyone else it applies as written.
-  The `offer` half is decided per forked contact by the transport its binding
-  registered over (`ws`/`wss`), so a control-plane `dial` to an `{aor}` (and `originate {aor}` and `dial {on_answer: "bridge"}`, which turn every auto half WebRTC for a `ws`/`wss` contact) with one
-  profile rings a browser and a desk phone together, each offered SDP of its own
-  kind from its own allocation (the answering branch settles the call, the
-  others are released). The `answer` half is decided by the caller's offer
-  (`UDP/TLS/RTP/SAVPF` with `a=ice-ufrag` and `a=fingerprint`), also on a
-  script's `rtpengine.offer()`, which anchors once and leaves the `offer` half as
-  written. `webrtc` takes `auto` only; `rtpproxy` refuses it at config load.
 
 ## [1.18.0] — 2026-11-26
 
