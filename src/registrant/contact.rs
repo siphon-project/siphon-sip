@@ -230,7 +230,7 @@ fn scheme_lowered(text: &str) -> String {
 ///
 /// An entry counts only with an effective expiry above zero (§10.3 step 8):
 /// its own `expires` parameter (a value too large for `u32` saturates, so it is
-/// bound, and a malformed one is the 3600 s default, §10.2.1), else the
+/// bound, and a malformed or valueless one is the 3600 s default, §10.2.1), else the
 /// response's `Expires` header, else 3600.
 pub(super) fn bound_contact_uris(lines: &[String], response_expires: Option<u32>) -> Vec<String> {
     use crate::sip::headers::nameaddr::{split_comma_respecting_angles, split_entry, split_params};
@@ -244,8 +244,10 @@ pub(super) fn bound_contact_uris(lines: &[String], response_expires: Option<u32>
             if uri == "*" || crate::sip::parser::parse_uri_complete(&scheme_lowered(uri)).is_err() {
                 continue;
             }
+            // A valueless `expires` is malformed: `delta_seconds("")` gives
+            // the 3600 s default rather than inheriting the header.
             let own = split_params(params).find_map(|parameter| {
-                let (name, value) = parameter.split_once('=')?;
+                let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
                 name.trim()
                     .eq_ignore_ascii_case("expires")
                     .then(|| delta_seconds(value.trim().trim_matches('"')))
@@ -380,6 +382,19 @@ mod tests {
         }
         let lines = vec!["<sip:u@192.0.2.1:5060>;expires=0".to_string()];
         assert!(bound_contact_uris(&lines, Some(60)).is_empty());
+    }
+
+    /// An `expires` with no value is malformed, so it is the 3600 s default
+    /// (§10.2.1) and does not inherit the response's `Expires: 0`.
+    #[test]
+    fn a_valueless_expires_does_not_inherit_the_header() {
+        for line in [
+            "<sip:u@192.0.2.1:5060>;expires",
+            "<sip:u@192.0.2.1:5060>;EXPIRES ;q=0.5",
+        ] {
+            let lines = vec![line.to_string()];
+            assert_eq!(bound_contact_uris(&lines, Some(0)).len(), 1, "{line:?}");
+        }
     }
 
     /// A URI the parser does not consume to its end is not our Contact.
