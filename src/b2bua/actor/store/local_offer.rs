@@ -53,4 +53,24 @@ impl CallActorStore {
             .filter(|call| call.pending_local_offer.is_some())
             .count()
     }
+
+    /// An offerless re-INVITE (CSeq `cseq`) was answered with the session in
+    /// force, which is an offer (RFC 3261 §14.1): its ACK carries the answer.
+    pub fn expect_refresh_answer(&self, call_id: &str, cseq: u32) {
+        if let Some(mut call) = self.get_call_mut(call_id) {
+            call.pending_refresh_answer = Some(cseq);
+        }
+    }
+
+    /// Claim the answer an ACK of CSeq `cseq` brings to such an offer, once.
+    pub fn take_refresh_answer(&self, call_id: &str, cseq: u32) -> bool {
+        self.get_call_mut(call_id).is_some_and(|mut call| {
+            if call.pending_refresh_answer == Some(cseq) {
+                call.pending_refresh_answer = None;
+                true
+            } else {
+                false
+            }
+        })
+    }
 }

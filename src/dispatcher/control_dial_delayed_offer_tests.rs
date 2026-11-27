@@ -668,3 +668,68 @@ async fn an_offerless_reinvite_after_a_delayed_offer_dial_is_answered_from_the_s
     assert!(to_phone(&dial.wire()).is_empty());
     assert!(dial.call_is_up());
 }
+
+/// The `200` to an offerless re-INVITE repeats the session in force, which is
+/// a new offer (RFC 3261 §14.1, RFC 3264 §4): the caller's ACK answers it, and
+/// where that answer moved the caller's media the engine has to be told.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_acks_answer_to_an_offerless_refresh_reaches_the_engine() {
+    let dial = DelayedDial::dial(&[PHONE], "rtp_to_srtp").await;
+    dial.phone_answers_with_an_offer();
+    let caller_200 = relayed_200(&dial.wire());
+    dial.caller_acks(&caller_200, Some(CALLER_ANSWER));
+    dial.wire();
+    let (arrived, reinvite) = dial.caller_request("INVITE", "2 INVITE", &caller_200, None);
+    handle_b2bua_reinvite(arrived, reinvite, &dial.state);
+    let refreshed = relayed_200(&dial.wire());
+    let offers = dial.engine.commands("offer").len();
+
+    let moved = CALLER_ANSWER.replace("m=audio 40000", "m=audio 41000");
+    let (inbound, ack) = dial.caller_request("ACK", "2 ACK", &refreshed, Some(&moved));
+    handle_request(inbound, ack, "ACK".to_string(), &dial.state);
+
+    let after = dial.engine.commands("offer");
+    assert_eq!(
+        after.len(),
+        offers + 1,
+        "the engine is told the caller's new media"
+    );
+    assert_eq!(after[offers].sdp.as_deref(), Some(moved.as_str()));
+    assert_eq!(after[offers].from_tag.as_deref(), Some("caller-tag"));
+    assert!(
+        to_phone(&dial.wire()).is_empty(),
+        "nothing is relayed to the phone"
+    );
+    assert!(dial.call_is_up());
+
+    // A retransmitted ACK has nothing left to answer.
+    let (inbound, ack) = dial.caller_request("ACK", "2 ACK", &refreshed, Some(&moved));
+    handle_request(inbound, ack, "ACK".to_string(), &dial.state);
+    assert_eq!(dial.engine.commands("offer").len(), offers + 1);
+}
+
+/// An ACK that answers the refresh's offer with nothing breaks the exchange
+/// (RFC 3264 §4): the call is ended and the engine call deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ack_with_no_answer_to_an_offerless_refresh_ends_the_call() {
+    let dial = DelayedDial::dial(&[PHONE], "rtp_to_srtp").await;
+    dial.phone_answers_with_an_offer();
+    let caller_200 = relayed_200(&dial.wire());
+    dial.caller_acks(&caller_200, Some(CALLER_ANSWER));
+    dial.wire();
+    let (arrived, reinvite) = dial.caller_request("INVITE", "2 INVITE", &caller_200, None);
+    handle_b2bua_reinvite(arrived, reinvite, &dial.state);
+    let refreshed = relayed_200(&dial.wire());
+
+    let (inbound, ack) = dial.caller_request("ACK", "2 ACK", &refreshed, None);
+    handle_request(inbound, ack, "ACK".to_string(), &dial.state);
+
+    assert!(
+        to_caller(&dial.wire())
+            .iter()
+            .any(|sent| sent.is(Method::Bye)),
+        "the caller is sent a BYE"
+    );
+    dial.deleted(1).await;
+    assert!(!dial.call_is_up());
+}

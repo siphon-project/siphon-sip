@@ -233,3 +233,60 @@ fn apply_answer(
     }
     Ok(answer)
 }
+
+/// The number in a request's `CSeq`.
+pub(super) fn cseq_number(message: &SipMessage) -> Option<u32> {
+    message
+        .headers
+        .cseq()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The caller's ACK to the `200` of an offerless re-INVITE, which repeated the
+/// session in force (RFC 3261 §14.1: an offer in a 2xx is answered in the ACK,
+/// RFC 3264 §4). The answer is the caller's media as it now stands, so the
+/// engine is told it the way a re-INVITE carrying it would be, and nothing is
+/// relayed to the other party. A no-op unless this ACK answers such an offer.
+///
+/// An ACK with no answer, or an engine that refuses it, ends the call with a
+/// BYE, as on the initial delayed offer.
+pub(super) fn complete_refresh_answer(call_id: &str, ack: &SipMessage, state: &DispatcherState) {
+    let Some(cseq) = cseq_number(ack) else {
+        return;
+    };
+    if !state.call_actors.take_refresh_answer(call_id, cseq) {
+        return;
+    }
+    let Some(answer) = sdp_in_body(message_content_type(ack), &ack.body) else {
+        warn!(call_id = %call_id, "B2BUA: the caller ACKed the session refresh's offer without an answer (RFC 3264 §4); ending the call");
+        b2bua_terminate_call_inner(call_id, Some(NO_ANSWER_IN_ACK_REASON), "b2bua", state);
+        return;
+    };
+    let Some((a_leg_call_id, source)) = state.call_actors.get_call(call_id).map(|call| {
+        (
+            call.a_leg.dialog.call_id.clone(),
+            call.a_leg.transport.remote_addr.ip(),
+        )
+    }) else {
+        return;
+    };
+    match super::reinvite_in::reoffer_through_media_engine(
+        state,
+        &a_leg_call_id,
+        true,
+        source,
+        &a_leg_call_id,
+        &answer,
+    ) {
+        ReofferOutcome::Rewritten(_) | ReofferOutcome::NotAnchored => {
+            state.call_actors.set_leg_last_sdp(call_id, true, &answer);
+        }
+        ReofferOutcome::NoOfferTag | ReofferOutcome::Failed(_) => {
+            warn!(call_id = %call_id, "B2BUA: the media engine refused the caller's answer to the session refresh's offer; ending the call");
+            b2bua_terminate_call_inner(call_id, Some(MEDIA_ANCHOR_FAILED_REASON), "b2bua", state);
+        }
+    }
+}

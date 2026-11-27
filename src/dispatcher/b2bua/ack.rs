@@ -706,6 +706,7 @@ pub fn absorb_b2bua_ack(dialog_call_id: &str, ack: &SipMessage, state: &Dispatch
         // The ACK to a 2xx that carried the engine's own offer brings the answer.
         if is_a_leg_dialog {
             super::local_offer::complete_local_offer(&internal_id, ack, state);
+            super::local_offer::complete_refresh_answer(&internal_id, ack, state);
         }
         // A teardown that began while this ACK was on its way may have held the
         // BYE for it (RFC 3261 §15): it goes out now, right after the ACK. Only

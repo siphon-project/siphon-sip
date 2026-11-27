@@ -225,6 +225,11 @@ pub fn handle_b2bua_reinvite(
             .as_ref()
             .is_some_and(|sessions| sessions.get(&a_leg.dialog.call_id).is_some())
     {
+        // The 200 repeats the session in force, which makes it an offer: the
+        // caller's ACK answers it, and is read as such.
+        if let Some(cseq) = super::local_offer::cseq_number(&message) {
+            state.call_actors.expect_refresh_answer(&call_id, cseq);
+        }
         answer_refresh(&inbound, &message, &call_id, true, state);
         return;
     }

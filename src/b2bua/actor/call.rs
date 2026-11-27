@@ -336,6 +336,8 @@ pub struct CallActor {
     /// The engine's offer in the 2xx of a caller's INVITE that carried no SDP,
     /// until the caller's ACK brings the answer (see [`PendingLocalOffer`]).
     pub pending_local_offer: Option<PendingLocalOffer>,
+    /// CSeq of the offerless re-INVITE whose 200 repeated the session in force: its ACK answers it.
+    pub pending_refresh_answer: Option<u32>,
     /// The ACKs held for 2xx responses that brought an offer back to siphon's
     /// offerless session refresh of a dialog, one per refresh, while the other
     /// party answers that offer (RFC 3261 §13.2.2.4). Kept once sent, so copies of
@@ -603,6 +605,7 @@ impl CallActor {
             script_shaped_headers: Vec::new(),
             delayed_offer_ack: None,
             pending_local_offer: None,
+            pending_refresh_answer: None,
             refresh_offer_relays: Vec::new(),
             teardown_claimed: false,
             resolved_header_policy: None,
