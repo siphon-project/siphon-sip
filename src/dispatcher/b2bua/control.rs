@@ -435,8 +435,7 @@ pub fn send_uas_response(
         return send_a_leg_provisional(internal_call_id, response, false, None, state);
     }
     if final_response && (200..300).contains(&code) {
-        // The claim on the INVITE's final response, taken before anything is
-        // sent: a CANCEL that has the call answers 487 and no 2xx follows it.
+        // Claim the final answer before sending: after a CANCEL's 487, no 2xx.
         if !state.call_actors.claim_final_answer(internal_call_id) {
             return false;
         }
