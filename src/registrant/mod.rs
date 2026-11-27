@@ -972,7 +972,11 @@ impl RegistrantManager {
     /// its own leaves the trunk registered until its `Expires` runs out — long
     /// enough for a carrier to keep offering calls to a trunk that was deleted.
     /// A `Registered` entry therefore gets an `Expires: 0` REGISTER queued for
-    /// [`registration_loop`] to send (RFC 3261 §10.2.2).
+    /// [`registration_loop`] to send (RFC 3261 §10.2.2), after a fetch of the
+    /// AoR's bindings (§10.2.3) for a digest entry: the `Expires: 0` follows only
+    /// when the registrar still lists this node's Contact, so a registrar that
+    /// keeps one binding per AoR and has already bound another node is left
+    /// alone (see [`removed`]).
     ///
     /// The message is built here rather than by the loop because it needs the
     /// entry's Call-ID and next CSeq, which go away with the entry. It is
@@ -1372,7 +1376,9 @@ impl RegistrantManager {
         due.into_iter().map(|(_, aor)| aor).collect()
     }
 
-    /// Build de-registration (Expires: 0) for all active entries.
+    /// Build a bare de-registration (`Expires: 0`, no fetch) for all registered
+    /// entries. Not what shutdown or a removal sends: those fetch first (see
+    /// [`removed`]).
     pub fn build_deregistrations(&self, defaults: EgressDefaults<'_>) -> Vec<BuiltRegister> {
         // Collect AoRs first to avoid deadlock: iter() holds a read lock on
         // each DashMap shard, and build_register() needs a write lock (get_mut).
@@ -2071,6 +2077,15 @@ mod tests {
 
     const SOURCED_AOR: &str = "sip:a@carrier.example";
 
+    /// A removal's first request is the fetch of RFC 3261 §10.2.3 (no Contact, no
+    /// Expires): the `Expires: 0` follows only when the registrar lists this
+    /// node's Contact, so it cannot clear another node's binding.
+    pub(super) fn assert_is_fetch(raw: &str) {
+        assert!(raw.starts_with("REGISTER "), "not a REGISTER: {raw}");
+        assert!(!raw.contains("Expires:"), "carries an Expires: {raw}");
+        assert!(!raw.contains("Contact:"), "carries a Contact: {raw}");
+    }
+
     fn raw_of(built: &BuiltRegister) -> String {
         String::from_utf8_lossy(&built.message.to_bytes()).into_owned()
     }
@@ -2117,7 +2132,7 @@ mod tests {
         let pending = manager.take_pending_deregistrations();
         assert_eq!(pending.len(), 1, "the binding on the registrar was left");
         let raw = raw_of(&pending[0]);
-        assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+        assert_is_fetch(&raw);
         assert!(raw.contains(&call_id), "Call-ID {call_id} not in: {raw}");
         assert!(cseq_of(&raw) > last_cseq, "CSeq must rise: {raw}");
     }
@@ -2158,7 +2173,7 @@ mod tests {
         let pending = manager.take_pending_deregistrations();
         assert_eq!(pending.len(), 1, "the binding on the registrar was left");
         let raw = raw_of(&pending[0]);
-        assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+        assert_is_fetch(&raw);
         assert!(raw.contains(&call_id), "Call-ID {call_id} not in: {raw}");
         // Above the REGISTER already in flight, so the registrar never
         // applies that one after this.
@@ -2182,7 +2197,7 @@ mod tests {
         let pending = manager.take_pending_deregistrations();
         assert_eq!(pending.len(), 1);
         let raw = raw_of(&pending[0]);
-        assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+        assert_is_fetch(&raw);
         assert!(raw.contains(&old_call_id), "wrong Call-ID: {raw}");
         assert!(
             raw.contains("registrar.carrier.com"),
@@ -2262,7 +2277,7 @@ mod tests {
         let pending = manager.take_pending_deregistrations();
         assert_eq!(pending.len(), 1, "the earlier grant was forgotten");
         let raw = raw_of(&pending[0]);
-        assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+        assert_is_fetch(&raw);
         assert!(cseq_of(&raw) > last_cseq + 1, "CSeq must rise: {raw}");
     }
 
@@ -2301,7 +2316,7 @@ mod tests {
         let pending = manager.take_pending_deregistrations();
         assert_eq!(pending.len(), 1, "an in-flight REGISTER may bind later");
         let raw = raw_of(&pending[0]);
-        assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+        assert_is_fetch(&raw);
         assert!(raw.contains(&call_id), "wrong Call-ID: {raw}");
         assert!(cseq_of(&raw) > first_cseq, "must outrank the first: {raw}");
 
@@ -2407,7 +2422,7 @@ mod tests {
         );
         let raw = String::from_utf8_lossy(&pending[0].message.to_bytes()).into_owned();
         assert!(raw.starts_with("REGISTER "), "not a REGISTER: {raw}");
-        assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+        assert_is_fetch(&raw);
         assert!(raw.contains("sip:alice@carrier.com"), "wrong AoR: {raw}");
     }
 
@@ -2474,7 +2489,7 @@ mod tests {
         for _ in 0..2 {
             let message = udp_rx.try_recv().expect("de-REGISTER on the wire");
             let raw = String::from_utf8_lossy(&message.data).into_owned();
-            assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
+            assert_is_fetch(&raw);
         }
         assert!(udp_rx.try_recv().is_err(), "sent more than it reported");
     }

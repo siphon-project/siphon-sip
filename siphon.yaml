@@ -700,6 +700,14 @@ registrar:
 # binding per AoR is never cleared of another node's binding. Known limit: another
 # node registering between the fetch and the de-REGISTER, on such a registrar.
 #
+# The same fetch goes before EVERY digest de-REGISTER: graceful shutdown, a trunk
+# the source drops or moves (another registrar, destination or transport), and
+# registration.remove(). `Expires: 0` is sent only when the fetch lists this
+# node's own Contact; a refusal, a timeout or another node's Contact alone sends
+# nothing and the binding expires by itself. At shutdown the fetch and the
+# de-REGISTER share the 20 s answer bound, so an unanswered fetch ends shutdown
+# without clearing anything. IMS AKA / IPsec entries are not fetched.
+#
 # EVERY NODE NEEDS A UNIQUE `server.instance_id` (or a unique HOSTNAME) for that
 # clean-up. The Contact siphon generates for a trunk carries `;rnode=<hash of the
 # instance id and the AoR>`, which is how a node knows a stored binding is its own
