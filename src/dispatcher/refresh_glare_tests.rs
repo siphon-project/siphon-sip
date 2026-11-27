@@ -52,6 +52,36 @@ async fn the_refresh_holds_the_pending_reinvite_guard_toward_the_caller_until_it
         .set_pending_reinvite(&dial.call_id, true, true));
 }
 
+/// A copy of the INVITE (same branch and CSeq) replays the stored 200.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retransmitted_reinvite_replays_the_stored_200_and_arms_nothing() {
+    let dial_and = refreshed_dial("3 INVITE").await;
+    let (dial, caller_200, refreshed) = dial_and;
+    // The same request again: same branch and CSeq.
+    let raw_branch = refreshed
+        .headers
+        .get("Via")
+        .expect("a Via")
+        .split("branch=")
+        .nth(1)
+        .expect("a branch")
+        .to_string();
+    let (arrived, mut copy) = dial.caller_request("INVITE", "3 INVITE", &caller_200, None);
+    copy.headers.set(
+        "Via",
+        format!("SIP/2.0/UDP 192.0.2.10:5060;branch={raw_branch}"),
+    );
+    handle_b2bua_reinvite(arrived, copy, &dial.state);
+    let replayed = dial.wire();
+    let replies: Vec<_> = to_caller(&replayed)
+        .into_iter()
+        .filter(|sent| sent.message.status_code() == Some(200))
+        .collect();
+    assert_eq!(replies.len(), 1, "the 200 is replayed");
+    assert_eq!(replies[0].message.body, refreshed.body);
+    assert!(to_phone(&replayed).is_empty());
+}
+
 /// A request with an older CSeq never replaces the newer exchange, whose ACK
 /// still reaches the engine.
 #[tokio::test(flavor = "multi_thread")]
@@ -60,9 +90,10 @@ async fn an_older_cseq_does_not_overwrite_a_newer_pending_refresh() {
     let (arrived, stale) = dial.caller_request("INVITE", "2 INVITE", &caller_200, None);
     handle_b2bua_reinvite(arrived, stale, &dial.state);
     let sent = dial.wire();
-    assert!(
-        !statuses(&to_caller(&sent)).contains(&200),
-        "no second answer for an old request"
+    assert_eq!(
+        statuses(&to_caller(&sent)),
+        vec![500],
+        "an out-of-order request is refused, not answered (RFC 3261 §14.2)"
     );
     let offers = dial.engine.commands("offer").len();
     let moved = CALLER_ANSWER.replace("m=audio 40000", "m=audio 41000");

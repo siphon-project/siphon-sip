@@ -81,8 +81,10 @@ pub(super) fn answer_offerless_refresh(
 }
 
 /// A re-INVITE from the caller while the offer its refresh's `200` made is
-/// still outstanding (RFC 3261 §14.1, §14.2): answered here, `491 Request
-/// Pending`, and never taken for an exchange of its own. `true` when it was
+/// still outstanding (RFC 3261 §14.1, §14.2): answered here and never taken for
+/// an exchange of its own. A copy of the refresh itself (same branch and CSeq)
+/// gets its stored `200` again, an older CSeq `500`, anything else `491
+/// Request Pending`. `true` when it was
 /// answered. A re-INVITE from the callee meets the same exchange on the
 /// pending re-INVITE guard the ordinary path takes ([`expect_refresh_answer`]
 /// holds the caller's leg on it).
@@ -92,17 +94,37 @@ pub(super) fn answer_outstanding_refresh(
     call_id: &str,
     state: &DispatcherState,
 ) -> bool {
-    if state.call_actors.refresh_in_progress(call_id).is_none() {
+    let Some(pending) = state.call_actors.refresh_in_progress(call_id) else {
         return false;
-    }
-    debug!(%call_id, "B2BUA: re-INVITE during an offerless refresh's offer: 491");
-    let response = build_response(
-        message,
-        491,
-        "Request Pending",
-        state.identity.load().server.as_deref(),
-        &[],
-    );
+    };
+    let cseq = cseq_number(message);
+    let response = if cseq == Some(pending.cseq)
+        && top_via_branch(message).as_deref() == Some(pending.branch.as_str())
+    {
+        // A copy of the INVITE the offer answers: the 200 again (RFC 3261
+        // §17.2.1), and nothing armed twice.
+        debug!(%call_id, "B2BUA: retransmitted re-INVITE during an offerless refresh: its 200 again");
+        pending.response
+    } else if cseq.is_some_and(|cseq| cseq < pending.cseq) {
+        // An older request never replaces the newer exchange (RFC 3261 §12.2.2).
+        debug!(%call_id, "B2BUA: out-of-order re-INVITE during an offerless refresh: 500");
+        build_response(
+            message,
+            500,
+            "Server Internal Error",
+            state.identity.load().server.as_deref(),
+            &[],
+        )
+    } else {
+        debug!(%call_id, "B2BUA: re-INVITE during an offerless refresh's offer: 491");
+        build_response(
+            message,
+            491,
+            "Request Pending",
+            state.identity.load().server.as_deref(),
+            &[],
+        )
+    };
     send_message_from(
         response,
         inbound.transport,
