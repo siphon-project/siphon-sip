@@ -29,7 +29,7 @@ const PHONE_OFFER: &str = concat!(
     "a=rtpmap:0 PCMU/8000\r\n",
     "a=rtpmap:101 telephone-event/8000\r\n",
 );
-const CALLER_ANSWER: &str = concat!(
+pub(super) const CALLER_ANSWER: &str = concat!(
     "v=0\r\n",
     "o=caller 3 3 IN IP4 192.0.2.10\r\n",
     "s=-\r\n",
@@ -66,13 +66,13 @@ fn offerless_invite() -> SipMessage {
     .expect("the caller's INVITE parses")
 }
 
-struct Sent {
-    destination: SocketAddr,
-    message: SipMessage,
+pub(super) struct Sent {
+    pub(super) destination: SocketAddr,
+    pub(super) message: SipMessage,
 }
 
 impl Sent {
-    fn is(&self, method: Method) -> bool {
+    pub(super) fn is(&self, method: Method) -> bool {
         self.message.method() == Some(&method)
     }
 }
@@ -95,19 +95,19 @@ fn body_text(message: &SipMessage) -> String {
 }
 
 /// A parked, offerless call whose controller dials one phone with a profile.
-struct DelayedDial {
-    state: Arc<DispatcherState>,
-    udp: flume::Receiver<OutboundMessage>,
-    engine: TestEngine,
-    sessions: Arc<crate::rtpengine::MediaSessionStore>,
-    call_id: String,
+pub(super) struct DelayedDial {
+    pub(super) state: Arc<DispatcherState>,
+    pub(super) udp: flume::Receiver<OutboundMessage>,
+    pub(super) engine: TestEngine,
+    pub(super) sessions: Arc<crate::rtpengine::MediaSessionStore>,
+    pub(super) call_id: String,
     /// The INVITEs siphon sent the phones, one per branch.
-    invites: Vec<SipMessage>,
+    pub(super) invites: Vec<SipMessage>,
 }
 
 impl DelayedDial {
     /// Park the call and dial `phones` in parallel with `profile`.
-    async fn dial(phones: &[&str], profile: &str) -> DelayedDial {
+    pub(super) async fn dial(phones: &[&str], profile: &str) -> DelayedDial {
         Self::dial_with(phones, profile, true).await
     }
 
@@ -166,7 +166,7 @@ impl DelayedDial {
         }
     }
 
-    fn wire(&self) -> Vec<Sent> {
+    pub(super) fn wire(&self) -> Vec<Sent> {
         drain(&self.udp)
     }
 
@@ -202,13 +202,13 @@ impl DelayedDial {
         ));
     }
 
-    fn phone_answers_with_an_offer(&self) -> SipMessage {
+    pub(super) fn phone_answers_with_an_offer(&self) -> SipMessage {
         let invite = self.invites[0].clone();
         self.phone_sends(&invite, self.phone_response(&invite, "200 OK", PHONE_OFFER));
         invite
     }
 
-    fn caller_request(
+    pub(super) fn caller_request(
         &self,
         method: &str,
         cseq: &str,
@@ -252,17 +252,17 @@ impl DelayedDial {
         (inbound, message)
     }
 
-    fn caller_acks(&self, relayed_200: &SipMessage, answer: Option<&str>) {
+    pub(super) fn caller_acks(&self, relayed_200: &SipMessage, answer: Option<&str>) {
         let (inbound, message) = self.caller_request("ACK", "1 ACK", relayed_200, answer);
         handle_request(inbound, message, "ACK".to_string(), &self.state);
     }
 
-    fn call_is_up(&self) -> bool {
+    pub(super) fn call_is_up(&self) -> bool {
         self.state.call_actors.get_call(&self.call_id).is_some()
     }
 
     /// Wait until the engine has been sent `count` `delete`s.
-    async fn deleted(&self, count: usize) {
+    pub(super) async fn deleted(&self, count: usize) {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while self.engine.commands("delete").len() < count {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -292,19 +292,19 @@ fn park(state: &DispatcherState) -> String {
     call_id
 }
 
-fn to_phone(sent: &[Sent]) -> Vec<&Sent> {
+pub(super) fn to_phone(sent: &[Sent]) -> Vec<&Sent> {
     sent.iter()
         .filter(|sent| sent.destination == address(PHONE))
         .collect()
 }
 
-fn to_caller(sent: &[Sent]) -> Vec<&Sent> {
+pub(super) fn to_caller(sent: &[Sent]) -> Vec<&Sent> {
     sent.iter()
         .filter(|sent| sent.destination == address(CALLER))
         .collect()
 }
 
-fn relayed_200(sent: &[Sent]) -> SipMessage {
+pub(super) fn relayed_200(sent: &[Sent]) -> SipMessage {
     to_caller(sent)
         .into_iter()
         .find(|sent| sent.message.status_code() == Some(200))
@@ -732,4 +732,26 @@ async fn an_ack_with_no_answer_to_an_offerless_refresh_ends_the_call() {
     );
     dial.deleted(1).await;
     assert!(!dial.call_is_up());
+}
+
+/// A connected delayed-offer dial whose caller has sent an offerless re-INVITE
+/// (`cseq`), and the `200` siphon answered it with. The wire is drained.
+pub(super) async fn refreshed_dial(cseq: &str) -> (DelayedDial, SipMessage, SipMessage) {
+    let dial = DelayedDial::dial(&[PHONE], "rtp_to_srtp").await;
+    dial.phone_answers_with_an_offer();
+    let caller_200 = relayed_200(&dial.wire());
+    dial.caller_acks(&caller_200, Some(CALLER_ANSWER));
+    dial.wire();
+    let refreshed = dial.refresh(cseq, &caller_200);
+    (dial, caller_200, refreshed)
+}
+
+impl DelayedDial {
+    /// The caller's offerless re-INVITE (`cseq`, as `"3 INVITE"`); returns the
+    /// `200` siphon answers it with.
+    pub(super) fn refresh(&self, cseq: &str, caller_200: &SipMessage) -> SipMessage {
+        let (arrived, reinvite) = self.caller_request("INVITE", cseq, caller_200, None);
+        handle_b2bua_reinvite(arrived, reinvite, &self.state);
+        relayed_200(&self.wire())
+    }
 }

@@ -1,6 +1,5 @@
 //! An inbound re-INVITE on a bridged call: glare, the offer/answer it drives
 //! across the bridge, and the media re-anchor behind it.
-use super::bridge_relay::answer_refresh;
 use crate::b2bua::reoffer::{AnswerExtras, ReofferDecision};
 use crate::dispatcher::*;
 
@@ -227,10 +226,7 @@ pub fn handle_b2bua_reinvite(
     {
         // The 200 repeats the session in force, which makes it an offer: the
         // caller's ACK answers it, and is read as such.
-        if let Some(cseq) = super::local_offer::cseq_number(&message) {
-            state.call_actors.expect_refresh_answer(&call_id, cseq);
-        }
-        answer_refresh(&inbound, &message, &call_id, true, state);
+        super::refresh_answer::answer_offerless_refresh(&inbound, &message, &call_id, state);
         return;
     }
 
@@ -1063,6 +1059,28 @@ pub fn send_one_legged_ok_with(
     extras: &AnswerExtras,
     state: &DispatcherState,
 ) -> SipMessage {
+    let response = build_one_legged_ok(inbound, message, call_id, body, extras, state);
+    send_message_from(
+        response.clone(),
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        Some(inbound.local_addr),
+        state,
+    );
+    response
+}
+
+/// The `200` [`send_one_legged_ok_with`] sends, built and not sent: the
+/// caller of an offerless refresh puts it under retransmission first.
+pub(super) fn build_one_legged_ok(
+    inbound: &InboundMessage,
+    message: &SipMessage,
+    call_id: &str,
+    body: Vec<u8>,
+    extras: &AnswerExtras,
+    state: &DispatcherState,
+) -> SipMessage {
     let mut response = build_response(
         message,
         200,
@@ -1098,14 +1116,6 @@ pub fn send_one_legged_ok_with(
             error!(call_id = %call_id, "B2BUA: the answer could not be framed: {why}");
         }
     }
-    send_message_from(
-        response.clone(),
-        inbound.transport,
-        inbound.remote_addr,
-        inbound.connection_id,
-        Some(inbound.local_addr),
-        state,
-    );
     response
 }
 
