@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.20.1] — 2026-11-27
+
 ### Deprecated
 
 - `RegistrantManager::answer_removed_deregistration` is deprecated in favour of `answer_removed_registration`, which also takes the response's `Contact` headers and `Expires`. The old function gets no Contacts, so it cannot read the answer to the fetch that now precedes a digest de-REGISTER: on such a fetch's 2xx it ends the exchange without sending `Expires: 0` (the binding expires on its own) and logs a warning once per process. Its behaviour on a de-REGISTER that has no fetch before it (IMS entries) is unchanged.
