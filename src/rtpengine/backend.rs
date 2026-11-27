@@ -965,6 +965,23 @@ impl MediaBackend {
         }
     }
 
+    /// [`Self::reoffer`] for a party that was already told its ports and cannot
+    /// be given others: the native engine's replacement of a call whose codec
+    /// changed (new ports, attachments dropped) is refused as an error instead.
+    /// The other backends re-offer as they always do.
+    pub async fn reoffer_in_place(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        sdp: &[u8],
+        flags: &NgFlags,
+    ) -> Result<Vec<u8>, RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => client.reoffer_in_place(call_id, from_tag, sdp, flags).await,
+            _ => self.reoffer(call_id, from_tag, sdp, flags).await,
+        }
+    }
+
     /// Complete a subscription's SDP negotiation.
     pub async fn subscribe_answer(
         &self,

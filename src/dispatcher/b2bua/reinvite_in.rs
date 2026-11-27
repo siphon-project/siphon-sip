@@ -1162,6 +1162,50 @@ pub fn reoffer_through_media_engine(
     offerer_sip_call_id: &str,
     offer: &[u8],
 ) -> ReofferOutcome {
+    reoffer_through_engine(
+        state,
+        a_leg_call_id,
+        from_a_leg,
+        received_from,
+        offerer_sip_call_id,
+        offer,
+        false,
+    )
+}
+
+/// [`reoffer_through_media_engine`] for an offer that is an *answer* to one
+/// the party already holds the ports of (the ACK to an offerless refresh's
+/// `200`): an engine that could take it only by replacing the session fails it
+/// instead, as a replacement would leave that party signalled with the old
+/// ports.
+pub fn reoffer_in_place_through_media_engine(
+    state: &DispatcherState,
+    a_leg_call_id: &str,
+    from_a_leg: bool,
+    received_from: std::net::IpAddr,
+    offerer_sip_call_id: &str,
+    offer: &[u8],
+) -> ReofferOutcome {
+    reoffer_through_engine(
+        state,
+        a_leg_call_id,
+        from_a_leg,
+        received_from,
+        offerer_sip_call_id,
+        offer,
+        true,
+    )
+}
+
+fn reoffer_through_engine(
+    state: &DispatcherState,
+    a_leg_call_id: &str,
+    from_a_leg: bool,
+    received_from: std::net::IpAddr,
+    offerer_sip_call_id: &str,
+    offer: &[u8],
+    in_place: bool,
+) -> ReofferOutcome {
     let (Some(rtpengine_set), Some(media_sessions), Some(profiles)) = (
         &state.rtpengine_set,
         &state.rtpengine_sessions,
@@ -1191,12 +1235,22 @@ pub fn reoffer_through_media_engine(
         .party_ingress(from_a_leg)
         .stamp_ingress(&mut offer_flags, profiles, received_from);
     offer_flags.stamp_sip_call_id(offerer_sip_call_id);
-    match crate::script::blocking::block_on_released(rtpengine_set.reoffer(
-        session.rtpengine_id(),
-        offer_tag,
-        offer,
-        &offer_flags,
-    )) {
+    let reoffered = if in_place {
+        crate::script::blocking::block_on_released(rtpengine_set.reoffer_in_place(
+            session.rtpengine_id(),
+            offer_tag,
+            offer,
+            &offer_flags,
+        ))
+    } else {
+        crate::script::blocking::block_on_released(rtpengine_set.reoffer(
+            session.rtpengine_id(),
+            offer_tag,
+            offer,
+            &offer_flags,
+        ))
+    };
+    match reoffered {
         Ok(rewritten) => ReofferOutcome::Rewritten(rewritten),
         Err(error) => ReofferOutcome::Failed(error.to_string()),
     }

@@ -185,7 +185,7 @@ pub(super) fn complete_refresh_answer(call_id: &str, ack: &SipMessage, state: &D
     }) else {
         return;
     };
-    match super::reinvite_in::reoffer_through_media_engine(
+    match super::reinvite_in::reoffer_in_place_through_media_engine(
         state,
         &a_leg_call_id,
         true,
@@ -197,8 +197,15 @@ pub(super) fn complete_refresh_answer(call_id: &str, ack: &SipMessage, state: &D
             state.call_actors.set_leg_last_sdp(call_id, true, &answer);
             state.call_actors.finish_refresh_answer(call_id);
         }
-        ReofferOutcome::NoOfferTag | ReofferOutcome::Failed(_) => {
-            warn!(call_id = %call_id, "B2BUA: the media engine refused the caller's answer to the session refresh's offer; ending the call");
+        ReofferOutcome::NoOfferTag => {
+            warn!(call_id = %call_id, "B2BUA: the session has no tag for the caller to name to the media engine; ending the call");
+            b2bua_terminate_call_inner(call_id, Some(MEDIA_ANCHOR_FAILED_REASON), "b2bua", state);
+        }
+        ReofferOutcome::Failed(error) => {
+            // The engine took the answer neither in place nor at all (a changed
+            // codec needs a replacement call, on ports the caller was never
+            // told): the session cannot be kept as advertised.
+            warn!(call_id = %call_id, %error, "B2BUA: the media engine cannot take the caller's answer to the session refresh's offer on the session it advertised; ending the call");
             b2bua_terminate_call_inner(call_id, Some(MEDIA_ANCHOR_FAILED_REASON), "b2bua", state);
         }
     }
