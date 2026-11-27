@@ -49,6 +49,7 @@ entry, but a working config keeps working.
 - Name-addr headers (From, To, Contact, P-Asserted-Identity and the rest) are parsed with quoted strings respected (RFC 3261 §25.1, quoted-pairs included). A `<`, `,` or `;` inside a quoted display name or a quoted parameter value no longer picks the wrong URI, splits one entry into two, or cuts a parameter short.
 ### Added
 
+- Control plane: an anchored `answer` (and `call.handover(answer=True)`) now answers a caller whose INVITE carries no SDP (a delayed offer, RFC 3261 section 13.2.1). The media engine makes the offer (`offer_local`), siphon puts it in the 2xx, and the caller's answer in its ACK completes the engine call. A `ws_uri` rides in the offer and the engine dials the bot with the answer, so the takeover is attached once. An ACK with no SDP, an answer the engine refuses, or no ACK within 64*T1 ends the call with a BYE and deletes the engine call. Control verbs that need the engine call (the media verbs and `dial`) wait for the ACK, up to 64*T1, before they run. Needs a siphon-rtp 0.30 or later; an older engine still gets `unavailable`, with the call left parked. Anchored early media on such an INVITE stays refused.
 - Control plane: a `dial` with a media `profile` now connects a caller whose INVITE carries no SDP (a delayed offer, RFC 3261 section 13.2.1). The phones are rung offerless, the answering phone's offer is anchored under the profile's `answer` half and the engine's offer goes in the caller's 2xx, and the caller's ACK answer completes it through the engine into the phone's ACK. An ACK with no answer, or none within 64*T1, ends the call and frees the media. Previously the dial was refused with "dial profile requires a caller SDP offer".
 
 ### Fixed
@@ -58,7 +59,6 @@ entry, but a working config keeps working.
 ### Changed
 
 - Pairs with siphon-rtp 0.30.0 and moves the control protocol crate (`siphon-rtp-proto`) to 0.30.0. An end reason the engine adds later no longer loses its event: the stream, bridge, split, playback, recording, media-timeout and X3 end events still reach `@rtpengine` handlers and the control rail, with the reason spelled `unknown` (a tee or bridge ending that way still counts as unexpected, a playback ending that way is not `completed`).
-- Control plane: an anchored `answer` on an INVITE with no SDP is still refused (`unavailable`), now with a message that says why: the media engine has no engine-originated offer for a single-leg call.
 
 ## [1.19.1] — 2026-11-26
 

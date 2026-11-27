@@ -253,6 +253,21 @@ pub fn answer_first_anchor(
     // it has already accepted.
     let answer_sdp = match state.call_actors.early_media_anchor(call_id) {
         Some(anchor) => anchor.answer_sdp,
+        // No offer to answer: the engine makes one, and the ACK answers it.
+        None if super::local_offer::carries_no_offer(invite) => {
+            return super::local_offer::answer_first_delayed_offer(
+                call_id,
+                invite,
+                source_ip,
+                code,
+                reason,
+                profile,
+                ws_uri,
+                media_flags,
+                headers,
+                state,
+            );
+        }
         None => anchor_a_leg(invite, source_ip, profile, ws_uri, media_flags, state)?.answer_sdp,
     };
 
@@ -309,6 +324,16 @@ pub fn anchor_a_leg(
         ws_uri,
         media_flags,
     )?;
+    if plan.offer_sdp.trim().is_empty() {
+        // An 18x would have to carry the engine's offer, and the caller's
+        // answer to it comes in a PRACK, which nothing here completes. Only the
+        // 2xx's offer, answered in the ACK, is anchored.
+        return Err(
+            "early media cannot be anchored on an INVITE with no SDP: answer it, and the 2xx \
+             carries the media engine's offer (RFC 3261 §13.2.1)"
+                .to_string(),
+        );
+    }
 
     // Media round-trip on the SIP-processing path (block_in_place is consistent
     // with the existing B2BUA answer paths — NOT the control-command path).
@@ -508,19 +533,9 @@ pub fn answer_first_prepare(
         ));
     }
 
+    // An INVITE with no SDP (RFC 3261 §13.2.1) leaves `offer_sdp` empty: the
+    // engine makes the offer for the 2xx instead (`answer_first_delayed_offer`).
     let offer_sdp = String::from_utf8_lossy(&invite.body).into_owned();
-    if offer_sdp.trim().is_empty() {
-        // RFC 3261 §13.2.1: an INVITE with no SDP wants the offer in the 2xx. The
-        // engine can answer an offer (`answer_local`) but has no verb that makes
-        // an offer of its own for a single-leg call, so there is nothing to put
-        // in that 2xx.
-        return Err(
-            "answer-first needs an SDP offer on the INVITE, and this one carries none: the media \
-             engine's protocol has no engine-originated offer for a single-leg call, so a delayed \
-             offer (RFC 3261 §13.2.1) cannot be answered anchored"
-                .to_string(),
-        );
-    }
 
     Ok(AnswerFirstPlan {
         flags,

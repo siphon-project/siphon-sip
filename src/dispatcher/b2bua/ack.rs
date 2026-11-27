@@ -581,13 +581,13 @@ pub fn reject_unanchorable_offer(
 /// caller broke the offer/answer exchange (RFC 3264 §4 puts the answer to an
 /// offer in a 2xx into the ACK). Not 16: nothing about this ending was normal,
 /// and no party hung up. The text says which rule was broken.
-const NO_ANSWER_IN_ACK_REASON: &str = q850_reason!(111, "No SDP answer in ACK");
+pub(super) const NO_ANSWER_IN_ACK_REASON: &str = q850_reason!(111, "No SDP answer in ACK");
 
 /// What a call ended because the media engine refused the caller's answer to an
 /// anchored delayed offer carries on its BYEs. Q.850 cause 47, "resource
 /// unavailable, unspecified": the media resource the call is anchored on could
 /// not complete the session.
-const MEDIA_ANCHOR_FAILED_REASON: &str = q850_reason!(47, "Media anchor failed");
+pub(super) const MEDIA_ANCHOR_FAILED_REASON: &str = q850_reason!(47, "Media anchor failed");
 
 /// An SDP answer that declines every stream `offer` makes (RFC 3264 §6): one
 /// `m=` line for each offered one, in the same order, with port 0 and the first
@@ -689,8 +689,10 @@ pub fn absorb_b2bua_ack(dialog_call_id: &str, ack: &SipMessage, state: &Dispatch
     if let Some(internal_id) = state.call_actors.find_by_message(ack) {
         // The leg carrying this dialog is confirmed, whichever slot a takeover
         // has moved it to.
+        let mut is_a_leg_dialog = false;
         if let Some(mut call) = state.call_actors.get_call_mut(&internal_id) {
             if call.a_leg.dialog.call_id == dialog_call_id {
+                is_a_leg_dialog = true;
                 call.a_leg.initial_acked = true;
             } else if let Some(leg) = call
                 .b_legs
@@ -701,6 +703,10 @@ pub fn absorb_b2bua_ack(dialog_call_id: &str, ack: &SipMessage, state: &Dispatch
             }
         }
         send_delayed_offer_ack(&internal_id, ack, state);
+        // The ACK to a 2xx that carried the engine's own offer brings the answer.
+        if is_a_leg_dialog {
+            super::local_offer::complete_local_offer(&internal_id, ack, state);
+        }
         // A teardown that began while this ACK was on its way may have held the
         // BYE for it (RFC 3261 §15): it goes out now, right after the ACK. Only
         // the ACK that took the answer can find one.

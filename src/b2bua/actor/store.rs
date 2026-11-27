@@ -27,6 +27,7 @@ mod failure;
 pub use adoption::{AdoptedSwap, AdoptionIndex};
 pub use failure::FailureConclusion;
 mod fork;
+mod local_offer;
 mod replacement;
 mod reserved_id;
 mod route_progress;

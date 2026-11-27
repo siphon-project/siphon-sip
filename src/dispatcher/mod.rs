@@ -219,6 +219,8 @@ mod control_unbridge_reoffer_tests;
 #[cfg(test)]
 mod delayed_offer_ack_tests;
 #[cfg(test)]
+mod delayed_offer_answer_tests;
+#[cfg(test)]
 mod delayed_offer_ingress_tests;
 #[cfg(test)]
 mod dial_bridge_test_harness;

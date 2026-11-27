@@ -333,6 +333,9 @@ pub struct CallActor {
     /// then kept as sent so every retransmission of the 2xx gets it again. `None`
     /// for a call whose INVITE carried an offer: that 2xx is ACKed on arrival.
     pub delayed_offer_ack: Option<DelayedOfferAck>,
+    /// The engine's offer in the 2xx of a caller's INVITE that carried no SDP,
+    /// until the caller's ACK brings the answer (see [`PendingLocalOffer`]).
+    pub pending_local_offer: Option<PendingLocalOffer>,
     /// The ACKs held for 2xx responses that brought an offer back to siphon's
     /// offerless session refresh of a dialog, one per refresh, while the other
     /// party answers that offer (RFC 3261 §13.2.2.4). Kept once sent, so copies of
@@ -599,6 +602,7 @@ impl CallActor {
             caller_contact_presented: std::sync::atomic::AtomicBool::new(false),
             script_shaped_headers: Vec::new(),
             delayed_offer_ack: None,
+            pending_local_offer: None,
             refresh_offer_relays: Vec::new(),
             teardown_claimed: false,
             resolved_header_policy: None,
@@ -1394,20 +1398,6 @@ impl CallActor {
     /// Store the original A-leg INVITE message.
     pub fn set_a_leg_invite(&mut self, message: Arc<Mutex<SipMessage>>) {
         self.a_leg_invite = Some(message);
-    }
-
-    /// Set the actor handle for a B-leg.
-    pub fn set_b_leg_handle(&mut self, index: usize, handle: LegHandle) {
-        if index < self.b_leg_handles.len() {
-            self.b_leg_handles[index] = Some(handle);
-        }
-    }
-
-    /// Send `Shutdown` to all active B-leg actor handles.
-    pub fn shutdown_actors(&self) {
-        for handle in self.b_leg_handles.iter().flatten() {
-            let _ = handle.tx.try_send(LegMessage::Shutdown);
-        }
     }
 }
 

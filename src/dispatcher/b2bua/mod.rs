@@ -44,6 +44,7 @@ mod info_outbound;
 mod invite;
 mod late_prack_offer;
 mod leg_offer;
+mod local_offer;
 mod on_failure;
 mod originate;
 mod originate_auth;

@@ -46,7 +46,12 @@ use tokio::net::TcpListener;
 
 use super::MediaBackend;
 
+mod offer_local;
 mod split;
+use offer_local::OfferLocalModel;
+pub(crate) use offer_local::{
+    NATIVE_ENGINE_ANSWER_REFUSALS, NATIVE_ENGINE_LOCAL_OFFER, NATIVE_ENGINE_OFFER_LOCAL,
+};
 use split::SplitModel;
 pub(crate) use split::NATIVE_ENGINE_WS_SPLIT;
 
@@ -861,6 +866,13 @@ fn recording_command(command: &Command) -> (Option<Recorded>, Option<String>, bo
             false,
             true,
         ),
+        // The engine's own offer for a call whose INVITE carried no SDP.
+        Command::OfferLocal { .. } => (
+            OfferLocalModel::record(command),
+            Some(NATIVE_ENGINE_LOCAL_OFFER.to_string()),
+            true,
+            false,
+        ),
         _ => (None, None, false, false),
     }
 }
@@ -934,6 +946,7 @@ pub(crate) struct NativeTestEngine {
     live: LiveCalls,
     x3: Arc<X3Model>,
     split: Arc<SplitModel>,
+    offer_local: Arc<OfferLocalModel>,
     /// Gates on the answers of `answer_local`, `delete` and `attach_x3`, in
     /// that order. Open (the default) answers; closed holds every answer until
     /// it opens, so a test can act while a command is provably out: report an
@@ -999,6 +1012,15 @@ impl NativeTestEngine {
         NativeTestEngine::start_with_features(&features).await
     }
 
+    /// [`NativeTestEngine::start`] for a siphon-rtp 0.30.0, which lists
+    /// `offer_local`: it makes its own offer for a call whose INVITE carried
+    /// no SDP and waits for the caller's answer.
+    pub(crate) async fn start_with_offer_local() -> NativeTestEngine {
+        let mut features = NATIVE_ENGINE_FEATURES.to_vec();
+        features.push(NATIVE_ENGINE_OFFER_LOCAL);
+        NativeTestEngine::start_with_features(&features).await
+    }
+
     /// [`NativeTestEngine::start`] for an engine whose `node_info` lists
     /// `features`: one from before a verb leaves the verb's feature out.
     pub(crate) async fn start_with_features(features: &[&str]) -> NativeTestEngine {
@@ -1020,6 +1042,8 @@ impl NativeTestEngine {
         let x3_model = Arc::clone(&x3);
         let split = Arc::new(SplitModel::default());
         let split_model = Arc::clone(&split);
+        let offer_local = Arc::new(OfferLocalModel::default());
+        let offer_local_model = Arc::clone(&offer_local);
         let (answers, answers_open) = tokio::sync::watch::channel(true);
         let (deletes, deletes_open) = tokio::sync::watch::channel(true);
         let (attaches, attaches_open) = tokio::sync::watch::channel(true);
@@ -1035,6 +1059,7 @@ impl NativeTestEngine {
                 let local = Arc::clone(&local);
                 let x3 = Arc::clone(&x3_model);
                 let split = Arc::clone(&split_model);
+                let offer_local = Arc::clone(&offer_local_model);
                 let next_play_id = Arc::clone(&next_play_id);
                 let mut gates = [
                     answers_open.clone(),
@@ -1068,11 +1093,13 @@ impl NativeTestEngine {
                             .and_then(|grown| grown.refusal.clone())
                             .or_else(|| seat_refusal(&request.command))
                             .or_else(|| x3.refusal(&request.command, &scope, &local, &grown))
-                            .or_else(|| split.refusal(&request.command, &scope));
+                            .or_else(|| split.refusal(&request.command, &scope))
+                            .or_else(|| offer_local.refusal(&request.command, &scope));
                         let on_seat = x3.names_seat(&request.command);
                         if let Ok(mut local) = local.lock() {
                             match &request.command {
-                                Command::AnswerLocal { call_id, .. } => {
+                                Command::AnswerLocal { call_id, .. }
+                                | Command::OfferLocal { call_id, .. } => {
                                     local.insert((scope.clone(), call_id.clone()));
                                 }
                                 Command::Offer { call_id, .. }
@@ -1131,12 +1158,13 @@ impl NativeTestEngine {
                             Command::Answer {
                                 call_id,
                                 from_tag,
+                                to_tag,
                                 profile,
                                 sdp,
-                                ..
                             } => (
                                 Some(Recorded {
                                     profile: Some(profile.clone()),
+                                    detail: Some(to_tag.clone()),
                                     ..Recorded::new("answer", call_id, from_tag)
                                 }),
                                 Some(native_engine_sdp(
@@ -1247,6 +1275,7 @@ impl NativeTestEngine {
                         if !refused && refusal.is_none() {
                             x3.accepted(&request.command, &scope);
                             split.accepted(&request.command, &scope);
+                            offer_local.accepted(&request.command, &scope);
                         }
                         let unknown_call = record
                             .as_ref()
@@ -1295,6 +1324,7 @@ impl NativeTestEngine {
             live,
             x3,
             split,
+            offer_local,
             gates: [answers, deletes, attaches],
         }
     }
@@ -1330,6 +1360,11 @@ impl NativeTestEngine {
     /// (`ws-split-renegotiation`, ...).
     pub(crate) fn refuse_next_split(&self, token: &str) {
         self.split.refuse_next(token);
+    }
+
+    /// How many calls made by `offer_local` still wait for their answer.
+    pub(crate) fn offer_local_pending_count(&self) -> usize {
+        self.offer_local.pending_calls()
     }
 
     /// How many calls the engine holds isolated by a split.
@@ -1431,6 +1466,14 @@ impl NativeTestEngine {
             super::SiphonRtpClientSet::new(vec![(self.address, 2000, 1)], None, 5_000, event_tx)
                 .expect("a native engine set");
         Arc::new(MediaBackend::SiphonRtp(set))
+    }
+
+    /// Every command the engine has been sent so far, in order.
+    pub(crate) fn all_commands(&self) -> Vec<NativeCommand> {
+        self.commands
+            .lock()
+            .map(|log| log.clone())
+            .unwrap_or_default()
     }
 
     /// Every command of kind `name` the engine has been sent so far, in order.
