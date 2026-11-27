@@ -40,8 +40,15 @@ pub fn transport_is_webrtc(transport: Transport) -> bool {
     matches!(transport, Transport::WebSocket | Transport::WebSocketSecure)
 }
 
-/// Whether `sdp` is a WebRTC offer: a `UDP/TLS/RTP/SAVPF` media section, and
-/// both `a=ice-ufrag` and `a=fingerprint` (at session or media level).
+/// Whether `sdp` is a WebRTC offer: its first live audio section (an `m=audio`
+/// whose port is not 0) is `UDP/TLS/RTP/SAVPF` and carries both `a=ice-ufrag`
+/// and `a=fingerprint`, each its own or inherited from the session level.
+///
+/// `a=ice-ufrag` (RFC 8839 §5.4) and `a=fingerprint` (RFC 8122 §5) are valid at
+/// either level, and a media-level one overrides the session's, so the
+/// verdict is made for the one section the answer half will shape, never over
+/// attributes pooled from every section: an audio section with a fingerprint
+/// and no ICE is not made WebRTC by a video section that has an ice-ufrag.
 ///
 /// The protocol alone is not enough. A desk phone doing SDES-over-DTLS-less
 /// SAVPF names `RTP/SAVPF`, and a plain DTLS-SRTP peer without ICE would be
@@ -50,20 +57,40 @@ pub fn offer_is_webrtc(sdp: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(sdp) else {
         return false;
     };
-    let mut protocol = false;
-    let mut ice_ufrag = false;
-    let mut fingerprint = false;
+    // `a=` lines before the first `m=` are session level; after it they belong
+    // to the section being read, which only matters while that is the live
+    // audio section.
+    let mut session = (false, false);
+    let mut section = (false, false);
+    let mut seen_media = false;
+    let mut in_audio = false;
+    let mut audio_protocol = false;
     for line in text.lines() {
         let line = line.trim_end();
         if let Some(media) = line.strip_prefix("m=") {
-            protocol |= media.split_whitespace().nth(2) == Some(WEBRTC_PROTOCOL);
-        } else if line.starts_with("a=ice-ufrag:") {
-            ice_ufrag = true;
-        } else if line.starts_with("a=fingerprint:") {
-            fingerprint = true;
+            if in_audio {
+                break;
+            }
+            seen_media = true;
+            let mut fields = media.split_whitespace();
+            let kind = fields.next();
+            let port = fields.next();
+            in_audio = kind == Some("audio") && port != Some("0");
+            audio_protocol = in_audio && fields.next() == Some(WEBRTC_PROTOCOL);
+        } else if !seen_media || in_audio {
+            let target = if seen_media {
+                &mut section
+            } else {
+                &mut session
+            };
+            if line.starts_with("a=ice-ufrag:") {
+                target.0 = true;
+            } else if line.starts_with("a=fingerprint:") {
+                target.1 = true;
+            }
         }
     }
-    protocol && ice_ufrag && fingerprint
+    in_audio && audio_protocol && (session.0 || section.0) && (session.1 || section.1)
 }
 
 #[cfg(test)]
@@ -121,6 +148,58 @@ mod tests {
             let offer = sdp(protocol, &["ice-ufrag:abcd", "fingerprint:sha-256 AA:BB"]);
             assert!(!offer_is_webrtc(&offer), "{protocol}");
         }
+    }
+
+    fn raw(text: &str) -> Vec<u8> {
+        text.replace('\n', "\r\n").into_bytes()
+    }
+
+    #[test]
+    fn attributes_in_another_section_do_not_complete_the_audio_section() {
+        // Audio is SAVPF with a fingerprint but no ICE; the video section has
+        // the ice-ufrag. Pooled over the SDP that looks WebRTC; audio is not.
+        let offer = raw("v=0\no=- 1 1 IN IP4 192.0.2.10\ns=-\nt=0 0\n\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\nc=IN IP4 192.0.2.10\na=fingerprint:sha-256 AA:BB\n\
+             m=video 9 UDP/TLS/RTP/SAVPF 96\nc=IN IP4 192.0.2.10\na=ice-ufrag:abcd\n");
+        assert!(!offer_is_webrtc(&offer));
+    }
+
+    #[test]
+    fn session_level_ice_and_fingerprint_are_inherited_by_the_audio_section() {
+        let offer = raw("v=0\no=- 1 1 IN IP4 192.0.2.10\ns=-\nt=0 0\n\
+             a=ice-ufrag:abcd\na=fingerprint:sha-256 AA:BB\n\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\nc=IN IP4 192.0.2.10\n");
+        assert!(offer_is_webrtc(&offer));
+    }
+
+    #[test]
+    fn a_session_level_attribute_and_a_media_level_one_combine_for_the_section() {
+        let offer = raw(
+            "v=0\no=- 1 1 IN IP4 192.0.2.10\ns=-\nt=0 0\na=fingerprint:sha-256 AA:BB\n\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\nc=IN IP4 192.0.2.10\na=ice-ufrag:abcd\n",
+        );
+        assert!(offer_is_webrtc(&offer));
+    }
+
+    #[test]
+    fn a_rejected_audio_section_does_not_decide_the_offer() {
+        // The first audio section is port 0 (rejected); the live one decides.
+        let offer = raw("v=0\no=- 1 1 IN IP4 192.0.2.10\ns=-\nt=0 0\n\
+             m=audio 0 UDP/TLS/RTP/SAVPF 111\na=ice-ufrag:abcd\na=fingerprint:sha-256 AA:BB\n\
+             m=audio 9 RTP/AVP 0\nc=IN IP4 192.0.2.10\n");
+        assert!(!offer_is_webrtc(&offer));
+        let live = raw("v=0\no=- 1 1 IN IP4 192.0.2.10\ns=-\nt=0 0\n\
+             m=audio 0 RTP/AVP 0\n\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\nc=IN IP4 192.0.2.10\na=ice-ufrag:abcd\na=fingerprint:sha-256 AA:BB\n");
+        assert!(offer_is_webrtc(&live));
+    }
+
+    #[test]
+    fn an_offer_without_an_audio_section_is_not_webrtc() {
+        let offer = raw("v=0\no=- 1 1 IN IP4 192.0.2.10\ns=-\nt=0 0\n\
+             a=ice-ufrag:abcd\na=fingerprint:sha-256 AA:BB\n\
+             m=video 9 UDP/TLS/RTP/SAVPF 96\nc=IN IP4 192.0.2.10\n");
+        assert!(!offer_is_webrtc(&offer));
     }
 
     #[test]
