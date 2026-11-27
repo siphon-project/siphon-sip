@@ -9,7 +9,11 @@
 //! security association) for a UE whose next process registers it afresh.
 //!
 //! What it does instead is de-register (TS 24.229 5.1.1.6, RFC 3261 §10.2.2):
-//! every registered entry sends `Expires: 0` on its registration's Call-ID,
+//! every registered entry sends `Expires: 0` on its registration's Call-ID
+//! (a digest entry first fetches, RFC 3261 §10.2.3, and sends it only when the
+//! registrar still lists this node's Contact: see [`super::removed`]; a fetch
+//! that is unanswered or fails by the shutdown bound sends nothing, and the
+//! binding expires on its own),
 //! over its SA set and from its own address, and an entry whose REGISTER is
 //! in flight sends it once that is answered (§10.2: one REGISTER at a time),
 //! never acting on the binding meanwhile. A challenged de-REGISTER answers its
@@ -113,6 +117,13 @@ impl RegistrantManager {
     /// The Call-ID is the entry's, with the next CSeq (RFC 3261 §10.2.2), so
     /// it also outranks a REGISTER still in flight: the registrar refuses the
     /// older one if it arrives after this.
+    ///
+    /// For a digest entry (see [`super::RegistrantEntry::fetches_before_deregistering`])
+    /// this is the fetch of RFC 3261 §10.2.3 that goes first, not the
+    /// `Expires: 0`: a registrar that keeps one binding per AoR dropped this
+    /// node's binding when another node registered, and an `Expires: 0` then
+    /// clears the other node's. The de-REGISTER follows only when the fetch's 2xx
+    /// lists this node's Contact (see [`super::removed`]).
     pub(super) fn build_deregistration(&self, aor: &str) -> Option<super::BuiltRegister> {
         let egress = self.egress.get()?;
         let entry = self.entries.get(aor)?;
@@ -121,7 +132,22 @@ impl RegistrantManager {
             return None;
         }
         drop(entry);
-        self.build_register(aor, egress.defaults(), 0)
+        self.build_clearing_register(aor, egress.defaults())
+    }
+
+    /// The first request that clears `aor`'s binding: the fetch for a digest
+    /// entry, the `Expires: 0` REGISTER for an IMS one.
+    fn build_clearing_register(
+        &self,
+        aor: &str,
+        defaults: super::EgressDefaults<'_>,
+    ) -> Option<super::BuiltRegister> {
+        let mut entry = self.entries.get_mut(aor)?;
+        if entry.fetches_before_deregistering() {
+            return self.build_unprotected_register_as(&mut entry, defaults, 0, None, true);
+        }
+        drop(entry);
+        self.build_register(aor, defaults, 0)
     }
 
     /// The `Expires` a REGISTER answering a challenge to `aor` carries: 0 for
@@ -208,12 +234,16 @@ impl RegistrantManager {
         aor: &str,
         defaults: super::EgressDefaults<'_>,
     ) -> Option<super::BuiltRegister> {
-        let built = self.build_register(aor, defaults, 0);
+        let built = self.build_clearing_register(aor, defaults);
         match built.as_ref() {
             Some(built) => {
                 if let Some(mut entry) = self.entries.get_mut(aor) {
                     entry.deregistration = Deregistration::InFlight;
                     entry.in_flight_branch = Some(built.branch.clone());
+                }
+                // The fetch's answer decides whether the de-REGISTER goes.
+                if let Some(entry) = self.entries.get(aor) {
+                    self.track_shutdown_deregistration(&entry, built);
                 }
             }
             None => self.set_deregistration(aor, Deregistration::Done),
@@ -231,6 +261,14 @@ impl RegistrantManager {
     /// nothing is registered from here on, and its SA sets are deleted (TS
     /// 24.229 5.1.1.6.1, TS 33.203 7.4.1a).
     pub fn finish_deregistration(&self, aor: &str, status_code: u16) {
+        self.finish_shutdown_deregistration(aor, Some(status_code));
+    }
+
+    /// [`finish_deregistration`](Self::finish_deregistration), or with `None`
+    /// one that ended without a de-REGISTER: the fetch before it showed the
+    /// registrar no longer holds this node's binding (another node's replaced
+    /// it), which is then not this node's to clear.
+    pub(super) fn finish_shutdown_deregistration(&self, aor: &str, status_code: Option<u16>) {
         let Some(mut entry) = self.entries.get_mut(aor) else {
             return;
         };
@@ -257,13 +295,20 @@ impl RegistrantManager {
             .unwrap_or_default();
         let call_id = entry.call_id.clone();
         drop(entry);
+        // Whatever fetch or de-REGISTER was still tracked is over.
+        self.draining_deregistrations.remove(&call_id);
         // Cleared, or given up on: either way a restart has nothing to clear.
         self.forget_binding_record(aor, &call_id);
         self.queue_sa_deletions(deletions);
-        if status_code == 200 {
-            info!(aor = %aor, "de-registered for shutdown");
-        } else {
-            warn!(aor = %aor, status_code, "shutdown de-registration ended without a 200");
+        match status_code {
+            Some(200) => info!(aor = %aor, "de-registered for shutdown"),
+            Some(status_code) => {
+                warn!(aor = %aor, status_code, "shutdown de-registration ended without a 200");
+            }
+            None => info!(
+                aor = %aor,
+                "shutdown: the registrar does not list this node's Contact, no de-REGISTER sent"
+            ),
         }
         self.emit_event(super::RegistrantEvent::Deregistered {
             aor: aor.to_string(),

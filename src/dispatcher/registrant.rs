@@ -75,6 +75,14 @@ fn handle_answer(
         }
     };
 
+    // The fetch before a de-REGISTER, or the de-REGISTER itself, of a removed
+    // entry or of one shutting down: the removal path answers it, challenge
+    // included (see `registrant::removed`).
+    if registrant.is_deregistering(&call_id) {
+        handle_removed_entry_answer(registrant, message, status_code, &call_id, state);
+        return;
+    }
+
     let aor = match registrant.find_by_call_id(&call_id) {
         Some(aor) => aor,
         None => {

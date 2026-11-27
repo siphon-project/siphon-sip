@@ -22,6 +22,16 @@
 # node's Contact, send NO `Expires: 0`, and leave the other node's binding in
 # place.
 #
+# SHUTDOWN=replaced and SHUTDOWN=alone run the graceful-shutdown scenarios
+# against the same registrar stub (they imply REPLACE_SEMANTICS=1). The node
+# registers; with `replaced` another node registers its own Contact (replacing
+# the node's binding), then the node gets SIGTERM. It must fetch on its
+# registration's Call-ID, see only the other node's Contact, send NO `Expires: 0`
+# and leave the other node's binding in place. With `alone` nobody replaced it:
+# the fetch lists the node's Contact, so `Expires: 0` follows on the next CSeq
+# and the binding is cleared. Both challenges (fetch and de-REGISTER) are
+# answered with the entry's own credentials.
+#
 #   scripts/registrant_restart_test.sh
 #   SIPHON_BIN=target/release/siphon scripts/registrant_restart_test.sh
 #   DEFAULT_CONTACT=1 scripts/registrant_restart_test.sh   # the generated Contact
@@ -45,6 +55,12 @@ REGISTRAR_PORT=25070
 TOKEN="restart-test-token"
 AOR="sip:trunk1@registrar.test"
 INSTANCE="edge-restart-test"
+
+case "${SHUTDOWN:-}" in
+  ""|replaced|alone) ;;
+  *) echo "FAILED: SHUTDOWN is 'replaced' or 'alone'"; exit 1 ;;
+esac
+if [[ -n "${SHUTDOWN:-}" ]]; then REPLACE_SEMANTICS=1; fi
 
 [[ -x "${SIPHON_BIN}" ]] || { echo "FAILED: no siphon binary at ${SIPHON_BIN}"; exit 1; }
 for tool in redis-server redis-cli sipp python3; do
@@ -209,6 +225,63 @@ if [[ -n "${DEFAULT_CONTACT:-}" ]]; then secrets=(secret123); fi
 for secret in "${secrets[@]}"; do
   if grep -q "${secret}" <<<"${record}"; then fail "the Redis record holds '${secret}'"; fi
 done
+
+if [[ -n "${SHUTDOWN:-}" ]]; then
+  OTHER_CONTACT="sip:trunk@198.51.100.77:5060;rnode=00000000deadbeef"
+  if [[ "${SHUTDOWN}" == "replaced" ]]; then
+    echo "[*] another node registers its own Contact, replacing this node's binding"
+    python3 -I scripts/registrant_replace_registrar.py register "${REGISTRAR_PORT}" "${AOR}" \
+      "${OTHER_CONTACT}" line-user-7 secret123 || fail "the other node's REGISTER was refused"
+  fi
+  echo "[*] SIGTERM: a graceful shutdown (${SHUTDOWN})"
+  kill -TERM "${SIPHON_PID}"
+  for _ in $(seq 400); do
+    kill -0 "${SIPHON_PID}" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -0 "${SIPHON_PID}" 2>/dev/null && fail "siphon did not exit within 40 seconds of SIGTERM"
+  wait "${SIPHON_PID}" 2>/dev/null || true
+  SIPHON_PID=""
+  python3 -I - "${WORK}/replace.log" "${SHUTDOWN}" "${OTHER_CONTACT}" <<'PY' || fail "the registrar's log does not show a safe shutdown"
+import json, sys
+log = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+mode, other = sys.argv[2], sys.argv[3]
+first = log[0]
+assert first["contact"] is not None, f"the first request is not the registration: {first}"
+# Everything after the registrations (the node's, and the other node's) is the shutdown.
+shutdown = [entry for entry in log[(2 if mode == "replaced" else 1):]]
+fetches = [entry for entry in shutdown if entry["contact"] is None]
+clears = [entry for entry in shutdown if entry["expires"] == "0"]
+assert fetches, f"no fetch reached the registrar: {log}"
+for fetch in fetches:
+    assert fetch["expires"] is None, f"the fetch carries an Expires: {fetch}"
+    assert fetch["call_id"] == first["call_id"], f"the fetch is not on the registration's Call-ID: {fetch}"
+if mode == "replaced":
+    assert not clears, f"an Expires: 0 reached the registrar: {log}"
+    assert log[-1]["binding_after"] == other, f"the other node's binding is gone: {log[-1]}"
+else:
+    assert len(clears) == 1, f"expected one Expires: 0: {log}"
+    clear = clears[0]
+    assert clear["call_id"] == first["call_id"], f"the de-REGISTER left the Call-ID: {clear}"
+    assert clear["contact"] == first["contact"], f"the de-REGISTER names another Contact: {clear}"
+    assert int(clear["cseq"].split()[0]) > int(fetches[-1]["cseq"].split()[0]), f"CSeq does not follow the fetch: {log}"
+    assert clear["binding_after"] is None, f"the binding is still held: {clear}"
+PY
+  if [[ "${SHUTDOWN}" == "replaced" ]]; then
+    grep -q "does not list this node's Contact" "${WORK}"/siphon-first.log \
+      || fail "siphon never logged that it left the binding"
+  else
+    grep -q "de-registered for shutdown" "${WORK}"/siphon-first.log \
+      || fail "siphon never logged the shutdown de-registration"
+  fi
+  for _ in $(seq 50); do
+    [[ "$(redis-cli -p "${REDIS_PORT}" exists "${key}")" == "0" ]] && break
+    sleep 0.1
+  done
+  [[ "$(redis-cli -p "${REDIS_PORT}" exists "${key}")" == "0" ]] || fail "the Redis record is still there"
+  echo "PASS: shutdown (${SHUTDOWN}) fetched first and the registrar's bindings are as they should be"
+  exit 0
+fi
 
 echo "[*] SIGKILL: no shutdown, no de-REGISTER"
 kill -9 "${SIPHON_PID}"

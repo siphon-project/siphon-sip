@@ -350,7 +350,12 @@ async fn a_removed_entry_is_de_registered_from_its_own_address() {
         message.source_local_addr,
         Some("192.0.2.40:5070".parse().expect("addr"))
     );
-    assert!(String::from_utf8_lossy(&message.data).contains("Expires: 0"));
+    // The fetch that goes before the de-REGISTER (no Contact, no Expires).
+    let raw = String::from_utf8_lossy(&message.data).into_owned();
+    assert!(
+        !raw.contains("Expires:") && !raw.contains("Contact:"),
+        "{raw}"
+    );
 }
 
 #[tokio::test]
@@ -691,7 +696,9 @@ fn expires_by_aor(sent: &flume::Receiver<OutboundMessage>) -> Vec<(String, u32)>
                 .headers
                 .get("Expires")
                 .and_then(|value| value.trim().parse().ok())
-                .expect("an Expires");
+                // A fetch (the first request of a digest entry's clearing,
+                // RFC 3261 §10.2.3) carries none and registers nothing.
+                .unwrap_or(0);
             (
                 to.trim_matches(|c| c == '<' || c == '>').to_string(),
                 expires,

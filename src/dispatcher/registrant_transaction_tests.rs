@@ -365,6 +365,9 @@ async fn register_cycles_leave_no_transaction_or_timer_behind() {
 
 // --- shutdown, end to end ------------------------------------------------------
 
+/// The `expires` a mock registrar logs for a fetch (RFC 3261 §10.2.3).
+const FETCH: u32 = u32::MAX;
+
 /// What a mock registrar saw and holds.
 #[derive(Default)]
 struct RegistrarLog {
@@ -373,6 +376,8 @@ struct RegistrarLog {
     requests: Vec<(String, String, u32, bool)>,
     /// The AoRs it holds a binding for.
     bound: std::collections::HashSet<String>,
+    /// The Contact each of them registered, which a fetch lists back.
+    contacts: HashMap<String, String>,
 }
 
 fn to_aor(request: &SipMessage) -> String {
@@ -395,6 +400,12 @@ async fn mock_registrar(
     held: &SipMessage,
 ) {
     let mut held = Some(held);
+    if let Some(contact) = held.and_then(|held| held.headers.get("Contact")) {
+        log.lock()
+            .expect("the log")
+            .contacts
+            .insert(to_aor(held.expect("held")), contact.clone());
+    }
     while let Ok(sent) = setup.dispatcher.udp.recv_async().await {
         let request = crate::sip::parser::parse_sip_message_bytes(&sent.data).expect("a request");
         let method = request
@@ -402,11 +413,18 @@ async fn mock_registrar(
             .map(|method| method.as_str().to_string())
             .unwrap_or_default();
         let aor = to_aor(&request);
-        let expires: u32 = request
-            .headers
-            .get("Expires")
-            .and_then(|value| value.trim().parse().ok())
-            .unwrap_or(0);
+        let fetch = method == "REGISTER"
+            && request.headers.get("Expires").is_none()
+            && request.headers.get("Contact").is_none();
+        let expires: u32 = if fetch {
+            FETCH
+        } else {
+            request
+                .headers
+                .get("Expires")
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0)
+        };
         let credentials = request.headers.get("Authorization").is_some();
         log.lock().expect("the log").requests.push((
             method.clone(),
@@ -417,7 +435,7 @@ async fn mock_registrar(
         if method != "REGISTER" {
             continue;
         }
-        if expires == 0 {
+        if fetch || expires == 0 {
             if let Some(in_flight) = held.take() {
                 log.lock().expect("the log").bound.insert(to_aor(in_flight));
                 setup.answer(in_flight, "200 OK", "Expires: 3600\r\n");
@@ -436,9 +454,28 @@ async fn mock_registrar(
                 );
                 continue;
             }
+            if fetch {
+                // The bindings it holds for the AoR (RFC 3261 §10.2.3).
+                let log = log.lock().expect("the log");
+                let listing = match log.contacts.get(&aor) {
+                    Some(contact) if log.bound.contains(&aor) => {
+                        format!("Contact: {contact}\r\nExpires: 3600\r\n")
+                    }
+                    _ => String::new(),
+                };
+                drop(log);
+                setup.answer(&request, "200 OK", &listing);
+                continue;
+            }
             log.lock().expect("the log").bound.remove(&aor);
             setup.answer(&request, "200 OK", "Expires: 0\r\n");
         } else {
+            if let Some(contact) = request.headers.get("Contact") {
+                log.lock()
+                    .expect("the log")
+                    .contacts
+                    .insert(aor.clone(), contact.clone());
+            }
             log.lock().expect("the log").bound.insert(aor);
             setup.answer(&request, "200 OK", &format!("Expires: {expires}\r\n"));
         }
@@ -460,9 +497,11 @@ async fn shutdown_de_registers_every_binding_and_registers_nothing() {
     let aors: Vec<String> = (0..ENTRIES)
         .map(|index| format!("sip:trunk{index}@carrier.example"))
         .collect();
+    let mut registered = Vec::new();
     for aor in &aors {
         setup.registrant.add(trunk(aor));
         let (register, _) = setup.send(aor, 3600);
+        registered.push(header(&register.message, "Contact"));
         setup.answer(&register.message, "200 OK", "Expires: 3600\r\n");
     }
     setup.registrant.add(trunk(IN_FLIGHT));
@@ -472,6 +511,12 @@ async fn shutdown_de_registers_every_binding_and_registers_nothing() {
         bound: aors.iter().cloned().collect(),
         ..RegistrarLog::default()
     });
+    for (index, aor) in aors.iter().enumerate() {
+        log.lock()
+            .expect("the log")
+            .contacts
+            .insert(aor.clone(), registered[index].clone());
+    }
 
     let config = crate::config::Config::from_str(concat!(
         "listen:\n  udp: [\"192.0.2.1:5060\"]\n",
@@ -500,14 +545,17 @@ async fn shutdown_de_registers_every_binding_and_registers_nothing() {
 
     let log = log.into_inner().expect("the log");
     for aor in aors.iter().chain([IN_FLIGHT.to_string()].iter()) {
-        let unauthenticated = log
-            .requests
-            .iter()
-            .filter(|(method, to, expires, credentials)| {
-                method == "REGISTER" && to == aor && *expires == 0 && !credentials
-            })
-            .count();
-        assert_eq!(unauthenticated, 1, "{aor}: {:?}", log.requests);
+        let unauthenticated = |wanted: u32| {
+            log.requests
+                .iter()
+                .filter(|(method, to, expires, credentials)| {
+                    method == "REGISTER" && to == aor && *expires == wanted && !credentials
+                })
+                .count()
+        };
+        // The fetch first, then the one de-REGISTER its answer allowed.
+        assert_eq!(unauthenticated(FETCH), 1, "{aor}: {:?}", log.requests);
+        assert_eq!(unauthenticated(0), 1, "{aor}: {:?}", log.requests);
     }
     assert!(
         log.requests
@@ -519,7 +567,8 @@ async fn shutdown_de_registers_every_binding_and_registers_nothing() {
     assert!(
         log.requests
             .iter()
-            .all(|(method, _, expires, _)| method == "REGISTER" && *expires == 0),
+            .all(|(method, _, expires, _)| method == "REGISTER"
+                && (*expires == 0 || *expires == FETCH)),
         "something other than a de-REGISTER went out: {:?}",
         log.requests
     );
@@ -584,13 +633,15 @@ fn cseq(message: &SipMessage) -> u32 {
 async fn a_challenged_de_register_is_answered_once_and_ended_by_the_200() {
     let setup = Setup::new();
     let deregister = setup.removed_trunk_deregistration();
-    assert_eq!(header(&deregister, "Expires"), "0");
+    // The fetch (RFC 3261 §10.2.3) that goes before any `Expires: 0`.
+    assert!(header(&deregister, "Expires").is_empty());
+    assert!(header(&deregister, "Contact").is_empty());
     assert!(header(&deregister, "Authorization").is_empty());
 
     setup.challenge(&deregister, "401 Unauthorized", "WWW-Authenticate");
 
     let answer = parse_sent(&setup.dispatcher.udp.try_recv().expect("the answer"));
-    assert_eq!(header(&answer, "Expires"), "0");
+    assert!(header(&answer, "Expires").is_empty(), "the fetch, answered");
     assert!(header(&answer, "Authorization").contains("username=\"trunk\""));
     assert_eq!(header(&answer, "Call-ID"), header(&deregister, "Call-ID"));
     assert_eq!(cseq(&answer), cseq(&deregister) + 1);
@@ -618,7 +669,7 @@ async fn a_proxy_challenge_to_a_de_register_is_answered_with_proxy_authorization
     );
 
     let answer = parse_sent(&setup.dispatcher.udp.try_recv().expect("the answer"));
-    assert_eq!(header(&answer, "Expires"), "0");
+    assert!(header(&answer, "Expires").is_empty(), "the fetch, answered");
     assert!(header(&answer, "Proxy-Authorization").contains("username=\"trunk\""));
 }
 
@@ -1375,3 +1426,6 @@ async fn a_partial_uri_or_an_expired_bare_contact_in_any_case_does_not_authorize
         );
     }
 }
+
+#[path = "registrant_fetch_deregistration_tests.rs"]
+mod fetch_deregistration;

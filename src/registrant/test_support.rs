@@ -193,3 +193,8 @@ pub(crate) fn set_sqn(manager: &RegistrantManager, aor: &str, sqn: [u8; 6]) {
         entry.sqn_ms = sqn;
     }
 }
+
+/// The Call-ID of the live entry `aor`.
+pub(crate) fn call_id(manager: &RegistrantManager, aor: &str) -> Option<String> {
+    manager.entries.get(aor).map(|entry| entry.call_id.clone())
+}

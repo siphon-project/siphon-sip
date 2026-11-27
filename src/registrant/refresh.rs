@@ -546,7 +546,9 @@ fn send_registrant_message(
 /// moving one to a new address, not a challenge answered meanwhile.
 ///
 /// Every registered entry sends `Expires: 0` on its registration's Call-ID
-/// (TS 24.229 5.1.1.6), from the address it registered from (its own
+/// (TS 24.229 5.1.1.6; a digest entry's is preceded by a fetch and goes only
+/// when the registrar still lists this node's Contact, and the whole exchange
+/// fits the [`SHUTDOWN_ANSWER_WAIT`] bound or sends nothing), from the address it registered from (its own
 /// `local_addr` included) and, for an IMS UE, over its SA set; one whose
 /// REGISTER is in flight sends it when that is answered (see the `lifecycle`
 /// module). The entries are kept rather than removed: their answers, a
@@ -554,7 +556,8 @@ fn send_registrant_message(
 /// their sockets open while they do. De-REGISTERs of entries removed before
 /// the shutdown and not yet sent go out too.
 ///
-/// Returns how many de-registrations were sent.
+/// Returns how many de-registrations were started (the fetch counts for a
+/// digest entry).
 pub fn deregister_all(manager: &RegistrantManager, outbound: &OutboundRouter) -> usize {
     let Some(egress) = manager.egress.get() else {
         // The loop never started, so nothing ever registered.
@@ -562,6 +565,10 @@ pub fn deregister_all(manager: &RegistrantManager, outbound: &OutboundRouter) ->
         return 0;
     };
 
+    // Counted from the signal: an answer to a fetch after this sends nothing.
+    let _ = manager
+        .shutdown_answer_by
+        .set(tokio::time::Instant::now() + SHUTDOWN_ANSWER_WAIT);
     let mut sent = 0;
     let removed = manager.take_pending_deregistrations();
     for built in manager

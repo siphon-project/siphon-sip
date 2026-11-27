@@ -164,6 +164,47 @@ the JSON fields in the table above.
 | `enabled` | `bool` | `True` |
 | `gateway` | `str \| None` | `None` |
 
+## Fetch before every de-REGISTER
+
+A digest entry never sends `Expires: 0` blind. Whatever clears its binding
+(graceful shutdown, `registration.remove()` or a source dropping or disabling the
+trunk, a source update that moves it to another registrar, destination or
+transport, and the restart clean-up below) first sends a **fetch** on the
+binding's Call-ID at the next CSeq: a REGISTER with no `Contact` and no `Expires`
+(RFC 3261 §10.2.3), which changes nothing. Only when its 2xx lists this node's
+own Contact (the one the entry last registered, compared as SIP URIs; a contact
+with an effective expiry of 0 is not listed) does siphon send `Expires: 0`, on
+the same Call-ID at the CSeq after the fetch's. Otherwise nothing more is sent,
+it is logged at info with the AoR and registrar, and the binding is left to
+expire. That covers a 2xx listing only other Contacts or none, any non-2xx, a
+transport failure and Timer F.
+
+The reason is a registrar that keeps one binding per AoR (not the multi-binding
+of §10.3): another node's REGISTER replaced this node's binding, so an
+`Expires: 0` on this node's Contact, or on the AoR, clears the live node's. The
+typical case is a trunk whose lease moved to another node, which has registered
+already by the time this one shuts down or drops it.
+
+A challenge to the fetch or to the de-REGISTER (RFC 3261 §22) is answered once
+each with the entry's own credentials. A live entry holds them, so no lookup is
+involved. The persisted binding record is dropped at every outcome. If the same
+trunk is added again and registers on the same Contact, registrar and destination
+before the fetch is answered, the `Expires: 0` is not sent either: it would clear
+the new entry's binding.
+
+**Shutdown stays bounded.** The fetch and the de-REGISTER share the existing
+shutdown answer bound (`SHUTDOWN_ANSWER_WAIT`, 20 seconds from the signal,
+overlapping the drain). When the fetch has no final answer by then, or fails,
+shutdown ends without sending `Expires: 0`: that is the safe side, since the
+binding then expires on its own. The extra round trip is the cost of not
+clearing another node's binding.
+
+**IMS entries are unchanged.** An AKA entry, or any entry with an IPsec UE, sends
+its `Expires: 0` directly, as before (a UE de-registers over the SA set it
+registered over, TS 24.229 5.1.1.6). An S-CSCF keeps every contact of the IMPU
+rather than replacing them, and an unprotected fetch would not reach the
+protected port. The one-binding-per-AoR hazard does not arise there.
+
 ## Lookup by AoR (optional)
 
 With `registrar.backend: redis` siphon keeps one record per granted binding
@@ -225,8 +266,9 @@ removed by Call-ID, so a newer registration's record is never touched.
 
 **Known limit.** On a registrar that replaces the AoR's binding on every
 REGISTER, another node can register between the fetch and the de-REGISTER that
-follows, and the `Expires: 0` then clears its binding. Nothing closes that
-window; the binding returns at the other node's next refresh.
+follows (a restart's clean-up, a removal and shutdown alike), and the `Expires: 0`
+then clears its binding. Nothing closes that window; the binding returns at the
+other node's next refresh.
 
 Records hold the AoR, registrar, destination, transport, the Contact sent, the
 Call-ID, the next CSeq, the local address, the interval, the grant's end and an

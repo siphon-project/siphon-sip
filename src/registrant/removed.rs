@@ -1,7 +1,15 @@
 //! The de-REGISTER of an entry that is gone from the manager.
 //!
 //! A removed entry clears its binding with an `Expires: 0` REGISTER (RFC 3261
-//! §10.2.2). Most registrars challenge every REGISTER, a de-registration
+//! §10.2.2), but only after a fetch (§10.2.3, no Contact and no Expires) on the
+//! same Call-ID shows the registrar still lists this node's own Contact: a
+//! registrar that keeps one binding per AoR dropped it when another node
+//! registered, and an `Expires: 0` then clears the other node's. Any other
+//! outcome of the fetch (another Contact only, none, a non-2xx, Timer F) sends no
+//! `Expires: 0` and leaves the binding to expire. The same exchange precedes the
+//! de-REGISTER of a live removal, of a source update that moves the binding, of
+//! shutdown (the entry stays, see [`super::lifecycle`]) and of a restart's
+//! clean-up (see [`super::startup`]). Most registrars challenge every REGISTER, a de-registration
 //! included (§22), so sending it and forgetting it leaves the binding in place
 //! against them. The challenge has to be answered, once, with the entry's
 //! credentials, and the whole exchange bounded: a final answer, a second
@@ -11,7 +19,7 @@
 //! is kept here, apart from the live entries, so a removed trunk is in no
 //! `list`, status or due-check while it drains.
 //!
-//! An IMS AKA entry is not tracked: its challenge needs the USIM's sequence
+//! An IMS AKA entry is not tracked and not fetched: its challenge needs the USIM's sequence
 //! number and the SA set, which go with the entry, and its protected
 //! de-REGISTER and teardown have their own path (see `protected`).
 
@@ -50,6 +58,12 @@ pub(super) struct DrainingDeregistration {
     /// before it clears a binding (see [`super::startup`]); the de-REGISTER
     /// follows only when the registrar lists this node's Contact.
     fetching: bool,
+    /// The entry is still in the manager, shutting down: its own
+    /// [`Deregistration`](super::Deregistration) ends with this exchange.
+    shutdown_of_live_entry: bool,
+    /// A shutdown exchange's answer bound ([`super::SHUTDOWN_ANSWER_WAIT`] from the
+    /// signal): a fetch answered after it sends no `Expires: 0`.
+    answer_by: Option<tokio::time::Instant>,
     deadline: Instant,
 }
 
@@ -84,6 +98,16 @@ pub enum RemovedAnswer {
     /// The challenge needs credentials the manager does not hold: look them up
     /// and hand them to [`RegistrantManager::answer_after_lookup`].
     Lookup(Box<CredentialRequest>),
+}
+
+static DEPRECATED_ANSWER_NOTICE: std::sync::Once = std::sync::Once::new();
+static DEPRECATED_ANSWER_NOTICED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the deprecated-answer warning was logged by this process.
+#[cfg(test)]
+pub(crate) fn deprecated_answer_noticed() -> bool {
+    DEPRECATED_ANSWER_NOTICED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// The CSeq number of `message`.
@@ -149,6 +173,16 @@ impl RegistrantEntry {
         true
     }
 
+    /// Whether a de-REGISTER of this entry is preceded by the fetch of RFC 3261
+    /// §10.2.3, so it clears the binding only when the registrar still lists
+    /// this node's Contact: a digest entry. An IMS entry (AKA, or any with an
+    /// IPsec UE) is not: its S-CSCF keeps every contact of the IMPU instead of
+    /// replacing them, its de-REGISTER rides the SA set it registered over, and
+    /// an unprotected fetch would not reach the protected port (see the module).
+    pub(super) fn fetches_before_deregistering(&self) -> bool {
+        self.auth_mode == AuthMode::Digest && self.ue_ipsec.is_none()
+    }
+
     /// What a challenge to this entry's de-REGISTER is answered from.
     fn copy_for_draining(&self) -> RegistrantEntry {
         let mut copy = RegistrantEntry::new(
@@ -163,6 +197,13 @@ impl RegistrantEntry {
         copy.call_id = self.call_id.clone();
         copy.cseq =
             std::sync::atomic::AtomicU32::new(self.cseq.load(std::sync::atomic::Ordering::Relaxed));
+        // The Contact the registrar was given, which the fetch's answer is read
+        // against and the de-REGISTER names.
+        copy.contact_uri = self
+            .contact_uri
+            .clone()
+            .or_else(|| self.sent_contact.clone());
+        copy.sent_contact = self.sent_contact.clone();
         copy.local_addr = self.local_addr;
         copy.ims_contact = self.ims_contact.clone();
         copy.register_extras = self.register_extras.clone();
@@ -196,6 +237,8 @@ impl RegistrantManager {
                     challenged: false,
                     needs_lookup: true,
                     fetching: true,
+                    shutdown_of_live_entry: false,
+                    answer_by: None,
                     deadline: Instant::now() + DRAINING_LIFETIME,
                 },
             );
@@ -212,9 +255,30 @@ impl RegistrantManager {
     }
 
     /// Track the de-REGISTER `built` of the removed (or replaced) `entry`, so
-    /// the challenge to it is answered. Not for an AKA entry (see the module).
+    /// the challenge to it is answered. `built` is the fetch that goes before
+    /// it when the entry takes one ([`RegistrantEntry::fetches_before_deregistering`]).
+    /// Not for an AKA entry (see the module).
     fn track_removed_deregistration(&self, entry: &RegistrantEntry, built: &BuiltRegister) {
-        if entry.auth_mode != AuthMode::Digest || entry.ue_ipsec.is_some() {
+        self.track_digest_deregistration(entry, built, false);
+    }
+
+    /// Track the fetch or de-REGISTER `built` of a live `entry` that is shutting
+    /// down, whose [`Deregistration`](super::Deregistration) the exchange ends.
+    pub(super) fn track_shutdown_deregistration(
+        &self,
+        entry: &RegistrantEntry,
+        built: &BuiltRegister,
+    ) {
+        self.track_digest_deregistration(entry, built, true);
+    }
+
+    fn track_digest_deregistration(
+        &self,
+        entry: &RegistrantEntry,
+        built: &BuiltRegister,
+        shutdown_of_live_entry: bool,
+    ) {
+        if !entry.fetches_before_deregistering() {
             return;
         }
         let Some(cseq) = cseq_number(&built.message) else {
@@ -228,7 +292,11 @@ impl RegistrantManager {
                 cseq,
                 challenged: false,
                 needs_lookup: false,
-                fetching: false,
+                fetching: true,
+                shutdown_of_live_entry,
+                answer_by: shutdown_of_live_entry
+                    .then(|| self.shutdown_answer_by.get().copied())
+                    .flatten(),
                 deadline: Instant::now() + DRAINING_LIFETIME,
             },
         );
@@ -295,6 +363,12 @@ impl RegistrantManager {
         superseded
     }
 
+    /// Whether a de-REGISTER (or the fetch before it) on `call_id` is tracked,
+    /// so its answers are the removal path's, not a live entry's.
+    pub fn is_deregistering(&self, call_id: &str) -> bool {
+        self.draining_deregistrations.contains_key(call_id)
+    }
+
     /// How many removed entries' de-REGISTERs are still tracked.
     pub fn removed_deregistrations_pending(&self) -> usize {
         self.draining_deregistrations.len()
@@ -305,6 +379,16 @@ impl RegistrantManager {
     /// answered once, with `challenge` (`true`: proxy authentication), as
     /// `Expires: 0` on the same Call-ID with the next CSeq; a second one, any
     /// other failure or a 2xx ends the de-registration.
+    ///
+    /// **Deprecated.** It is given no `Contact` headers, so it cannot read the
+    /// answer to the fetch that now precedes a digest de-REGISTER (RFC 3261
+    /// §10.2.3). On such a fetch's 2xx it ends the exchange without sending
+    /// `Expires: 0` (the safe side: the binding expires on its own) and logs a
+    /// warning once per process. Use [`answer_removed_registration`](Self::answer_removed_registration).
+    /// On a de-REGISTER that is not preceded by a fetch it behaves as before.
+    #[deprecated(
+        note = "cannot read a fetch's answer, so it never sends Expires: 0 after one; use answer_removed_registration with the response's Contact headers"
+    )]
     pub fn answer_removed_deregistration(
         &self,
         call_id: &str,
@@ -313,6 +397,23 @@ impl RegistrantManager {
         challenge: Option<(&DigestChallenge, bool)>,
         defaults: EgressDefaults<'_>,
     ) -> RemovedAnswer {
+        let undecidable = (200..300).contains(&status_code)
+            && self
+                .draining_deregistrations
+                .get(call_id)
+                .is_some_and(|draining| draining.fetching && response_cseq == Some(draining.cseq));
+        if undecidable {
+            DEPRECATED_ANSWER_NOTICE.call_once(|| {
+                DEPRECATED_ANSWER_NOTICED.store(true, std::sync::atomic::Ordering::SeqCst);
+                warn!(
+                    "answer_removed_deregistration cannot read the answer to the fetch before a \
+                     de-REGISTER, so it sends no Expires: 0; use answer_removed_registration \
+                     with the response's Contact headers"
+                );
+            });
+            self.conclude_draining(call_id, Some(0));
+            return RemovedAnswer::Finished;
+        }
         self.answer_removed_registration(
             call_id,
             response_cseq,
@@ -359,38 +460,67 @@ impl RegistrantManager {
             );
             return RemovedAnswer::Stale;
         }
+        let mut skipped = false;
+        let mut status_code_override: Option<u16> = None;
         if (200..300).contains(&status_code) && draining.fetching {
             let ours = draining.entry.contact_uri.clone().unwrap_or_default();
             let listed = super::contact::bound_contact_uris(contacts, response_expires)
                 .iter()
                 .any(|listed| super::contact::contacts_equivalent(listed, &ours));
-            if listed {
+            if listed
+                && draining
+                    .answer_by
+                    .is_some_and(|bound| tokio::time::Instant::now() >= bound)
+            {
+                warn!(
+                    aor = %draining.entry.aor,
+                    registrar = %draining.entry.registrar_uri,
+                    "shutdown: the fetch was answered after the shutdown bound, \
+                     no de-REGISTER is sent and the binding is left to expire"
+                );
+                // Over, with no answer to the de-REGISTER to come.
+                status_code_override = Some(0);
+            } else if listed && self.superseded_by_live_entry(&draining) {
+                info!(
+                    aor = %draining.entry.aor,
+                    registrar = %draining.entry.registrar_uri,
+                    "de-REGISTER not sent: a live entry holds the binding on this Contact now"
+                );
+                skipped = true;
+            } else if listed {
                 let built = self.build_unprotected_register(&mut draining.entry, defaults, 0, None);
-                if let Some(cseq) = built.as_ref().and_then(|built| cseq_number(&built.message)) {
-                    if let Some(built) = built {
+                if let Some(built) = built {
+                    if let Some(cseq) = cseq_number(&built.message) {
                         draining.cseq = cseq;
                         draining.branch = built.branch.clone();
                         draining.challenged = false;
                         draining.fetching = false;
                         draining.deadline = Instant::now() + DRAINING_LIFETIME;
+                        // A restart's goes through the checks made just before
+                        // it leaves; a live entry's is sent by the caller, now.
+                        let staged = draining.needs_lookup;
                         drop(draining);
-                        self.stage_startup_deregistration(built);
-                        return RemovedAnswer::Continued;
+                        if staged {
+                            self.stage_startup_deregistration(built);
+                            return RemovedAnswer::Continued;
+                        }
+                        return RemovedAnswer::Retry(Box::new(built));
                     }
                 }
                 warn!(
                     aor = %draining.entry.aor,
                     registrar = %draining.entry.registrar_uri,
-                    "restart clean-up: the de-REGISTER cannot be built, binding left to expire"
+                    "de-REGISTER cannot be built after the fetch, binding left to expire"
                 );
             } else {
                 info!(
                     aor = %draining.entry.aor,
                     registrar = %draining.entry.registrar_uri,
                     listed = contacts.len(),
-                    "restart clean-up: the registrar does not list this node's Contact, \
+                    "the registrar does not list this node's Contact, \
                      the binding is not this node's to clear and is left"
                 );
+                skipped = true;
             }
         } else if (200..300).contains(&status_code) {
             info!(aor = %draining.entry.aor, "removed registrant de-registered");
@@ -421,12 +551,14 @@ impl RegistrantManager {
             } else if let (false, Some((challenge, is_proxy_auth))) =
                 (draining.needs_lookup, challenge)
             {
-                let built = self.build_register_with_auth_for(
+                let fetch = draining.fetching;
+                let built = self.build_register_with_auth_as(
                     &mut draining.entry,
                     defaults,
                     challenge,
                     is_proxy_auth,
                     0,
+                    fetch,
                 );
                 if let Some(built) = built {
                     if let Some(cseq) = cseq_number(&built.message) {
@@ -452,11 +584,49 @@ impl RegistrantManager {
                 "removed registrant: de-REGISTER (or the fetch before it) not accepted, binding left to expire"
             );
         }
-        let aor = draining.entry.aor.clone();
         drop(draining);
-        self.draining_deregistrations.remove(call_id);
-        self.forget_binding_record(&aor, call_id);
+        let outcome = status_code_override.or((!skipped).then_some(status_code));
+        self.conclude_draining(call_id, outcome);
         RemovedAnswer::Finished
+    }
+
+    /// End the tracked de-registration on `call_id`: forget it and its record,
+    /// and, when it is a shutting-down live entry's, end that entry's
+    /// [`Deregistration`](super::Deregistration) too. `status_code` is the final
+    /// answer (`Some(0)`: none), `None` when no de-REGISTER was needed.
+    fn conclude_draining(&self, call_id: &str, status_code: Option<u16>) {
+        let Some((_, draining)) = self.draining_deregistrations.remove(call_id) else {
+            return;
+        };
+        if draining.shutdown_of_live_entry {
+            self.finish_shutdown_deregistration(&draining.entry.aor, status_code);
+        } else {
+            self.forget_binding_record(&draining.entry.aor, call_id);
+        }
+    }
+
+    /// Whether a live entry now holds `draining`'s AoR on the Contact its
+    /// de-REGISTER would clear, on the same registrar and destination, so an
+    /// `Expires: 0` on it would clear that entry's binding (RFC 3261 §10.3). A
+    /// removal followed by the same trunk added again meets it. Not for a
+    /// shutting-down entry (it is the live one) or a restart's (see
+    /// [`Self::startup_deregistration_superseded`]).
+    fn superseded_by_live_entry(&self, draining: &DrainingDeregistration) -> bool {
+        if draining.needs_lookup || draining.shutdown_of_live_entry {
+            return false;
+        }
+        let Some(contact) = draining.entry.contact_uri.as_deref() else {
+            return false;
+        };
+        self.entries.get(&draining.entry.aor).is_some_and(|live| {
+            live.registrar_uri == draining.entry.registrar_uri
+                && live.destination == draining.entry.destination
+                && live.transport == draining.entry.transport
+                && live
+                    .sent_contact
+                    .as_deref()
+                    .is_some_and(|sent| super::contact::contacts_equivalent(sent, contact))
+        })
     }
 
     /// The credentials for `request`'s challenge, looked up: `Ok(Some(..))` a
@@ -541,29 +711,28 @@ impl RegistrantManager {
         else {
             return false;
         };
-        if let Some((_, draining)) = self.draining_deregistrations.remove(&call_id) {
+        if let Some(draining) = self.draining_deregistrations.get(&call_id) {
             warn!(
                 aor = %draining.entry.aor,
                 registrar = %draining.entry.registrar_uri,
-                "removed registrant: de-REGISTER {why}, binding left to expire"
+                fetch = draining.fetching,
+                "removed registrant: de-REGISTER (or the fetch before it) {why}, binding left to expire"
             );
-            self.forget_binding_record(&draining.entry.aor, &call_id);
         }
+        self.conclude_draining(&call_id, Some(0));
         true
     }
 
     /// Drop the tracked de-REGISTERs past [`DRAINING_LIFETIME`].
     pub fn expire_removed_deregistrations(&self, now: Instant) {
-        let expired: Vec<(String, String)> = self
+        let expired: Vec<String> = self
             .draining_deregistrations
             .iter()
             .filter(|draining| draining.deadline <= now)
-            .map(|draining| (draining.key().clone(), draining.entry.aor.clone()))
+            .map(|draining| draining.key().clone())
             .collect();
-        for (call_id, aor) in expired {
-            if self.draining_deregistrations.remove(&call_id).is_some() {
-                self.forget_binding_record(&aor, &call_id);
-            }
+        for call_id in expired {
+            self.conclude_draining(&call_id, Some(0));
         }
     }
 }
