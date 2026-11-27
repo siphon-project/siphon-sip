@@ -38,8 +38,14 @@ entry, but a working config keeps working.
   `a=ice-ufrag` and `a=fingerprint` inherited. `#` is reserved in a media
   profile name and refused at config load, since the resolved forms are named
   `base#webrtc-offer`, `-answer` and `-both`; a `profile` typed on a control verb
-  or a script's `rtpengine` call cannot name one either. URI parameter names now
-  match case-insensitively (`;Transport=WS`, `;LR`).
+  or a script's `rtpengine` call cannot name one either.
+
+### Fixed
+
+- SIP and tel URI parameter names are matched without case (RFC 3261 §19.1.4,
+  RFC 3966 §3), so `;Transport=WS`, `;LR` and `;Phone-Context=` are read like
+  their lowercase forms, and editing a parameter on a `tel:` URI with a
+  mixed-case `phone-context` no longer fails to read back.
 
 ## [1.19.1] — 2026-11-26
 
