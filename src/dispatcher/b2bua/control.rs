@@ -327,9 +327,6 @@ pub fn send_uas_response(
             return false;
         }
     }
-    if final_response && super::cancel::answered_487(state, internal_call_id, code) {
-        return false;
-    }
     let (transport, remote_addr, connection_id, local_addr, local_tag, local_contact) =
         match state.call_actors.get_call(internal_call_id) {
             Some(call) => (
@@ -438,6 +435,11 @@ pub fn send_uas_response(
         return send_a_leg_provisional(internal_call_id, response, false, None, state);
     }
     if final_response && (200..300).contains(&code) {
+        // The claim on the INVITE's final response, taken before anything is
+        // sent: a CANCEL that has the call answers 487 and no 2xx follows it.
+        if !state.call_actors.claim_final_answer(internal_call_id) {
+            return false;
+        }
         // An answer siphon gives the caller itself is the session description in
         // force on the caller's dialog, under the `o=` it went out with. A
         // provisional's early media is not, until a 2xx confirms it. The 2xx answers

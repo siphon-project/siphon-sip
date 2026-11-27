@@ -252,3 +252,56 @@ async fn an_offer_completing_inside_a_cancel_sends_no_2xx_after_the_487() {
     assert_eq!(call.engine.held_count(), 0);
     assert_eq!(call.state.call_actors.pending_local_offer_count(), 0);
 }
+
+/// The check that no CANCEL has claimed the call and the move to answered are
+/// one step under the call's lock: a CANCEL that comes after finds the call
+/// answered (no 487 on top of the 2xx), and one that came before is found.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_final_answer_and_a_cancel_cannot_both_win() {
+    let call = OfferlessCall::park(
+        NativeTestEngine::start_with_offer_local().await,
+        "dly-race-6",
+    );
+    assert!(call.state.call_actors.claim_final_answer(&call.call_id));
+    let raw = concat!(
+        "CANCEL sip:4000@siphon.example.com SIP/2.0\r\n",
+        "Via: SIP/2.0/UDP 192.0.2.40:5060;branch=z9hG4bK-dly-race-6\r\n",
+        "Max-Forwards: 70\r\n",
+        "From: \"Caller One\" <sip:15550100001@siphon.example.com>;tag=caller-tag\r\n",
+        "To: <sip:4000@siphon.example.com>\r\n",
+        "Call-ID: dly-race-6\r\n",
+        "CSeq: 1 CANCEL\r\n",
+        "Content-Length: 0\r\n\r\n",
+    );
+    let inbound = InboundMessage {
+        client_transport: None,
+        connection_id: ConnectionId::default(),
+        transport: Transport::Udp,
+        local_addr: socket("192.0.2.1:5060"),
+        remote_addr: socket("192.0.2.40:5060"),
+        data: Bytes::from(raw),
+    };
+    let message = parse_sip_message_bytes(raw.as_bytes()).expect("the CANCEL parses");
+    tokio::task::block_in_place(|| handle_b2bua_cancel(inbound, message, &call.state));
+    assert!(
+        call.wire()
+            .iter()
+            .all(|sent| sent.message.status_code() != Some(487)),
+        "an answered call is not answered 487 as well"
+    );
+
+    let other = OfferlessCall::park(
+        NativeTestEngine::start_with_offer_local().await,
+        "dly-race-7",
+    );
+    other
+        .state
+        .call_actors
+        .get_call_mut(&other.call_id)
+        .expect("the call")
+        .cancel_claimed = true;
+    assert!(
+        !other.state.call_actors.claim_final_answer(&other.call_id),
+        "a cancelled call is not answered"
+    );
+}

@@ -5,17 +5,6 @@
 
 use crate::dispatcher::*;
 
-/// Whether a final response `code` would follow the 487 a CANCEL is answering
-/// the call's INVITE with (RFC 3261 §9.2): a 2xx after it would be a second
-/// final response, so it is not sent.
-pub(super) fn answered_487(state: &DispatcherState, call_id: &str, code: u16) -> bool {
-    (200..300).contains(&code)
-        && state
-            .call_actors
-            .get_call(call_id)
-            .is_some_and(|call| call.cancel_claimed)
-}
-
 /// Handle CANCEL for a B2BUA call — cancel all pending B-legs.
 pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: &DispatcherState) {
     let sip_call_id = message

@@ -26,6 +26,7 @@ mod dialog_watch;
 mod failure;
 pub use adoption::{AdoptedSwap, AdoptionIndex};
 pub use failure::FailureConclusion;
+mod final_answer;
 mod fork;
 mod local_offer;
 mod replacement;
