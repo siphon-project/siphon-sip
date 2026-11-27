@@ -232,6 +232,21 @@ impl RegistrantManager {
         expires: u32,
         authorization: Option<String>,
     ) -> Option<BuiltRegister> {
+        self.build_unprotected_register_as(entry, defaults, expires, authorization, false)
+    }
+
+    /// [`build_unprotected_register`](Self::build_unprotected_register), or with
+    /// `fetch` the query of RFC 3261 §10.2.3: no Contact and no Expires, so the
+    /// registrar answers with the bindings it holds and changes none. `expires`
+    /// is 0 then (a fetch registers nothing).
+    pub(super) fn build_unprotected_register_as(
+        &self,
+        entry: &mut RegistrantEntry,
+        defaults: EgressDefaults<'_>,
+        expires: u32,
+        authorization: Option<String>,
+        fetch: bool,
+    ) -> Option<BuiltRegister> {
         let challenge_rejected = authorization.is_some();
         let egress = EntryEgress::of(entry, defaults);
         let effective_addr = defaults.header_sent_by(entry.transport, egress);
@@ -262,13 +277,16 @@ impl RegistrantManager {
             .from(format!("<{}>;tag=reg-{}", entry.aor, cseq))
             .call_id(entry.call_id.clone())
             .cseq(format!("{cseq} REGISTER"))
-            .header(
-                "Contact",
-                build_contact_header(&contact, entry.ims_contact.as_ref()),
-            )
-            .header("Expires", expires.to_string())
             .max_forwards(70)
             .content_length(0);
+        if !fetch {
+            builder = builder
+                .header(
+                    "Contact",
+                    build_contact_header(&contact, entry.ims_contact.as_ref()),
+                )
+                .header("Expires", expires.to_string());
+        }
 
         if let Some(ref user_agent) = self.identity.load().user_agent {
             builder = builder.header("User-Agent", user_agent.clone());
@@ -374,6 +392,21 @@ impl RegistrantManager {
         is_proxy_auth: bool,
         expires: u32,
     ) -> Option<BuiltRegister> {
+        self.build_register_with_auth_as(entry, defaults, challenge, is_proxy_auth, expires, false)
+    }
+
+    /// [`build_register_with_auth_for`](Self::build_register_with_auth_for), or
+    /// with `fetch` the authenticated query of RFC 3261 §10.2.3 (no Contact, no
+    /// Expires; `expires` is 0).
+    pub(super) fn build_register_with_auth_as(
+        &self,
+        entry: &mut RegistrantEntry,
+        defaults: EgressDefaults<'_>,
+        challenge: &DigestChallenge,
+        is_proxy_auth: bool,
+        expires: u32,
+        fetch: bool,
+    ) -> Option<BuiltRegister> {
         let egress = EntryEgress::of(entry, defaults);
         let effective_addr = defaults.header_sent_by(entry.transport, egress);
         let cseq = entry.next_cseq();
@@ -447,14 +480,17 @@ impl RegistrantManager {
             .from(format!("<{}>;tag=reg-{}", entry.aor, cseq))
             .call_id(entry.call_id.clone())
             .cseq(format!("{cseq} REGISTER"))
-            .header(
-                "Contact",
-                build_contact_header(&contact, entry.ims_contact.as_ref()),
-            )
-            .header("Expires", expires.to_string())
             .header(auth_header_name, auth_header_value)
             .max_forwards(70)
             .content_length(0);
+        if !fetch {
+            builder = builder
+                .header(
+                    "Contact",
+                    build_contact_header(&contact, entry.ims_contact.as_ref()),
+                )
+                .header("Expires", expires.to_string());
+        }
 
         if let Some(ref user_agent) = self.identity.load().user_agent {
             builder = builder.header("User-Agent", user_agent.clone());

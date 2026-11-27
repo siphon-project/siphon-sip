@@ -13,6 +13,10 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- The restart clean-up no longer clears another node's binding at a registrar that keeps one binding per AoR. Before it de-registers a binding the last process left, siphon sends a fetch (a REGISTER with no Contact and no Expires, same Call-ID, next CSeq, RFC 3261 §10.2.3) and sends `Expires: 0` only when the 2xx lists this node's stored Contact (compared as SIP URIs). A registrar that replaces the AoR's binding on every REGISTER had already dropped this node's binding when another node registered, and the `Expires: 0` cleared the live one until that node's next refresh. A 2xx listing only other Contacts or none, a refusal or Timer F leaves the binding to expire and drops the record; a fetch and its de-REGISTER are one attempt, and a challenge to either is answered from the source's lookup. **Known limit:** on such a registrar another node can still register between the fetch and the de-REGISTER.
+
 ## [1.19.1] — 2026-11-26
 
 ### Fixed

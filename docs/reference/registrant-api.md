@@ -173,16 +173,28 @@ the registrar when it restarts. Without that, a trunk whose lease moved to
 another node meanwhile stays registered from the dead node, as a second contact,
 until the old binding expires (up to one `interval`).
 
-At restart, once the source has been read for the first time, siphon sends
-`Expires: 0` (RFC 3261 §10.2.2) for every stored binding no live entry owns, on
-the stored Contact, with the stored Call-ID and a CSeq above every one the
-process before used (§10.2.4). A live entry that has not registered yet and
+At restart, once the source has been read for the first time, siphon clears
+every stored binding no live entry owns in two steps, on the stored Call-ID and
+a CSeq above every one the process before used (§10.2.4). It first sends a
+**fetch**: a REGISTER with no `Contact` and no `Expires` (§10.2.3), which
+changes nothing and is answered with the bindings the registrar holds. Only when
+that 2xx lists this node's stored Contact (compared as SIP URIs, §19.1.4:
+case, parameter order and the like do not matter) does it send `Expires: 0`
+(§10.2.2) for it, the CSeq after the fetch's. In every other case the binding is
+not this node's to clear, or is gone already, and it is left: the 2xx lists only
+other Contacts or none, the fetch is refused, or it times out. That is logged
+at info with the AoR and registrar, and the record is dropped. The reason is a
+registrar that keeps one binding per AoR (not the multi-binding of §10.3):
+another node's REGISTER replaced this node's binding, and an `Expires: 0` on
+this node's Contact would clear the other node's. A fetch and its de-REGISTER
+are one attempt toward the bound below. A live entry that has not registered yet and
 targets the same contact takes the binding over instead (same Call-ID, CSeq
 continued), so its first REGISTER refreshes it. Rows the source returned that
 siphon rejected count as still listed and are left alone.
 
-**No credential is stored.** A registrar that challenges that de-REGISTER (RFC
-3261 §22) is answered from a lookup of the trunk by AoR, once. Configure it with
+**No credential is stored.** A registrar that challenges the fetch or the
+de-REGISTER (RFC 3261 §22) is answered from a lookup of the trunk by AoR, once
+for each. Configure it with
 `lookup_url` (HTTP) or `lookup_query` (database); without one the challenge is
 not answered, the binding expires as it would have, and the record is dropped
 (logged with the AoR and registrar).
@@ -210,6 +222,11 @@ that cannot be established, Redis unreadable included, leaves the binding to
 expire. A registrar keys a binding by its Contact (RFC 3261 §10.3), so a wrong
 `Expires: 0` would delete a live binding. Records are only ever rewritten or
 removed by Call-ID, so a newer registration's record is never touched.
+
+**Known limit.** On a registrar that replaces the AoR's binding on every
+REGISTER, another node can register between the fetch and the de-REGISTER that
+follows, and the `Expires: 0` then clears its binding. Nothing closes that
+window; the binding returns at the other node's next refresh.
 
 Records hold the AoR, registrar, destination, transport, the Contact sent, the
 Call-ID, the next CSeq, the local address, the interval, the grant's end and an

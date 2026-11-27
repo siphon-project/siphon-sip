@@ -216,6 +216,46 @@ pub(super) fn contacts_equivalent(left: &str, right: &str) -> bool {
     }
 }
 
+/// The URIs a registrar's answer lists in its `Contact` header lines (RFC 3261
+/// §10.2.3, §20.10): each line may fold several comma-separated values, each
+/// either `<uri>;params` (with an optional display name) or a bare `uri;params`
+/// whose parameters are the header's, not the URI's. `*` is no URI and is
+/// skipped.
+pub(super) fn listed_contact_uris(lines: &[String]) -> Vec<String> {
+    let mut uris = Vec::new();
+    for line in lines {
+        let mut start = 0;
+        let mut depth = 0i32;
+        let mut in_quotes = false;
+        let mut values = Vec::new();
+        for (index, byte) in line.bytes().enumerate() {
+            match byte {
+                b'"' => in_quotes = !in_quotes,
+                b'<' if !in_quotes => depth += 1,
+                b'>' if !in_quotes => depth -= 1,
+                b',' if !in_quotes && depth == 0 => {
+                    values.push(&line[start..index]);
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        values.push(&line[start..]);
+        for value in values {
+            let value = value.trim();
+            let uri = match (value.find('<'), value.find('>')) {
+                (Some(open), Some(close)) if open < close => &value[open + 1..close],
+                _ => value.split(';').next().unwrap_or(value),
+            };
+            let uri = uri.trim();
+            if !uri.is_empty() && uri != "*" {
+                uris.push(uri.to_string());
+            }
+        }
+    }
+    uris
+}
+
 /// The token a Contact URI carries, if it has one. The parameter name is read
 /// as RFC 3261 §19.1.4 compares it, after the decoding of escaped unreserved
 /// characters and without case (the same decoding as
@@ -269,6 +309,25 @@ mod tests {
         // The separator keeps ("ab", "c") apart from ("a", "bc").
         assert_ne!(instance_token("ab", "c"), instance_token("a", "bc"));
         assert!(!token.contains("node"));
+    }
+
+    #[test]
+    fn listed_contacts_are_read_from_angle_brackets_or_bare_uris() {
+        let lines = vec![
+            "<sip:u@203.0.113.10:5060;rnode=ab>;expires=60, \"Name, Q\" <sip:v@198.51.100.1>"
+                .to_string(),
+            "sip:w@192.0.2.9:5070;expires=30".to_string(),
+            "*".to_string(),
+        ];
+        assert_eq!(
+            listed_contact_uris(&lines),
+            vec![
+                "sip:u@203.0.113.10:5060;rnode=ab".to_string(),
+                "sip:v@198.51.100.1".to_string(),
+                "sip:w@192.0.2.9:5070".to_string(),
+            ]
+        );
+        assert!(listed_contact_uris(&[]).is_empty());
     }
 
     #[test]

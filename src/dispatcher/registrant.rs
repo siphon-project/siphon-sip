@@ -517,13 +517,19 @@ fn handle_removed_entry_answer(
         .flatten()
         .and_then(|raw| crate::auth::parse_challenge(raw));
     let defaults = state_defaults(registrant, state);
-    let answer = registrant.answer_removed_deregistration(
+    let contacts: Vec<String> = message
+        .headers
+        .get_all("Contact")
+        .map(|lines| lines.iter().map(|line| line.to_string()).collect())
+        .unwrap_or_default();
+    let answer = registrant.answer_removed_registration(
         call_id,
         crate::registrant::cseq_number(message),
         status_code,
         challenge
             .as_ref()
             .map(|challenge| (challenge, status_code == 407)),
+        &contacts,
         defaults,
     );
     match answer {
@@ -550,7 +556,7 @@ fn handle_removed_entry_answer(
                 }
             }
         }
-        RemovedAnswer::Finished | RemovedAnswer::Stale => {}
+        RemovedAnswer::Finished | RemovedAnswer::Stale | RemovedAnswer::Continued => {}
         RemovedAnswer::NotTracked => {
             // Any final answer ends the protected de-REGISTER of a removed UE.
             if status_code >= 200 && registrant.finish_teardown(call_id) {

@@ -3,11 +3,80 @@
 
 <!-- The upstream registrar after the node was killed and restarted without the
      trunk in its list. The binding the dead process held is still here; the
-     restarted siphon must clear it (RFC 3261 §10.2.2) on the Contact and the
-     Call-ID it was made with. The registrar challenges every REGISTER (§22),
-     the de-registration included, so the credential has to come from the
-     source's lookup: nothing persisted it. -->
+     restarted siphon must fetch the bindings first (RFC 3261 §10.2.3: no
+     Contact, no Expires) and, the 2xx listing its Contact (the one the first
+     run registered, passed in as [$listed_contact]), clear it (§10.2.2) on the
+     Contact and the Call-ID it was made with. The registrar challenges every
+     REGISTER (§22), the fetch and the de-registration included, so the
+     credential has to come from the source's lookup: nothing persisted it. -->
 <scenario name="Upstream registrar: clearing the binding a killed node left">
+
+  <Global variables="listed_contact" />
+
+  <!-- The fetch, challenged. -->
+  <recv request="REGISTER" />
+
+  <send>
+    <![CDATA[
+
+      SIP/2.0 401 Unauthorized
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      WWW-Authenticate: Digest realm="registrar.test", nonce="0123456789abcdef", algorithm=MD5, qop="auth"
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- The authorised fetch: its digest is verified against the trunk's
+       password; the answer lists the binding the first run made. -->
+  <recv request="REGISTER">
+    <action>
+      <ereg regexp="username=.line-user-7." search_in="hdr" header="Authorization:"
+            check_it="true" assign_to="fetch_auth" />
+      <verifyauth assign_to="fetchauthok" username="line-user-7" password="secret123" />
+      <log message="authorised fetch carried [$fetch_auth]" />
+    </action>
+  </recv>
+
+  <nop test="fetchauthok" next="fetch_accepted" />
+
+  <send>
+    <![CDATA[
+
+      SIP/2.0 403 Forbidden
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Never arrives: the call fails, so SIPp exits non-zero. -->
+  <recv request="BYE" timeout="2000" />
+
+  <label id="fetch_accepted" />
+
+  <send>
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: [$listed_contact]
+      Content-Length: 0
+
+    ]]>
+  </send>
 
   <recv request="REGISTER">
     <action>

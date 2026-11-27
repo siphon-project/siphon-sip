@@ -113,10 +113,11 @@ async fn bindings_registered_before_the_store_attached_are_written_when_it_does(
     assert_eq!(store.load().await.expect("loaded").len(), 1);
 }
 
-/// RFC 3261 §10.2.2 / §10.2.4: Expires 0 on the stored Contact, the stored
-/// Call-ID, a CSeq above every one the process before used.
+/// RFC 3261 §10.2.3 / §10.2.4: the first request is a fetch (no Contact, no
+/// Expires) on the stored Call-ID with a CSeq above every one the process
+/// before used; the de-REGISTER follows it only on a 2xx listing our Contact.
 #[tokio::test]
-async fn an_orphan_is_de_registered_on_its_call_id_contact_and_next_cseq() {
+async fn an_orphan_is_fetched_then_de_registered_on_its_call_id_contact_and_next_cseq() {
     let (manager, store) = manager_with_store();
     let listen = listen();
     let stored = record(AOR);
@@ -131,21 +132,39 @@ async fn an_orphan_is_de_registered_on_its_call_id_contact_and_next_cseq() {
             ..CleanupReport::default()
         }
     );
-    let built = released(&manager)
-        .await
-        .pop()
-        .expect("a queued de-REGISTER");
-    assert_eq!(header(&built.message, "Expires"), "0");
-    assert_eq!(header(&built.message, "Call-ID"), stored.call_id);
-    assert!(header(&built.message, "Contact").contains(CONTACT));
-    assert!(cseq_number(&built.message).expect("CSeq") > stored.next_cseq);
-    assert!(header(&built.message, "Authorization").is_empty());
+    let fetch = released(&manager).await.pop().expect("a queued fetch");
+    assert!(fetch.message.headers.get("Expires").is_none());
+    assert!(fetch.message.headers.get("Contact").is_none());
+    assert_eq!(header(&fetch.message, "Call-ID"), stored.call_id);
+    assert!(cseq_number(&fetch.message).expect("CSeq") > stored.next_cseq);
+    assert!(header(&fetch.message, "Authorization").is_empty());
     assert_eq!(manager.removed_deregistrations_pending(), 1);
     assert!(manager.is_empty(), "an orphan is not a live entry");
 
     // The attempt is counted where a later restart reads it.
     let after = store.load().await.expect("loaded");
     assert_eq!(after[0].attempts, 1);
+
+    let answer = manager.answer_removed_registration(
+        &stored.call_id,
+        cseq_number(&fetch.message),
+        200,
+        None,
+        &[format!("<{CONTACT}>;expires=120")],
+        defaults(&listen),
+    );
+    assert!(matches!(
+        answer,
+        crate::registrant::RemovedAnswer::Continued
+    ));
+    let deregister = released(&manager).await.pop().expect("a de-REGISTER");
+    assert_eq!(header(&deregister.message, "Expires"), "0");
+    assert_eq!(header(&deregister.message, "Call-ID"), stored.call_id);
+    assert!(header(&deregister.message, "Contact").contains(CONTACT));
+    assert_eq!(
+        cseq_number(&deregister.message),
+        cseq_number(&fetch.message).map(|cseq| cseq + 1)
+    );
 }
 
 #[tokio::test]
@@ -210,6 +229,15 @@ async fn a_live_entry_on_another_contact_leaves_the_stored_one_to_be_cleared() {
     let report = manager.startup_cleanup(vec![stored.clone()], defaults(&listen));
 
     assert_eq!(report.deregistered, 1);
+    let fetch = released(&manager).await.pop().expect("a fetch");
+    manager.answer_removed_registration(
+        &stored.call_id,
+        cseq_number(&fetch.message),
+        200,
+        None,
+        &[format!("<{CONTACT}>")],
+        defaults(&listen),
+    );
     let built = released(&manager).await.pop().expect("a de-REGISTER");
     assert!(header(&built.message, "Contact").contains(CONTACT));
     assert_eq!(manager.len(), 1);

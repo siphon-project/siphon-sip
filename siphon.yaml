@@ -694,7 +694,11 @@ registrar:
 # key prefix, `registrar.redis.registrant_key_prefix`, default
 # "siphon:registrant:"; no credential is stored) so a node that was killed
 # without shutting down de-registers at restart what it left on the registrar,
-# instead of leaving a second contact there until it expires.
+# instead of leaving a second contact there until it expires. It fetches the
+# registrar's bindings first (a REGISTER with no Contact, RFC 3261 §10.2.3) and
+# de-registers only when its own Contact is listed, so a registrar that keeps one
+# binding per AoR is never cleared of another node's binding. Known limit: another
+# node registering between the fetch and the de-REGISTER, on such a registrar.
 #
 # EVERY NODE NEEDS A UNIQUE `server.instance_id` (or a unique HOSTNAME) for that
 # clean-up. The Contact siphon generates for a trunk carries `;rnode=<hash of the
