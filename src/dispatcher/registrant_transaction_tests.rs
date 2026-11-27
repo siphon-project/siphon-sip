@@ -1356,3 +1356,22 @@ async fn a_contact_inside_a_display_name_is_not_ours() {
         );
     }
 }
+
+/// A listed URI the parser does not consume to its end, and a bare Contact in
+/// an upper-case scheme with `expires=0`, are not a listing of ours.
+#[tokio::test]
+async fn a_partial_uri_or_an_expired_bare_contact_in_any_case_does_not_authorize_the_de_register() {
+    for listed in [
+        "Contact: <sip:trunk@192.0.2.1:5060/other>\r\n",
+        "Contact: SIP:trunk@192.0.2.1:5060;expires=0\r\nContact: <sip:trunk@198.51.100.77:5060>\r\n",
+    ] {
+        let setup = Setup::new();
+        let (_store, fetch) = setup.startup_fetch(None).await;
+        setup.answer(&fetch, "200 OK", listed);
+        setup.registrant.release_startup_deregistrations().await;
+        assert!(
+            test_support::take_deregistrations(&setup.registrant).is_empty(),
+            "a de-REGISTER was queued over {listed:?}"
+        );
+    }
+}

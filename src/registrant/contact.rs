@@ -200,13 +200,6 @@ fn fnv1a_64(bytes: impl IntoIterator<Item = u8>) -> u64 {
 /// Whether two Contact URIs name the same binding at a registrar (RFC 3261
 /// §19.1.4). Text that does not parse as a URI is compared as text.
 pub(super) fn contacts_equivalent(left: &str, right: &str) -> bool {
-    // The scheme is case-insensitive (RFC 3261 §19.1.1) but the parser only
-    // knows the lower-case ones, so the token before the first colon is
-    // lower-cased first.
-    let scheme_lowered = |text: &str| match text.split_once(':') {
-        Some((scheme, rest)) => format!("{}:{rest}", scheme.to_ascii_lowercase()),
-        None => text.to_string(),
-    };
     match (
         crate::sip::parser::parse_uri_complete(&scheme_lowered(left)),
         crate::sip::parser::parse_uri_complete(&scheme_lowered(right)),
@@ -216,25 +209,63 @@ pub(super) fn contacts_equivalent(left: &str, right: &str) -> bool {
     }
 }
 
+/// `text` with the token before its first colon lower-cased: the scheme is
+/// case-insensitive (RFC 3261 §19.1.1) but the URI parser only knows the
+/// lower-case ones.
+fn scheme_lowered(text: &str) -> String {
+    match text.split_once(':') {
+        Some((scheme, rest)) => format!("{}:{rest}", scheme.to_ascii_lowercase()),
+        None => text.to_string(),
+    }
+}
+
 /// The Contact URIs a registrar's answer lists as bound (RFC 3261 §10.2.3,
-/// §20.10): parsed as name-addr values by the shared header parser (comma
-/// folding, quoted display names, quoted-pairs), `*` skipped. A Contact counts
-/// only with an effective expiry above zero: its own `expires` parameter, else
-/// the response's `Expires` header (§10.3 step 8, §10.2.4), else the 3600 s
-/// default. A line that does not parse lists nothing: the safe side.
+/// §20.10), for the restart clean-up's decision. Entries are cut by the shared
+/// header scanner (comma folding, quoted display names and parameter values,
+/// quoted-pairs; `*` skipped) and each URI must parse to its end
+/// ([`parse_uri_complete`](crate::sip::parser::parse_uri_complete), scheme
+/// without case, §19.1.4): an entry with trailing input is not a Contact this
+/// node registered. A bare entry's parameters are all the header's (§20.10),
+/// whatever the scheme's case.
+///
+/// An entry counts only with an effective expiry above zero (§10.3 step 8):
+/// its own `expires` parameter (a value too large for `u32` saturates, so it is
+/// bound, and a malformed one is the 3600 s default, §10.2.1), else the
+/// response's `Expires` header, else 3600.
 pub(super) fn bound_contact_uris(lines: &[String], response_expires: Option<u32>) -> Vec<String> {
+    use crate::sip::headers::nameaddr::{split_comma_respecting_angles, split_entry, split_params};
+
     let mut uris = Vec::new();
     for line in lines {
-        let Ok(entries) = crate::sip::headers::nameaddr::NameAddr::parse_multi(line) else {
-            continue;
-        };
-        for entry in entries {
-            if entry.expires.or(response_expires).unwrap_or(3600) > 0 {
-                uris.push(entry.uri.to_string());
+        for entry in split_comma_respecting_angles(line) {
+            let Some((uri, params)) = split_entry(entry) else {
+                continue;
+            };
+            if uri == "*" || crate::sip::parser::parse_uri_complete(&scheme_lowered(uri)).is_err() {
+                continue;
+            }
+            let own = split_params(params).find_map(|parameter| {
+                let (name, value) = parameter.split_once('=')?;
+                name.trim()
+                    .eq_ignore_ascii_case("expires")
+                    .then(|| delta_seconds(value.trim().trim_matches('"')))
+            });
+            if own.or(response_expires).unwrap_or(3600) > 0 {
+                uris.push(uri.to_string());
             }
         }
     }
     uris
+}
+
+/// `delta-seconds` (RFC 3261 §25.1): digits, saturating at `u32::MAX` when too
+/// large; anything else is the 3600 s default of §10.2.1.
+fn delta_seconds(value: &str) -> u32 {
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        value.parse().unwrap_or(u32::MAX)
+    } else {
+        3600
+    }
 }
 
 /// The token a Contact URI carries, if it has one. The parameter name is read
@@ -324,6 +355,54 @@ mod tests {
         assert_eq!(bound_contact_uris(&bare, None).len(), 1);
         let own = vec!["<sip:u@192.0.2.1:5060>;expires=60".to_string()];
         assert_eq!(bound_contact_uris(&own, Some(0)).len(), 1);
+    }
+
+    /// A quoted parameter value that holds `;expires=0` is not an expiry.
+    #[test]
+    fn a_quoted_parameter_value_is_not_an_expiry() {
+        let lines = vec![r#"<sip:u@192.0.2.1:5060>;expires=60;note="x;expires=0;y""#.to_string()];
+        assert_eq!(bound_contact_uris(&lines, None).len(), 1);
+        let lines = vec![r#"<sip:u@192.0.2.1:5060>;note="x;expires=60";expires=0"#.to_string()];
+        assert!(bound_contact_uris(&lines, None).is_empty());
+    }
+
+    /// RFC 3261 §10.2.1: an `expires` too large saturates (bound), a malformed
+    /// one is the default, neither inherits a zero `Expires` header.
+    #[test]
+    fn an_invalid_or_oversized_expires_does_not_inherit_the_header() {
+        for value in ["99999999999999999999", "abc", "-1", "", "1.5"] {
+            let lines = vec![format!("<sip:u@192.0.2.1:5060>;expires={value}")];
+            assert_eq!(
+                bound_contact_uris(&lines, Some(0)).len(),
+                1,
+                "expires={value:?}"
+            );
+        }
+        let lines = vec!["<sip:u@192.0.2.1:5060>;expires=0".to_string()];
+        assert!(bound_contact_uris(&lines, Some(60)).is_empty());
+    }
+
+    /// A URI the parser does not consume to its end is not our Contact.
+    #[test]
+    fn a_uri_with_trailing_input_is_not_listed() {
+        let lines = vec![
+            "<sip:ours@192.0.2.1:5060/other>".to_string(),
+            "<sip:ours@192.0.2.1:5060 junk>".to_string(),
+            "sip:ours@192.0.2.1:5060/other;expires=60".to_string(),
+        ];
+        assert!(bound_contact_uris(&lines, None).is_empty());
+    }
+
+    /// The scheme is case-insensitive (§19.1.4), and a bare entry's parameters
+    /// are the header's, so `expires=0` is seen whatever the scheme's case.
+    #[test]
+    fn a_bare_contact_in_any_scheme_case_shows_its_expires() {
+        for scheme in ["sip", "SIP", "Sip", "SIPS"] {
+            let lines = vec![format!("{scheme}:ours@192.0.2.1:5060;expires=0")];
+            assert!(bound_contact_uris(&lines, None).is_empty(), "{scheme}");
+            let lines = vec![format!("{scheme}:ours@192.0.2.1:5060;expires=60")];
+            assert_eq!(bound_contact_uris(&lines, None).len(), 1, "{scheme}");
+        }
     }
 
     #[test]
