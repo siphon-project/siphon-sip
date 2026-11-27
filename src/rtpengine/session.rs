@@ -438,6 +438,19 @@ impl MediaSessionStore {
             .insert(call_id.to_string(), answer_sdp.to_string());
     }
 
+    /// [`Self::record_local_answer`] for a session that is still stored, the
+    /// check and the write made while the session is held, so a teardown that
+    /// removes it meanwhile cannot leave the record behind. `false` when the
+    /// session is gone.
+    pub fn record_local_answer_if_held(&self, call_id: &str, answer_sdp: &str) -> bool {
+        let Some(_held) = self.sessions.get(call_id) else {
+            return false;
+        };
+        self.local_answers
+            .insert(call_id.to_string(), answer_sdp.to_string());
+        true
+    }
+
     /// The answer the engine gave `call_id` itself, while that session lasts.
     pub fn local_answer(&self, call_id: &str) -> Option<String> {
         self.local_answers.get(call_id).map(|entry| entry.clone())
@@ -658,8 +671,12 @@ impl MediaSessionStore {
     pub fn remove(&self, call_id: &str) -> Option<MediaSession> {
         self.forget_dial_branches(call_id);
         self.forget_own_media(call_id);
+        // The session first, then its record: [`Self::record_local_answer_if_held`]
+        // writes while it holds the session, so a record made before this
+        // takes the session is cleared below and none can follow it.
+        let taken = self.take_session(call_id);
         self.local_answers.remove(call_id);
-        self.take_session(call_id)
+        taken
     }
 
     /// Take the session stored under `call_id` out of the store and release

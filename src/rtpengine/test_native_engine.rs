@@ -899,9 +899,10 @@ fn seat_refusal(command: &Command) -> Option<String> {
 async fn held_answer(command: &Command, gates: &mut [tokio::sync::watch::Receiver<bool>; 3]) {
     let [answers_open, deletes_open, attaches_open] = gates;
     let gate = match command {
-        Command::AnswerLocal { .. } | Command::OfferLocal { .. } | Command::Offer { .. } => {
-            answers_open
-        }
+        Command::AnswerLocal { .. }
+        | Command::OfferLocal { .. }
+        | Command::Offer { .. }
+        | Command::Answer { .. } => answers_open,
         Command::Delete { .. } => deletes_open,
         Command::AttachX3 { .. } => attaches_open,
         _ => return,

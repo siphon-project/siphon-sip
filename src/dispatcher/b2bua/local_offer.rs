@@ -228,7 +228,7 @@ fn apply_answer(
     // A WebSocket takeover is its own far side; nothing can be dialled behind it.
     if pending.flags.ws_uri.is_none() {
         if let Some(sessions) = state.rtpengine_sessions.as_ref() {
-            sessions.record_local_answer(&pending.engine_call_id, &pending.offer_sdp);
+            sessions.record_local_answer_if_held(&pending.engine_call_id, &pending.offer_sdp);
         }
     }
     Ok(answer)

@@ -477,3 +477,39 @@ async fn answered_refused_and_unacked_calls_drain_the_pending_state() {
     .expect("every engine call was deleted");
     assert_eq!(engine.offer_local_pending_count(), 0);
 }
+
+/// A BYE that lands while the caller's answer is with the engine removes the
+/// session. The answer then completes: nothing may be recorded for the call
+/// that is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bye_while_the_acks_answer_is_in_flight_leaves_no_orphan_record() {
+    let call = Arc::new(OfferlessCall::park(
+        NativeTestEngine::start_with_offer_local().await,
+        "dly-race-4",
+    ));
+    call.answer("rtp_passthrough", None).expect("answered");
+    let two_xx = call.two_xx();
+    call.engine.hold_answers();
+    let acking = {
+        let call = Arc::clone(&call);
+        let two_xx = two_xx.clone();
+        tokio::task::spawn_blocking(move || call.acks(&two_xx, Some(CALLER_ANSWER)))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while call.engine.commands("answer").is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the engine was sent the answer");
+    call.caller_request("BYE", &two_xx, None);
+    call.engine.release_answers();
+    acking.await.expect("the ACK ran");
+    let sessions = call.state.rtpengine_sessions.as_ref().expect("sessions");
+    assert!(sessions.get("dly-race-4").is_none());
+    assert!(
+        sessions.local_answer("dly-race-4").is_none(),
+        "no record is left for a call that is gone"
+    );
+    assert_eq!(call.state.call_actors.pending_local_offer_count(), 0);
+}
