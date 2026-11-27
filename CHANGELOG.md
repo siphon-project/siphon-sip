@@ -54,7 +54,7 @@ entry, but a working config keeps working.
 
 ### Fixed
 
-- A re-INVITE with no SDP from the caller of a media-anchored two-leg call is answered from the session in force toward the caller instead of being relayed offerless: the callee's 2xx offer was handed to the media engine as an answer to nothing, and the caller's ACK answer went nowhere.
+- A re-INVITE with no SDP from the caller of a media-anchored two-leg call is answered from the session in force toward the caller instead of being relayed offerless: the callee's 2xx offer was handed to the media engine as an answer to nothing, and the caller's ACK answer went nowhere. That answer now reaches the engine, so media the caller moved in it is followed, and an ACK with no SDP ends the call.
 
 ### Changed
 
