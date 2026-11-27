@@ -426,7 +426,7 @@ fn parse_tel_uri(input: &str) -> IResult<&str, SipUri> {
     // Extract phone-context as the host equivalent
     let host = params
         .iter()
-        .find(|(name, _)| name == "phone-context")
+        .find(|(name, _)| name.eq_ignore_ascii_case("phone-context"))
         .and_then(|(_, value)| value.clone())
         .unwrap_or_default();
 

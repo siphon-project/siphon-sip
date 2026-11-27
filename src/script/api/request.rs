@@ -4424,6 +4424,21 @@ mod tests {
         );
     }
 
+    /// Parameter names are case-insensitive (RFC 3966 §3), so a tel: URI that
+    /// spells `Phone-Context` still has its host, and an edit survives a reparse.
+    #[test]
+    fn a_mixed_case_phone_context_still_edits() {
+        assert_eq!(
+            ruri_after(concat!(
+                "request.set_ruri('tel:8367;Phone-Context=example.com')\n",
+                "request.set_ruri_param('isub', '123')\n",
+                "assert request.ruri.host == 'example.com'\n",
+            ))
+            .unwrap(),
+            "tel:8367;Phone-Context=example.com;isub=123"
+        );
+    }
+
     #[test]
     fn assigning_on_request_ruri_writes_the_request() {
         // It used to change a copy, so the relay went out unchanged and the
