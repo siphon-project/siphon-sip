@@ -61,6 +61,9 @@ pub(super) struct DrainingDeregistration {
     /// The entry is still in the manager, shutting down: its own
     /// [`Deregistration`](super::Deregistration) ends with this exchange.
     shutdown_of_live_entry: bool,
+    /// A shutdown exchange's answer bound ([`super::SHUTDOWN_ANSWER_WAIT`] from the
+    /// signal): a fetch answered after it sends no `Expires: 0`.
+    answer_by: Option<tokio::time::Instant>,
     deadline: Instant,
 }
 
@@ -225,6 +228,7 @@ impl RegistrantManager {
                     needs_lookup: true,
                     fetching: true,
                     shutdown_of_live_entry: false,
+                    answer_by: None,
                     deadline: Instant::now() + DRAINING_LIFETIME,
                 },
             );
@@ -280,6 +284,9 @@ impl RegistrantManager {
                 needs_lookup: false,
                 fetching: true,
                 shutdown_of_live_entry,
+                answer_by: shutdown_of_live_entry
+                    .then(|| self.shutdown_answer_by.get().copied())
+                    .flatten(),
                 deadline: Instant::now() + DRAINING_LIFETIME,
             },
         );
@@ -417,12 +424,26 @@ impl RegistrantManager {
             return RemovedAnswer::Stale;
         }
         let mut skipped = false;
+        let mut status_code_override: Option<u16> = None;
         if (200..300).contains(&status_code) && draining.fetching {
             let ours = draining.entry.contact_uri.clone().unwrap_or_default();
             let listed = super::contact::bound_contact_uris(contacts, response_expires)
                 .iter()
                 .any(|listed| super::contact::contacts_equivalent(listed, &ours));
-            if listed && self.superseded_by_live_entry(&draining) {
+            if listed
+                && draining
+                    .answer_by
+                    .is_some_and(|bound| tokio::time::Instant::now() >= bound)
+            {
+                warn!(
+                    aor = %draining.entry.aor,
+                    registrar = %draining.entry.registrar_uri,
+                    "shutdown: the fetch was answered after the shutdown bound, \
+                     no de-REGISTER is sent and the binding is left to expire"
+                );
+                // Over, with no answer to the de-REGISTER to come.
+                status_code_override = Some(0);
+            } else if listed && self.superseded_by_live_entry(&draining) {
                 info!(
                     aor = %draining.entry.aor,
                     registrar = %draining.entry.registrar_uri,
@@ -527,7 +548,8 @@ impl RegistrantManager {
             );
         }
         drop(draining);
-        self.conclude_draining(call_id, (!skipped).then_some(status_code));
+        let outcome = status_code_override.or((!skipped).then_some(status_code));
+        self.conclude_draining(call_id, outcome);
         RemovedAnswer::Finished
     }
 

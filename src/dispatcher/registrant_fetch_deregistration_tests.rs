@@ -502,3 +502,37 @@ async fn an_entry_added_again_while_its_fetch_is_in_flight_registers_on_a_call_i
     assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
     assert_eq!(test_support::call_id(&setup.registrant, TRUNK), Some(live));
 }
+
+/// The bound is counted from the signal: an active call can hold the drain open
+/// for longer, and a fetch answered after the bound must not send `Expires: 0`
+/// (nothing waits for it any more, and the process may be about to exit).
+#[tokio::test(start_paused = true)]
+async fn a_shutdown_fetch_answered_after_the_bound_sends_no_de_register() {
+    let setup = Setup::new();
+    let store = setup.with_store();
+    let (contact, _register) = setup.bound(TRUNK);
+    setup.begin_shutdown();
+    let fetch = setup.next_sent().expect("the fetch");
+
+    tokio::time::advance(crate::registrant::SHUTDOWN_ANSWER_WAIT + Duration::from_secs(5)).await;
+    setup.answer(&fetch, "200 OK", &lists(&contact));
+
+    assert!(setup.next_sent().is_none(), "Expires: 0 after the bound");
+    assert!(!setup.registrant.deregistrations_pending());
+    assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
+    assert!(store.load().await.expect("loaded").is_empty());
+}
+
+/// Inside the bound the same answer still clears the binding.
+#[tokio::test(start_paused = true)]
+async fn a_shutdown_fetch_answered_inside_the_bound_still_sends_the_de_register() {
+    let setup = Setup::new();
+    let (contact, _register) = setup.bound(TRUNK);
+    setup.begin_shutdown();
+    let fetch = setup.next_sent().expect("the fetch");
+
+    tokio::time::advance(crate::registrant::SHUTDOWN_ANSWER_WAIT - Duration::from_secs(5)).await;
+    setup.answer(&fetch, "200 OK", &lists(&contact));
+
+    assert!(setup.next_sent().is_some(), "no de-REGISTER");
+}

@@ -565,6 +565,10 @@ pub fn deregister_all(manager: &RegistrantManager, outbound: &OutboundRouter) ->
         return 0;
     };
 
+    // Counted from the signal: an answer to a fetch after this sends nothing.
+    let _ = manager
+        .shutdown_answer_by
+        .set(tokio::time::Instant::now() + SHUTDOWN_ANSWER_WAIT);
     let mut sent = 0;
     let removed = manager.take_pending_deregistrations();
     for built in manager

@@ -783,6 +783,9 @@ pub struct RegistrantManager {
     /// Set once shutdown begins (see [`lifecycle`]): no REGISTER with
     /// `Expires > 0` is started from then on.
     shutting_down: std::sync::atomic::AtomicBool,
+    /// When shutdown stops waiting for the answers to its de-REGISTERs (and the
+    /// fetches before them), set by [`deregister_all`] as the signal arrives.
+    shutdown_answer_by: std::sync::OnceLock<tokio::time::Instant>,
     /// The client transaction layer every REGISTER is sent under, attached by
     /// the dispatcher (see [`lifecycle`]).
     transactions: std::sync::OnceLock<Arc<dyn RegisterTransactions>>,
@@ -840,6 +843,7 @@ impl RegistrantManager {
             refresh_window: RefreshWindow::HALF,
             max_registers_per_sec: None,
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            shutdown_answer_by: std::sync::OnceLock::new(),
             transactions: std::sync::OnceLock::new(),
             instance_id: None,
             restart: startup::RestartState::default(),
