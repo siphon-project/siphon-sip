@@ -340,7 +340,9 @@ pub fn release_dial_branch_media(sip_call_id: &str, state: &DispatcherState) {
 /// that lands while an engine round trip is out finds no session to take. The
 /// session is therefore recorded first and the call checked afterwards: either
 /// the teardown has not yet taken sessions and takes this one, or it has
-/// claimed already and this releases the engine call itself. `false` when the
+/// claimed already and this releases the engine call itself. A CANCEL claims
+/// the call too (`cancel_claimed`), answers the INVITE 487 and removes the call
+/// later, so a call being cancelled counts as ended. `false` when the
 /// call had ended and the session was released.
 pub(super) fn commit_media_session(
     state: &DispatcherState,
@@ -355,7 +357,7 @@ pub(super) fn commit_media_session(
     let ended = state
         .call_actors
         .get_call(internal_call_id)
-        .is_none_or(|call| call.teardown_claimed);
+        .is_none_or(|call| call.teardown_claimed || call.cancel_claimed);
     if !ended {
         return true;
     }

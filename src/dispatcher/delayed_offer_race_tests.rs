@@ -142,3 +142,113 @@ async fn a_teardown_while_a_delayed_dial_anchors_leaves_nothing_behind() {
     assert!(sessions.get("dly-race-2").is_none());
     assert_eq!(call.engine.held_count(), 0, "the engine call was deleted");
 }
+
+/// A CANCEL that lands while the engine is still making the offer ends the
+/// call with a 487. The offer then completes: the allocation is released, and
+/// no 2xx follows the 487 on the same INVITE.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_while_offer_local_is_in_flight_releases_the_allocation_and_sends_no_2xx() {
+    let call = Arc::new(OfferlessCall::park(
+        NativeTestEngine::start_with_offer_local().await,
+        "dly-race-3",
+    ));
+    call.engine.hold_answers();
+    let answering = {
+        let call = Arc::clone(&call);
+        tokio::task::spawn_blocking(move || call.answer("rtp_passthrough", None))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while call.engine.commands("offer_local").is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the engine was sent the offer_local");
+
+    let raw = concat!(
+        "CANCEL sip:4000@siphon.example.com SIP/2.0\r\n",
+        "Via: SIP/2.0/UDP 192.0.2.40:5060;branch=z9hG4bK-dly-race-3\r\n",
+        "Max-Forwards: 70\r\n",
+        "From: \"Caller One\" <sip:15550100001@siphon.example.com>;tag=caller-tag\r\n",
+        "To: <sip:4000@siphon.example.com>\r\n",
+        "Call-ID: dly-race-3\r\n",
+        "CSeq: 1 CANCEL\r\n",
+        "Content-Length: 0\r\n\r\n",
+    );
+    let inbound = InboundMessage {
+        client_transport: None,
+        connection_id: ConnectionId::default(),
+        transport: Transport::Udp,
+        local_addr: socket("192.0.2.1:5060"),
+        remote_addr: socket("192.0.2.40:5060"),
+        data: Bytes::from(raw),
+    };
+    let message = parse_sip_message_bytes(raw.as_bytes()).expect("the CANCEL parses");
+    tokio::task::block_in_place(|| handle_b2bua_cancel(inbound, message, &call.state));
+
+    call.engine.release_answers();
+    let outcome = answering.await.expect("the answer ran");
+    assert!(outcome.is_err(), "no answer for a cancelled call");
+    let statuses: Vec<_> = call
+        .wire()
+        .iter()
+        .filter_map(|sent| sent.message.status_code())
+        .collect();
+    assert!(
+        statuses.contains(&487),
+        "the INVITE is answered 487: {statuses:?}"
+    );
+    assert!(
+        !statuses.contains(&200) || statuses.iter().filter(|c| **c == 200).count() == 1,
+        "only the CANCEL's own 200: {statuses:?}"
+    );
+    assert!(
+        call.wire().iter().all(|sent| sent.message.body.is_empty()),
+        "no SDP-carrying 2xx"
+    );
+    call.deleted(1).await;
+    let sessions = call.state.rtpengine_sessions.as_ref().expect("sessions");
+    assert!(sessions.get("dly-race-3").is_none());
+    assert_eq!(call.engine.held_count(), 0);
+    assert_eq!(call.engine.offer_local_pending_count(), 0);
+}
+
+/// The window inside a CANCEL: it has claimed the call and answered the INVITE
+/// 487, and the call is not yet removed. An offer completing then must not
+/// become a 2xx after that 487, and its allocation is released.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offer_completing_inside_a_cancel_sends_no_2xx_after_the_487() {
+    let call = Arc::new(OfferlessCall::park(
+        NativeTestEngine::start_with_offer_local().await,
+        "dly-race-5",
+    ));
+    call.engine.hold_answers();
+    let answering = {
+        let call = Arc::clone(&call);
+        tokio::task::spawn_blocking(move || call.answer("rtp_passthrough", None))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while call.engine.commands("offer_local").is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the engine was sent the offer_local");
+    call.state
+        .call_actors
+        .get_call_mut(&call.call_id)
+        .expect("the call")
+        .cancel_claimed = true;
+    call.engine.release_answers();
+    let outcome = answering.await.expect("the answer ran");
+    assert!(outcome.is_err(), "no answer for a call being cancelled");
+    assert!(
+        call.wire().iter().all(|sent| sent.message.body.is_empty()),
+        "no 2xx carrying the offer"
+    );
+    call.deleted(1).await;
+    let sessions = call.state.rtpengine_sessions.as_ref().expect("sessions");
+    assert!(sessions.get("dly-race-5").is_none());
+    assert_eq!(call.engine.held_count(), 0);
+    assert_eq!(call.state.call_actors.pending_local_offer_count(), 0);
+}
