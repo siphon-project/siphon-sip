@@ -109,6 +109,14 @@ impl RegistrantManager {
         if let Some(key) = address_key(&entry) {
             self.refuse_taken(&entry.aor, &key)?;
         }
+        // An entry handed back after `remove()` can meet its own fetch or
+        // de-REGISTER still in flight on that Call-ID. Two REGISTER streams on
+        // one Call-ID keep separate CSeq counters (a repeat, and an answer taken
+        // for the other's), so the live entry registers afresh on a Call-ID of
+        // its own (RFC 3261 §10.2.4).
+        if self.is_deregistering(&entry.call_id) {
+            entry.call_id = format!("reg-{}", uuid::Uuid::new_v4());
+        }
         if entry.require_local_addr && entry.local_addr.is_none() {
             entry.state = RegistrantState::AwaitingAddress;
         }

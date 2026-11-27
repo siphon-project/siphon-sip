@@ -474,3 +474,31 @@ async fn fetches_and_de_registers_leave_nothing_behind_whichever_way_they_end() 
     assert_eq!(setup.dispatcher.state.timer_wheel.len(), baseline_timers);
     assert!(store.load().await.expect("loaded").is_empty());
 }
+
+/// An embedder may hand the entry `remove()` returned back to `add()` while
+/// its fetch is in flight. The live entry then needs a Call-ID of its own: two
+/// REGISTER streams on one Call-ID with separate CSeq counters would reuse a
+/// CSeq, and the answer to one would be taken for the other's.
+#[tokio::test]
+async fn an_entry_added_again_while_its_fetch_is_in_flight_registers_on_a_call_id_of_its_own() {
+    let setup = Setup::new();
+    let (contact, _register) = setup.bound(TRUNK);
+    let removed = setup.registrant.remove(TRUNK).expect("the entry");
+    let fetch = setup.send_queued_deregistration();
+    assert_fetch(&fetch);
+
+    setup.registrant.add(removed);
+
+    let live = test_support::call_id(&setup.registrant, TRUNK).expect("a live entry");
+    assert_ne!(
+        live,
+        header(&fetch, "Call-ID"),
+        "one Call-ID, two CSeq counters"
+    );
+    // The fetch's answer is still the removal's: it ends, and the live entry
+    // (on the same Contact) keeps its binding.
+    setup.answer(&fetch, "200 OK", &lists(&contact));
+    assert!(setup.next_sent().is_none(), "the live binding was cleared");
+    assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
+    assert_eq!(test_support::call_id(&setup.registrant, TRUNK), Some(live));
+}
