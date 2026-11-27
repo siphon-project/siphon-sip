@@ -171,7 +171,11 @@ pub(super) fn complete_local_offer(call_id: &str, ack: &SipMessage, state: &Disp
     // Dropped after the call is settled either way: a verb waiting on the
     // answer then finds the engine call answered, or the call gone.
     match outcome {
-        Ok(()) => {
+        Ok(answer) => {
+            // The caller's own description of its media, which its INVITE did
+            // not carry: what a later bridge or transfer offers from. Set before
+            // the waiting verbs are released.
+            state.call_actors.set_leg_last_sdp(call_id, true, &answer);
             state.call_actors.finish_pending_local_offer(call_id);
         }
         Err((message, reason)) => {
@@ -189,7 +193,7 @@ fn apply_answer(
     pending: &PendingLocalOffer,
     ack: &SipMessage,
     state: &DispatcherState,
-) -> Result<(), (String, &'static str)> {
+) -> Result<Vec<u8>, (String, &'static str)> {
     let Some(answer) = sdp_in_body(message_content_type(ack), &ack.body) else {
         return Err((
             "the caller ACKed the engine's offer without an answer (RFC 3264 §4)".to_string(),
@@ -221,5 +225,5 @@ fn apply_answer(
             sessions.record_local_answer(&pending.engine_call_id, &pending.offer_sdp);
         }
     }
-    Ok(())
+    Ok(answer)
 }

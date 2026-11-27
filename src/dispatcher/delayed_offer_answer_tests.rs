@@ -27,23 +27,23 @@ const CALLER_ANSWER: &str = concat!(
 
 /// A caller whose INVITE carries no SDP, parked on a dispatcher whose media
 /// is `engine`.
-struct OfferlessCall {
-    state: Arc<DispatcherState>,
-    udp: flume::Receiver<OutboundMessage>,
-    engine: Arc<NativeTestEngine>,
-    call_id: String,
-    sip_call_id: String,
-    invite: SipMessage,
+pub(super) struct OfferlessCall {
+    pub(super) state: Arc<DispatcherState>,
+    pub(super) udp: flume::Receiver<OutboundMessage>,
+    pub(super) engine: Arc<NativeTestEngine>,
+    pub(super) call_id: String,
+    pub(super) sip_call_id: String,
+    pub(super) invite: SipMessage,
 }
 
 impl OfferlessCall {
-    fn park(engine: NativeTestEngine, sip_call_id: &str) -> OfferlessCall {
+    pub(super) fn park(engine: NativeTestEngine, sip_call_id: &str) -> OfferlessCall {
         Self::park_on(&Arc::new(engine), sip_call_id)
     }
 
     /// A caller parked on a dispatcher of its own whose media is the shared
     /// `engine`.
-    fn park_on(engine: &Arc<NativeTestEngine>, sip_call_id: &str) -> OfferlessCall {
+    pub(super) fn park_on(engine: &Arc<NativeTestEngine>, sip_call_id: &str) -> OfferlessCall {
         let dispatcher = anchored_dispatcher(engine);
         let udp = dispatcher.udp.clone();
         let state = Arc::new(dispatcher.state);
@@ -78,7 +78,7 @@ impl OfferlessCall {
     }
 
     /// The controller's anchored `answer`.
-    fn answer(&self, profile: &str, ws_uri: Option<&str>) -> Result<(), String> {
+    pub(super) fn answer(&self, profile: &str, ws_uri: Option<&str>) -> Result<(), String> {
         answer_first_anchor(
             &self.call_id,
             &self.invite,
@@ -93,12 +93,12 @@ impl OfferlessCall {
         )
     }
 
-    fn wire(&self) -> Vec<Sent> {
+    pub(super) fn wire(&self) -> Vec<Sent> {
         drain(&self.udp)
     }
 
     /// The 2xx siphon sent the caller.
-    fn two_xx(&self) -> SipMessage {
+    pub(super) fn two_xx(&self) -> SipMessage {
         self.wire()
             .into_iter()
             .find(|sent| sent.message.status_code() == Some(200))
@@ -107,7 +107,7 @@ impl OfferlessCall {
     }
 
     /// The caller's request in the dialog the 2xx established.
-    fn caller_request(&self, method: &str, two_xx: &SipMessage, body: Option<&str>) {
+    pub(super) fn caller_request(&self, method: &str, two_xx: &SipMessage, body: Option<&str>) {
         let mut raw = format!(
             concat!(
                 "{method} sip:192.0.2.1:5060;transport=udp SIP/2.0\r\n",
@@ -151,16 +151,16 @@ impl OfferlessCall {
         }
     }
 
-    fn acks(&self, two_xx: &SipMessage, answer: Option<&str>) {
+    pub(super) fn acks(&self, two_xx: &SipMessage, answer: Option<&str>) {
         self.caller_request("ACK", two_xx, answer);
     }
 
-    fn call_is_up(&self) -> bool {
+    pub(super) fn call_is_up(&self) -> bool {
         self.state.call_actors.get_call(&self.call_id).is_some()
     }
 
     /// Wait until the engine has been sent `count` `delete`s.
-    async fn deleted(&self, count: usize) {
+    pub(super) async fn deleted(&self, count: usize) {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while self.engine.commands("delete").len() < count {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -231,6 +231,20 @@ async fn the_acks_answer_completes_the_engine_call_with_the_right_tags() {
     // A retransmitted ACK completes nothing twice.
     call.acks(&two_xx, Some(CALLER_ANSWER));
     assert_eq!(call.engine.commands("answer").len(), 1);
+}
+
+/// The caller's answer is the SDP its leg holds from here on, which a later
+/// `bridge` reads: its INVITE had none to keep.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_acks_answer_is_kept_as_the_callers_sdp_and_a_bridge_can_read_it() {
+    let call = OfferlessCall::park(NativeTestEngine::start_with_offer_local().await, "dly-9");
+    call.answer("rtp_passthrough", None).expect("answered");
+    let two_xx = call.two_xx();
+    call.acks(&two_xx, Some(CALLER_ANSWER));
+    let leg = crate::dispatcher::bridge_leg_snapshot(&call.state, "dly-9", "anchor")
+        .expect("the leg resolves");
+    assert_eq!(leg.last_sdp, CALLER_ANSWER.as_bytes());
+    crate::dispatcher::bridge_leg_validate(&leg).expect("the leg can be bridged");
 }
 
 /// Every answer the engine refuses ends the call and deletes its engine call,
