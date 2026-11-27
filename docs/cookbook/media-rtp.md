@@ -339,8 +339,8 @@ Which party decides each half:
 
 | Half | Faces | Turns WebRTC when |
 |---|---|---|
-| `offer` | each forked contact | the contact's binding registered over `ws` or `wss` (RFC 7118) |
-| `answer` | the offerer (the caller) | its offer is `UDP/TLS/RTP/SAVPF` with `a=ice-ufrag` and `a=fingerprint` |
+| `offer` | each forked contact | the contact's REGISTER arrived over `ws`/`wss` (RFC 7118), or its Contact URI says `transport=ws`/`wss` (any case), as a browser behind a relaying edge proxy with Path does |
+| `answer` | the offerer (the caller) | its first live audio section (port not 0) is `UDP/TLS/RTP/SAVPF` with `a=ice-ufrag` and `a=fingerprint`, its own or from the session level (RFC 8839, RFC 8122) |
 
 A control-plane `dial` to an `{aor}` decides the `offer` half per contact (and
 `originate {aor}` and `dial {on_answer: "bridge"}`, which anchor each contact as

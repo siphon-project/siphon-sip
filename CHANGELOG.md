@@ -32,6 +32,12 @@ entry, but a working config keeps working.
   (`UDP/TLS/RTP/SAVPF` with `a=ice-ufrag` and `a=fingerprint`), also on a
   script's `rtpengine.offer()`, which anchors once and leaves the `offer` half as
   written. `webrtc` takes `auto` only; `rtpproxy` refuses it at config load.
+  A contact is WebRTC when its REGISTER arrived over `ws`/`wss` or its Contact
+  says `transport=ws`/`wss`, so a browser behind a relaying edge proxy counts. The
+  caller's offer is judged on its first live audio section, with session-level
+  `a=ice-ufrag` and `a=fingerprint` inherited. `#` is reserved in a media
+  profile name and refused at config load, since the resolved forms are named
+  `base#webrtc-offer`, `-answer` and `-both`.
 
 ## [1.19.1] — 2026-11-26
 
