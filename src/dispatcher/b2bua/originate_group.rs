@@ -930,7 +930,24 @@ pub fn create_originate_group(
     // The shared shape of every leg is checked once here, not per leg: a
     // media plan this deployment cannot serve fails the command, never a call.
     if let OriginateMedia::Anchor { profile, .. } = &spec.params.media {
+        // The group's own profile may be the resolved name a bridge dial
+        // inherits from its caller's media session, so it is looked up, not
+        // gated as typed.
         originate_validate_anchor(profile, state)?;
+    }
+    // A profile a target names is a typed name: a generated `base#webrtc-...`
+    // form is chosen per contact below, never named.
+    if let Some(registry) = state.rtpengine_profiles.as_ref() {
+        if let Some(name) = spec
+            .targets
+            .iter()
+            .filter_map(|target| target.profile.as_deref())
+            .find(|name| !registry.is_defined(name))
+        {
+            return Err(OriginateError::Unsupported(format!(
+                "unknown media profile '{name}' for originate"
+            )));
+        }
     }
     let group_id = format!("originate-group-{}", uuid::Uuid::new_v4().simple());
     state.originate_groups.insert(
@@ -1225,7 +1242,8 @@ fn place_leg(
     legs: &LegsToPlace,
 ) -> Option<DialBranch> {
     let sink = &legs.sink;
-    let params = leg_params(&legs.params, target);
+    let mut params = leg_params(&legs.params, target);
+    super::dial_media::resolve_leg_profile(&mut params, target, state);
     let route = OriginateRoute {
         request_uri: Some(target.uri.clone()),
         flow: target.flow.clone(),

@@ -72,6 +72,46 @@ pub(super) fn anchored_dispatcher(engine: &NativeTestEngine) -> TestDispatcher {
     dispatcher
 }
 
+/// A desk-phone profile whose two halves are `webrtc: auto`: plain RTP with
+/// ICE removed as written, WebRTC toward a browser contact.
+pub(super) fn extension_profiles() -> Arc<crate::rtpengine::ProfileRegistry> {
+    let half = || crate::config::NgFlagsConfig {
+        transport_protocol: Some("RTP/AVP".to_string()),
+        ice: Some("remove".to_string()),
+        dtls: Some("off".to_string()),
+        rtcp_mux: vec!["demux".to_string()],
+        replace: vec!["origin".to_string()],
+        webrtc: Some(crate::config::WebrtcMode::Auto),
+        ..Default::default()
+    };
+    let custom = std::collections::HashMap::from([(
+        "extension".to_string(),
+        crate::config::MediaProfileConfig {
+            offer: half(),
+            answer: half(),
+        },
+    )]);
+    Arc::new(crate::rtpengine::ProfileRegistry::from_config(&custom))
+}
+
+/// Register `contact` at `aor` as a binding whose REGISTER arrived over
+/// `transport`, still reached by its URI (no flow is captured).
+pub(super) fn register_over(aor: &str, contact: &str, transport: Transport) {
+    let host = contact.rsplit('@').next().unwrap_or(contact);
+    crate::script::api::test_registrar()
+        .save_with_source(
+            aor,
+            parse_uri_standalone(contact).expect("a contact URI"),
+            3600,
+            1.0,
+            format!("register-{contact}"),
+            1,
+            Some(socket(host)),
+            Some(transport),
+        )
+        .expect("the binding saves");
+}
+
 /// Replace the dispatcher's egress with fresh channels and return the one the
 /// stream transports (TCP, TLS, WS, WSS) write to. `dispatcher.udp` is the new
 /// UDP channel.

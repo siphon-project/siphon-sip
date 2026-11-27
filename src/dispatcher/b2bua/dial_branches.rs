@@ -167,6 +167,30 @@ pub fn control_dial_branches_for_failure(
         .collect()
 }
 
+/// The transport a binding is reached over, for deciding whether it is a
+/// WebRTC endpoint.
+///
+/// A browser is a WebSocket client (RFC 7118), but the REGISTER that created
+/// its binding may have reached siphon over TCP or TLS from an edge proxy that
+/// relays the WebSocket traffic, with the browser's own Contact (`;transport=ws`
+/// or `wss`, any case) kept behind a Path (RFC 3327). So a WebSocket source
+/// transport and a WebSocket Contact `transport` parameter each mark the
+/// binding as WebSocket, and either wins over a relaying hop's TCP/TLS. Else the
+/// source transport, else whatever the Contact names, for a binding stored
+/// without a source.
+fn binding_transport(contact: &crate::registrar::Contact) -> Option<crate::transport::Transport> {
+    let named = contact
+        .uri
+        .get_param("transport")
+        .and_then(crate::transport::Transport::from_scheme);
+    [contact.source_transport, named]
+        .into_iter()
+        .flatten()
+        .find(|transport| crate::rtpengine::webrtc_auto::transport_is_webrtc(*transport))
+        .or(contact.source_transport)
+        .or(named)
+}
+
 /// Resolve an AoR to one dial target per registered contact, each carrying its
 /// own flow and Path route set.
 ///
@@ -214,6 +238,7 @@ pub fn dial_targets_for_aor(aor: &str) -> Result<Vec<DialTarget>, DialError> {
                 next_hop: None,
                 flow,
                 route,
+                binding_transport: binding_transport(&contact),
                 headers: std::collections::HashMap::new(),
                 aor: Some(registered.clone()),
                 ..Default::default()

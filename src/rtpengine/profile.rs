@@ -140,6 +140,27 @@ impl CodecFlags {
 }
 
 impl ProfileEntry {
+    /// This profile with the `offer` and/or `answer` half taken as WebRTC. A
+    /// half not marked `webrtc: auto` is left as written whatever is asked.
+    fn with_webrtc(&self, offer: bool, answer: bool) -> Self {
+        let resolve = |flags: &NgFlags, wanted: bool| {
+            if wanted && flags.webrtc_auto {
+                flags.as_webrtc()
+            } else {
+                flags.clone()
+            }
+        };
+        Self {
+            offer: resolve(&self.offer, offer),
+            answer: resolve(&self.answer, answer),
+        }
+    }
+
+    /// Whether either half is `webrtc: auto`.
+    pub fn has_webrtc_auto(&self) -> bool {
+        self.offer.webrtc_auto || self.answer.webrtc_auto
+    }
+
     /// True when this profile's two halves are not interchangeable — the offer
     /// and answer flags describe *specific sides* of the call rather than a
     /// symmetric relay.
@@ -173,6 +194,13 @@ impl ProfileEntry {
 #[derive(Debug, Clone)]
 pub struct ProfileRegistry {
     profiles: HashMap<String, ProfileEntry>,
+    /// The resolved forms of every profile with a `webrtc: auto` half, by the
+    /// name [`Self::resolve_webrtc`] returns, each with the base profile it
+    /// was resolved from. Registered up front so the name a branch records is
+    /// a profile every later lookup (a re-INVITE, a transfer, an answer) finds
+    /// by name, and kept out of [`Self::profile_names`] because an operator
+    /// never writes one.
+    webrtc_variants: HashMap<String, (String, ProfileEntry)>,
 }
 
 impl ProfileRegistry {
@@ -187,7 +215,10 @@ impl ProfileRegistry {
         profiles.insert("srs_recording".into(), Self::builtin_srs_recording());
         profiles.insert("siprec_src".into(), Self::builtin_siprec_src());
         profiles.insert("voice_ai".into(), Self::builtin_voice_ai());
-        Self { profiles }
+        Self {
+            profiles,
+            webrtc_variants: HashMap::new(),
+        }
     }
 
     /// Create a registry from built-in defaults + custom YAML profiles.
@@ -203,12 +234,70 @@ impl ProfileRegistry {
                 },
             );
         }
+        registry.register_webrtc_variants();
         registry
     }
 
-    /// Look up a profile by name.
+    /// Register the resolved form of every profile with a `webrtc: auto` half,
+    /// one per combination of halves that can turn WebRTC.
+    fn register_webrtc_variants(&mut self) {
+        let mut variants = HashMap::new();
+        for (name, entry) in &self.profiles {
+            for (offer, answer) in [(true, false), (false, true), (true, true)] {
+                if (offer && !entry.offer.webrtc_auto) || (answer && !entry.answer.webrtc_auto) {
+                    continue;
+                }
+                variants.insert(
+                    super::webrtc_auto::variant_name(name, offer, answer),
+                    (name.clone(), entry.with_webrtc(offer, answer)),
+                );
+            }
+        }
+        self.webrtc_variants = variants;
+    }
+
+    /// Look up a profile by name — an operator's or built-in one, or the
+    /// resolved form [`Self::resolve_webrtc`] returned for one.
     pub fn get(&self, name: &str) -> Option<&ProfileEntry> {
-        self.profiles.get(name)
+        self.profiles
+            .get(name)
+            .or_else(|| self.webrtc_variants.get(name).map(|(_, entry)| entry))
+    }
+
+    /// Whether `name` is a profile an operator configured or siphon ships, as
+    /// opposed to a resolved form [`Self::resolve_webrtc`] generated. What a
+    /// caller names (a control verb's `profile`, a dial's `profile`) is checked
+    /// with this, so a generated name cannot be selected directly: the
+    /// resolution picks the flavour, not the caller.
+    pub fn is_defined(&self, name: &str) -> bool {
+        self.profiles.contains_key(name)
+    }
+
+    /// The name of `name` with its `webrtc: auto` halves resolved for a call:
+    /// `offer_webrtc` when the party the offer half faces is a WebRTC endpoint
+    /// (a contact registered over `ws`/`wss`), `answer_webrtc` when the party
+    /// the answer half faces is (an offer with ICE and DTLS).
+    ///
+    /// A half not marked `webrtc: auto` is unaffected, so a profile with none
+    /// — and an unknown name — resolves to itself.
+    pub fn resolve_webrtc(&self, name: &str, offer_webrtc: bool, answer_webrtc: bool) -> String {
+        let Some(entry) = self.profiles.get(name) else {
+            return name.to_string();
+        };
+        let offer = offer_webrtc && entry.offer.webrtc_auto;
+        let answer = answer_webrtc && entry.answer.webrtc_auto;
+        if !offer && !answer {
+            return name.to_string();
+        }
+        super::webrtc_auto::variant_name(name, offer, answer)
+    }
+
+    /// The profile `name` was resolved from: itself unless it is a name
+    /// [`Self::resolve_webrtc`] returned.
+    pub fn base_name<'a>(&'a self, name: &'a str) -> &'a str {
+        self.webrtc_variants
+            .get(name)
+            .map_or(name, |(base, _)| base.as_str())
     }
 
     /// List all available profile names (sorted for deterministic error messages).
@@ -571,6 +660,10 @@ pub fn validate_ws_sample_rate(rate: u32) -> Result<(), String> {
 /// NG protocol flags sent with offer/answer commands.
 #[derive(Debug, Clone, Default)]
 pub struct NgFlags {
+    /// `webrtc: auto` — this half becomes WebRTC toward a WebRTC party. Never
+    /// sent to the engine: [`ProfileRegistry::resolve_webrtc`] picks the
+    /// registered variant whose halves already carry the WebRTC set.
+    pub webrtc_auto: bool,
     /// Transport protocol override (e.g. "RTP/AVP", "RTP/SAVPF").
     pub transport_protocol: Option<String>,
     /// Codec manipulation — see [`CodecFlags`]. Honoured by rtpengine (as its NG
@@ -816,6 +909,24 @@ pub struct NgFlags {
 }
 
 impl NgFlags {
+    /// These flags with the WebRTC media set in place of what the half says for
+    /// transport, ICE, DTLS and RTCP multiplexing: `UDP/TLS/RTP/SAVPF`, ICE
+    /// `force`, DTLS keying, `rtcp-mux: require` (RFC 5764, RFC 8829 §5.1.1).
+    ///
+    /// An explicit DTLS role the operator wrote is kept; `off`, which
+    /// contradicts a DTLS transport, is dropped so the engine takes the role
+    /// RFC 5763 §5 recommends.
+    pub fn as_webrtc(&self) -> Self {
+        Self {
+            webrtc_auto: false,
+            transport_protocol: Some(super::webrtc_auto::WEBRTC_PROTOCOL.into()),
+            ice: Some("force".into()),
+            dtls: self.dtls.clone().filter(|mode| mode != "off"),
+            rtcp_mux: vec!["require".into()],
+            ..self.clone()
+        }
+    }
+
     /// Fill in [`NgFlags::sip_call_id`] with the Call-ID of the dialog whose SDP
     /// this command carries.
     ///
@@ -868,6 +979,7 @@ impl NgFlags {
     /// per-call and is injected by the script API.
     pub fn from_config(config: &NgFlagsConfig) -> Self {
         Self {
+            webrtc_auto: config.webrtc.is_some(),
             transport_protocol: config.transport_protocol.clone(),
             codec: CodecFlags::from_config(&config.codec),
             ice: config.ice.clone(),
@@ -1747,6 +1859,34 @@ mod tests {
                 "{name} answer pins an address family"
             );
         }
+    }
+
+    #[test]
+    fn only_configured_and_builtin_names_are_defined_not_generated_variants() {
+        let half = NgFlagsConfig {
+            transport_protocol: Some("RTP/AVP".into()),
+            webrtc: Some(crate::config::WebrtcMode::Auto),
+            ..NgFlagsConfig::default()
+        };
+        let custom = HashMap::from([(
+            "extension".to_string(),
+            MediaProfileConfig {
+                offer: half.clone(),
+                answer: half,
+            },
+        )]);
+        let registry = ProfileRegistry::from_config(&custom);
+        assert!(registry.is_defined("extension"));
+        assert!(registry.is_defined("rtp_passthrough"));
+        for name in [
+            "extension#webrtc-offer",
+            "extension#webrtc-answer",
+            "extension#webrtc-both",
+        ] {
+            assert!(registry.get(name).is_some(), "{name} still resolves");
+            assert!(!registry.is_defined(name), "{name} is not selectable");
+        }
+        assert!(!registry.is_defined("missing"));
     }
 
     #[test]

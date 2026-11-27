@@ -8,9 +8,9 @@
 use std::sync::{Arc, Mutex};
 
 use super::originate_test_harness::{
-    anchored_dispatcher, anchored_params, drain, phone_offer, phone_response, phone_sends,
-    phone_tries, pinned_ingress_profiles, requests_to, socket, with_stream_egress, Sent,
-    PINNED_INGRESS,
+    anchored_dispatcher, anchored_params, drain, extension_profiles, phone_offer, phone_response,
+    phone_sends, phone_tries, pinned_ingress_profiles, register_over, requests_to, socket,
+    with_stream_egress, Sent, PINNED_INGRESS,
 };
 use super::test_dispatcher::TestDispatcher;
 use super::*;
@@ -1224,5 +1224,268 @@ async fn the_answer_is_reported_once_the_leg_is_answered_and_a_late_180_cannot_u
         winner,
         Some(crate::b2bua::actor::CallState::Answered),
         "a straggling 180 leaves the leg answered"
+    );
+}
+
+// ---- `webrtc: auto`, resolved per contact ----
+
+/// What the engine was asked to answer a phone's 2xx offer with.
+fn answer_local_profile(engine: &NativeTestEngine) -> siphon_rtp_proto::ProfileFlags {
+    let answers = engine.commands("answer_local");
+    assert_eq!(answers.len(), 1, "only the winner is anchored");
+    answers[0].profile.clone().expect("the profile it carried")
+}
+
+/// `originate {aor}` with one profile reaches a browser (registered over WSS)
+/// and a desk phone: whichever answers first is anchored with its own flavour
+/// of the profile, recorded under its resolved name, and the other leg is
+/// CANCELled with nothing allocated for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_originate_aor_anchors_the_winner_with_its_contacts_flavour() {
+    const BROWSER: &str = "198.51.100.51:5060";
+    const DESK: &str = "198.51.100.52:5060";
+    for (index, browser_wins) in [true, false].into_iter().enumerate() {
+        let aor = format!("sip:wa30{index}@siphon.example.com");
+        register_over(
+            &aor,
+            &format!("sip:wa30{index}@{BROWSER}"),
+            Transport::WebSocketSecure,
+        );
+        register_over(&aor, &format!("sip:wa30{index}@{DESK}"), Transport::Udp);
+        let engine = NativeTestEngine::start().await;
+        let mut dispatcher = anchored_dispatcher(&engine);
+        dispatcher.state.rtpengine_profiles = Some(extension_profiles());
+        let mut params = anchored_params(&aor);
+        params.media = OriginateMedia::Anchor {
+            profile: "extension".to_string(),
+            ws_uri: None,
+        };
+        let (_group, _recorder) = ring_with(
+            &dispatcher.state,
+            &aor,
+            params,
+            OriginateGroupStrategy::Parallel,
+            30,
+        );
+        let sent = drain(&dispatcher.udp);
+        let browser_invite = invite_to(&sent, BROWSER);
+        let desk_invite = invite_to(&sent, DESK);
+        let (winner, winner_at, loser, loser_at, winner_host) = if browser_wins {
+            (browser_invite, BROWSER, desk_invite, DESK, "198.51.100.51")
+        } else {
+            (desk_invite, DESK, browser_invite, BROWSER, "198.51.100.52")
+        };
+        // The loser has taken its INVITE, so it can be CANCELled (RFC 3261 §9.1).
+        phone_tries(&dispatcher.state, loser_at, &loser);
+        phone_sends(
+            &dispatcher.state,
+            socket(winner_at),
+            &phone_response(
+                &winner,
+                200,
+                "OK",
+                "winner-tag",
+                &format!("sip:wa30{index}@{winner_at}"),
+                Some(&phone_offer(winner_host)),
+            ),
+        );
+        let sent = drain(&dispatcher.udp);
+        assert_eq!(
+            requests_to(&sent, socket(loser_at), Method::Cancel).len(),
+            1
+        );
+        let profile = answer_local_profile(&engine);
+        if browser_wins {
+            assert_eq!(
+                profile.transport_protocol.as_deref(),
+                Some("UDP/TLS/RTP/SAVPF")
+            );
+            assert_eq!(profile.ice.as_deref(), Some("force"));
+            assert_eq!(profile.rtcp_mux, vec!["require"]);
+        } else {
+            assert_eq!(profile.transport_protocol.as_deref(), Some("RTP/AVP"));
+            assert_eq!(profile.ice.as_deref(), Some("remove"));
+            assert_eq!(profile.rtcp_mux, vec!["demux"]);
+        }
+        let sessions = dispatcher
+            .state
+            .rtpengine_sessions
+            .as_ref()
+            .expect("a media store");
+        let winner_call = winner.headers.call_id().cloned().expect("a Call-ID");
+        assert_eq!(
+            sessions
+                .get(&winner_call)
+                .expect("the winner's session")
+                .profile,
+            if browser_wins {
+                "extension#webrtc-both"
+            } else {
+                "extension"
+            }
+        );
+        assert_eq!(sessions.len(), 1, "nothing is held for the loser");
+    }
+}
+
+/// Leak gate: rings across both kinds of contact that nobody answers leave no
+/// group, leg or media session behind, iteration after iteration.
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_originate_rings_across_both_flavours_drain_to_baseline() {
+    const BROWSER: &str = "198.51.100.53:5060";
+    const DESK: &str = "198.51.100.54:5060";
+    let aor = "sip:wa310@siphon.example.com";
+    register_over(
+        aor,
+        &format!("sip:wa310@{BROWSER}"),
+        Transport::WebSocketSecure,
+    );
+    register_over(aor, &format!("sip:wa310@{DESK}"), Transport::Udp);
+    let engine = NativeTestEngine::start().await;
+    let mut dispatcher = anchored_dispatcher(&engine);
+    dispatcher.state.rtpengine_profiles = Some(extension_profiles());
+    for _ in 0..10 {
+        let mut params = anchored_params(aor);
+        params.media = OriginateMedia::Anchor {
+            profile: "extension".to_string(),
+            ws_uri: None,
+        };
+        let (_group, _recorder) = ring_with(
+            &dispatcher.state,
+            aor,
+            params,
+            OriginateGroupStrategy::Parallel,
+            30,
+        );
+        let sent = drain(&dispatcher.udp);
+        for (invite, at) in [
+            (invite_to(&sent, BROWSER), BROWSER),
+            (invite_to(&sent, DESK), DESK),
+        ] {
+            phone_sends(
+                &dispatcher.state,
+                socket(at),
+                &phone_response(
+                    &invite,
+                    486,
+                    "Busy Here",
+                    "busy",
+                    &format!("sip:wa310@{at}"),
+                    None,
+                ),
+            );
+        }
+        let _ = drain(&dispatcher.udp);
+        assert_drained(&dispatcher);
+        assert_eq!(
+            dispatcher
+                .state
+                .rtpengine_sessions
+                .as_ref()
+                .map(|sessions| sessions.len()),
+            Some(0),
+            "no media session survives a ring nobody answered"
+        );
+    }
+    assert!(engine.commands("answer_local").is_empty());
+}
+
+/// A browser behind a WebSocket edge proxy that relays over TCP (RFC 3327
+/// Path): the REGISTER arrived over TCP, but the Contact names `transport=ws`
+/// (RFC 7118). Every AoR dial path resolves its targets through
+/// `dial_targets_for_aor`, so the verdict made there is the verdict of all
+/// three.
+#[test]
+fn a_contact_naming_websocket_is_webrtc_however_its_register_arrived() {
+    let aor = "sip:wa320@siphon.example.com";
+    register_over_flow(
+        aor,
+        "sip:wa320@198.51.100.61:5060;transport=WS",
+        Transport::Tcp,
+        "198.51.100.61:5060",
+        "198.51.100.1:5060",
+        7,
+        vec!["<sip:edge.example.com;lr>".to_string()],
+    );
+    register_over(aor, "sip:wa320@198.51.100.62:5060", Transport::Udp);
+    register_over(aor, "sip:wa320@198.51.100.63:5060", Transport::Tcp);
+    let targets = dial_targets_for_aor(aor).expect("the AoR has contacts");
+    let webrtc: std::collections::HashMap<_, _> = targets
+        .iter()
+        .map(|target| {
+            (
+                target.uri.clone(),
+                target
+                    .binding_transport
+                    .is_some_and(crate::rtpengine::webrtc_auto::transport_is_webrtc),
+            )
+        })
+        .collect();
+    assert_eq!(webrtc.len(), 3);
+    for (uri, is_webrtc) in webrtc {
+        assert_eq!(is_webrtc, uri.contains("transport=WS"), "{uri}");
+    }
+}
+
+/// A browser caller is anchored under `extension#webrtc-answer`, and a bridge
+/// dial with no `profile` of its own inherits that resolved name for the
+/// group. State carried over is not a typed name, so it is not refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_inheriting_a_resolved_profile_name_rings() {
+    const PHONE: &str = "198.51.100.71:5060";
+    let aor = "sip:wa330@siphon.example.com";
+    register_over(aor, &format!("sip:wa330@{PHONE}"), Transport::Udp);
+    let engine = NativeTestEngine::start().await;
+    let mut dispatcher = anchored_dispatcher(&engine);
+    dispatcher.state.rtpengine_profiles = Some(extension_profiles());
+    let mut params = anchored_params(aor);
+    params.media = OriginateMedia::Anchor {
+        profile: "extension#webrtc-answer".to_string(),
+        ws_uri: None,
+    };
+    let (_group, _recorder) = ring_with(
+        &dispatcher.state,
+        aor,
+        params,
+        OriginateGroupStrategy::Parallel,
+        30,
+    );
+    let sent = drain(&dispatcher.udp);
+    invite_to(&sent, PHONE);
+}
+
+/// A profile a target names is a typed name: a generated form is refused
+/// before any leg is placed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_target_naming_a_generated_profile_is_refused() {
+    let aor = "sip:wa331@siphon.example.com";
+    register_over(aor, "sip:wa331@198.51.100.72:5060", Transport::Udp);
+    let engine = NativeTestEngine::start().await;
+    let mut dispatcher = anchored_dispatcher(&engine);
+    dispatcher.state.rtpengine_profiles = Some(extension_profiles());
+    let mut params = anchored_params(aor);
+    params.media = OriginateMedia::Anchor {
+        profile: "extension".to_string(),
+        ws_uri: None,
+    };
+    let mut targets = dial_targets_for_aor(aor).expect("the AoR has contacts");
+    targets[0].profile = Some("extension#webrtc-both".to_string());
+    let error = create_originate_group(
+        &dispatcher.state,
+        OriginateGroupSpec {
+            params,
+            targets,
+            strategy: OriginateGroupStrategy::Parallel,
+            total_timeout_secs: 30,
+            answers: OriginateGroupAnswers::First,
+            early_offer: None,
+            media_flags: None,
+        },
+        Arc::new(Recorder::default()) as Arc<dyn OriginateGroupSink>,
+    )
+    .expect_err("a generated name is not selectable");
+    assert!(
+        error.to_string().contains("extension#webrtc-both"),
+        "{error}"
     );
 }

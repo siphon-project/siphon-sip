@@ -478,10 +478,12 @@ impl SipUri {
         };
     }
 
+    /// The value of parameter `name`, matched without regard to case: URI
+    /// parameter names are case-insensitive (RFC 3261 §19.1.4).
     pub fn get_param(&self, name: &str) -> Option<&str> {
         self.params
             .iter()
-            .find(|(n, _)| n == name)
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_deref().unwrap_or(""))
     }
 }
@@ -552,6 +554,18 @@ impl fmt::Display for SipUri {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parameter names are case-insensitive (RFC 3261 §19.1.4): a peer that
+    /// writes `;Transport=WS` has named the transport.
+    #[test]
+    fn get_param_matches_the_name_in_any_case() {
+        let uri = crate::sip::parser::parse_uri_standalone("sip:alice@192.0.2.10;Transport=WS;LR")
+            .unwrap();
+        assert_eq!(uri.get_param("transport"), Some("WS"));
+        assert_eq!(uri.get_param("TRANSPORT"), Some("WS"));
+        assert_eq!(uri.get_param("lr"), Some(""));
+        assert_eq!(uri.get_param("maddr"), None);
+    }
 
     #[test]
     fn checked_uri_user_takes_the_rfc_3261_user_alphabet() {

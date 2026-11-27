@@ -310,6 +310,57 @@ media:
 await rtpengine.offer(request, profile="srtp_to_srtp")
 ```
 
+### One profile for a browser and a desk phone: `webrtc: auto`
+
+A half marked `webrtc: auto` is written for the ordinary peer and becomes
+WebRTC only where the party it faces is a browser. Toward a WebRTC party the
+half takes `transport_protocol: UDP/TLS/RTP/SAVPF`, `ice: force`, DTLS (an
+explicit `dtls: passive` or `active` is kept, `off` is dropped) and
+`rtcp_mux: [require]` in place of whatever it set for those; everything else it
+says (`replace`, `flags`, `direction`, codecs) is kept.
+
+```yaml
+media:
+  profiles:
+    extension:
+      offer:                    # toward each forked contact
+        webrtc: auto
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        replace: ["origin"]
+      answer:                   # toward the caller
+        webrtc: auto
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        replace: ["origin"]
+```
+
+Which party decides each half:
+
+| Half | Faces | Turns WebRTC when |
+|---|---|---|
+| `offer` | each forked contact | the contact's REGISTER arrived over `ws`/`wss` (RFC 7118), or its Contact URI says `transport=ws`/`wss` (any case), as a browser behind a relaying edge proxy with Path does |
+| `answer` | the offerer (the caller) | its first live audio section (port not 0) is `UDP/TLS/RTP/SAVPF` with `a=ice-ufrag` and `a=fingerprint`, its own or from the session level (RFC 8839, RFC 8122) |
+
+A control-plane `dial` to an `{aor}` decides the `offer` half per contact (and
+`originate {aor}` and `dial {on_answer: "bridge"}`, which anchor each contact as
+a call of its own, turn every auto half WebRTC for a `ws`/`wss` contact), so one
+ring reaches a browser and a desk phone with a single profile: each is offered
+SDP of its own kind from its own engine allocation, the branch that answers
+settles the call, and the other allocation is released (see
+[`dial`](../reference/control-plane.md#dial--ring-while-the-caller-waits)). A
+script's `rtpengine.offer()` anchors once, before any fork, so there only the
+`answer` half is decided (from the caller's offer) and the `offer` half applies
+as written; a later `rtpengine.answer(reply, profile="extension")` follows what
+the offer anchored. `webrtc` takes `auto` only, and `rtpproxy` fails the config
+load because the WebRTC set needs `rtcp-mux`.
+
+`#` is reserved in a profile name: the resolved forms are `base#webrtc-offer`,
+`-answer` and `-both`. A config that names a profile with one fails to load, and
+a control verb's `profile` (`dial`, `originate`, `bridge`, recording) or a
+script's `rtpengine` `profile=` cannot select a resolved form directly (a script
+gets a `ValueError`). Name the base profile; siphon picks the form.
+
 ### IPv4 and IPv6 interworking
 
 `address_family` pins the family the engine allocates its **own** relay endpoints

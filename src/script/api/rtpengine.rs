@@ -639,13 +639,6 @@ impl PyRtpEngine {
     ) -> PyResult<Bound<'py, PyAny>> {
         let scope = scope::per_call_scope(scope, &[Some(request)], &self.client, "offer")?;
         let sessions = scope::store_for(&self.sessions, scope.as_ref())?;
-        let profile_name = profile.unwrap_or(DEFAULT_PROFILE);
-        let entry = self.registry.get(profile_name).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown RTP profile '{profile_name}'; valid profiles: {}",
-                self.registry.profile_names().join(", ")
-            ))
-        })?;
         let offer::OfferInput {
             call_id,
             from_tag,
@@ -655,6 +648,12 @@ impl PyRtpEngine {
             source_ip,
         } = offer::OfferInput::resolve(request, sdp)?;
         let anchored = sessions.get(&call_id);
+        let (profile_name, entry) = offer::anchoring_entry(
+            &self.registry,
+            anchored.as_ref(),
+            profile.unwrap_or(DEFAULT_PROFILE),
+            &offer_sdp,
+        )?;
         // Shaped for the party the rewritten offer is sent to: the callee of
         // the call under the `offer` half, and on a re-offer from the callee
         // the caller, under the `answer` half that has described it since the
@@ -698,7 +697,7 @@ impl PyRtpEngine {
             resolved_ws_uri,
             overrides,
             source_ip.as_deref(),
-            profile_name,
+            &profile_name,
         )?;
         // The message mode's offer is the message's own SDP, so its Call-ID
         // labels the captures. A raw SDP need not belong to the call's SIP
@@ -854,7 +853,8 @@ impl PyRtpEngine {
         let mut exchange = AnswerExchange::resolve(reply, call, sdp, to_tag, &sessions)?;
         exchange.scope = scope;
 
-        let profile_name = resolve_answer_profile(profile, &sessions, &exchange.call_id);
+        let profile_name =
+            offer::answer_profile(&self.registry, &sessions, &exchange.call_id, profile)?;
         let entry = self.registry.get(&profile_name).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown RTP profile '{profile_name}'; valid profiles: {}",
@@ -1007,7 +1007,7 @@ impl PyRtpEngine {
 
         // Resolve the answer-side flags exactly as `answer` does (explicit
         // profile → offer-recorded profile → default).
-        let profile_name = resolve_answer_profile(profile, &sessions, &call_id);
+        let profile_name = offer::answer_profile(&self.registry, &sessions, &call_id, profile)?;
         let entry = self.registry.get(&profile_name).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown RTP profile '{profile_name}'; valid profiles: {}",
@@ -2225,13 +2225,7 @@ impl PyRtpEngine {
         scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let leg = self.leg(scope, None, &call_id, "subscribe_request")?;
-        let profile_name = profile.unwrap_or(DEFAULT_PROFILE);
-        let entry = self.registry.get(profile_name).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown RTP profile '{profile_name}'; valid profiles: {}",
-                self.registry.profile_names().join(", ")
-            ))
-        })?;
+        let entry = offer::typed_entry(&self.registry, profile.unwrap_or(DEFAULT_PROFILE))?;
         let flags = entry.offer.clone();
         let client = Arc::clone(&self.client);
 
@@ -2281,13 +2275,7 @@ impl PyRtpEngine {
         scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let leg = self.leg(scope, None, &call_id, "subscribe_answer")?;
-        let profile_name = profile.unwrap_or(DEFAULT_PROFILE);
-        let entry = self.registry.get(profile_name).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown RTP profile '{profile_name}'; valid profiles: {}",
-                self.registry.profile_names().join(", ")
-            ))
-        })?;
+        let entry = offer::typed_entry(&self.registry, profile.unwrap_or(DEFAULT_PROFILE))?;
         let flags = entry.answer.clone();
         let client = Arc::clone(&self.client);
 
@@ -4870,6 +4858,134 @@ mod tests {
                 registry,
             );
             (engine, requests)
+        }
+
+        /// A profile whose `answer` half (toward the caller) is `webrtc: auto`.
+        fn auto_profiles() -> Arc<ProfileRegistry> {
+            let half = |auto: bool| crate::config::NgFlagsConfig {
+                transport_protocol: Some("RTP/AVP".to_string()),
+                ice: Some("remove".to_string()),
+                webrtc: auto.then_some(crate::config::WebrtcMode::Auto),
+                ..Default::default()
+            };
+            let custom = std::collections::HashMap::from([(
+                "extension".to_string(),
+                crate::config::MediaProfileConfig {
+                    offer: half(false),
+                    answer: half(true),
+                },
+            )]);
+            Arc::new(ProfileRegistry::from_config(&custom))
+        }
+
+        const BROWSER_SDP: &str = "v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=-\r\n\
+            c=IN IP4 192.0.2.10\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+            a=ice-ufrag:abcd\r\na=ice-pwd:0123456789abcdef01234567\r\n\
+            a=fingerprint:sha-256 AA:BB:CC:DD\r\n";
+
+        /// Offer `sdp` as the caller's under `profile="extension"`, then answer
+        /// naming the same profile; the commands the engine was sent.
+        async fn offer_then_answer_extension(
+            sdp: &'static str,
+            call_id: &'static str,
+        ) -> (Vec<serde_json::Value>, Arc<MediaSessionStore>) {
+            Python::initialize();
+            let sessions = Arc::new(MediaSessionStore::new());
+            let (namespace, mut requests) = stand_in_namespace(&sessions, auto_profiles()).await;
+            with_engine(namespace, move |python, engine| {
+                let invite = dialog_message(call_id, None, sdp);
+                let call = PyCall::new(
+                    "id-auto".to_string(),
+                    Arc::clone(&invite),
+                    CALLER_SOURCE.to_string(),
+                    "udp".to_string(),
+                );
+                let target = Bound::new(python, call).unwrap();
+                let kwargs = PyDict::new(python);
+                kwargs.set_item("profile", "extension").unwrap();
+                await_offer(python, engine, target.as_any(), &kwargs).unwrap();
+
+                let reply = PyReply::new(dialog_message(call_id, Some("tag-b"), FAR_SDP))
+                    .with_a_leg(invite)
+                    .with_response_source(CALLEE_SOURCE.to_string(), 5060);
+                let reply = Bound::new(python, reply).unwrap();
+                await_answer(python, engine, reply.as_any(), &kwargs).unwrap();
+            })
+            .await;
+            (sent_commands(&mut requests), sessions)
+        }
+
+        /// A browser caller: the call is anchored with the `answer` half
+        /// resolved WebRTC, the callee-facing offer half as written, and an
+        /// answer that names the base profile again is shaped by the anchored
+        /// one rather than the as-written half.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_webrtc_caller_anchors_with_the_answer_half_resolved() {
+            let (sent, sessions) = offer_then_answer_extension(BROWSER_SDP, "call-30").await;
+            let offer = sent.iter().find(|body| body["command"] == "offer").unwrap();
+            let answer = sent
+                .iter()
+                .find(|body| body["command"] == "answer")
+                .unwrap();
+            assert_eq!(offer["profile"]["transport_protocol"], "RTP/AVP");
+            assert_eq!(answer["profile"]["transport_protocol"], "UDP/TLS/RTP/SAVPF");
+            assert_eq!(answer["profile"]["ice"], "force");
+            assert_eq!(answer["profile"]["rtcp_mux"][0], "require");
+            assert_eq!(
+                sessions.get("call-30").unwrap().profile,
+                "extension#webrtc-answer"
+            );
+        }
+
+        /// An ordinary caller leaves the profile exactly as written.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_plain_caller_anchors_with_the_profile_as_written() {
+            let (sent, sessions) = offer_then_answer_extension(OFFER_SDP, "call-31").await;
+            let answer = sent
+                .iter()
+                .find(|body| body["command"] == "answer")
+                .unwrap();
+            assert_eq!(answer["profile"]["transport_protocol"], "RTP/AVP");
+            assert_eq!(answer["profile"]["ice"], "remove");
+            assert_eq!(sessions.get("call-31").unwrap().profile, "extension");
+        }
+
+        /// A generated `base#webrtc-...` name is chosen by siphon, never typed:
+        /// `offer` and `answer` refuse it with a `ValueError` naming it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_script_cannot_name_a_generated_variant() {
+            Python::initialize();
+            let sessions = Arc::new(MediaSessionStore::new());
+            let (namespace, _requests) = stand_in_namespace(&sessions, auto_profiles()).await;
+            with_engine(namespace, move |python, engine| {
+                let invite = dialog_message("call-32", None, BROWSER_SDP);
+                let call = PyCall::new(
+                    "id-gen".to_string(),
+                    Arc::clone(&invite),
+                    CALLER_SOURCE.to_string(),
+                    "udp".to_string(),
+                );
+                let target = Bound::new(python, call).unwrap();
+                let kwargs = PyDict::new(python);
+                kwargs
+                    .set_item("profile", "extension#webrtc-answer")
+                    .unwrap();
+                let error = await_offer(python, engine, target.as_any(), &kwargs)
+                    .expect_err("offer refuses a generated name");
+                assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+                assert!(error.to_string().contains("extension#webrtc-answer"));
+
+                let reply = PyReply::new(dialog_message("call-32", Some("tag-b"), FAR_SDP))
+                    .with_a_leg(invite)
+                    .with_response_source(CALLEE_SOURCE.to_string(), 5060);
+                let reply = Bound::new(python, reply).unwrap();
+                let error = await_answer(python, engine, reply.as_any(), &kwargs)
+                    .expect_err("answer refuses a generated name");
+                assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+                assert!(error.to_string().contains("extension#webrtc-answer"));
+            })
+            .await;
+            assert!(sessions.get("call-32").is_none(), "nothing was anchored");
         }
 
         /// Every media command the stand-in has been sent so far, ping aside.

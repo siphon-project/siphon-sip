@@ -13,6 +13,34 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- Media profiles: a half may declare `webrtc: auto`. Toward a WebRTC party it
+  takes `UDP/TLS/RTP/SAVPF`, ICE `force`, DTLS and `rtcp_mux: [require]` in
+  place of what it sets for those, and toward anyone else it applies as written.
+  The `offer` half is decided per forked contact by the transport its binding
+  registered over (`ws`/`wss`), so a control-plane `dial` to an `{aor}` (and `originate {aor}` and `dial {on_answer: "bridge"}`, which turn every auto half WebRTC for a `ws`/`wss` contact) with one
+  profile rings a browser and a desk phone together, each offered SDP of its own
+  kind from its own allocation (the answering branch settles the call, the
+  others are released). The `answer` half is decided by the caller's offer
+  (`UDP/TLS/RTP/SAVPF` with `a=ice-ufrag` and `a=fingerprint`), also on a
+  script's `rtpengine.offer()`, which anchors once and leaves the `offer` half as
+  written. `webrtc` takes `auto` only; `rtpproxy` refuses it at config load.
+  A contact is WebRTC when its REGISTER arrived over `ws`/`wss` or its Contact
+  says `transport=ws`/`wss`, so a browser behind a relaying edge proxy counts. The
+  caller's offer is judged on its first live audio section, with session-level
+  `a=ice-ufrag` and `a=fingerprint` inherited. `#` is reserved in a media
+  profile name and refused at config load, since the resolved forms are named
+  `base#webrtc-offer`, `-answer` and `-both`; a `profile` typed on a control verb
+  or a script's `rtpengine` call cannot name one either.
+
+### Fixed
+
+- SIP and tel URI parameter names are matched without case (RFC 3261 §19.1.4,
+  RFC 3966 §3), so `;Transport=WS`, `;LR` and `;Phone-Context=` are read like
+  their lowercase forms, and editing a parameter on a `tel:` URI with a
+  mixed-case `phone-context` no longer fails to read back.
+
 ## [1.19.2] — 2026-11-27
 
 ### Fixed

@@ -255,6 +255,7 @@ pub(super) fn join<'py>(
 
     // The engine is the participant's far side, as on `answer_local`: the
     // profile's answer half shapes what the participant is sent.
+    super::offer::typed_profile(&engine.registry, profile)?;
     let profile_name = resolve_answer_profile(profile, &engine.sessions, &call_id);
     let entry = engine.registry.get(&profile_name).ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err(format!(
@@ -425,6 +426,7 @@ pub(super) fn offer<'py>(
     let dtmf = parse_dtmf(dtmf)?.unwrap_or_default();
     // The engine is the offerer toward the participant, the far side of the
     // call the focus places: the profile's offer half shapes what it is sent.
+    super::offer::typed_profile(&engine.registry, profile)?;
     let profile_name = profile.unwrap_or(super::DEFAULT_PROFILE).to_string();
     let entry = engine.registry.get(&profile_name).ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err(format!(

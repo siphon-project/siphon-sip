@@ -256,7 +256,7 @@ fn accept_options(
         let known = state
             .rtpengine_profiles
             .as_ref()
-            .is_some_and(|registry| registry.get(profile).is_some());
+            .is_some_and(|registry| registry.is_defined(profile));
         if !known {
             return Err(bad(format!("unknown media profile {profile:?}")));
         }

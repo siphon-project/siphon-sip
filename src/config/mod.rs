@@ -75,7 +75,7 @@ pub use listen::{
 pub use media::{
     CodecFlagsConfig, MediaBackendKind, MediaConfig, MediaProfileConfig, NgFlagsConfig,
     RtpEngineEventsConfig, RtpEngineInstanceConfig, RtpEngineSetConfig, RtpProxyConfig,
-    RtpProxyInstanceConfig, SiphonRtpConfig, SiphonRtpInstanceConfig,
+    RtpProxyInstanceConfig, SiphonRtpConfig, SiphonRtpInstanceConfig, WebrtcMode,
 };
 pub use observability::{
     HepConfig, HepTransport, LogConfig, LogFormat, LogLevel, MetricsConfig, PrometheusConfig,
@@ -1337,6 +1337,7 @@ impl Config {
             let Some(profile) = media.profiles.get(name) else {
                 continue;
             };
+            media::check_profile_name(name)?;
             for (direction, flags) in [("offer", &profile.offer), ("answer", &profile.answer)] {
                 let unsupported = media.backend().unsupported_profile_fields(flags);
                 if !unsupported.is_empty() {

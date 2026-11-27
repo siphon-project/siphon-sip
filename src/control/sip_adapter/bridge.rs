@@ -127,7 +127,7 @@ pub(super) async fn bridge_with_bus(
         let known = state
             .rtpengine_profiles
             .as_ref()
-            .is_some_and(|registry| registry.get(name).is_some());
+            .is_some_and(|registry| registry.is_defined(name));
         if !known {
             return profile_refusal(
                 "unknown_profile",

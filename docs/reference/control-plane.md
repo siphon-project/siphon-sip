@@ -1903,6 +1903,32 @@ branch on one profile and an answer from a branch on another reach it with
 different session descriptions, exactly as the raw SDP of two phones does on an
 unanchored fork.
 
+**One extension, a browser and a desk phone.** An `{aor}` target applies its
+one `profile` to every contact it forks to, so a profile whose halves carry
+`webrtc: auto` (see [media profiles](../cookbook/media-rtp.md#one-profile-for-a-browser-and-a-desk-phone-webrtc-auto))
+is resolved per contact. A contact whose binding registered over `ws` or `wss`
+is offered the WebRTC form of the profile's `offer` half (`UDP/TLS/RTP/SAVPF`,
+ICE forced, DTLS, `rtcp-mux` required) and every other contact is offered the
+half as written, each from an allocation of its own, so one ring reaches both
+and the Path and connection reuse of each binding are untouched. The `answer`
+half, which shapes what the caller is sent, turns WebRTC when the caller's own
+offer is `UDP/TLS/RTP/SAVPF` with `a=ice-ufrag` and `a=fingerprint`. Whichever
+branch answers settles the call on its allocation, and the others are released
+as above. A URI target has no binding, so it is always offered the half as
+written. A script's `rtpengine.offer` anchors once, before any fork, so it
+decides only the half facing the offerer and applies the `offer` half as
+written.
+
+`originate {aor}` and `dial {on_answer: "bridge"}` place each contact as a call
+of its own with a media session of its own, so they resolve per contact too, a
+little differently: the profile there describes the one phone a leg faces, so a
+contact whose binding registered over `ws` or `wss` turns **every**
+`webrtc: auto` half WebRTC (the `answer` half that answers an offerless leg's
+2xx offer, and the `offer` half of an `offer: "early"` leg or of the bridge's
+offer to the phone), and any other contact keeps the profile as written. The
+leg is recorded under the resolved profile name. A URI target has no binding
+and is always anchored as written.
+
 `strategy` is `parallel` (default) or `sequential`; `timeout` is the ring
 timeout in seconds (default 30). Dialling a call that is already answered is
 `invalid_state` — answering first is what the verb exists to avoid, since it

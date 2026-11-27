@@ -301,3 +301,11 @@ fn an_originate_refuses_a_profile_that_is_not_a_string() {
         .expect_err("refused");
     assert!(error.contains("must be a string"), "{error}");
 }
+
+#[test]
+fn an_originate_cannot_name_a_generated_webrtc_variant() {
+    let error =
+        parse_originate_media(&json!({ "media": true, "profile": "extension#webrtc-both" }))
+            .expect_err("a generated name is not selectable");
+    assert!(error.contains('#'), "{error}");
+}

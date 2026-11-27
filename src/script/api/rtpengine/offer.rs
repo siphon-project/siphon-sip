@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use pyo3::prelude::*;
 use tracing::debug;
 
-use crate::rtpengine::profile::NgFlags;
+use crate::rtpengine::profile::{NgFlags, ProfileRegistry};
 use crate::rtpengine::session::{MediaSession, MediaSessionStore};
 use crate::rtpengine::{CallScope, MediaBackend};
 use crate::sip::message::SipMessage;
@@ -28,6 +28,94 @@ use super::{
     extract_delete_params, extract_message, extract_offer_params, extract_raw_sdp,
     extract_source_ip, PyCall, PyReply, PyRequest,
 };
+
+/// The profile an `offer` anchors the call with, and its entry: `requested`,
+/// with a `webrtc: auto` half resolved.
+///
+/// An auto half is decided once, on the offer that anchors the call; a later
+/// offer keeps what the call was anchored with. The script anchors before it
+/// forks, so only the half facing the offerer can be decided here (from its
+/// SDP): the half facing the callee applies as written, and a ring that must
+/// reach a browser and a desk phone together is placed through the control
+/// plane's per-contact `dial`.
+pub(super) fn anchoring_entry<'a>(
+    registry: &'a ProfileRegistry,
+    anchored: Option<&MediaSession>,
+    requested: &str,
+    offer_sdp: &[u8],
+) -> PyResult<(String, &'a crate::rtpengine::profile::ProfileEntry)> {
+    typed_profile(registry, Some(requested))?;
+    let name = match anchored {
+        Some(session) if registry.base_name(&session.profile) == requested => {
+            session.profile.clone()
+        }
+        _ => registry.resolve_webrtc(
+            requested,
+            false,
+            crate::rtpengine::webrtc_auto::offer_is_webrtc(offer_sdp),
+        ),
+    };
+    let entry = registry.get(&name).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown RTP profile '{requested}'; valid profiles: {}",
+            registry.profile_names().join(", ")
+        ))
+    })?;
+    Ok((name, entry))
+}
+
+/// The profile an `answer` or `answer_local` is shaped by: the script's
+/// `profile`, else the one recorded at offer, else the default; and, when the
+/// script names the base profile that anchoring resolved a `webrtc: auto` half
+/// of, the call's anchored form.
+///
+/// `rtpengine.offer(call, profile="extension")` records the resolved name
+/// (`extension#webrtc-answer` for a browser caller); a script that repeats
+/// `profile="extension"` on the answer means the same profile, not the
+/// as-written one the offer decided against.
+pub(super) fn answer_profile(
+    registry: &ProfileRegistry,
+    sessions: &MediaSessionStore,
+    call_id: &str,
+    profile: Option<&str>,
+) -> PyResult<String> {
+    typed_profile(registry, profile)?;
+    let name = super::resolve_answer_profile(profile, sessions, call_id);
+    Ok(match sessions.get(call_id) {
+        Some(session) if registry.base_name(&session.profile) == name => session.profile,
+        _ => name,
+    })
+}
+
+/// Refuse a `profile=` a script typed that is not one an operator configured
+/// or siphon ships. The `base#webrtc-...` forms are what siphon resolves a
+/// `webrtc: auto` profile to; a script names the base and never the form. A
+/// profile carried over from the call's stored session is not typed, and is
+/// looked up as stored.
+pub(super) fn typed_profile(registry: &ProfileRegistry, profile: Option<&str>) -> PyResult<()> {
+    match profile {
+        Some(name) if !registry.is_defined(name) => {
+            Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown RTP profile '{name}'; valid profiles: {}",
+                registry.profile_names().join(", ")
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A profile a script typed, and its entry: refused unless it is one an
+/// operator configured or siphon ships (see [`typed_profile`]).
+pub(super) fn typed_entry<'a>(
+    registry: &'a ProfileRegistry,
+    name: &'a str,
+) -> PyResult<&'a crate::rtpengine::profile::ProfileEntry> {
+    typed_profile(registry, Some(name))?;
+    let entry = registry.get(name).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!("unknown RTP profile '{name}'"))
+    })?;
+    Ok(entry)
+}
 
 /// What an `offer` call hands the engine, from either mode.
 pub(super) struct OfferInput {

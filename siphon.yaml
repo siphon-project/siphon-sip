@@ -1500,6 +1500,16 @@ auth:
 #                       engine derives from the offered SDP: offer | require |
 #                       demux | accept | reject | remove. Empty (default) mirrors
 #                       the offer. rtpengine + siphon-rtp only.
+#   webrtc              auto: this half applies as written, except toward a
+#                       WebRTC party, where it takes UDP/TLS/RTP/SAVPF, ice:
+#                       force, DTLS and rtcp_mux: [require] in place of what it
+#                       sets for those. The offer half is decided per forked
+#                       contact by the transport its binding registered over
+#                       (ws/wss) on a control-plane dial to an {aor}, so one ring
+#                       reaches a browser and a desk phone; the answer half by
+#                       the caller's offer (UDP/TLS/RTP/SAVPF with a=ice-ufrag
+#                       and a=fingerprint). Only "auto" is accepted. rtpengine +
+#                       siphon-rtp only; rtpproxy fails the config load.
 #
 # siphon-rtp-only keys (siphon REFUSES TO START if a profile sets one of these on
 # the rtpengine or rtpproxy backend — an ignored ws_uri answers the call and
