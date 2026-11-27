@@ -1389,3 +1389,40 @@ async fn rejected_originate_rings_across_both_flavours_drain_to_baseline() {
     }
     assert!(engine.commands("answer_local").is_empty());
 }
+
+/// A browser behind a WebSocket edge proxy that relays over TCP (RFC 3327
+/// Path): the REGISTER arrived over TCP, but the Contact names `transport=ws`
+/// (RFC 7118). Every AoR dial path resolves its targets through
+/// `dial_targets_for_aor`, so the verdict made there is the verdict of all
+/// three.
+#[test]
+fn a_contact_naming_websocket_is_webrtc_however_its_register_arrived() {
+    let aor = "sip:wa320@siphon.example.com";
+    register_over_flow(
+        aor,
+        "sip:wa320@198.51.100.61:5060;transport=WS",
+        Transport::Tcp,
+        "198.51.100.61:5060",
+        "198.51.100.1:5060",
+        7,
+        vec!["<sip:edge.example.com;lr>".to_string()],
+    );
+    register_over(aor, "sip:wa320@198.51.100.62:5060", Transport::Udp);
+    register_over(aor, "sip:wa320@198.51.100.63:5060", Transport::Tcp);
+    let targets = dial_targets_for_aor(aor).expect("the AoR has contacts");
+    let webrtc: std::collections::HashMap<_, _> = targets
+        .iter()
+        .map(|target| {
+            (
+                target.uri.clone(),
+                target
+                    .binding_transport
+                    .is_some_and(crate::rtpengine::webrtc_auto::transport_is_webrtc),
+            )
+        })
+        .collect();
+    assert_eq!(webrtc.len(), 3);
+    for (uri, is_webrtc) in webrtc {
+        assert_eq!(is_webrtc, uri.contains("transport=WS"), "{uri}");
+    }
+}
