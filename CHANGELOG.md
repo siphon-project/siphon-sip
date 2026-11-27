@@ -60,6 +60,13 @@ entry, but a working config keeps working.
 
 - Pairs with siphon-rtp 0.30.0 and moves the control protocol crate (`siphon-rtp-proto`) to 0.30.0. An end reason the engine adds later no longer loses its event: the stream, bridge, split, playback, recording, media-timeout and X3 end events still reach `@rtpengine` handlers and the control rail, with the reason spelled `unknown` (a tee or bridge ending that way still counts as unexpected, a playback ending that way is not `completed`).
 
+## [1.19.2] — 2026-11-27
+
+### Fixed
+
+- The restart clean-up no longer clears another node's binding at a registrar that keeps one binding per AoR. Before it de-registers a binding the last process left, siphon sends a fetch (a REGISTER with no Contact and no Expires, same Call-ID, next CSeq, RFC 3261 §10.2.3) and sends `Expires: 0` only when the 2xx lists this node's stored Contact (compared as SIP URIs). A registrar that replaces the AoR's binding on every REGISTER had already dropped this node's binding when another node registered, and the `Expires: 0` cleared the live one until that node's next refresh. A 2xx listing only other Contacts or none, a refusal or Timer F leaves the binding to expire and drops the record; a fetch and its de-REGISTER are one attempt, and a challenge to either is answered from the source's lookup. **Known limit:** on such a registrar another node can still register between the fetch and the de-REGISTER.
+- Name-addr headers (From, To, Contact, P-Asserted-Identity and the rest) are parsed with quoted strings respected (RFC 3261 §25.1, quoted-pairs included). A `<`, `,` or `;` inside a quoted display name or a quoted parameter value no longer picks the wrong URI, splits one entry into two, or cuts a parameter short.
+
 ## [1.19.1] — 2026-11-26
 
 ### Fixed
