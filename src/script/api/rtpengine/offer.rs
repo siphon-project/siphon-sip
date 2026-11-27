@@ -44,6 +44,7 @@ pub(super) fn anchoring_entry<'a>(
     requested: &str,
     offer_sdp: &[u8],
 ) -> PyResult<(String, &'a crate::rtpengine::profile::ProfileEntry)> {
+    typed_profile(registry, Some(requested))?;
     let name = match anchored {
         Some(session) if registry.base_name(&session.profile) == requested => {
             session.profile.clone()
@@ -77,12 +78,43 @@ pub(super) fn answer_profile(
     sessions: &MediaSessionStore,
     call_id: &str,
     profile: Option<&str>,
-) -> String {
+) -> PyResult<String> {
+    typed_profile(registry, profile)?;
     let name = super::resolve_answer_profile(profile, sessions, call_id);
-    match sessions.get(call_id) {
+    Ok(match sessions.get(call_id) {
         Some(session) if registry.base_name(&session.profile) == name => session.profile,
         _ => name,
+    })
+}
+
+/// Refuse a `profile=` a script typed that is not one an operator configured
+/// or siphon ships. The `base#webrtc-...` forms are what siphon resolves a
+/// `webrtc: auto` profile to; a script names the base and never the form. A
+/// profile carried over from the call's stored session is not typed, and is
+/// looked up as stored.
+pub(super) fn typed_profile(registry: &ProfileRegistry, profile: Option<&str>) -> PyResult<()> {
+    match profile {
+        Some(name) if !registry.is_defined(name) => {
+            Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown RTP profile '{name}'; valid profiles: {}",
+                registry.profile_names().join(", ")
+            )))
+        }
+        _ => Ok(()),
     }
+}
+
+/// A profile a script typed, and its entry: refused unless it is one an
+/// operator configured or siphon ships (see [`typed_profile`]).
+pub(super) fn typed_entry<'a>(
+    registry: &'a ProfileRegistry,
+    name: &'a str,
+) -> PyResult<(&'a str, &'a crate::rtpengine::profile::ProfileEntry)> {
+    typed_profile(registry, Some(name))?;
+    let entry = registry.get(name).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!("unknown RTP profile '{name}'"))
+    })?;
+    Ok((name, entry))
 }
 
 /// What an `offer` call hands the engine, from either mode.

@@ -5767,6 +5767,11 @@ class MockRtpEngine(_WsSplitMixin):
 
     Valid profiles: ``"srtp_to_rtp"``, ``"ws_to_rtp"``, ``"wss_to_rtp"``,
     ``"rtp_passthrough"``.
+
+    A ``profile=`` names a built-in or ``media.profiles`` entry. ``#`` is
+    reserved in a profile name: ``base#webrtc-offer``, ``-answer`` and ``-both``
+    are what siphon resolves a ``webrtc: auto`` profile to, and a script that
+    names one gets a ``ValueError``. Name ``base`` instead.
     """
 
     def __init__(self) -> None:
