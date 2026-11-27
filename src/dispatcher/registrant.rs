@@ -530,6 +530,10 @@ fn handle_removed_entry_answer(
             .as_ref()
             .map(|challenge| (challenge, status_code == 407)),
         &contacts,
+        message
+            .headers
+            .get("Expires")
+            .and_then(|value| value.trim().parse().ok()),
         defaults,
     );
     match answer {

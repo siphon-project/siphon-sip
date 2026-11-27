@@ -319,12 +319,15 @@ impl RegistrantManager {
             status_code,
             challenge,
             &[],
+            None,
             defaults,
         )
     }
 
     /// [`answer_removed_deregistration`](Self::answer_removed_deregistration)
-    /// also given the `Contact` header lines of the answer, which the fetch a
+    /// also given the `Contact` header lines of the answer and its `Expires`
+    /// header (a Contact whose effective expiry is zero is not bound, RFC 3261
+    /// §10.3 step 8), which the fetch a
     /// restart sends first needs (RFC 3261 §10.2.3): its 2xx lists the bindings
     /// the registrar holds. The de-REGISTER follows only when one is this
     /// node's Contact ([`RemovedAnswer::Continued`]); otherwise the binding is
@@ -342,6 +345,7 @@ impl RegistrantManager {
         status_code: u16,
         challenge: Option<(&DigestChallenge, bool)>,
         contacts: &[String],
+        response_expires: Option<u32>,
         defaults: EgressDefaults<'_>,
     ) -> RemovedAnswer {
         let Some(mut draining) = self.draining_deregistrations.get_mut(call_id) else {
@@ -357,7 +361,7 @@ impl RegistrantManager {
         }
         if (200..300).contains(&status_code) && draining.fetching {
             let ours = draining.entry.contact_uri.clone().unwrap_or_default();
-            let listed = super::contact::listed_contact_uris(contacts)
+            let listed = super::contact::bound_contact_uris(contacts, response_expires)
                 .iter()
                 .any(|listed| super::contact::contacts_equivalent(listed, &ours));
             if listed {

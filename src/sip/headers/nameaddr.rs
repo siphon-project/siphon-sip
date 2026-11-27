@@ -34,8 +34,9 @@ impl NameAddr {
     pub fn parse(input: &str) -> Result<Self, String> {
         let input = input.trim();
 
-        let bracketed = input.contains('<');
-        let (display_name, uri_str, params_str) = if let Some(lt_pos) = input.find('<') {
+        let open_bracket = find_outside_quotes(input, '<');
+        let bracketed = open_bracket.is_some();
+        let (display_name, uri_str, params_str) = if let Some(lt_pos) = open_bracket {
             // Angle-bracket form: optional display name before '<'
             let display = input[..lt_pos].trim();
             let display_name = if display.is_empty() {
@@ -224,15 +225,51 @@ pub fn contact_wildcard<S: AsRef<str>>(
     }
 }
 
-/// Split comma-separated values while respecting angle brackets.
+/// The byte offset of the first `target` outside a quoted string (RFC 3261
+/// §25.1: a backslash inside the quotes makes the next character a
+/// quoted-pair, so `\"` does not close the string).
+fn find_outside_quotes(input: &str, target: char) -> Option<usize> {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (index, c) in input.char_indices() {
+        if in_quotes {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_quotes = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            in_quotes = true;
+        } else if c == target {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Split comma-separated values while respecting angle brackets and quoted
+/// strings (quoted-pairs included).
 /// `"A" <sip:a@x>;tag=1, "B" <sip:b@y>;tag=2` → two parts.
 fn split_comma_respecting_angles(input: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0u32;
     let mut start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
 
     for (i, c) in input.char_indices() {
+        if in_quotes {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_quotes = false,
+                _ => {}
+            }
+            continue;
+        }
         match c {
+            '"' => in_quotes = true,
             '<' => depth += 1,
             '>' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
@@ -261,6 +298,29 @@ fn split_comma_respecting_angles(input: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bracket_inside_a_quoted_display_name_is_not_the_uri() {
+        let na = NameAddr::parse("\"Old <sip:ours@192.0.2.1>\" <sip:peer@192.0.2.2>").unwrap();
+        assert_eq!(na.uri.host, "192.0.2.2");
+        assert_eq!(na.display_name.as_deref(), Some("Old <sip:ours@192.0.2.1>"));
+    }
+
+    #[test]
+    fn a_quoted_pair_does_not_close_the_display_name_or_split_the_list() {
+        let list = r#""A \" , <sip:x@192.0.2.9>" <sip:a@192.0.2.1>, "B" <sip:b@192.0.2.2>"#;
+        let entries = NameAddr::parse_multi(list).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].uri.host, "192.0.2.1");
+        assert_eq!(entries[1].uri.host, "192.0.2.2");
+    }
+
+    #[test]
+    fn a_comma_inside_quotes_does_not_split() {
+        let entries =
+            NameAddr::parse_multi(r#""Q, R" <sip:a@192.0.2.1>, <sip:b@192.0.2.2>"#).unwrap();
+        assert_eq!(entries.len(), 2);
+    }
 
     #[test]
     fn parse_display_name_and_tag() {

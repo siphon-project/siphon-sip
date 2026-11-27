@@ -216,40 +216,21 @@ pub(super) fn contacts_equivalent(left: &str, right: &str) -> bool {
     }
 }
 
-/// The URIs a registrar's answer lists in its `Contact` header lines (RFC 3261
-/// §10.2.3, §20.10): each line may fold several comma-separated values, each
-/// either `<uri>;params` (with an optional display name) or a bare `uri;params`
-/// whose parameters are the header's, not the URI's. `*` is no URI and is
-/// skipped.
-pub(super) fn listed_contact_uris(lines: &[String]) -> Vec<String> {
+/// The Contact URIs a registrar's answer lists as bound (RFC 3261 §10.2.3,
+/// §20.10): parsed as name-addr values by the shared header parser (comma
+/// folding, quoted display names, quoted-pairs), `*` skipped. A Contact counts
+/// only with an effective expiry above zero: its own `expires` parameter, else
+/// the response's `Expires` header (§10.3 step 8, §10.2.4), else the 3600 s
+/// default. A line that does not parse lists nothing: the safe side.
+pub(super) fn bound_contact_uris(lines: &[String], response_expires: Option<u32>) -> Vec<String> {
     let mut uris = Vec::new();
     for line in lines {
-        let mut start = 0;
-        let mut depth = 0i32;
-        let mut in_quotes = false;
-        let mut values = Vec::new();
-        for (index, byte) in line.bytes().enumerate() {
-            match byte {
-                b'"' => in_quotes = !in_quotes,
-                b'<' if !in_quotes => depth += 1,
-                b'>' if !in_quotes => depth -= 1,
-                b',' if !in_quotes && depth == 0 => {
-                    values.push(&line[start..index]);
-                    start = index + 1;
-                }
-                _ => {}
-            }
-        }
-        values.push(&line[start..]);
-        for value in values {
-            let value = value.trim();
-            let uri = match (value.find('<'), value.find('>')) {
-                (Some(open), Some(close)) if open < close => &value[open + 1..close],
-                _ => value.split(';').next().unwrap_or(value),
-            };
-            let uri = uri.trim();
-            if !uri.is_empty() && uri != "*" {
-                uris.push(uri.to_string());
+        let Ok(entries) = crate::sip::headers::nameaddr::NameAddr::parse_multi(line) else {
+            continue;
+        };
+        for entry in entries {
+            if entry.expires.or(response_expires).unwrap_or(3600) > 0 {
+                uris.push(entry.uri.to_string());
             }
         }
     }
@@ -312,22 +293,51 @@ mod tests {
     }
 
     #[test]
-    fn listed_contacts_are_read_from_angle_brackets_or_bare_uris() {
+    fn bound_contacts_are_read_from_angle_brackets_or_bare_uris() {
         let lines = vec![
             "<sip:u@203.0.113.10:5060;rnode=ab>;expires=60, \"Name, Q\" <sip:v@198.51.100.1>"
                 .to_string(),
             "sip:w@192.0.2.9:5070;expires=30".to_string(),
             "*".to_string(),
         ];
-        assert_eq!(
-            listed_contact_uris(&lines),
-            vec![
-                "sip:u@203.0.113.10:5060;rnode=ab".to_string(),
-                "sip:v@198.51.100.1".to_string(),
-                "sip:w@192.0.2.9:5070".to_string(),
-            ]
-        );
-        assert!(listed_contact_uris(&[]).is_empty());
+        let uris = bound_contact_uris(&lines, None);
+        assert_eq!(uris.len(), 3, "{uris:?}");
+        assert!(uris[0].contains("203.0.113.10") && uris[0].contains("rnode=ab"));
+        assert!(uris[1].contains("198.51.100.1"));
+        assert!(uris[2].contains("192.0.2.9"));
+        assert!(bound_contact_uris(&[], None).is_empty());
+    }
+
+    /// RFC 3261 §10.3 step 8: a Contact whose effective expiry is zero is not
+    /// bound, by its own parameter or by the response's Expires.
+    #[test]
+    fn an_expired_contact_is_not_bound() {
+        let line =
+            vec!["<sip:u@192.0.2.1:5060>;expires=0, <sip:p@192.0.2.2:5060>;expires=60".to_string()];
+        let uris = bound_contact_uris(&line, None);
+        assert_eq!(uris.len(), 1);
+        assert!(uris[0].contains("192.0.2.2"));
+        // No parameter: the response's Expires decides; its own parameter wins.
+        let bare = vec!["<sip:u@192.0.2.1:5060>".to_string()];
+        assert!(bound_contact_uris(&bare, Some(0)).is_empty());
+        assert_eq!(bound_contact_uris(&bare, Some(60)).len(), 1);
+        assert_eq!(bound_contact_uris(&bare, None).len(), 1);
+        let own = vec!["<sip:u@192.0.2.1:5060>;expires=60".to_string()];
+        assert_eq!(bound_contact_uris(&own, Some(0)).len(), 1);
+    }
+
+    #[test]
+    fn a_display_name_with_a_bracket_or_quoted_pair_lists_the_real_uri() {
+        let lines = vec![
+            r#""Old <sip:ours@192.0.2.1:5060>" <sip:peer@192.0.2.2:5060>"#.to_string(),
+            r#""A \", <sip:x@192.0.2.9>" <sip:a@192.0.2.3:5060>, <sip:b@192.0.2.4:5060>"#
+                .to_string(),
+        ];
+        let uris = bound_contact_uris(&lines, None);
+        assert_eq!(uris.len(), 3, "{uris:?}");
+        assert!(uris
+            .iter()
+            .all(|uri| !uri.contains("ours") && !uri.contains("192.0.2.9")));
     }
 
     #[test]

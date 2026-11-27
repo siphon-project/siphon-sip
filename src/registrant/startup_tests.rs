@@ -151,6 +151,7 @@ async fn an_orphan_is_fetched_then_de_registered_on_its_call_id_contact_and_next
         200,
         None,
         &[format!("<{CONTACT}>;expires=120")],
+        None,
         defaults(&listen),
     );
     assert!(matches!(
@@ -236,6 +237,7 @@ async fn a_live_entry_on_another_contact_leaves_the_stored_one_to_be_cleared() {
         200,
         None,
         &[format!("<{CONTACT}>")],
+        None,
         defaults(&listen),
     );
     let built = released(&manager).await.pop().expect("a de-REGISTER");

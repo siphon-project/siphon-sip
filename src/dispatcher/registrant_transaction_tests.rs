@@ -1316,3 +1316,43 @@ async fn fetches_leave_nothing_behind_whichever_way_they_end() {
     assert!(test_support::take_deregistrations(&setup.registrant).is_empty());
     assert!(setup.registrant.is_empty());
 }
+
+/// RFC 3261 §10.3 step 8: our Contact listed with an expiry of zero (its own
+/// parameter, or the answer's `Expires`) is not bound, whatever else is listed.
+#[tokio::test]
+async fn our_contact_listed_with_a_zero_expiry_does_not_authorize_the_de_register() {
+    for listed in [
+        "Contact: <sip:trunk@192.0.2.1:5060>;expires=0\r\nContact: <sip:trunk@198.51.100.77:5060>;expires=120\r\n",
+        "Expires: 0\r\nContact: <sip:trunk@192.0.2.1:5060>\r\n",
+    ] {
+        let setup = Setup::new();
+        let (store, fetch) = setup.startup_fetch(None).await;
+        setup.answer(&fetch, "200 OK", listed);
+        setup.registrant.release_startup_deregistrations().await;
+        assert!(
+            test_support::take_deregistrations(&setup.registrant).is_empty(),
+            "a de-REGISTER was queued over {listed:?}"
+        );
+        assert_eq!(setup.registrant.removed_deregistrations_pending(), 0);
+        assert!(store.load().await.expect("loaded").is_empty());
+    }
+}
+
+/// Our Contact quoted inside a peer's display name, or behind a quoted-pair, is
+/// not a listing of ours.
+#[tokio::test]
+async fn a_contact_inside_a_display_name_is_not_ours() {
+    for listed in [
+        "Contact: \"Old <sip:trunk@192.0.2.1:5060>\" <sip:trunk@198.51.100.77:5060>\r\n",
+        "Contact: \"A \\\", <sip:trunk@192.0.2.1:5060>\" <sip:trunk@198.51.100.77:5060>\r\n",
+    ] {
+        let setup = Setup::new();
+        let (_store, fetch) = setup.startup_fetch(None).await;
+        setup.answer(&fetch, "200 OK", listed);
+        setup.registrant.release_startup_deregistrations().await;
+        assert!(
+            test_support::take_deregistrations(&setup.registrant).is_empty(),
+            "a de-REGISTER was queued over {listed:?}"
+        );
+    }
+}
