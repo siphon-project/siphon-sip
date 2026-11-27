@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.20.0] — 2026-11-27
+
 ### Added
 
 - Media profiles: a half may declare `webrtc: auto`. Toward a WebRTC party it

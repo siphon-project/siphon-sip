@@ -3270,9 +3270,9 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.29.0"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e0509d455232c078fc7779611c85d7ab7c0713a44d15c6135c1748b9b8bce0f"
+checksum = "6866a848b367a5ec6164de896c3600334327a812429a24fe8a5e7b5bb9495fa4"
 dependencies = [
  "serde",
  "serde_json",
@@ -3308,8 +3308,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sip"
-version = "1.19.1"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#6ec97c1396cfc1e8b983556a1c010ec72a6e5899"
+version = "1.19.2"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#a5e72f2c882086f20f75e5bc9aecc544084ddc07"
 dependencies = [
  "aes",
  "arc-swap",
