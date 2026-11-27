@@ -77,6 +77,16 @@ impl OfferLocalModel {
 
     /// The engine's refusal of a command on a call `offer_local` made.
     pub(super) fn refusal(&self, command: &Command, scope: &Option<String>) -> Option<String> {
+        // A re-offer that changes the negotiated codec: the engine's own wording,
+        // which a caller may answer by replacing the call.
+        if let Command::Reoffer { sdp, .. } = command {
+            if sdp.contains("a=x-test-codec-change") {
+                return Some(
+                    "reoffer: re-offer changes the negotiated codec; replace the call with an offer"
+                        .to_string(),
+                );
+            }
+        }
         let mut named = command.clone();
         let key = (scope.clone(), named.call_id_mut()?.clone());
         let pending = self.pending.lock().is_ok_and(|held| held.contains(&key));

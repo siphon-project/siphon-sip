@@ -884,12 +884,6 @@ fn seat_refusal(command: &Command) -> Option<String> {
         Command::AnswerLocal { sdp, .. } if sdp.contains(NATIVE_ENGINE_REFUSED_OFFER) => {
             Some("answer_local: no stream of the offer can be answered".to_string())
         }
-        // A re-offer that changes the negotiated codec: the engine's own refusal
-        // wording, which a caller may answer by replacing the call.
-        Command::Reoffer { sdp, .. } if sdp.contains("a=x-test-codec-change") => Some(
-            "reoffer: re-offer changes the negotiated codec; replace the call with an offer"
-                .to_string(),
-        ),
         Command::ConferenceSeat { conference_id, .. } if conference_id.starts_with("full-") => {
             Some(format!(
                 "conference_seat: conference {conference_id} is full"
