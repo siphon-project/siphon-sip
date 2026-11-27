@@ -327,15 +327,7 @@ pub fn send_uas_response(
             return false;
         }
     }
-    // A call being cancelled has had (or is about to get) its 487, the INVITE's
-    // final response (RFC 3261 §9.2): a 2xx after it would be a second one.
-    if final_response
-        && (200..300).contains(&code)
-        && state
-            .call_actors
-            .get_call(internal_call_id)
-            .is_some_and(|call| call.cancel_claimed)
-    {
+    if final_response && super::cancel::answered_487(state, internal_call_id, code) {
         return false;
     }
     let (transport, remote_addr, connection_id, local_addr, local_tag, local_contact) =
