@@ -639,7 +639,6 @@ impl PyRtpEngine {
     ) -> PyResult<Bound<'py, PyAny>> {
         let scope = scope::per_call_scope(scope, &[Some(request)], &self.client, "offer")?;
         let sessions = scope::store_for(&self.sessions, scope.as_ref())?;
-        let requested_name = profile.unwrap_or(DEFAULT_PROFILE);
         let offer::OfferInput {
             call_id,
             from_tag,
@@ -649,19 +648,12 @@ impl PyRtpEngine {
             source_ip,
         } = offer::OfferInput::resolve(request, sdp)?;
         let anchored = sessions.get(&call_id);
-        let resolved_name = offer::anchoring_profile(
+        let (profile_name, entry) = offer::anchoring_entry(
             &self.registry,
             anchored.as_ref(),
-            requested_name,
+            profile.unwrap_or(DEFAULT_PROFILE),
             &offer_sdp,
-        );
-        let profile_name = resolved_name.as_str();
-        let entry = self.registry.get(profile_name).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown RTP profile '{requested_name}'; valid profiles: {}",
-                self.registry.profile_names().join(", ")
-            ))
-        })?;
+        )?;
         // Shaped for the party the rewritten offer is sent to: the callee of
         // the call under the `offer` half, and on a re-offer from the callee
         // the caller, under the `answer` half that has described it since the
@@ -705,7 +697,7 @@ impl PyRtpEngine {
             resolved_ws_uri,
             overrides,
             source_ip.as_deref(),
-            profile_name,
+            &profile_name,
         )?;
         // The message mode's offer is the message's own SDP, so its Call-ID
         // labels the captures. A raw SDP need not belong to the call's SIP
@@ -861,12 +853,8 @@ impl PyRtpEngine {
         let mut exchange = AnswerExchange::resolve(reply, call, sdp, to_tag, &sessions)?;
         exchange.scope = scope;
 
-        let profile_name = offer::anchored_variant(
-            &self.registry,
-            &sessions,
-            &exchange.call_id,
-            resolve_answer_profile(profile, &sessions, &exchange.call_id),
-        );
+        let profile_name =
+            offer::answer_profile(&self.registry, &sessions, &exchange.call_id, profile);
         let entry = self.registry.get(&profile_name).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown RTP profile '{profile_name}'; valid profiles: {}",
@@ -1019,12 +1007,7 @@ impl PyRtpEngine {
 
         // Resolve the answer-side flags exactly as `answer` does (explicit
         // profile → offer-recorded profile → default).
-        let profile_name = offer::anchored_variant(
-            &self.registry,
-            &sessions,
-            &call_id,
-            resolve_answer_profile(profile, &sessions, &call_id),
-        );
+        let profile_name = offer::answer_profile(&self.registry, &sessions, &call_id, profile);
         let entry = self.registry.get(&profile_name).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown RTP profile '{profile_name}'; valid profiles: {}",

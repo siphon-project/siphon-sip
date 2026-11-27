@@ -29,8 +29,8 @@ use super::{
     extract_source_ip, PyCall, PyReply, PyRequest,
 };
 
-/// The profile an `offer` anchors the call with: `requested`, with a
-/// `webrtc: auto` half resolved.
+/// The profile an `offer` anchors the call with, and its entry: `requested`,
+/// with a `webrtc: auto` half resolved.
 ///
 /// An auto half is decided once, on the offer that anchors the call; a later
 /// offer keeps what the call was anchored with. The script anchors before it
@@ -38,13 +38,13 @@ use super::{
 /// SDP): the half facing the callee applies as written, and a ring that must
 /// reach a browser and a desk phone together is placed through the control
 /// plane's per-contact `dial`.
-pub(super) fn anchoring_profile(
-    registry: &ProfileRegistry,
+pub(super) fn anchoring_entry<'a>(
+    registry: &'a ProfileRegistry,
     anchored: Option<&MediaSession>,
     requested: &str,
     offer_sdp: &[u8],
-) -> String {
-    match anchored {
+) -> PyResult<(String, &'a crate::rtpengine::profile::ProfileEntry)> {
+    let name = match anchored {
         Some(session) if registry.base_name(&session.profile) == requested => {
             session.profile.clone()
         }
@@ -53,22 +53,32 @@ pub(super) fn anchoring_profile(
             false,
             crate::rtpengine::webrtc_auto::offer_is_webrtc(offer_sdp),
         ),
-    }
+    };
+    let entry = registry.get(&name).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown RTP profile '{requested}'; valid profiles: {}",
+            registry.profile_names().join(", ")
+        ))
+    })?;
+    Ok((name, entry))
 }
 
-/// The profile the call was anchored with when a script names, on the answer
-/// side, the base profile that anchoring resolved a `webrtc: auto` half of.
+/// The profile an `answer` or `answer_local` is shaped by: the script's
+/// `profile`, else the one recorded at offer, else the default; and, when the
+/// script names the base profile that anchoring resolved a `webrtc: auto` half
+/// of, the call's anchored form.
 ///
 /// `rtpengine.offer(call, profile="extension")` records the resolved name
 /// (`extension#webrtc-answer` for a browser caller); a script that repeats
 /// `profile="extension"` on the answer means the same profile, not the
 /// as-written one the offer decided against.
-pub(super) fn anchored_variant(
+pub(super) fn answer_profile(
     registry: &ProfileRegistry,
     sessions: &MediaSessionStore,
     call_id: &str,
-    name: String,
+    profile: Option<&str>,
 ) -> String {
+    let name = super::resolve_answer_profile(profile, sessions, call_id);
     match sessions.get(call_id) {
         Some(session) if registry.base_name(&session.profile) == name => session.profile,
         _ => name,

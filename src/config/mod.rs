@@ -1337,14 +1337,7 @@ impl Config {
             let Some(profile) = media.profiles.get(name) else {
                 continue;
             };
-            // `base#webrtc-offer`, `-answer` and `-both` are the names a
-            // `webrtc: auto` profile resolves to; a configured name with a
-            // `#` could shadow one, so the character is reserved.
-            if name.contains('#') {
-                return Err(SiphonError::Config(format!(
-                    "media profile {name:?} contains '#', which is reserved for the names a                      `webrtc: auto` profile resolves to (such as `base#webrtc-offer`) —                      rename the profile"
-                )));
-            }
+            media::check_profile_name(name)?;
             for (direction, flags) in [("offer", &profile.offer), ("answer", &profile.answer)] {
                 let unsupported = media.backend().unsupported_profile_fields(flags);
                 if !unsupported.is_empty() {

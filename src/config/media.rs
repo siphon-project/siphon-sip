@@ -7,6 +7,20 @@ use serde::{Deserialize, Deserializer};
 // Media (RTPEngine)
 // ---------------------------------------------------------------------------
 
+/// Refuse a media profile name containing `#`. `base#webrtc-offer`, `-answer`
+/// and `-both` are the names a `webrtc: auto` profile resolves to, so a
+/// configured name with a `#` could shadow one: the character is reserved.
+pub(super) fn check_profile_name(name: &str) -> crate::error::Result<()> {
+    if name.contains('#') {
+        return Err(crate::error::SiphonError::Config(format!(
+            "media profile {name:?} contains '#', which is reserved for the names a \
+             `webrtc: auto` profile resolves to (such as `base#webrtc-offer`) — rename \
+             the profile"
+        )));
+    }
+    Ok(())
+}
+
 /// Which media-control backend siphon drives.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
