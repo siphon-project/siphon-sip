@@ -2225,8 +2225,7 @@ impl PyRtpEngine {
         scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let leg = self.leg(scope, None, &call_id, "subscribe_request")?;
-        let (profile_name, entry) =
-            offer::typed_entry(&self.registry, profile.unwrap_or(DEFAULT_PROFILE))?;
+        let entry = offer::typed_entry(&self.registry, profile.unwrap_or(DEFAULT_PROFILE))?;
         let flags = entry.offer.clone();
         let client = Arc::clone(&self.client);
 
@@ -2276,8 +2275,7 @@ impl PyRtpEngine {
         scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let leg = self.leg(scope, None, &call_id, "subscribe_answer")?;
-        let (profile_name, entry) =
-            offer::typed_entry(&self.registry, profile.unwrap_or(DEFAULT_PROFILE))?;
+        let entry = offer::typed_entry(&self.registry, profile.unwrap_or(DEFAULT_PROFILE))?;
         let flags = entry.answer.clone();
         let client = Arc::clone(&self.client);
 

@@ -109,12 +109,12 @@ pub(super) fn typed_profile(registry: &ProfileRegistry, profile: Option<&str>) -
 pub(super) fn typed_entry<'a>(
     registry: &'a ProfileRegistry,
     name: &'a str,
-) -> PyResult<(&'a str, &'a crate::rtpengine::profile::ProfileEntry)> {
+) -> PyResult<&'a crate::rtpengine::profile::ProfileEntry> {
     typed_profile(registry, Some(name))?;
     let entry = registry.get(name).ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err(format!("unknown RTP profile '{name}'"))
     })?;
-    Ok((name, entry))
+    Ok(entry)
 }
 
 /// What an `offer` call hands the engine, from either mode.
