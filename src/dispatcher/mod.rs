@@ -251,6 +251,8 @@ mod handover_no_controller_tests;
 #[cfg(test)]
 mod held_bye_tests;
 #[cfg(test)]
+mod hunt_path_tests;
+#[cfg(test)]
 mod inbound_drop_tests;
 #[cfg(test)]
 mod inflight_invite_tests;
@@ -342,6 +344,8 @@ mod proxy_cancel_wire_tests;
 mod proxy_dialog_state_tests;
 #[cfg(test)]
 mod proxy_failure_reply_tests;
+#[cfg(test)]
+mod proxy_first_target_tests;
 #[cfg(test)]
 mod proxy_flow_ack_tests;
 #[cfg(test)]
@@ -486,6 +490,8 @@ mod tls_verify_server_tests;
 mod transfer_bye_tests;
 #[cfg(test)]
 mod transfer_ingress_tests;
+#[cfg(test)]
+mod transfer_route_tests;
 #[cfg(test)]
 mod uas_answer_session_timer_tests;
 #[cfg(test)]

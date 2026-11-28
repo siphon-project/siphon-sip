@@ -804,6 +804,9 @@ fn supersede_b_leg_with_retry(
     //  - local_cseq advances past the retry CSeq.
     //  - local_contact / from_uri / to_uri stay so mid-dialog requests on this
     //    leg work.
+    // The retry is the same leg continuing, so its INVITE still went to the
+    // proxy the failed one did.
+    b_leg.proxy_first_hop = snapshot.b_leg_proxy_first_hop;
     b_leg.dialog.local_cseq = snapshot.b_leg_local_cseq.saturating_add(1);
     b_leg.dialog.local_contact = retry.headers.get("Contact").cloned();
     b_leg.dialog.local_from_uri = retry.headers.from().cloned();

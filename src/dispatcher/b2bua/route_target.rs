@@ -56,6 +56,7 @@ pub(super) fn route_verb_routes(
                 headers,
                 reroute_after_progress: target.reroute_after_progress,
                 route: target.route,
+                named_route: true,
                 contact_host: target.contact_host,
                 contact_user: target.contact_user,
                 verify_server: target.verify_server,

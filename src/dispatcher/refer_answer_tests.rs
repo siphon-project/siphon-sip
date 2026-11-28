@@ -100,6 +100,7 @@ impl Controlled {
                 None,
                 &ReplacementDial::default(),
             )
+            .expect("nothing shaping a leg is named")
         })
     }
 
@@ -919,6 +920,7 @@ async fn a_refer_held_across_a_takeover_is_still_decided_by_its_channel() {
             None,
             &ReplacementDial::default(),
         )
+        .expect("nothing shaping a leg is named")
     });
     assert!(accepted, "the REFER is found by the channel's Call-ID");
     let sent = summaries(&wire(&controlled.call.dispatcher));
@@ -979,6 +981,7 @@ async fn a_refer_accepted_after_a_takeover_names_its_sender_as_the_referrer() {
             None,
             &ReplacementDial::default(),
         )
+        .expect("nothing shaping a leg is named")
     });
     assert!(accepted);
     let sent = wire(&controlled.call.dispatcher);

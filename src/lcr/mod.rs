@@ -335,6 +335,14 @@ pub struct Route {
     /// from — an IMS application server sending it back through the S-CSCF.
     #[serde(skip)]
     pub route: Vec<String>,
+    /// Whether [`route`](Self::route) is a route set a controller named, as
+    /// opposed to a registered binding's Path (RFC 3327 §5.3), which a script's
+    /// sequential hunt over registered contacts fills in and leaves this unset.
+    /// A registered peer's dialog keeps going to the address siphon has for it,
+    /// not to its Contact, however its INVITE was routed
+    /// (`Leg::proxy_first_hop`).
+    #[serde(skip)]
+    pub named_route: bool,
     /// The host siphon presents in its own `Contact` on this attempt's leg, in
     /// place of the advertised one, when a controller `route` or sequential
     /// `dial` target named one (`contact_host`). Only the host: port,

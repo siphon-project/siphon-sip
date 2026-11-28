@@ -11,4 +11,5 @@ pub mod enum_query;
 pub mod enum_servers;
 mod resolver;
 
+pub(crate) use resolver::numeric_target;
 pub use resolver::SipResolver;

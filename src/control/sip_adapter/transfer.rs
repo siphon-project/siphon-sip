@@ -70,25 +70,18 @@ pub(super) struct TransferDial {
     pub(super) dial: crate::dispatcher::ReplacementDial,
 }
 
-impl TransferDial {
-    /// Whether the verb named anything a transfer siphon does not dial itself
-    /// would have to ignore.
-    fn names_a_dial(&self) -> bool {
-        let shaping = &self.dial.shaping;
-        self.dial.aor.is_some()
-            || !self.dial.headers.is_empty()
-            || shaping.from.is_some()
-            || shaping.from_display.is_some()
-            || shaping.p_asserted_identity.is_some()
-            || shaping.privacy.is_some()
-    }
-}
-
 /// Parse a transfer verb's `target` and identity arguments.
 ///
-/// `target` is a URI string, `{uri}`, or `{aor}` — a registered AoR, dialled
-/// over the flow its phone registered on and through the Path of its binding,
-/// which is the only way to reach a phone on TCP, TLS or WebSocket. `from`,
+/// `target` is a URI string, `{uri, route?}`, or `{aor}` — a registered AoR,
+/// dialled over the flow its phone registered on and through the Path of its
+/// binding, which is the only way to reach a phone on TCP, TLS or WebSocket.
+/// `route` is the route set the new leg's first INVITE carries, topmost first,
+/// and the INVITE goes to its topmost entry unless `next_hop` pins it: how an
+/// IMS application server sends a transfer's leg back through the S-CSCF
+/// (TS 24.229 §5.7.5). It is the `dial` target's `route`, parsed by the same
+/// function, and is refused beside an `{aor}`, whose own Path is its route. The
+/// leg's dialog route set is still the 2xx's Record-Route (RFC 3261 §12.1.2).
+/// `from`,
 /// `from_display`, `p_asserted_identity`, `privacy` and `headers` are the
 /// arguments `dial` takes, and shape the new leg the same way.
 ///
@@ -141,6 +134,8 @@ pub(super) fn parse_transfer_dial(
         }
     }
     let headers = super::routing::parse_extra_headers(args.get("headers"));
+    super::routing::refuse_route_header(headers.iter().map(|(name, _)| name))
+        .map_err(|error| bad(format!("{verb} {error}")))?;
     let uri_target = |uri: &str| match crate::sip::parser::parse_uri_standalone(uri) {
         Ok(_) => Ok(Some(uri.to_string())),
         Err(error) => Err(bad(format!("invalid {verb} target: {error}"))),
@@ -165,11 +160,22 @@ pub(super) fn parse_transfer_dial(
             )))
         }
     };
+    // The route set the new leg's INVITE carries, as `dial` takes it.
+    let route = super::routing::parse_route_set(object)
+        .map_err(|error| bad(format!("invalid {verb} target: {error}")))?;
     match (
         object.get("uri").and_then(|value| value.as_str()),
         object.get("aor").and_then(|value| value.as_str()),
     ) {
-        (Some(uri), None) => Ok(plain(uri_target(uri)?, shaping, headers)),
+        (Some(uri), None) => {
+            let mut transfer = plain(uri_target(uri)?, shaping, headers);
+            transfer.dial.route = route;
+            Ok(transfer)
+        }
+        (None, Some(_)) if !route.is_empty() => Err(bad(format!(
+            "{verb} args.target 'route' applies to a {{uri}} target: an {{aor}} routes each \
+             contact over its own binding's Path"
+        ))),
         (None, Some(aor)) => {
             if args.get("next_hop").is_some_and(|value| !value.is_null()) {
                 return Err(bad(format!(
@@ -323,11 +329,10 @@ pub(super) fn accept_refer(channel: &ChannelRef, args: &serde_json::Value) -> Co
     };
     // A transparent transfer relays the REFER and dials nothing, so a flow to
     // dial over or an identity to present would be accepted and never used.
-    if mode == Some(crate::script::api::call::ReferMode::Transparent) && transfer.names_a_dial() {
-        return ControlResult::error(
-            ControlErrorCode::BadRequest,
-            "accept_refer mode \"transparent\" relays the REFER and dials no leg: an {aor} target, from, from_display, p_asserted_identity, privacy and headers apply to mode \"terminate\"",
-        );
+    if mode == Some(crate::script::api::call::ReferMode::Transparent)
+        && transfer.dial.names_a_dial()
+    {
+        return transparent_dial_refusal("mode \"transparent\"");
     }
 
     // Media profile for the pairing the transfer creates. Same requirement as
@@ -344,7 +349,7 @@ pub(super) fn accept_refer(channel: &ChannelRef, args: &serde_json::Value) -> Co
         Err(result) => return result,
     };
 
-    if crate::dispatcher::b2bua_accept_refer_call_dialling(
+    match crate::dispatcher::b2bua_accept_refer_call_dialling(
         &channel.sip_call_id,
         transfer.target,
         next_hop.map(|s| s.to_string()),
@@ -353,15 +358,27 @@ pub(super) fn accept_refer(channel: &ChannelRef, args: &serde_json::Value) -> Co
         number_shape,
         &transfer.dial,
     ) {
-        ControlResult::Ok(
+        Ok(true) => ControlResult::Ok(
             serde_json::json!({ "channel": channel.channel_id, "transfer": "accepted" }),
-        )
-    } else {
-        ControlResult::error(
+        ),
+        Ok(false) => ControlResult::error(
             ControlErrorCode::NotFound,
             "no pending transfer for this call",
-        )
+        ),
+        // No `mode` named, and `b2bua.default_refer_mode` is transparent.
+        Err(_) => transparent_dial_refusal("the configured default_refer_mode \"transparent\""),
     }
+}
+
+/// An accept naming a leg to dial where the transfer relays the REFER and dials
+/// none: refused, not accepted and ignored.
+fn transparent_dial_refusal(which: &str) -> ControlResult {
+    ControlResult::error(
+        ControlErrorCode::BadRequest,
+        format!(
+            "accept_refer {which} relays the REFER and dials no leg: an {{aor}} target, a target's route, from, from_display, p_asserted_identity, privacy and headers apply to mode \"terminate\""
+        ),
+    )
 }
 
 /// The arguments of `accept_refer` that describe the leg a transfer dials.

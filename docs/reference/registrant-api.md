@@ -84,6 +84,7 @@ and takes the default below. When the statement references `$1`, siphon binds
 | `transport` | string | `"udp"` | `udp`, `tcp` or `tls` |
 | `enabled` | bool | `true` | `false` de-registers without removing the row |
 | `gateway` | string | — | `gateway:` group this trunk's calls egress through |
+| `hold_secs` | int | — | Seconds after the last successful read during which this node may keep refreshing the trunk while the source is unreadable; past it the trunk stops registering with nothing sent. Absent: never. `0`: on the first failed read. Negative or above `4294967295`: the row is rejected. See [Behavior notes](#behavior-notes) |
 
 ## Choosing between `password` and `ha1`
 
@@ -163,6 +164,7 @@ the JSON fields in the table above.
 | `transport` | `str` | `"udp"` |
 | `enabled` | `bool` | `True` |
 | `gateway` | `str \| None` | `None` |
+| `hold_secs` | `int \| None` | `None` |
 
 ## Fetch before every de-REGISTER
 
@@ -291,11 +293,40 @@ the username must not appear in Redis at all.
 - **A removed or disabled row de-registers.** siphon sends `Expires: 0`
   (RFC 3261 §10.2.2) rather than dropping local state and leaving the binding on
   the registrar until it ages out.
-- **An unreadable source changes nothing.** A failed read keeps the current
-  registrations. Reconciling an outage to "no trunks" would tear down the whole
-  estate because a database was briefly down, so an endpoint that cannot answer
-  should fail the request rather than return an empty list — an empty `200` is
-  indistinguishable from "delete everything".
+- **An unreadable source changes nothing, unless a row asked for a hold.** A
+  failed read keeps the current registrations. Reconciling an outage to "no
+  trunks" would tear down the whole estate because a database was briefly down,
+  so an endpoint that cannot answer should fail the request rather than return
+  an empty list — an empty `200` is indistinguishable from "delete everything".
+  The exception is a row with `hold_secs`. With several nodes sharing one
+  controller, each trunk leased to one node and each node served only its own,
+  a node whose controller died while siphon lived would otherwise keep
+  refreshing a trunk another node has taken over, and at a registrar that keeps
+  one binding per AoR that refresh steals the binding. So once the source has
+  failed to read and `hold_secs` have passed since the last successful read, the
+  node stops registering the trunk: the entry is dropped **without a REGISTER of
+  any kind** (no `Expires: 0`, no fetch: it cannot know who holds the binding
+  now), a refresh that was about to go is refused, the stored binding record is
+  kept for a later restart's clean-up, and `siphon_registrant_source_standdowns_total`
+  counts it with a warning naming the AoR. Registrant events report it as
+  `stood_down`. The next successful read that serves the row registers it afresh.
+  A change of `hold_secs` alone re-registers nothing. Entries from
+  `registrant.entries` and scripts never have a hold.
+
+  **For controllers:** the anchor is siphon's last *successful read*, not your
+  lease's last renewal. Serve `hold_secs` as the time remaining on the lease at
+  serve time (lease expiry minus now, minus a small margin), not the full lease
+  length. Otherwise a node can still refresh in the gap between the lease's last
+  renewal and its last read.
+
+  **What stand-down stops.** It stops new REGISTERs and abandons the ones in
+  flight: the entry's client transaction ends, so Timer E retransmits nothing,
+  and a REGISTER built just before the hold ran out is refused when it is about
+  to be sent (the Call-ID is remembered as stood down for as long as a
+  transaction can live). It cannot recall a request already handed to the
+  transport, which may still leave: that window is bounded by the transport
+  queue and any connect in progress. Keep a margin of a few seconds below the
+  lease's remaining time in the `hold_secs` you serve to cover it.
 - **The source owns only what it created.** Entries from `registrant.entries`
   and from `registration.add()` in a script are never updated or removed by a
   reconcile, and a row whose AoR one of them already holds is skipped with a

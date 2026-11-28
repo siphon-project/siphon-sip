@@ -1103,7 +1103,7 @@ export interface RegistrantChangedPayload extends OutboundRegistration {
    * order; `null` without a registrar identity.
    */
   instance_epoch?: string | null;
-  /** `registered`, `refreshed`, `failed`, `deregistered`, `awaiting_address` or `snapshot`. */
+  /** `registered`, `refreshed`, `failed`, `deregistered`, `stood_down`, `awaiting_address` or `snapshot`. */
   event: string;
 }
 

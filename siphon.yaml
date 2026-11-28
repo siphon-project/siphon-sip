@@ -671,6 +671,12 @@ registrar:
 #     query: "SELECT aor, registrar, username, password, realm,
 #              expires AS interval, contact, transport, enabled
 #              FROM registrants WHERE node = $1"
+#     # Optional column `hold_secs` (integer, absent = none, negative = the row
+#     # is rejected): seconds after the last successful read during which this
+#     # node may keep refreshing the trunk while the source is unreadable.  Past
+#     # it the trunk stops registering and nothing is sent.  Serve the time left
+#     # on the trunk's lease, not the full lease length.  The http source reads
+#     # the same field.  See docs/reference/registrant-api.md.
 #     refresh_secs: 30
 #     timeout_ms: 2000
 #     # Optional: the one trunk whose AoR is $1, same columns as `query`, even

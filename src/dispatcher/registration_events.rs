@@ -90,7 +90,8 @@ impl RegistrarChange {
 }
 
 /// One registrant (outbound REGISTER) delivery: which AoR, what happened
-/// (`registered`, `refreshed`, `failed`, `deregistered`, `awaiting_address`,
+/// (`registered`, `refreshed`, `failed`, `deregistered`, `stood_down`,
+/// `awaiting_address`,
 /// or [`SNAPSHOT`]), and
 /// the status a `failed` carried.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,6 +108,7 @@ impl RegistrantChange {
             RegistrantEvent::Refreshed { aor } => (aor, "refreshed", None),
             RegistrantEvent::Failed { aor, status_code } => (aor, "failed", Some(status_code)),
             RegistrantEvent::Deregistered { aor } => (aor, "deregistered", None),
+            RegistrantEvent::StoodDown { aor } => (aor, "stood_down", None),
             RegistrantEvent::AwaitingAddress { aor } => (aor, "awaiting_address", None),
         };
         Self {
@@ -345,7 +347,7 @@ impl EventSource for RegistrantSource {
 
     fn presence(&self, change: &RegistrantChange) -> Presence {
         match change.event {
-            "deregistered" => Presence::Absent,
+            "deregistered" | "stood_down" => Presence::Absent,
             _ => Presence::Present,
         }
     }

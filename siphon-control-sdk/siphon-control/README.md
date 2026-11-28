@@ -210,7 +210,7 @@ reported as a failure. That is damage control, not a substitute for closing.
   nothing is ringing, and once a phone has answered and is being bridged.
 - `await call.accept_refer(target=None, next_hop=None, mode=None, profile=None, *,
   aor=None, from_uri=None, from_display=None, p_asserted_identity=None, privacy=None,
-  headers=None, timeout=None, number_policy=None, format=None)` accepts a pending
+  headers=None, timeout=None, number_policy=None, format=None, route=None)` accepts a pending
   inbound REFER (a `TransferRequested`
   event). `mode` is `"terminate"` (siphon dials the target), `"transparent"` (siphon
   relays the REFER) or `"controller"`: siphon answers `202` and dials nothing, this app
@@ -218,18 +218,22 @@ reported as a failure. That is damage control, not a substitute for closing.
   reason=None)`, within `timeout` seconds (default 60, at most 180). `aor=` names the
   target by its registered address-of-record in place of a URI: it is dialled over the
   flow its phone registered on, every registered contact rings and the first to answer
-  is kept. The identity arguments are the ones `dial` takes, for the leg the transfer
-  dials; `number_policy` names a number policy configured on the server for the
+  is kept. `route=` is the route set the transfer's new leg INVITE carries, a list of
+  name-addr Route entries, topmost first, as a `dial` target's `route` is (to send the
+  leg back through the S-CSCF that gave it the Route); it needs the target URI and
+  raises `ValueError` beside `aor=`. The identity arguments are the ones `dial` takes,
+  for the leg the transfer dials; `number_policy` names a number policy configured on the server for the
   numbers in them, or `format` gives one format (`"e164"`, `"plain"`,
   `"international"`, `"national"`). A target URI together with `aor=`, `mode="controller"` with any argument that
   describes a leg, and `timeout` with another mode each raise `ValueError` before a
   frame goes out. `await call.reject_refer(code, reason=None)` declines the REFER.
 - `await call.replace_peer(target=None, next_hop=None, replace_a_leg=None, profile=None,
   timeout=None, *, aor=None, from_uri=None, from_display=None, p_asserted_identity=None,
-  privacy=None, headers=None, number_policy=None, format=None)` swaps one party of
+  privacy=None, headers=None, number_policy=None, format=None, route=None)` swaps one party of
   an answered call for a freshly
   dialled target, with no REFER involved; the replaced leg stays up while the target
-  rings. Exactly one of `target` and `aor=` (`ValueError` otherwise). The reply says
+  rings. Exactly one of `target` and `aor=` (`ValueError` otherwise); `route=` is the
+  route set of a `target` URI, as for `accept_refer`. The reply says
   the INVITE is on the wire; `PeerReplaced` / `ReplaceFailed` is the outcome.
 - `await call.bridge(with_channel, on_peer_hangup=None)` joins this call to another
   leg the app owns, and `await call.unbridge(reason=None)` parts them, both legs

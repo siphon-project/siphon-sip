@@ -1925,7 +1925,7 @@ impl PyCall {
     /// (RFC 3261 §16.7).
     ///
     /// `strategy="sequential"` carries the same route set per carrier (as an
-    /// explicit next-hop plus a `Route` header), so serial failover across an
+    /// explicit next-hop plus the carrier's route set), so serial failover across an
     /// AoR's bindings reaches each binding's own proxy chain.
     #[pyo3(signature = (targets, strategy="parallel", timeout=30, max_duration=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), send_socket=None, auth_passthrough=false, number_policy=None, format=None))]
     #[allow(clippy::too_many_arguments)]
@@ -1997,7 +1997,7 @@ impl PyCall {
                     };
                     if let Some(routing) = routing {
                         if let Some(route_set) = routing.route_set {
-                            route.headers.insert("Route".to_string(), route_set);
+                            route.route = crate::proxy::core::route_set_entries(&route_set);
                             route.next_hop = Some(routing.next_hop);
                         }
                     }
@@ -4285,10 +4285,8 @@ mod tests {
                         .as_deref()
                         .unwrap()
                         .contains("TOKEN-A@edge.example.com"));
-                    assert_eq!(
-                        routes[0].headers.get("Route").map(String::as_str),
-                        Some("<sip:TOKEN-A@edge.example.com;lr>")
-                    );
+                    assert_eq!(routes[0].route, ["<sip:TOKEN-A@edge.example.com;lr>"]);
+                    assert!(routes[0].headers.is_empty());
                     // A bare string keeps pure R-URI routing, exactly as before.
                     assert_eq!(routes[1].ruri.as_deref(), Some("sip:carol@10.0.0.4"));
                     assert!(routes[1].next_hop.is_none());

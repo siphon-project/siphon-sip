@@ -442,6 +442,19 @@ pub struct BranchRouting {
 /// to the target URI: a binding whose Path is unusable is not reachable by
 /// Request-URI either, and silently sending it anyway is how a branch ends up
 /// delivered to the *wrong* binding.
+/// The entries of a joined route set (`route_set_from_path`, or a
+/// `BranchRouting::route_set`), one Route entry each, topmost first: the shape
+/// a B-leg's route set (`lcr::Route.route`, `b_leg_route`) takes.
+pub fn route_set_entries(route_set: &str) -> Vec<String> {
+    match RouteEntry::parse_multi(route_set) {
+        Ok(entries) => entries.iter().map(|entry| entry.to_string()).collect(),
+        // `route_set_from_path` only joins entries that parsed or that it wrapped
+        // itself, so this is not reached for one of its results; keep the value
+        // whole rather than lose a hop.
+        Err(_) => vec![route_set.to_string()],
+    }
+}
+
 pub fn branch_routing(branch_path: &[String], target: &str) -> Option<BranchRouting> {
     let Some(route_set) = route_set_from_path(branch_path) else {
         return Some(BranchRouting {
@@ -985,6 +998,24 @@ mod tests {
         let path = vec!["<sip:TOKEN-B@edge.example.com;lr>".to_string()];
         let route = super::route_set_from_path(&path).unwrap();
         assert!(route.contains("TOKEN-B@edge.example.com"));
+    }
+
+    #[test]
+    fn route_set_entries_keep_their_order_around_a_quoted_comma() {
+        let path = vec![
+            "<sip:first.example.com;lr>".to_string(),
+            "\"Edge, west\" <sip:second.example.com;lr>, <sip:third.example.com;lr>".to_string(),
+        ];
+        let route_set = super::route_set_from_path(&path).expect("a route set");
+        let entries = super::route_set_entries(&route_set);
+        assert_eq!(
+            entries,
+            [
+                "<sip:first.example.com;lr>",
+                "<sip:second.example.com;lr>",
+                "<sip:third.example.com;lr>"
+            ]
+        );
     }
 
     #[test]

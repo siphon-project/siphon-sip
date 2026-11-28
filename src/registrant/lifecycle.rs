@@ -52,6 +52,14 @@ pub trait RegisterTransactions: Send + Sync {
     /// `message`, before `message` is sent. Its retransmissions go where
     /// `message` goes, from the same local address.
     fn open(&self, request: &SipMessage, message: &OutboundMessage) -> Result<(), String>;
+
+    /// Drop the transaction of the REGISTER with Via branch `branch` and stop
+    /// its timers, so nothing is retransmitted and no answer is waited for.
+    fn abandon(&self, branch: &str);
+
+    /// The longest a REGISTER's client transaction can live in this layer
+    /// (Timer F as configured, and the wait after a final answer).
+    fn transaction_lifetime(&self) -> Duration;
 }
 
 /// Where an entry is in the shutdown de-registration.
@@ -82,13 +90,16 @@ impl RegistrantManager {
     }
 
     /// Whether a REGISTER of `aor` with `expires` must not be built: one that
-    /// would register (`expires > 0`) once shutdown has begun.
+    /// would register (`expires > 0`) once shutdown has begun, or for an entry
+    /// whose `hold_secs` has run out with its source unreadable (see
+    /// [`super::hold`]), which this stands down.
     pub(super) fn refuses_registration(&self, aor: &str, expires: u32) -> bool {
         let refused = expires > 0 && self.is_shutting_down();
         if refused {
             debug!(aor = %aor, "registrant shutting down: REGISTER not started");
+            return true;
         }
-        refused
+        self.refuses_held_down(aor, expires)
     }
 
     /// Whether the registration of `aor` whose dialog is `call_id` may still
@@ -96,10 +107,12 @@ impl RegistrantManager {
     /// removed and added again), and either shutdown has not begun or this is
     /// its de-registration.
     pub fn registration_live(&self, aor: &str, call_id: &str) -> bool {
-        self.entries.get(aor).is_some_and(|entry| {
+        let live = self.entries.get(aor).is_some_and(|entry| {
             entry.call_id == call_id
                 && (!self.is_shutting_down() || entry.deregistration == Deregistration::InFlight)
-        })
+        });
+        // And no stand-down has retired it (see [`super::hold`]).
+        live && !self.send_refused(call_id)
     }
 
     /// Build the `Expires: 0` REGISTER that clears one entry's binding.
@@ -142,6 +155,11 @@ impl RegistrantManager {
         aor: &str,
         defaults: super::EgressDefaults<'_>,
     ) -> Option<super::BuiltRegister> {
+        // Past its hold, what the registrar lists for the AoR is not known to be
+        // this node's: no fetch and no `Expires: 0` (see [`super::hold`]).
+        if self.stand_down(aor) {
+            return None;
+        }
         let mut entry = self.entries.get_mut(aor)?;
         if entry.fetches_before_deregistering() {
             return self.build_unprotected_register_as(&mut entry, defaults, 0, None, true);
@@ -192,6 +210,9 @@ impl RegistrantManager {
         defaults: super::EgressDefaults<'_>,
     ) -> Vec<super::BuiltRegister> {
         self.begin_shutdown();
+        // Sweeps stop with shutdown, so an entry past its hold is dropped here
+        // and not de-registered.
+        self.stand_down_expired();
         // Collected first: building takes each entry's write lock.
         let aors: Vec<(String, RegistrantState)> = self
             .entries
@@ -340,9 +361,30 @@ impl RegistrantManager {
         request: &SipMessage,
         message: &OutboundMessage,
     ) -> Result<(), String> {
+        // Every send site ends here, so a stood-down Call-ID is refused at the
+        // last moment: the hold can run out while a request is built, an SA is
+        // installed or a connection opens (see [`super::hold`]). A request
+        // already handed to a transport queue may still leave; the
+        // controller's margin below the lease covers that window.
+        if request
+            .headers
+            .get("Call-ID")
+            .is_some_and(|call_id| self.send_refused(call_id))
+        {
+            return Err("the registration stood down (hold_secs): not sent".to_string());
+        }
         match self.transactions.get() {
             Some(transactions) => transactions.open(request, message),
             None => no_transaction_layer(),
+        }
+    }
+
+    /// Give up the client transaction of the REGISTER with Via branch `branch`:
+    /// its timers stop, so it is not retransmitted. A no-op before the layer
+    /// is attached.
+    pub(super) fn abandon_transaction(&self, branch: &str) {
+        if let Some(transactions) = self.transactions.get() {
+            transactions.abandon(branch);
         }
     }
 

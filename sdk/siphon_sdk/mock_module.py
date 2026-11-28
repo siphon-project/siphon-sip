@@ -10395,7 +10395,10 @@ class MockRegistration:
         The handler receives ``(aor, event_type, state)`` where:
           - ``aor``: str -- Address of Record (e.g. "sip:trunk@carrier.com")
           - ``event_type``: str -- ``"registered"``, ``"refreshed"``,
-            ``"failed"``, ``"deregistered"``, ``"awaiting_address"`` (the
+            ``"failed"``, ``"deregistered"``, ``"stood_down"`` (a registrant
+            source's trunk stopped registering when its ``hold_secs`` ran out
+            with the source unreadable; nothing was sent),
+            ``"awaiting_address"`` (the
             entry needs an address of its own and has none: added with
             ``require_local_addr=True`` and no ``local_addr``, or its address
             taken away with ``set_local_addr(aor, None)``), or ``"snapshot"``

@@ -97,7 +97,9 @@ Every verb the server's `sip` adapter describes has a typed method:
   `accept_refer` and `reject_refer` decide a pending inbound one.
   `accept_refer_dialling(target, mode, profile, &TransferDial)` names who the
   transfer dials and what that leg presents: a `TransferTarget` is
-  `TransferTarget::uri(..)` or `TransferTarget::aor(..)`, a registered
+  `TransferTarget::uri(..)`, `TransferTarget::uri_routed(..)` (a URI whose
+  new leg's INVITE carries a route set, topmost first, as `DialTarget::uri_routed`
+  does for a dial) or `TransferTarget::aor(..)`, a registered
   address-of-record dialled over the flow its phone registered on with every
   registered contact rung, and `TransferDial` carries `next_hop`, `from`,
   `from_display`, `p_asserted_identity`, `privacy` and `headers`, and
@@ -105,6 +107,8 @@ Every verb the server's `sip` adapter describes has a typed method:
   `accept_refer_controller(timeout)` has the server answer `202` and dial
   nothing, leaving the transfer to the app, which then reports with
   `complete_refer(code, reason)`.
+- **Breaking (next minor):** `TransferTarget` gained the `UriRouted` variant and is
+  now `#[non_exhaustive]`; an exhaustive `match` on it needs a wildcard arm.
 - **Replacing a party:** `replace_peer` swaps one leg of an answered call for a
   freshly dialled target with no REFER involved, and `replace_peer_dialling`
   takes the same `TransferTarget` and `TransferDial`.

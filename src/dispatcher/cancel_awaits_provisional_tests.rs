@@ -405,7 +405,8 @@ async fn a_silent_branch_on_a_reliable_transport_ends_at_timer_b_without_a_cance
             None,
             None,
             &[],
-            state,
+            false,
+            state
         ));
     }
     let winner = invite_among(&drain(&sequence.dispatcher.udp), FIRST_CARRIER);

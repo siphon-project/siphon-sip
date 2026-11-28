@@ -60,6 +60,179 @@ pub(super) fn resolve_in_dialog_destination(
     (destination, transport)
 }
 
+/// Where the dialog a 2xx established is reached, for a B-leg whose INVITE went
+/// to a proxy first ([`Leg::proxy_first_hop`]).
+///
+/// With an empty route set an in-dialog request goes to the remote target, the
+/// peer's Contact (RFC 3261 §12.2.1.1, resolved as §8.1.2 says). siphon sends
+/// those to the address it has cached for the leg, the address its INVITE went
+/// to, which is the peer itself for a leg dialled straight at it and is how a
+/// peer behind NAT is reached (the cache follows the peer's own source from its
+/// requests on). It is the wrong address when the INVITE went through a proxy
+/// that did not Record-Route: the dialog is then with the peer, not the proxy.
+///
+/// Decided per 2xx, from that 2xx alone: its own Record-Route (an early dialog's
+/// route set on the leg says nothing about this dialog) and its own Contact. A
+/// proxy that forks the INVITE answers from several dialogs on the one leg, each
+/// with a Contact of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ProxyFirstTarget {
+    /// Not a proxy-first leg, or the 2xx names no usable remote target (a
+    /// Record-Route, no Contact, a Contact that is not a SIP URI or whose
+    /// transport needs a verification name siphon is not carrying): the leg's
+    /// cached address, as always.
+    Cached,
+    /// The Contact names its address outright (an IP literal): this dialog is
+    /// reached there, with no resolution to wait for.
+    Now(SocketAddr, Transport),
+    /// The Contact names a host that has to be resolved. The resolution does
+    /// not run on the response path, so this 2xx is ACKed at the leg's first
+    /// hop, and later requests go to the resolved address once it is known
+    /// ([`adopt_proxy_first_target`]).
+    Later(SipUri),
+}
+
+/// [`ProxyFirstTarget`] for `response`, a 2xx to the INVITE of a leg whose first
+/// hop was `first_hop`. No DNS, never blocks.
+pub(super) fn proxy_first_target(
+    first_hop: Option<(SocketAddr, Transport)>,
+    response: &SipMessage,
+) -> ProxyFirstTarget {
+    if first_hop.is_none()
+        || response
+            .headers
+            .get_all("Record-Route")
+            .is_some_and(|lines| !lines.is_empty())
+    {
+        return ProxyFirstTarget::Cached;
+    }
+    let Some(contact) = response
+        .headers
+        .get("Contact")
+        .or_else(|| response.headers.get("m"))
+        .map(|value| crate::b2bua::actor::extract_contact_uri(value))
+        .and_then(|uri| parse_uri_standalone(&uri).ok())
+        .filter(|uri| uri.scheme.is_sip_family() && !uri.host.is_empty())
+    else {
+        return ProxyFirstTarget::Cached;
+    };
+    // RFC 3263 §4.1: a `transport=` parameter, else UDP for `sip:` and TLS for
+    // `sips:`. Only UDP and TCP, and TLS to an address, are taken: a connection
+    // to a name needs that name for the handshake (SNI and certificate
+    // verification), and the leg's destination does not carry one.
+    let secure = contact.scheme.as_str() == "sips";
+    let hint = contact.get_param("transport");
+    let transport = hint.and_then(transport_from_token).unwrap_or(if secure {
+        Transport::Tls
+    } else {
+        Transport::Udp
+    });
+    // The resolver's own numeric rule, default port included (5061 for `sips:`
+    // and `transport=tls`).
+    match crate::dns::numeric_target(&contact.host, contact.port, contact.scheme.as_str(), hint) {
+        Some(numeric) if matches!(transport, Transport::Udp | Transport::Tcp | Transport::Tls) => {
+            ProxyFirstTarget::Now(
+                numeric.address,
+                ipsec_pin_transport(numeric.address, transport),
+            )
+        }
+        // A `sips:` name is TLS to a name, whatever `transport=` says.
+        None if !secure && matches!(transport, Transport::Udp | Transport::Tcp) => {
+            ProxyFirstTarget::Later(contact)
+        }
+        _ => ProxyFirstTarget::Cached,
+    }
+}
+
+/// The dialog the leg adopted (its first 2xx to win the call) fixes the leg's
+/// remote target for every later in-dialog request, once, and a later copy or
+/// another dialog of a forking proxy never moves it. [`ProxyFirstTarget::Now`]
+/// rewrites the leg's cached address at once. [`ProxyFirstTarget::Later`]
+/// resolves the Contact's host in a task of its own, off the response path, and
+/// rewrites the cache only if the dialog is still the adopted one and the peer
+/// has not moved the address since (it follows the peer's own requests). A
+/// Contact that does not resolve leaves the cache as it was.
+pub(super) fn adopt_proxy_first_target(
+    state: &DispatcherState,
+    call_id: &str,
+    branch: &str,
+    response: &SipMessage,
+) {
+    let to_tag = crate::b2bua::actor::extract_to_tag(response);
+    let (target, cached, leg_id) = {
+        let Some(mut call) = state.call_actors.get_call_mut(call_id) else {
+            return;
+        };
+        let Some((_, leg)) = call.find_b_leg_by_branch_mut(branch) else {
+            return;
+        };
+        if leg.remote_target_settled {
+            return;
+        }
+        leg.remote_target_settled = true;
+        let target = proxy_first_target(leg.proxy_first_hop, response);
+        if let ProxyFirstTarget::Now(address, transport) = &target {
+            leg.transport.remote_addr = *address;
+            leg.transport.transport = *transport;
+            leg.transport.connection_id = ConnectionId::default();
+        }
+        (target, leg.transport.remote_addr, leg.id.clone())
+    };
+    let ProxyFirstTarget::Later(contact) = target else {
+        return;
+    };
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        debug!(call_id = %call_id, "B2BUA: no runtime to resolve the 2xx Contact on, in-dialog requests keep the leg's cached address");
+        return;
+    };
+    let resolver = Arc::clone(&state.dns_resolver);
+    let call_actors = Arc::clone(&state.call_actors);
+    let call_id = call_id.to_string();
+    runtime.spawn(async move {
+        let transport_hint = contact.get_param("transport").map(str::to_string);
+        let resolved = resolver
+            .resolve(
+                &contact.host,
+                contact.port,
+                contact.scheme.as_str(),
+                transport_hint.as_deref(),
+            )
+            .await;
+        let Some(first) = resolved.into_iter().next() else {
+            debug!(call_id = %call_id, contact = %contact, "B2BUA: the 2xx Contact does not resolve, in-dialog requests keep the leg's cached address");
+            return;
+        };
+        let transport = first
+            .transport
+            .as_deref()
+            .or(transport_hint.as_deref())
+            .and_then(transport_from_token)
+            .unwrap_or(Transport::Udp);
+        if !matches!(transport, Transport::Udp | Transport::Tcp) {
+            return;
+        }
+        let Some(mut call) = call_actors.get_call_mut(&call_id) else {
+            return;
+        };
+        // The leg by its own identity, not its Via branch or its place on the
+        // call: a transfer target promoted to the caller's position while the
+        // lookup ran is the same leg.
+        let position = call.b_legs.iter().position(|leg| leg.id == leg_id);
+        let leg = match position {
+            Some(index) => &mut call.b_legs[index],
+            None if call.a_leg.id == leg_id => &mut call.a_leg,
+            None => return,
+        };
+        // Still the dialog the leg adopted, and the peer has not moved it.
+        if leg.transport.remote_addr != cached || leg.dialog.remote_tag != to_tag {
+            return;
+        }
+        leg.transport.remote_addr = first.address;
+        leg.transport.transport = ipsec_pin_transport(first.address, transport);
+        leg.transport.connection_id = ConnectionId::default();
+    });
+}
+
 /// For an in-dialog request whose next hop did not resolve — e.g. a WebSocket
 /// UE registered a `<uuid>.invalid` Contact (RFC 7118), so the R-URI can't be
 /// DNS-resolved — recover the destination from the connection the dialog was
@@ -412,9 +585,10 @@ pub(super) fn uac_route_set_from_record_routes(record_routes: &[String]) -> Vec<
 /// writes to it: a call ringing several transfer targets has several such legs,
 /// and a position read beforehand may be another's by the time it is used.
 ///
-/// Returns whether a route set was stored. `false` covers the ordinary
-/// direct-peer case where the 2xx carries no `Record-Route`, and leaves whatever
-/// the leg already had alone.
+/// A 2xx with no `Record-Route` leaves the dialog no route set (RFC 3261
+/// §12.1.2), so one an early dialog's reliable provisional put on the leg does not
+/// survive it, as on the ordinary answer path. Returns whether the dialog has a
+/// route set: `false` for the ordinary direct-peer case.
 pub(super) fn store_b_leg_route_set_from_2xx(
     call_actors: &CallActorStore,
     call_id: &str,
@@ -428,17 +602,15 @@ pub(super) fn store_b_leg_route_set_from_2xx(
             .cloned()
             .unwrap_or_default(),
     );
-    if route_set.is_empty() {
-        return false;
-    }
     let Some(mut call) = call_actors.get_call_mut(call_id) else {
         return false;
     };
     let Some((_, leg)) = call.find_b_leg_by_branch_mut(branch) else {
         return false;
     };
+    let stored = !route_set.is_empty();
     leg.dialog.route_set = route_set;
-    true
+    stored
 }
 
 /// Resolve a script-supplied translate-op name (from `call.dial(translate=[(…, "rfc7044")])`)

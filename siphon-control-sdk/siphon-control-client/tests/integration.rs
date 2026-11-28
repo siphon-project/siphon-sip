@@ -487,6 +487,29 @@ async fn stasis_start_dispatches_a_call_and_verbs_round_trip() {
     assert!(sent.get("next_hop").is_none(), "next_hop leaked: {sent}");
     assert!(sent.get("timeout").is_none(), "timeout leaked: {sent}");
 
+    // A transfer's URI target carries its route set to the server as the
+    // `{uri, route}` object a dial target is.
+    let routed = call
+        .replace_peer_dialling(
+            &siphon_control_client::sip::TransferTarget::uri_routed(
+                "sip:+15550100@ims.example.test",
+                ["<sip:term@scscf.example.test;lr;odi=4f1c>"],
+            ),
+            None,
+            None,
+            None,
+            &siphon_control_client::sip::TransferDial::default(),
+        )
+        .await
+        .expect("replace_peer_dialling ok");
+    assert_eq!(
+        routed["echo_args"]["target"],
+        serde_json::json!({
+            "uri": "sip:+15550100@ims.example.test",
+            "route": ["<sip:term@scscf.example.test;lr;odi=4f1c>"],
+        })
+    );
+
     // A backend-gated verb (ws_tee is siphon-rtp-only) surfaces the server's
     // unsupported_verb as a typed error.
     match call.stream_start("ws://ai:9000/stream", None, None).await {

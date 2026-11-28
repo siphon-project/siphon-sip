@@ -39,6 +39,9 @@ pub(super) fn route(channel: &ChannelRef, args: &serde_json::Value) -> ControlRe
         .and_then(|v| v.as_str())
         .unwrap_or("sequential");
     let extra_headers = parse_extra_headers(args.get("headers"));
+    if let Err(message) = refuse_route_header(extra_headers.iter().map(|(name, _)| name)) {
+        return ControlResult::error(ControlErrorCode::BadRequest, message);
+    }
     let target_count = targets.len();
     // The caller's own Contact host and user, which the 2xx relayed to it
     // carries; the targets' `contact_host` / `contact_user` are what each
@@ -214,6 +217,9 @@ pub(super) fn dial(channel: &ChannelRef, command: &AdapterCommand) -> ControlRes
         .unwrap_or(30)
         .clamp(1, 3600) as u32;
     let extra_headers = parse_extra_headers(args.get("headers"));
+    if let Err(message) = refuse_route_header(extra_headers.iter().map(|(name, _)| name)) {
+        return ControlResult::error(ControlErrorCode::BadRequest, message);
+    }
     let target_count = targets.len();
     // The caller's own Contact host and user. The targets' `contact_host` and
     // `contact_user` belong to the legs siphon places, so the caller side has
@@ -526,6 +532,7 @@ pub(super) fn parse_dial_target(
     };
 
     let route = parse_route_set(object)?;
+    refuse_route_header(shaped.headers.keys())?;
 
     if let Some(aor) = object.get("aor").and_then(|v| v.as_str()) {
         // Each branch of an AoR is routed over its own binding's Path, which
@@ -621,6 +628,7 @@ pub(super) fn parse_route_target(
         .map(|t| t as u32);
     let reroute_after_progress = parse_reroute_after_progress(object)?.unwrap_or(false);
     let route = parse_route_set(object)?;
+    refuse_route_header(headers.iter().map(|(name, _)| name))?;
     let contact_host = parse_contact_host(object).map_err(|error| format!("target {error}"))?;
     let contact_user = parse_contact_user(object).map_err(|error| format!("target {error}"))?;
     Ok(crate::dispatcher::RouteTarget {
@@ -766,7 +774,7 @@ pub(super) fn parse_contact_user(
 /// RFC 3261 §25.1, so a URI's `;lr` cannot be mistaken for a header parameter); a
 /// value siphon cannot put on the wire is refused rather than dropped, because
 /// a request sent without its route set goes somewhere else entirely.
-fn parse_route_set(
+pub(super) fn parse_route_set(
     object: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Vec<String>, String> {
     let entries = match object.get("route") {
@@ -791,6 +799,29 @@ fn parse_route_set(
             }
         })
         .collect()
+}
+
+/// Refuse a `Route` among a verb's `headers`.
+///
+/// `Route` is framework-managed on a B-leg: the leg's route set is a target's
+/// `route`, and the builder sets the Route headers from it. An injected one
+/// would replace them after the destination was chosen from the real ones, so
+/// the INVITE would carry one route set and go to another's first hop. Refused
+/// rather than dropped, as an unusable `route` is.
+pub(super) fn refuse_route_header<'a>(
+    names: impl IntoIterator<Item = &'a String>,
+) -> Result<(), String> {
+    if names
+        .into_iter()
+        .any(|name| name.eq_ignore_ascii_case("Route"))
+    {
+        return Err(
+            "'headers' cannot carry Route: it is framework-managed on a B-leg, name the route \
+             set as a target's 'route'"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Parse a command-level `headers` object (applied to every route attempt).

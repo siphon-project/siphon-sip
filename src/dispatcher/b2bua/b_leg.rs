@@ -113,6 +113,7 @@ pub fn b2bua_send_b_leg_invite(
     branch_contact_user: Option<&str>,
     verify_server: Option<bool>,
     extra_headers: &[(String, String)],
+    route_from_path: bool,
     state: &DispatcherState,
 ) -> bool {
     b2bua_dial_b_leg(
@@ -134,6 +135,7 @@ pub fn b2bua_send_b_leg_invite(
         branch_contact_user,
         verify_server,
         extra_headers,
+        route_from_path,
         state,
     )
     .is_some()
@@ -203,6 +205,11 @@ pub fn b2bua_dial_b_leg(
     // branch routes to and over `tls.verify_server`; `None` leaves it to them.
     verify_server: Option<bool>,
     extra_headers: &[(String, String)],
+    // Whether `b_leg_route` is a registered binding's Path rather than a route
+    // set a controller or script named. A registered peer's leg is reached at the
+    // address siphon has for it, so a Path never makes the INVITE's first hop a
+    // proxy whose dialog's remote target is the Contact.
+    route_from_path: bool,
     state: &DispatcherState,
 ) -> Option<String> {
     // Checked where every caller converges, so no path can put a port or a
@@ -727,6 +734,15 @@ pub fn b2bua_dial_b_leg(
     // account token / routing tag always lands on the wire regardless of the
     // policy's strip set.
     for (name, value) in extra_headers {
+        // The route set is the `b_leg_route` this leg's destination was chosen
+        // from, set above: an injected `Route` would replace it with another.
+        if name.eq_ignore_ascii_case("Route") {
+            warn!(
+                call_id = %call_id,
+                "B2BUA: ignoring a Route injected as a header, the route set is the leg's own",
+            );
+            continue;
+        }
         b_leg_invite.headers.set(name, value.clone());
     }
 
@@ -796,6 +812,14 @@ pub fn b2bua_dial_b_leg(
             local_addr: flow_local_addr,
         },
     );
+    // The INVITE went to a proxy first: a route set a controller or script named
+    // (not a registered binding's Path) or a pinned next hop, and not over a
+    // captured flow. With no Record-Route in the 2xx the dialog's
+    // remote target is then the peer's Contact, not this first hop
+    // (`proxy_first_target`).
+    b_leg.proxy_first_hop =
+        (flow.is_none() && !route_from_path && (!b_leg_route.is_empty() || next_hop.is_some()))
+            .then_some((destination, outbound_transport));
     b_leg.dialog.local_contact = Some(b_contact_value);
     // Store From/To URIs for mid-dialog requests (BYE, re-INVITE).
     // These must match the dialog-creating INVITE's From/To exactly.

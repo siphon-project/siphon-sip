@@ -741,6 +741,45 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     ]);
   });
 
+  it("a transfer's URI target carries its route set, as a dial target does", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    const route = ["<sip:term@scscf.example.test;lr;odi=4f1c>", "<sip:edge.example.test;lr>"];
+    await call.acceptRefer({
+      mode: "terminate",
+      target: { uri: "sip:+15550100@ims.example.test", route },
+    });
+    await call.replacePeer(
+      { uri: "sip:+15550100@ims.example.test", route },
+      { nextHop: "sip:198.51.100.9" },
+    );
+    // An empty route set, or none, is a bare URI.
+    await call.acceptRefer({ target: { uri: "sip:+15550100@ims.example.test", route: [] } });
+    await call.replacePeer({ uri: "sip:+15550100@ims.example.test" });
+    expect(transport.calls.map((recorded) => recorded.args)).toEqual([
+      { mode: "terminate", target: { uri: "sip:+15550100@ims.example.test", route } },
+      {
+        target: { uri: "sip:+15550100@ims.example.test", route },
+        next_hop: "sip:198.51.100.9",
+      },
+      { target: "sip:+15550100@ims.example.test" },
+      { target: "sip:+15550100@ims.example.test" },
+    ]);
+
+    // A route set beside an aor, or not a list of strings, never goes out.
+    const sent = transport.calls.length;
+    await expect(
+      call.acceptRefer({ target: { aor: "sip:204@example.com", route } as never }),
+    ).rejects.toThrow(/aor/);
+    await expect(
+      call.replacePeer({ uri: "sip:1@example.com", route: "<sip:p.example;lr>" } as never),
+    ).rejects.toThrow(/route/);
+    await expect(
+      call.replacePeer({ uri: "sip:1@example.com", route: [7] } as never),
+    ).rejects.toThrow(/route/);
+    expect(transport.calls.length).toBe(sent);
+  });
+
   it("a play names a tone or a URL as its source, and its gain", async () => {
     const transport = new RecordingTransport();
     const call = makeCall(transport);

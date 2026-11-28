@@ -52,12 +52,14 @@ PROXY="127.0.0.1:5060"
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
+# Only the processes this run started are stopped. A pattern kill (pkill -f)
+# on a shared host also hits other runs of siphon and sipp.
+SIPHON_PID=""
+UAS_PID=""
 cleanup() {
-    pkill -f "invite_uac" 2>/dev/null || true
-    pkill -f "invite_uas" 2>/dev/null || true
-    pkill -f "register.xml" 2>/dev/null || true
-    pkill -f "subscribe_abandon" 2>/dev/null || true
-    pkill -9 -f "target/release/siphon" 2>/dev/null || true
+    for pid in $UAS_PID $SIPHON_PID; do
+        kill -9 "$pid" 2>/dev/null || true
+    done
 }
 trap cleanup EXIT
 
@@ -92,6 +94,7 @@ if ! cargo build --release --quiet > /tmp/siphon_leak_build.log 2>&1; then
     echo "FAIL: cargo build failed"; tail -40 /tmp/siphon_leak_build.log; exit 1
 fi
 echo "[+] build ok"
+SIPHON_BIN="${CARGO_TARGET_DIR:-target}/release/siphon"
 
 MODE="${MODE:-proxy}"
 # Proxy mode runs a richer script than proxy_default.py so the test also
@@ -110,9 +113,8 @@ TRANSPORT="${TRANSPORT:-udp}"
 case "$TRANSPORT" in udp) SIPP_T="u1" ;; tcp) SIPP_T="t1" ;; *) echo "FAIL: bad TRANSPORT"; exit 1 ;; esac
 echo "[*] Mode: $MODE  Transport: $TRANSPORT  Metrics: :$METRICS_PORT"
 
-cleanup; sleep 1
 RUST_LOG="${RUST_LOG:-warn}" PYO3_PYTHON="$PYO3_PYTHON" LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" \
-    ./target/release/siphon -c "$CONFIG_FILE" > /tmp/siphon_leak_proxy.log 2>&1 &
+    "$SIPHON_BIN" -c "$CONFIG_FILE" > /tmp/siphon_leak_proxy.log 2>&1 &
 SIPHON_PID=$!
 sleep 2
 kill -0 $SIPHON_PID 2>/dev/null || { echo "FAIL: siphon did not start"; cat /tmp/siphon_leak_proxy.log; exit 1; }
@@ -123,8 +125,10 @@ echo "[+] siphon started (PID $SIPHON_PID), metrics up"
 UAS_IP="127.0.0.2"; UAC_IP="127.0.0.51"; UAS_PORT=5061; UAC_PORT=5062
 sipp -sf sipp/register.xml "$PROXY" -m 1 -t "$SIPP_T" -i "$UAS_IP" -p "$UAS_PORT" -s bob1 -au bob1 -ap secret > /tmp/siphon_leak_register.log 2>&1 || true
 grep -q "Successful call.*1" /tmp/siphon_leak_register.log || { echo "FAIL: register bob1"; cat /tmp/siphon_leak_register.log; exit 1; }
-sipp -sf sipp/invite_uas_fast.xml -t "$SIPP_T" -i "$UAS_IP" -p "$UAS_PORT" -bg > /dev/null 2>&1 || true
+sipp -sf sipp/invite_uas_fast.xml -t "$SIPP_T" -i "$UAS_IP" -p "$UAS_PORT" > /dev/null 2>&1 < /dev/null &
+UAS_PID=$!
 sleep 1
+kill -0 "$UAS_PID" 2>/dev/null || { echo "FAIL: UAS did not start"; exit 1; }
 echo "[+] bob1 registered, UAS up"
 
 read_gauge() { curl -s "http://127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null | awk -v m="siphon_$1" '$1==m {print $2}'; }
@@ -133,7 +137,6 @@ read_gauge() { curl -s "http://127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null | 
 burst_invite() {
     sipp -sf sipp/invite_uac_fast.xml "$PROXY" -m "$CALLS_PER_CYCLE" -r "$CPS" -t "$SIPP_T" \
         -i "$UAC_IP" -p "$UAC_PORT" -s bob1 -trace_stat -stf /tmp/leak_uac.csv -fd 1 > /dev/null 2>&1 || true
-    while pgrep -f "invite_uac_fast.xml" > /dev/null 2>&1; do sleep 1; done
     [ -f /tmp/leak_uac.csv ] && tail -1 /tmp/leak_uac.csv | awk -F';' '{print $18+0}' || echo 0
 }
 burst_register() {
@@ -143,7 +146,6 @@ burst_register() {
     sipp -sf sipp/register.xml "$PROXY" -m "$CALLS_PER_CYCLE" -r "$CPS" -t "$SIPP_T" \
         -i "$UAC_IP" -p "$UAC_PORT" -s bob2 -au bob2 -ap secret \
         -trace_stat -stf /tmp/leak_reg.csv -fd 1 > /dev/null 2>&1 || true
-    while pgrep -f "register.xml" > /dev/null 2>&1; do sleep 1; done
     [ -f /tmp/leak_reg.csv ] && tail -1 /tmp/leak_reg.csv | awk -F';' '{print $18+0}' || echo 0
 }
 burst_subscribe() {
@@ -153,7 +155,6 @@ burst_subscribe() {
     sipp -sf sipp/subscribe_abandon_uac.xml "$PROXY" -m "$CALLS_PER_CYCLE" -r "$CPS" -t "$SIPP_T" \
         -i "$UAC_IP" -p "$UAC_PORT" -s presence \
         -trace_stat -stf /tmp/leak_sub.csv -fd 1 > /dev/null 2>&1 || true
-    while pgrep -f "subscribe_abandon_uac.xml" > /dev/null 2>&1; do sleep 1; done
     [ -f /tmp/leak_sub.csv ] && tail -1 /tmp/leak_sub.csv | awk -F';' '{print $18+0}' || echo 0
 }
 

@@ -296,12 +296,12 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 | `hangup` | sip | `{reason?}` | BYE an answered call, or reject an unanswered one |
 | `drop` | sip | `{reason?, ban?}` | abandon an **unanswered** call with no final response and no CANCEL on the wire (the `100 Trying` siphon sent when the INVITE arrived has already gone) and release it; `ban: true` also scores the caller's source toward an auto-ban; refused (`invalid_state`) on an answered call, whose dialog is owed a BYE, and on an `originate {aor}` whose phones are still ringing, whose INVITEs are owed a CANCEL (`hangup`). See [dropping unsolicited traffic](#drop--abandon-a-call-without-answering-it) |
 | `refer` | sip | `{to, replaces?}` | in-dialog REFER on the A-leg |
-| `accept_refer` | sip | `{target?, next_hop?, mode?, timeout?, profile?, number_policy?, format?, from?, from_display?, p_asserted_identity?, privacy?, headers?}` | accept a pending inbound REFER (from a `TransferRequested` event) and run the transfer. `mode` is `terminate`, `transparent` or `controller`; with `controller` siphon answers `202` and dials nothing, the app carries the transfer out and reports with `complete_refer` within `timeout` seconds. `timeout` belongs to `controller` alone: with `terminate`, `transparent` or no `mode` it is `bad_request`. `target` is a URI, `{uri}` or `{aor}` — see [inbound REFER](#an-inbound-refer-on-a-controlled-call) |
+| `accept_refer` | sip | `{target?, next_hop?, mode?, timeout?, profile?, number_policy?, format?, from?, from_display?, p_asserted_identity?, privacy?, headers?}` | accept a pending inbound REFER (from a `TransferRequested` event) and run the transfer. `mode` is `terminate`, `transparent` or `controller`; with `controller` siphon answers `202` and dials nothing, the app carries the transfer out and reports with `complete_refer` within `timeout` seconds. `timeout` belongs to `controller` alone: with `terminate`, `transparent` or no `mode` it is `bad_request`. `target` is a URI, `{uri, route?}` or `{aor}` — see [inbound REFER](#an-inbound-refer-on-a-controlled-call) |
 | `reject_refer` | sip | `{code?, reason?}` | reject a pending inbound REFER with a final non-2xx (default `603 Decline`) |
 | `complete_refer` | sip | `{code, reason?}` | report how a transfer accepted with `accept_refer {mode: "controller"}` went: siphon sends the referrer the sipfrag NOTIFY that ends its subscription, with this status (200-699, a 2xx for success). Report before releasing the referrer's leg — see [inbound REFER](#a-transfer-the-application-carries-out) |
 | `bridge` | sip | `{with, on_peer_hangup?, profile?}` | join this channel to another the app owns; the reply says the media was negotiated, `ChannelBridged` says the audio meets. `profile` names one media profile for the pair — see [`bridge`](#joining-two-legs-bridge) |
 | `unbridge` | sip | `{reason?}` | break a bridge — both legs stay answered, owned and held |
-| `replace_peer` | sip | `{target, next_hop?, replace_a_leg?, profile?, number_policy?, format?, timeout?, from?, from_display?, p_asserted_identity?, privacy?, headers?}` | swap one party of this answered call for a freshly dialed target, no REFER involved; the replaced leg stays up while the target rings, `PeerReplaced` says the swap landed |
+| `replace_peer` | sip | `{target, next_hop?, replace_a_leg?, profile?, number_policy?, format?, timeout?, from?, from_display?, p_asserted_identity?, privacy?, headers?}` | swap one party of this answered call for a freshly dialed target, no REFER involved; the replaced leg stays up while the target rings, `PeerReplaced` says the swap landed. `target` is a URI, `{uri, route?}` or `{aor}` as for `accept_refer`: `route` is the route set the new leg's INVITE carries, topmost first |
 | `dial` | sip | `{targets, strategy?, timeout?, headers?, profile?, from?, from_display?, p_asserted_identity?, privacy?, on_answer?, ringback?, offer?}` (identity fields, `profile?` and `offer?` also per target, as is the called party `to?`) | ring B-legs while the caller stays **unanswered** and the app keeps the channel; refused (`invalid_state`) on an answered call with `error.details: {verb: "dial", reason: "already_answered", call_state}` — see [`dial`](#dial--ring-while-the-caller-waits). With `on_answer: "bridge"`, ring phones for a caller the app already **answered** and anchored, play `ringback` while they alert, and bridge the one that picks up — see [`on_answer`](#dial-on_answer-bridge--ring-phones-for-an-answered-caller) |
 | `cancel_dial` | sip | `{reason?}` | give up on the dial ringing for this channel's caller and leave the caller alone: the phones are CANCELled and the dial ends in `DialFailed` with code 487 — see [`cancel_dial`](#cancel_dial--stop-a-dial-and-keep-the-caller) |
 | `route` | sip | `{targets, strategy?, headers?}` | return control to siphon: un-park the call and dial the B-leg via LCR sequential failover. Refused (`invalid_state`, `error.details: {verb: "route", reason: "dial_in_progress"}`) while a `dial` still rings for the call, since `route` releases the channel the dial reports on: `cancel_dial` first |
@@ -902,7 +902,7 @@ whether or not a `@registration.on_change` handler is registered:
 | `seq` | per-process number, its own sequence, as for `RegistrationChanged` |
 | `instance_epoch` | as for `RegistrationChanged` |
 | `aor` | the registration's AoR |
-| `event` | `registered`, `refreshed`, `failed`, `deregistered`, `awaiting_address` or `snapshot` (as above) |
+| `event` | `registered`, `refreshed`, `failed`, `deregistered`, `stood_down` (a source's trunk stopped registering when its `hold_secs` ran out with the source unreadable, nothing sent), `awaiting_address` or `snapshot` (as above) |
 | `registrar` | the registrar it registers with, `null` once the registration was removed |
 | `state` | `unregistered`, `registering`, `challenging`, `registered`, `failed` or `awaiting_address` (it needs an address of its own and has none), `null` once removed |
 | `expires_in` | seconds left on the binding the registrar granted, `0` when none |
@@ -1103,7 +1103,7 @@ The app decides with:
   own dialog). On a single-leg call (a voice-AI / IVR call siphon answered itself,
   no B leg) terminate mode re-dials the target off the A dialog.
 
-  `target` is a URI string, `{uri}` or `{aor}`. An AoR is dialled the way
+  `target` is a URI string, `{uri, route?}` or `{aor}`. An AoR is dialled the way
   `dial {aor}` dials one: over the flow its phone registered on and through the
   Path of its binding, which is the only way to reach a phone on TCP, TLS or
   WSS behind NAT. Nobody registered answers `not_found`. `next_hop` beside an
@@ -1122,11 +1122,22 @@ The app decides with:
   engine call of its own, and the ones that do not answer are released.
   To ring one phone of the party, name it with `{uri}`.
 
+  A `{uri}` target may carry `route?`, the route set the new leg's first
+  INVITE carries, as it does on a [`dial` target](#dial-ring-while-the-caller-waits): an array of Route
+  entries in name-addr form, topmost first, the INVITE going to the topmost
+  entry unless `next_hop` pins the destination. It is how an IMS application
+  server sends a transfer's new leg back through the S-CSCF with the Route the
+  S-CSCF gave it (TS 24.229 §5.7.5). The route set rides the first INVITE only:
+  the leg's dialog route set is the 2xx's Record-Route (RFC 3261 §12.1.2), so a
+  2xx with none leaves the in-dialog requests with no Route. An entry that is
+  not exactly one Route entry is `bad_request`, and so is a `route` beside an
+  `{aor}`, whose contacts follow their own binding's Path.
+
   `from`, `from_display`, `p_asserted_identity`, `privacy` and `headers` are
   the arguments [`dial` takes](#presenting-an-identity) and shape the leg the
   transfer dials the same way. Without them it presents what the call's own
   INVITE carried, which after a transfer is the wrong party as often as not.
-  They and `{aor}` apply to `terminate`; `transparent` relays the REFER, dials
+  They, `route` and `{aor}` apply to `terminate`; `transparent` relays the REFER, dials
   no leg, and refuses them `bad_request` rather than accepting and ignoring
   them.
 
@@ -2536,13 +2547,16 @@ re-INVITE: that sequence silences the caller for the length of the ring, and it
 leaves the call's own state behind — no `on_bye`, no CDR, no charging stop, no
 media release.
 
-`target` is a URI string, `{uri}` or `{aor}`, and `from`, `from_display`,
+`target` is a URI string, `{uri, route?}` or `{aor}`, and `from`, `from_display`,
 `p_asserted_identity`, `privacy` and `headers` shape the new leg, all exactly as
 for [`accept_refer`](#an-inbound-refer-on-a-controlled-call): an AoR is dialled
 over the flow its phone registered on, and one with several registered contacts
 rings them all. The first to answer is the party that replaces the leg, and the
 rest are CANCELled. The replaced leg stays up through all of it, and is released
-only when one of them answers.
+only when one of them answers. A `{uri}` target's `route` is the route set the new
+leg's INVITE carries, topmost first, as on a `dial` target: the INVITE goes to the
+topmost entry unless `next_hop` pins it, and the leg's dialog route set is the
+2xx's Record-Route.
 
 `replace_a_leg` picks the direction. Omitted or `false` replaces the callee and
 keeps the caller; `true` does the reverse. `profile` names the media profile for
@@ -2588,7 +2602,7 @@ Refusals are typed the same way as `bridge`'s:
 
 | code | when |
 |---|---|
-| `bad_request` | no `args.target`, a target or `next_hop` that will not parse, a nonsense `timeout`, or a target siphon cannot route to. Nothing was dialled and no event follows: the reply is the outcome, the call is as it was, and another `replace_peer` can follow at once |
+| `bad_request` | no `args.target`, a target, a target's `route` or `next_hop` that will not parse, a nonsense `timeout`, or a target siphon cannot route to. Nothing was dialled and no event follows: the reply is the outcome, the call is as it was, and another `replace_peer` can follow at once |
 | `not_found` | no such channel, or the call is already gone |
 | `invalid_state` | the call has not answered, has no peer leg to replace, or already has a replacement in flight — all worth retrying later |
 | `unavailable` | the B2BUA is not running |
