@@ -531,6 +531,7 @@ pub fn b2bua_advance_route_with_numbers(
             route.contact_user.as_deref(),
             route.verify_server,
             &extra_headers,
+            !route.route.is_empty() && !route.named_route,
             state,
         );
         if !sent {

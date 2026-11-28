@@ -147,6 +147,7 @@ fn b_leg_invite_bytes(caller: &str, policy: Option<ResolvedPolicy>) -> Vec<u8> {
         None,
         None,
         &[],
+        false,
         &dispatcher.state,
     );
     assert!(dialled, "the B-leg INVITE was not sent");

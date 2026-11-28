@@ -397,6 +397,12 @@ pub fn b2bua_ack_and_bye_answered_leg(
             .cloned()
             .unwrap_or_default(),
     );
+    // A dialog nobody adopted is reached at its own Contact when its INVITE went
+    // to a proxy first and the Contact names an address outright.
+    let (destination, transport) = match proxy_first_target(leg.proxy_first_hop, response) {
+        ProxyFirstTarget::Now(address, transport) => (address, transport),
+        _ => (destination, transport),
+    };
     let (destination, transport) =
         resolve_in_dialog_destination(&route_set, state, destination, transport);
 

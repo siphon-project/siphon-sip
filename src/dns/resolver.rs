@@ -56,6 +56,33 @@ pub struct SipResolver {
     total_budget: std::time::Duration,
 }
 
+/// The port a SIP URI without one is reached on: 5061 for `sips:` or
+/// `transport=tls`, 5060 otherwise (RFC 3261 §19.1.2, §26.2.2).
+pub(crate) fn default_port(scheme: &str, transport_hint: Option<&str>) -> u16 {
+    let is_tls = scheme == "sips" || transport_hint.is_some_and(|t| t.eq_ignore_ascii_case("tls"));
+    if is_tls {
+        5061
+    } else {
+        5060
+    }
+}
+
+/// The target a numeric host names, with the default port the scheme and
+/// transport give it, or `None` for a name that needs resolving. No DNS, so safe
+/// where nothing may block.
+pub(crate) fn numeric_target(
+    host: &str,
+    port: Option<u16>,
+    scheme: &str,
+    transport_hint: Option<&str>,
+) -> Option<ResolvedTarget> {
+    let ip = strip_ipv6_brackets(host).parse::<IpAddr>().ok()?;
+    Some(ResolvedTarget {
+        address: SocketAddr::new(ip, port.unwrap_or(default_port(scheme, transport_hint))),
+        transport: transport_hint.map(|s| s.to_string()),
+    })
+}
+
 impl SipResolver {
     /// Create a resolver using system DNS configuration, bounded by siphon's
     /// own query timeout, attempt cap and total budget.
@@ -177,17 +204,11 @@ impl SipResolver {
         // Strip brackets from IPv6 addresses (SIP URIs store as [::1])
         let host = strip_ipv6_brackets(host);
 
-        // Default port: 5061 for sips: or transport=tls, 5060 otherwise
-        let is_tls =
-            scheme == "sips" || transport_hint.is_some_and(|t| t.eq_ignore_ascii_case("tls"));
-        let default_port = if is_tls { 5061 } else { 5060 };
+        let default_port = default_port(scheme, transport_hint);
 
         // 1. Numeric IP — no DNS needed
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            return vec![ResolvedTarget {
-                address: SocketAddr::new(ip, port.unwrap_or(default_port)),
-                transport: transport_hint.map(|s| s.to_string()),
-            }];
+        if let Some(target) = numeric_target(host, port, scheme, transport_hint) {
+            return vec![target];
         }
 
         // 2. Explicit port provided — skip SRV, go straight to A/AAAA

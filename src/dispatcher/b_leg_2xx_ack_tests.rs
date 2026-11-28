@@ -145,6 +145,7 @@ impl Call {
                 None,
                 None,
                 &[],
+                false,
                 &state,
             )
         };
@@ -842,7 +843,8 @@ async fn a_stream_flow_dial_advertises_the_public_listener_and_keeps_its_connect
             None,
             None,
             &[],
-            &state,
+            false,
+            &state
         ));
         let sent = outbound.try_recv().unwrap();
         assert_eq!(sent.connection_id, ConnectionId(73));
@@ -914,6 +916,7 @@ async fn a_registrant_flow_dial_rides_the_sa_and_carries_its_route_set() {
             None,
             None,
             &[],
+            false,
             &state,
         );
         (dialled, udp)

@@ -896,16 +896,6 @@ pub(super) fn dial_headers_with_asserted_identity(
     headers
 }
 
-/// The config spelling of a presentation, for the failover engine's routes.
-const fn presentation_token(
-    presentation: crate::sip::privacy::CallerIdPresentation,
-) -> &'static str {
-    match presentation {
-        crate::sip::privacy::CallerIdPresentation::Allowed => "allowed",
-        crate::sip::privacy::CallerIdPresentation::Restricted => "restricted",
-    }
-}
-
 /// Why a `dial` could not be started.
 #[derive(Debug)]
 pub enum DialError {
@@ -1272,6 +1262,7 @@ fn dial_parallel(
             target.contact_user.as_deref(),
             target.verify_server,
             &headers,
+            target.aor.is_some(), // an AoR's route set is its binding's Path
             state,
         ) {
             sent += 1;
@@ -1331,9 +1322,9 @@ fn sequential_dial_routes(
                 // The failover engine applies this per attempt, after the
                 // number policy, which is where CLIR belongs: the presentation
                 // has to survive every hop of the hunt, not just the first.
-                caller_id_presentation: branch
-                    .privacy
-                    .map(|presentation| presentation_token(presentation).to_string()),
+                caller_id_presentation: branch.privacy.map(|presentation| {
+                    super::dial_target::presentation_token(presentation).to_string()
+                }),
                 // The rest of the target's identity — the host its `from` named
                 // and the display name — which a number cannot carry.
                 from_host: branch_from.as_ref().and_then(|shaped| shaped.host.clone()),
@@ -1343,6 +1334,7 @@ fn sequential_dial_routes(
                 presented_to: branch_to,
                 // The target's own route set, which an attempt would otherwise
                 // go without: the failover engine builds each INVITE afresh.
+                named_route: target.aor.is_none(),
                 route: target.route,
                 // The Contact host this target presents, which every attempt
                 // has to carry for the same reason its route set does.

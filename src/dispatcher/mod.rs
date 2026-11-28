@@ -345,6 +345,8 @@ mod proxy_dialog_state_tests;
 #[cfg(test)]
 mod proxy_failure_reply_tests;
 #[cfg(test)]
+mod proxy_first_target_tests;
+#[cfg(test)]
 mod proxy_flow_ack_tests;
 #[cfg(test)]
 mod proxy_generated_locally_tests;

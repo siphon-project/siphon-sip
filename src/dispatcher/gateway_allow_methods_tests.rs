@@ -186,7 +186,8 @@ fn b_leg_invite(dispatcher: &TestDispatcher, callee: &str) -> SipMessage {
         None,
         None,
         &[],
-        &dispatcher.state,
+        false,
+        &dispatcher.state
     ));
     let mut sent = Vec::new();
     while let Ok(outbound) = dispatcher.udp.try_recv() {

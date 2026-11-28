@@ -521,6 +521,8 @@ impl ReplacementPlan<'_> {
                 // gateway's `verify_server`), else `tls.verify_server`.
                 None,
                 shaped.headers.as_slice(),
+                // A registered contact's route set is its binding's Path.
+                dial.is_registered_contact(),
                 self.state,
             )
         });

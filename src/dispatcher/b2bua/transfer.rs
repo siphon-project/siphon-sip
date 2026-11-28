@@ -1129,13 +1129,14 @@ pub fn b2bua_complete_terminated_transfer(
 
     // Capture the target dialog's route set before anything reads the leg —
     // everything siphon sends the target from here on takes it from there.
-    if store_b_leg_route_set_from_2xx(&state.call_actors, call_id, branch, response) {
-        if let Some(leg) = state.call_actors.get_call(call_id).and_then(|call| {
-            call.find_b_leg_by_branch(branch)
-                .map(|(_, leg)| leg.clone())
-        }) {
-            target_leg = leg;
-        }
+    store_b_leg_route_set_from_2xx(&state.call_actors, call_id, branch, response);
+    // The target that answered is the dialog the leg adopts (`proxy_first_target`).
+    adopt_proxy_first_target(state, call_id, branch, response);
+    if let Some(leg) = state.call_actors.get_call(call_id).and_then(|call| {
+        call.find_b_leg_by_branch(branch)
+            .map(|(_, leg)| leg.clone())
+    }) {
+        target_leg = leg;
     }
 
     // Media re-anchor inputs, snapshotted BEFORE any mutation — promotion changes

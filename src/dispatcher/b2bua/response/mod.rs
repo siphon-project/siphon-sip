@@ -33,6 +33,9 @@ pub struct BLegResponseSnapshot {
     pub b_leg_remote_contact: Option<String>,
     pub b_leg_dialog: Option<(String, String)>,
     pub b_leg_dest: Option<(SocketAddr, Transport)>,
+    /// The first hop the leg's INVITE went to when that was a proxy
+    /// ([`Leg::proxy_first_hop`]).
+    pub b_leg_proxy_first_hop: Option<(SocketAddr, Transport)>,
     pub b_leg_local_addr: Option<SocketAddr>,
     pub b_leg_connection_id: ConnectionId,
     /// Whether a B-leg carried the response's Via branch when the call was
@@ -111,6 +114,7 @@ pub fn b_leg_response_snapshot(
         b_leg_remote_contact: remote_contact,
         b_leg_dialog: dialog,
         b_leg_dest: dest,
+        b_leg_proxy_first_hop: matching_b.and_then(|b| b.proxy_first_hop),
         b_leg_local_addr: b_local_addr,
         b_leg_connection_id: connection_id,
         matched_b_leg: matching_b_idx.is_some(),
@@ -226,9 +230,21 @@ pub fn handle_b2bua_response(
 
     // Read the A-leg info and the matching B-leg out of the call and drop the
     // `DashMap` guard before entering Python.
-    let Some(snapshot) = b_leg_response_snapshot(call_id, branch, state) else {
+    let Some(mut snapshot) = b_leg_response_snapshot(call_id, branch, state) else {
         return false;
     };
+    // A 2xx on a leg whose INVITE went to a proxy first is ACKed to its own
+    // dialog's remote target when its Contact names an address outright, and to
+    // the first hop otherwise, the leg's cached address being the adopted
+    // dialog's by then (`proxy_first_target`).
+    if let Some(first_hop) = snapshot.b_leg_proxy_first_hop {
+        if (200..300).contains(&status_code) && is_invite_response(message) {
+            snapshot.b_leg_dest = Some(match proxy_first_target(Some(first_hop), message) {
+                ProxyFirstTarget::Now(address, transport) => (address, transport),
+                _ => first_hop,
+            });
+        }
+    }
 
     // A `2xx` to a B-leg CANCEL shares the INVITE's top Via branch (RFC 3261
     // §9.1), so branch-matching alone would misclassify it as the carrier's
@@ -437,4 +453,13 @@ pub fn handle_b2bua_response(
         }
     }
     true
+}
+
+/// Whether `response` answers an INVITE (its CSeq method).
+fn is_invite_response(response: &SipMessage) -> bool {
+    response
+        .headers
+        .cseq()
+        .and_then(|cseq| cseq.split_whitespace().nth(1))
+        .is_some_and(|method| method.eq_ignore_ascii_case("INVITE"))
 }

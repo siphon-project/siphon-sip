@@ -331,3 +331,13 @@ pub(super) fn branch_called_parties(targets: &[DialTarget]) -> Result<Vec<Option
         })
         .collect()
 }
+
+/// The config spelling of a presentation, for the failover engine's routes.
+pub(super) const fn presentation_token(
+    presentation: crate::sip::privacy::CallerIdPresentation,
+) -> &'static str {
+    match presentation {
+        crate::sip::privacy::CallerIdPresentation::Allowed => "allowed",
+        crate::sip::privacy::CallerIdPresentation::Restricted => "restricted",
+    }
+}

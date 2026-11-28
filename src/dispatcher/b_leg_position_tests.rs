@@ -111,6 +111,7 @@ fn dial(sequence: &Sequence, address: &str) -> SipMessage {
             None,
             None,
             &[],
+            false,
             &sequence.dispatcher.state,
         )
     };

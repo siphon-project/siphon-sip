@@ -699,6 +699,37 @@ pub fn release_failed_call_media(a_sip_call_id: &str, state: &DispatcherState) {
     }
 }
 
+/// Fail a call that could not be routed as its handler asked: its B-leg INVITE
+/// never reached the transport, or no LCR carrier was routable.
+///
+/// The alternative — the behaviour this replaces — is to arm the answer deadline
+/// anyway and let the caller sit in ringback for its full length before a `408
+/// Request Timeout`, for a failure siphon logged milliseconds earlier. `503` is
+/// honest about whose problem this is: no callee ever saw the call.
+///
+/// It concludes like any failed call. The script asked for a route and did not
+/// get one, so `@b2bua.on_failure` hears about it the way it would have had the
+/// callee answered 503 (it may be holding per-call state, such as Rx / N5 QoS,
+/// an anchored media session or an external reservation, that only a failure
+/// releases), and can route the call somewhere else. Called with **no lock held
+/// on the A-leg INVITE**, which the response and the handlers' `Call` both take.
+pub fn b2bua_fail_undialed_call(
+    call_id: &str,
+    status_code: u16,
+    reason: &str,
+    state: &DispatcherState,
+) {
+    conclude_failed_call(
+        call_id,
+        FailedCallEnd::Local {
+            status_code,
+            reason: reason.to_string(),
+            headers: Vec::new(),
+        },
+        state,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

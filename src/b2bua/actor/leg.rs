@@ -351,6 +351,17 @@ pub struct Leg {
     /// already pending toward the same leg we respond 491 Request
     /// Pending rather than forward a second concurrent offer/answer.
     pub pending_reinvite: bool,
+    /// On a B-leg: the first hop its initial INVITE went to, when that was a
+    /// proxy, a route set a controller or script named or a pinned `next_hop`,
+    /// rather than the peer, and the INVITE was not sent over a captured flow.
+    /// Set where the INVITE's destination is chosen (`b2bua_send_b_leg_invite`)
+    /// and kept: every 2xx on the leg is ACKed per its own dialog from it
+    /// (`proxy_first_target`). `None` on every other leg, the A-leg included.
+    pub proxy_first_hop: Option<(std::net::SocketAddr, crate::transport::Transport)>,
+    /// On a B-leg: the answer that settled which dialog the leg adopted has been
+    /// seen, so the remote target is decided once and a later copy or a fork's
+    /// other dialog never moves the leg's cached address.
+    pub remote_target_settled: bool,
     /// Highest RSeq we've already PRACKed for each early dialog on this leg
     /// (RFC 3262 auto-PRACK), keyed by the early dialog's remote To-tag.
     /// Reliable 1xx responses retransmit until PRACKed — without this guard we
@@ -454,6 +465,8 @@ impl Leg {
             last_sdp: None,
             initial_acked: false,
             pending_reinvite: false,
+            proxy_first_hop: None,
+            remote_target_settled: false,
             prack_acked_rseq: HashMap::new(),
             b_leg_invite: None,
             pending_cancel: false,
@@ -514,6 +527,8 @@ impl Leg {
             last_sdp: None,
             initial_acked: false,
             pending_reinvite: false,
+            proxy_first_hop: None,
+            remote_target_settled: false,
             prack_acked_rseq: HashMap::new(),
             b_leg_invite: None,
             pending_cancel: false,

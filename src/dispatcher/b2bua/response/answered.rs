@@ -30,6 +30,8 @@ pub fn b_leg_answered(
         if absorb_answered_retransmit(call_id, message, state, snapshot) {
             return;
         }
+        // The dialog this leg adopts is reached at its remote target from here on.
+        adopt_proxy_first_target(state, call_id, &snapshot.branch, message);
 
         // (siphon-terminated transfer-target responses are intercepted earlier,
         // before the class match, so they never reach this normal-answer path.)

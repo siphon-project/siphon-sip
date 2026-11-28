@@ -216,6 +216,7 @@ impl Sequence {
                     None,
                     None,
                     &[],
+                    false,
                     &sequence.dispatcher.state,
                 );
                 assert!(dialled, "the branch to {address} was not dialled");
