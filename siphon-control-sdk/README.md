@@ -53,7 +53,9 @@ package's README lists them under its own names.
   carried out by siphon (`terminate`), relayed (`transparent`) or left to the
   application (`controller`, then `complete_refer` to report how it went);
   `replace_peer` to swap a party with no REFER involved. A transfer target is a
-  URI or `{aor}`, a registered address-of-record, and the leg the transfer dials
+  URI, `{uri, route}` (the route set the new leg's INVITE carries, topmost first,
+  to send it back through the S-CSCF that gave it the Route) or `{aor}`, a
+  registered address-of-record, and the leg the transfer dials
   takes the identity arguments `dial` takes (`from`, `from_display`,
   `p_asserted_identity`, `privacy`, `headers`) and a `number_policy` or a
   `format` for the numbers in them.

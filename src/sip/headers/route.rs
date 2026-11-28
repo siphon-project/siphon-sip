@@ -7,6 +7,9 @@
 
 use std::fmt;
 
+use crate::sip::headers::nameaddr::{
+    find_outside_quotes, has_unterminated_quote, split_comma_respecting_angles,
+};
 use crate::sip::parser::parse_uri_standalone;
 use crate::sip::uri::SipUri;
 
@@ -24,8 +27,11 @@ impl RouteEntry {
     pub fn parse(input: &str) -> Result<Self, String> {
         let input = input.trim();
 
-        let lt_pos = input
-            .find('<')
+        // The `<` that opens the URI, not one inside a quoted display name. An
+        // entry whose quote never closes has no `<` outside it, so the first `<`
+        // is the URI's: a malformed display name never costs the hop.
+        let lt_pos = find_outside_quotes(input, '<')
+            .or_else(|| input.find('<').filter(|_| has_unterminated_quote(input)))
             .ok_or_else(|| format!("Route entry missing '<': {input}"))?;
         // Search for the closing '>' AFTER the '<'. Searching from offset 0 would
         // accept a '>' that precedes the '<', giving a reversed range that panics
@@ -54,7 +60,9 @@ impl RouteEntry {
         Ok(RouteEntry { uri, params })
     }
 
-    /// Parse a Route/Record-Route header value containing comma-separated entries.
+    /// Parse a Route/Record-Route header value containing comma-separated
+    /// entries. A comma inside a quoted display name or inside the angle
+    /// brackets is part of its entry (RFC 3261 §25.1).
     pub fn parse_multi(input: &str) -> Result<Vec<RouteEntry>, String> {
         let mut result = Vec::new();
         for part in split_comma_respecting_angles(input) {
@@ -89,35 +97,6 @@ pub fn format_route_header(entries: &[RouteEntry]) -> String {
         .map(|e| e.to_string())
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// Split comma-separated values while respecting angle brackets.
-fn split_comma_respecting_angles(input: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0u32;
-    let mut start = 0;
-
-    for (i, c) in input.char_indices() {
-        match c {
-            '<' => depth += 1,
-            '>' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                let part = input[start..i].trim();
-                if !part.is_empty() {
-                    parts.push(part);
-                }
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-
-    let last = input[start..].trim();
-    if !last.is_empty() {
-        parts.push(last);
-    }
-
-    parts
 }
 
 /// One route entry as its parts, each a slice of the text it was written in.
@@ -180,11 +159,16 @@ pub fn route_parts(value: &str) -> Result<Vec<RouteParts<'_>>, String> {
             parameters: "",
         }]);
     }
-    split_route_entries(value)
+    // Entries are cut at the commas outside `<...>` and outside a well-formed
+    // quoted display name. Angle depth is a count, not a flag: a raw `<` inside a
+    // URI (`<sip:a;x=<v>, ...>`) is invalid (RFC 3261 §25.1), and is not
+    // second-guessed here.
+    split_comma_respecting_angles(value)
         .into_iter()
         .map(|entry| {
             let malformed = |why: &str| format!("route entry {entry:?} {why}");
-            let open = find_unquoted(entry, '<')
+            let open = find_outside_quotes(entry, '<')
+                .or_else(|| entry.find('<').filter(|_| has_unterminated_quote(entry)))
                 .ok_or_else(|| malformed("has no '<' outside its display name"))?;
             let close = entry[open..]
                 .find('>')
@@ -224,54 +208,6 @@ fn route_uri<'a>(uri: &'a str, entry: &str) -> Result<&'a str, String> {
         ));
     }
     Ok(uri)
-}
-
-/// The byte offset of the first `needle` in `input` that is not inside a quoted
-/// string (RFC 3261 §25.1 `quoted-string`, where a backslash escapes the next
-/// character).
-fn find_unquoted(input: &str, needle: char) -> Option<usize> {
-    let mut quoted = false;
-    let mut escaped = false;
-    for (offset, character) in input.char_indices() {
-        if escaped {
-            escaped = false;
-        } else if quoted && character == '\\' {
-            escaped = true;
-        } else if character == '"' {
-            quoted = !quoted;
-        } else if !quoted && character == needle {
-            return Some(offset);
-        }
-    }
-    None
-}
-
-/// Split a `Route` value at the commas between its entries: those outside angle
-/// brackets and outside a quoted display name.
-fn split_route_entries(input: &str) -> Vec<&str> {
-    let mut entries = Vec::new();
-    let mut quoted = false;
-    let mut escaped = false;
-    let mut bracketed = false;
-    let mut start = 0;
-    for (offset, character) in input.char_indices() {
-        match character {
-            _ if escaped => escaped = false,
-            '\\' if quoted => escaped = true,
-            '"' if !bracketed => quoted = !quoted,
-            _ if quoted => {}
-            '<' => bracketed = true,
-            '>' => bracketed = false,
-            ',' if !bracketed => {
-                entries.push(input[start..offset].trim());
-                start = offset + 1;
-            }
-            _ => {}
-        }
-    }
-    entries.push(input[start..].trim());
-    entries.retain(|entry| !entry.is_empty());
-    entries
 }
 
 // ---------------------------------------------------------------------------
@@ -448,6 +384,79 @@ mod tests {
         assert!(formatted.contains("p1.example.com"));
         assert!(formatted.contains("p2.example.com"));
         assert!(formatted.contains(", "));
+    }
+
+    /// RFC 3261 §25.1: a comma inside a quoted display name, or inside the angle
+    /// brackets, belongs to its entry; only a comma between entries splits.
+    #[test]
+    fn a_comma_in_a_quoted_display_name_or_a_uri_is_not_a_separator() {
+        for (input, uri) in [
+            (r#""Edge, west" <sip:198.51.100.51;lr>"#, "198.51.100.51"),
+            // A quoted-pair keeps the string open past an escaped quote.
+            (
+                r#""Say \"hi, there\"" <sip:198.51.100.51;lr>"#,
+                "198.51.100.51",
+            ),
+            // A `<` inside the quoted name is not the URI's.
+            (
+                r#""Edge <west, 1>" <sip:198.51.100.51;lr>"#,
+                "198.51.100.51",
+            ),
+            ("<sip:198.51.100.51;lr;x=a,b>", "198.51.100.51"),
+        ] {
+            let entries =
+                RouteEntry::parse_multi(input).unwrap_or_else(|error| panic!("{input}: {error}"));
+            assert_eq!(entries.len(), 1, "{input}");
+            assert_eq!(entries[0].uri.host, uri, "{input}");
+        }
+    }
+
+    #[test]
+    fn real_entries_split_in_order_around_quoted_commas() {
+        let entries = RouteEntry::parse_multi(
+            r#""A, B" <sip:a.example.test;lr>, <sip:b.example.test;lr>,"C" <sip:c.example.test;lr>"#,
+        )
+        .expect("three entries");
+        let hosts: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.uri.host.as_str())
+            .collect();
+        assert_eq!(
+            hosts,
+            ["a.example.test", "b.example.test", "c.example.test"]
+        );
+    }
+
+    /// A stray `"` inside `<...>` or an unterminated quote must not cost a hop:
+    /// popping the top route has to leave the next one.
+    #[test]
+    fn a_malformed_quote_never_swallows_the_next_hop() {
+        for input in [
+            r#"<sip:a.example;lr;x=">, <sip:b.example;lr>"#,
+            r#"<sip:a.example;lr?x=">, <sip:b.example;lr>"#,
+            r#""Edge <sip:a.example;lr>, <sip:b.example;lr>"#,
+            r#"<sip:a.example;lr>;x=", <sip:b.example;lr>"#,
+        ] {
+            let entries =
+                RouteEntry::parse_multi(input).unwrap_or_else(|error| panic!("{input}: {error}"));
+            let hosts: Vec<&str> = entries
+                .iter()
+                .map(|entry| entry.uri.host.as_str())
+                .collect();
+            assert_eq!(hosts, ["a.example", "b.example"], "{input}");
+            let parts = route_parts(input).unwrap_or_else(|error| panic!("{input}: {error}"));
+            let uris: Vec<&str> = parts
+                .iter()
+                .map(|part| part.uri.split(';').next().unwrap_or(""))
+                .collect();
+            assert_eq!(uris, ["sip:a.example", "sip:b.example"], "{input}");
+        }
+        // A well-formed quoted string is still respected, after a stray quote
+        // elsewhere in the same value does not apply.
+        let entries =
+            RouteEntry::parse_multi(r#""Edge, west" <sip:a.example;lr>, <sip:b.example;lr>"#)
+                .expect("two entries");
+        assert_eq!(entries.len(), 2);
     }
 
     #[test]

@@ -22,17 +22,32 @@ use crate::args::{
 use crate::{attach_if_running, interpreter_gone, json_to_py, optional_json, to_pyerr};
 
 /// The target of a transfer verb: a URI, or a registered AoR — never both.
+/// `route` is the route set of a URI target's INVITE: an AoR follows its own
+/// binding's Path, and with no target the Refer-To is dialled as the referrer
+/// wrote it, so a route set beside either is refused rather than dropped.
 fn transfer_target(
     verb: &str,
     target: Option<String>,
     aor: Option<String>,
+    route: Option<Vec<String>>,
 ) -> PyResult<Option<TransferTarget>> {
+    let route = route.unwrap_or_default();
     match (target, aor) {
         (Some(_), Some(_)) => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "{verb} takes a target URI or aor=, not both"
         ))),
-        (Some(uri), None) => Ok(Some(TransferTarget::Uri(uri))),
+        (Some(uri), None) if route.is_empty() => Ok(Some(TransferTarget::Uri(uri))),
+        (Some(uri), None) => Ok(Some(TransferTarget::uri_routed(uri, route))),
+        (None, Some(_)) if !route.is_empty() => {
+            Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "{verb} route= applies to a target URI: an aor= routes each contact over its \
+                 own binding's Path"
+            )))
+        }
         (None, Some(aor)) => Ok(Some(TransferTarget::Aor(aor))),
+        (None, None) if !route.is_empty() => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{verb} route= needs the target URI it is the route set of"
+        ))),
         (None, None) => Ok(None),
     }
 }
@@ -448,6 +463,11 @@ impl Call {
     /// is kept and the rest are CANCELled. `from_uri`,
     /// `from_display`, `p_asserted_identity`, `privacy` and `headers` are the
     /// identity arguments `dial` takes, for the leg the transfer dials.
+    /// `route=` is the route set that leg's INVITE carries, a list of Route
+    /// values in name-addr form (`"<sip:scscf.example;lr>"`), topmost first, as a
+    /// `dial` target's `route` is: how an IMS application server sends the leg
+    /// back through the S-CSCF that gave it the Route. It needs `target`, refuses
+    /// `aor=` and `mode="transparent"`, which dials no leg.
     /// `number_policy` names a number policy configured on the server for the
     /// numbers in that leg's identity headers, and `format` gives one format
     /// instead (`"e164"`, `"plain"`, `"international"`, `"national"`); the
@@ -466,7 +486,7 @@ impl Call {
     #[pyo3(signature = (
         target=None, next_hop=None, mode=None, profile=None, *, aor=None, from_uri=None,
         from_display=None, p_asserted_identity=None, privacy=None, headers=None, timeout=None,
-        number_policy=None, format=None,
+        number_policy=None, format=None, route=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn accept_refer<'py>(
@@ -485,6 +505,7 @@ impl Call {
         timeout: Option<u32>,
         number_policy: Option<String>,
         format: Option<String>,
+        route: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         if mode.as_deref() == Some("controller") {
             let dials_a_leg = target.is_some()
@@ -497,7 +518,8 @@ impl Call {
                 || privacy.is_some()
                 || headers.is_some()
                 || number_policy.is_some()
-                || format.is_some();
+                || format.is_some()
+                || route.is_some();
             if dials_a_leg {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "accept_refer mode \"controller\" dials no leg: it takes timeout only",
@@ -515,7 +537,7 @@ impl Call {
                 "accept_refer timeout applies to mode \"controller\"",
             ));
         }
-        let target = transfer_target("accept_refer", target, aor)?;
+        let target = transfer_target("accept_refer", target, aor, route)?;
         let dial = TransferDial {
             next_hop,
             from: from_uri,
@@ -684,7 +706,12 @@ impl Call {
     /// Pass `aor=` instead of `target` to dial a registered address-of-record
     /// over the flow its phone registered on (`not_found` when nobody is
     /// registered; several registered contacts all ring, the first to answer
-    /// is kept and the rest are CANCELled). `from_uri`,
+    /// is kept and the rest are CANCELled). `route=` is the route set the new
+    /// leg's INVITE carries, a list of Route values in name-addr form
+    /// (`"<sip:scscf.example;lr>"`), topmost first, as a `dial` target's `route`
+    /// is: the INVITE goes to the topmost entry unless `next_hop` pins it, and
+    /// the leg's own route set is the 2xx's Record-Route. It needs `target` and
+    /// refuses `aor=` (`ValueError`). `from_uri`,
     /// `from_display`, `p_asserted_identity`, `privacy` and `headers` are the
     /// identity arguments `dial` takes, for the new leg. `number_policy` names
     /// a number policy configured on the server for the numbers in its
@@ -694,7 +721,7 @@ impl Call {
     #[pyo3(signature = (
         target=None, next_hop=None, replace_a_leg=None, profile=None, timeout=None, *, aor=None,
         from_uri=None, from_display=None, p_asserted_identity=None, privacy=None, headers=None,
-        number_policy=None, format=None,
+        number_policy=None, format=None, route=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn replace_peer<'py>(
@@ -713,8 +740,9 @@ impl Call {
         headers: Option<Bound<'py, PyAny>>,
         number_policy: Option<String>,
         format: Option<String>,
+        route: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let Some(target) = transfer_target("replace_peer", target, aor)? else {
+        let Some(target) = transfer_target("replace_peer", target, aor, route)? else {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "replace_peer requires a target URI or aor=",
             ));

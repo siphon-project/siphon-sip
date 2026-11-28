@@ -270,14 +270,48 @@ export interface ReferReplaces {
 
 /** Options for {@link Call.acceptRefer}. */
 /**
- * Who a transfer's new leg is dialled at: a SIP URI, or `{ aor }` — a
- * registered address-of-record, dialled over the flow its phone registered on
- * (the only way to reach one on TCP, TLS or WebSocket behind NAT). An AoR nobody
- * is registered at rejects with `not_found`. One with several registered
- * contacts rings them all: the first to answer is the party brought into the
- * call, and the server CANCELs the rest.
+ * Who a transfer's new leg is dialled at: a SIP URI, `{ uri, route }`, or
+ * `{ aor }` — a registered address-of-record, dialled over the flow its phone
+ * registered on (the only way to reach one on TCP, TLS or WebSocket behind
+ * NAT). An AoR nobody is registered at rejects with `not_found`. One with
+ * several registered contacts rings them all: the first to answer is the party
+ * brought into the call, and the server CANCELs the rest.
+ *
+ * `route` is the route set the new leg's first INVITE carries, topmost first,
+ * each entry one Route value in name-addr form (`"<sip:scscf.example;lr>"`, RFC
+ * 3261 §25.1); the INVITE goes to the topmost entry unless `nextHop` pins it.
+ * It is how an IMS application server sends a transfer's leg back through the
+ * S-CSCF with the Route it was given (TS 24.229 §5.7.5), as a
+ * {@link Call.dial} target's `route` does. The leg's own route set is the 2xx's
+ * Record-Route (RFC 3261 §12.1.2). An `{ aor }` takes none: its contacts follow
+ * their own binding's Path. Refused with `mode: "transparent"`, which dials no
+ * leg.
  */
-export type TransferTarget = string | { aor: string };
+export type TransferTarget = string | { uri: string; route?: string[] } | { aor: string };
+
+/**
+ * A transfer target as the wire carries it: a URI string, a `{ uri, route }`
+ * object only when it names a route set, or `{ aor }`. A route set beside an
+ * `aor`, or one that is not a list of strings, throws before a frame goes out.
+ */
+function transferTargetToWire(target: TransferTarget): unknown {
+  if (typeof target === "string") return target;
+  const { uri, aor } = target as { uri?: unknown; aor?: unknown };
+  const route = routeSetToWire((target as { route?: unknown }).route);
+  if (typeof aor === "string" && typeof uri !== "string") {
+    if (route !== undefined) {
+      throw new TypeError(
+        'an aor transfer target takes no "route": each of its contacts follows its own ' +
+          "binding's Path",
+      );
+    }
+    return { aor };
+  }
+  if (typeof uri === "string" && typeof aor !== "string") {
+    return route === undefined ? uri : { uri, route };
+  }
+  throw new TypeError('a transfer target is a URI string, { uri, route? } or { aor }');
+}
 
 /**
  * The identity a transfer's new leg presents — the arguments {@link Call.dial}
@@ -1823,7 +1857,7 @@ export class Call {
   async acceptRefer(options?: AcceptReferOptions): Promise<void> {
     const args: Record<string, unknown> = {};
     if (options?.target !== undefined) {
-      args.target = options.target;
+      args.target = transferTargetToWire(options.target);
     }
     if (options?.nextHop !== undefined) {
       args.next_hop = options.nextHop;
@@ -1974,7 +2008,7 @@ export class Call {
       timeout?: number;
     } & TransferIdentity = {},
   ): Promise<unknown> {
-    const args: Record<string, unknown> = { target };
+    const args: Record<string, unknown> = { target: transferTargetToWire(target) };
     if (options.nextHop !== undefined) args.next_hop = options.nextHop;
     if (options.replaceALeg !== undefined) args.replace_a_leg = options.replaceALeg;
     if (options.profile !== undefined) args.profile = options.profile;

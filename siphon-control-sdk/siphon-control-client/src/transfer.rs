@@ -20,10 +20,24 @@ use crate::originate::OriginatePrivacy;
 use crate::sip::{Call, CallEvent};
 
 /// Who a transfer's new leg is dialled at.
+///
+/// `#[non_exhaustive]`: a later target form is not a breaking change. Adding
+/// [`TransferTarget::UriRouted`] was one for an exhaustive `match`, and so is
+/// this attribute for code that wrote one; match with a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransferTarget {
     /// A SIP URI, resolved as written.
     Uri(String),
+    /// A SIP URI whose new leg's first INVITE carries `route` as its route set,
+    /// topmost first, and is sent to the topmost entry unless the
+    /// [`TransferDial::next_hop`] pins it. Built by [`TransferTarget::uri_routed`].
+    UriRouted {
+        /// The URI to dial: the Request-URI.
+        uri: String,
+        /// The route set, one name-addr Route entry each.
+        route: Vec<String>,
+    },
     /// A registered address-of-record. The server dials its registered contact
     /// over the flow it registered on and through the Path of its binding —
     /// the only way to reach a phone on TCP, TLS or WebSocket behind NAT.
@@ -40,6 +54,32 @@ impl TransferTarget {
         TransferTarget::Uri(uri.into())
     }
 
+    /// A target named by its URI, whose new leg's INVITE carries `route` as its
+    /// route set, topmost first, and is sent to the topmost entry.
+    ///
+    /// Each entry is one Route value in name-addr form
+    /// (`"<sip:scscf.example;lr>"`, RFC 3261 §25.1); the server refuses one that
+    /// is not exactly one Route value with `bad_request`. This is how a
+    /// controller acting as an IMS application server sends a transfer's new
+    /// leg back through the S-CSCF with the Route it was given (TS 24.229
+    /// §5.7.5), as [`DialTarget::uri_routed`](crate::sip::DialTarget::uri_routed)
+    /// does for a dial. The route set rides the first INVITE only: the leg's own
+    /// route set is the 2xx's Record-Route (RFC 3261 §12.1.2). An empty `route`
+    /// is [`TransferTarget::Uri`]. A [`TransferTarget::Aor`] cannot carry a route
+    /// set, which is why this is a constructor of its own. Not for
+    /// `accept_refer` with `mode` `"transparent"`, which dials no leg: the
+    /// server refuses it.
+    pub fn uri_routed<I, S>(uri: impl Into<String>, route: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        TransferTarget::UriRouted {
+            uri: uri.into(),
+            route: route.into_iter().map(Into::into).collect(),
+        }
+    }
+
     /// A target named by its registered AoR.
     pub fn aor(aor: impl Into<String>) -> Self {
         TransferTarget::Aor(aor.into())
@@ -48,6 +88,8 @@ impl TransferTarget {
     fn to_json(&self) -> serde_json::Value {
         match self {
             TransferTarget::Uri(uri) => json!(uri),
+            TransferTarget::UriRouted { uri, route } if route.is_empty() => json!(uri),
+            TransferTarget::UriRouted { uri, route } => json!({ "uri": uri, "route": route }),
             TransferTarget::Aor(aor) => json!({ "aor": aor }),
         }
     }
@@ -332,6 +374,31 @@ mod tests {
         assert_eq!(
             TransferTarget::aor("sip:204@example.com").to_json(),
             json!({ "aor": "sip:204@example.com" })
+        );
+    }
+
+    /// A routed URI target is the `{uri, route}` object the server reads, the
+    /// route set in the order given; none is a bare URI, as for a dial.
+    #[test]
+    fn a_routed_uri_target_is_a_uri_object_with_its_route_set() {
+        assert_eq!(
+            TransferTarget::uri_routed(
+                "sip:+15550100@ims.example.test",
+                [
+                    "<sip:term@scscf.example.test;lr;odi=4f1c>",
+                    "<sip:edge.example.test;lr>"
+                ],
+            )
+            .to_json(),
+            json!({
+                "uri": "sip:+15550100@ims.example.test",
+                "route": ["<sip:term@scscf.example.test;lr;odi=4f1c>", "<sip:edge.example.test;lr>"],
+            })
+        );
+        assert_eq!(
+            TransferTarget::uri_routed("sip:+15550100@ims.example.test", Vec::<String>::new())
+                .to_json(),
+            json!("sip:+15550100@ims.example.test")
         );
     }
 
