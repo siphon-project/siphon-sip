@@ -2560,14 +2560,19 @@ mod tests {
         assert_eq!(normalize_aor("alice@example.com"), "sip:alice@example.com");
     }
 
+    /// RFC 3261 §19.1.4: a URI omitting the port does not match one that
+    /// declares it, not even the scheme's default, so every port is kept.
     #[test]
-    fn normalize_aor_strips_default_port() {
-        assert_eq!(normalize_aor("sip:bob@127.0.0.1:5060"), "sip:bob@127.0.0.1");
+    fn normalize_aor_keeps_every_port() {
+        assert_eq!(
+            normalize_aor("sip:bob@127.0.0.1:5060"),
+            "sip:bob@127.0.0.1:5060"
+        );
         assert_eq!(
             normalize_aor("sip:bob@127.0.0.1:5080"),
             "sip:bob@127.0.0.1:5080"
         );
-        assert_eq!(normalize_aor("sips:bob@host:5061"), "sips:bob@host");
+        assert_eq!(normalize_aor("sips:bob@host:5061"), "sips:bob@host:5061");
         assert_eq!(normalize_aor("sips:bob@host:5060"), "sips:bob@host:5060");
     }
 
@@ -2579,7 +2584,7 @@ mod tests {
         );
         assert_eq!(
             normalize_aor("sip:alice@example.com:5060;transport=tls"),
-            "sip:alice@example.com"
+            "sip:alice@example.com:5060"
         );
         assert_eq!(
             normalize_aor("sip:alice@example.com:5061;transport=tls"),

@@ -13,6 +13,19 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Changed
+
+- **The registrar keys an AoR the way RFC 3261 §10.3 step 5 and §19.1.4 define it.** The port is
+  kept, every port: `sip:bob@example.com:5060` and `sip:bob@example.com` are different AoRs, where
+  `:5060` (and `:5061` on `sips:`) used to be stripped. Scheme and host now compare
+  case-insensitively, `%HH` escapes of unreserved characters in the user part are decoded, and a
+  `;` inside the user part (a telephone-subscriber's `phone-context`) no longer cuts the AoR short.
+  The user part stays case-sensitive. **Upgrade note:** a UA that registers without a port but is
+  called with `:5060` in the Request-URI (or the reverse) no longer matches; a binding stored under
+  a stripped key before the upgrade is found again on the UA's next REGISTER. Contact lookups
+  (`registrar.lookup_contact`, `is_registered_contact`) are unchanged and still treat a missing port
+  as the default one. The SDK mock registrar matches.
+
 ## [1.20.1] — 2026-11-27
 
 ### Deprecated
