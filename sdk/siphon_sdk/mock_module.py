@@ -34,6 +34,32 @@ from siphon_sdk.http import MockHttp
 from siphon_sdk.ws_split import _WsSplitMixin
 
 
+_AOR_UNRESERVED = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.!~*'()"
+)
+
+
+def _unescape_aor_user(user: str) -> str:
+    """Decode ``%HH`` escapes of unreserved characters (RFC 3261 §19.1.4, §25.1).
+
+    Mirrors ``push_unescaped_user`` on the Rust side: other well-formed escapes
+    stay escaped with uppercase hex, a malformed ``%`` is copied as written.
+    """
+    out = []
+    index = 0
+    while index < len(user):
+        if user[index] == "%" and index + 2 < len(user):
+            pair = user[index + 1:index + 3]
+            if all(c in "0123456789abcdefABCDEF" for c in pair):
+                decoded = chr(int(pair, 16))
+                out.append(decoded if decoded in _AOR_UNRESERVED else "%" + pair.upper())
+                index += 3
+                continue
+        out.append(user[index])
+        index += 1
+    return "".join(out)
+
+
 def _strip_nameaddr(value: str) -> str:
     """Reduce a name-addr header value to its bare URI.
 
@@ -3419,20 +3445,27 @@ class MockRegistrar:
 
     @staticmethod
     def _normalize_aor(uri: str) -> str:
-        """Mirror of ``crate::registrar::normalize_aor``.
+        """Mirror of ``crate::registrar::normalize_aor`` (RFC 3261 §10.3 step 5).
 
-        Strip angle brackets, prepend ``sip:`` if no scheme, drop URI
-        parameters / headers and the default port.
+        Strip angle brackets, prepend ``sip:`` if no scheme, drop the URI
+        parameters / headers that follow the host, lowercase scheme and host,
+        decode escapes of unreserved characters in the user part (reserved
+        ones stay escaped, hex uppercased) and keep every port: RFC 3261
+        §19.1.4 says ``sip:bob@host`` and ``sip:bob@host:5060`` differ.
         """
         s = str(uri).strip().lstrip("<").rstrip(">")
-        if not (s.startswith("sip:") or s.startswith("sips:")):
-            s = f"sip:{s}"
-        s = s.split(";", 1)[0].split("?", 1)[0]
-        if s.startswith("sips:") and s.endswith(":5061"):
-            s = s[:-5]
-        elif s.startswith("sip:") and s.endswith(":5060"):
-            s = s[:-5]
-        return s
+        lowered = s.lower()
+        if lowered.startswith("sips:"):
+            scheme, rest = "sips:", s[5:]
+        elif lowered.startswith("sip:"):
+            scheme, rest = "sip:", s[4:]
+        else:
+            scheme, rest = "sip:", s
+        user, at, host = rest.rpartition("@")
+        host = host.split(";", 1)[0].split("?", 1)[0].lower()
+        if not at:
+            return f"{scheme}{host}"
+        return f"{scheme}{_unescape_aor_user(user)}@{host}"
 
     def _resolve_alias(self, aor: str) -> str:
         return self._aliases.get(aor, aor)
@@ -4021,11 +4054,16 @@ class MockRegistrar:
             has that contact.
         """
         def device(text: str) -> str:
-            # RFC 3261 §19.1.4: the host compares case-insensitively, the
-            # user does not.
+            # Mirrors `same_contact` in src/registrar/mod.rs: scheme, user and
+            # host (case-insensitively) and port, a missing port equal to the
+            # scheme's default. This matches a device's contact address, which
+            # is looser than the AoR key (RFC 3261 §19.1.4 keeps every port
+            # there), so the default port is folded here explicitly.
             normalized = self._normalize_aor(text)
-            user, at, host = normalized.rpartition("@")
-            return f"{user}{at}{host.lower()}" if at else normalized.lower()
+            default = ":5061" if normalized.startswith("sips:") else ":5060"
+            if normalized.endswith(default):
+                normalized = normalized[: -len(default)]
+            return normalized
 
         target = device(str(uri))
         matches = [

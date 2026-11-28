@@ -378,9 +378,12 @@ mod tests {
             identity_of("<sip:15550100077@example.com;user=phone>"),
             ("sip:15550100077@example.com;user=phone".to_string(), None)
         );
+        // Keyed like the registrar (RFC 3261 §19.1.4): host case folds, the
+        // port is part of the URI.
+        assert_eq!(aor_of("<sip:201@EXAMPLE.com>;tag=x"), "sip:201@example.com");
         assert_eq!(
             aor_of("<sip:201@example.com:5060>;tag=x"),
-            "sip:201@example.com"
+            "sip:201@example.com:5060"
         );
     }
 

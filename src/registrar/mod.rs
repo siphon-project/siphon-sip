@@ -61,12 +61,20 @@ pub enum RegistrationEvent {
 /// Typically `sip:user@domain`.
 pub type Aor = String;
 
-/// Normalize a URI string to canonical AoR form.
+/// Normalize a URI string to canonical AoR form (RFC 3261 §10.3 step 5).
 ///
 /// - Strip surrounding angle brackets.
-/// - If the input doesn't start with `sip:` or `sips:`, prepend `sip:`.
-/// - Strip URI parameters (`;…`) and headers (`?…`).
-/// - Strip the default port (`:5060` for sip, `:5061` for sips).
+/// - If the input has no `sip:`/`sips:` scheme, prepend `sip:`.
+/// - Remove URI parameters (`;…`) and headers (`?…`) that follow the host. A
+///   `;` inside the user part (a telephone-subscriber's `phone-context`,
+///   §25.1) belongs to the user and stays.
+/// - Lowercase the scheme and the host (§19.1.4 compares them
+///   case-insensitively); the user part stays case-sensitive.
+/// - Decode `%HH` escapes of unreserved characters in the user part; §19.1.4
+///   makes only characters outside the reserved set equal to their escaped
+///   form, so reserved and control escapes stay escaped, hex uppercased.
+/// - Keep the port, every port: §19.1.4 says a URI omitting the port does not
+///   match one that declares it, not even the default 5060.
 ///
 /// The same canonicalization is applied at the Python API boundary and
 /// when populating the alias index, so both writes and reads of an AoR
@@ -80,33 +88,98 @@ pub fn normalize_aor(uri: &str) -> Aor {
 /// Every registrar key is stored canonicalised, so this runs on the lookup path
 /// as well as the write path — and the input is almost always already canonical
 /// there, because the scripting API canonicalises at its own boundary. Trimming
-/// in place and only allocating for the one case that needs it (a scheme to
-/// prepend) keeps a lookup free of the four `String`s the all-owned form built
-/// and threw away.
+/// in place and only allocating when something has to be rewritten (a scheme to
+/// prepend or lowercase, an uppercase host, an escape) keeps a lookup free of
+/// allocations.
 pub fn normalize_aor_cow(uri: &str) -> std::borrow::Cow<'_, str> {
     let uri = uri.trim_start_matches('<').trim_end_matches('>');
 
-    // The scheme decides which port counts as default, so read it before any
-    // trimming that could remove it.
-    let sips = uri.starts_with("sips:");
-    let has_scheme = sips || uri.starts_with("sip:");
-
-    // Parameters and headers are not part of the identity.
-    let uri = uri.split(';').next().unwrap_or(uri);
-    let uri = uri.split('?').next().unwrap_or(uri);
-
-    // Nor is a default port — but only the port that is default *for this
-    // scheme*, so `sip:…:5061` and `sips:…:5060` are explicit and survive.
-    let uri = if sips {
-        uri.trim_end_matches(":5061")
-    } else {
-        uri.trim_end_matches(":5060")
+    let (scheme, rest) = split_aor_scheme(uri);
+    // The userinfo ends at the last `@`: `@` may appear in neither a URI
+    // parameter nor a header unescaped, so a later one cannot exist.
+    let (user, host_and_more) = match rest.rfind('@') {
+        Some(at) => (Some(&rest[..at]), &rest[at + 1..]),
+        None => (None, rest),
     };
+    // Parameters and headers are not part of the identity.
+    let hostport = host_and_more
+        .split([';', '?'])
+        .next()
+        .unwrap_or(host_and_more);
 
-    if has_scheme {
-        std::borrow::Cow::Borrowed(uri)
-    } else {
-        std::borrow::Cow::Owned(format!("sip:{uri}"))
+    let canonical_scheme = matches!(scheme, Some("sip" | "sips"));
+    let canonical_host = !hostport.bytes().any(|byte| byte.is_ascii_uppercase());
+    let canonical_user = user.is_none_or(|user| !user.contains('%'));
+    if canonical_scheme && canonical_host && canonical_user {
+        // Everything kept is one prefix of the input: scheme, user, host.
+        let kept = uri.len() - host_and_more.len() + hostport.len();
+        return std::borrow::Cow::Borrowed(&uri[..kept]);
+    }
+
+    let mut canonical = String::with_capacity(uri.len() + 4);
+    canonical.push_str(match scheme {
+        Some(scheme) if scheme.eq_ignore_ascii_case("sips") => "sips:",
+        _ => "sip:",
+    });
+    if let Some(user) = user {
+        push_unescaped_user(&mut canonical, user);
+        canonical.push('@');
+    }
+    canonical.extend(
+        hostport
+            .chars()
+            .map(|character| character.to_ascii_lowercase()),
+    );
+    std::borrow::Cow::Owned(canonical)
+}
+
+/// Split a `sip:`/`sips:` scheme (any case) off an AoR. Returns the scheme as
+/// written and the rest; no scheme yields `None` and the whole input.
+fn split_aor_scheme(uri: &str) -> (Option<&str>, &str) {
+    for scheme in ["sips", "sip"] {
+        let prefix_length = scheme.len() + 1;
+        if uri.len() >= prefix_length
+            && uri.as_bytes()[scheme.len()] == b':'
+            && uri[..scheme.len()].eq_ignore_ascii_case(scheme)
+        {
+            return (Some(&uri[..scheme.len()]), &uri[prefix_length..]);
+        }
+    }
+    (None, uri)
+}
+
+/// Append `user` with every escape of an unreserved character decoded
+/// (RFC 3261 §19.1.4; unreserved = alphanum / mark, §25.1). Any other
+/// well-formed escape stays escaped with its hex uppercased, so `%2f` and
+/// `%2F` key the same; a malformed `%` is copied as written.
+fn push_unescaped_user(canonical: &mut String, user: &str) {
+    let bytes = user.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let high = (bytes[index + 1] as char).to_digit(16);
+            let low = (bytes[index + 2] as char).to_digit(16);
+            if let (Some(high), Some(low)) = (high, low) {
+                let decoded = (high * 16 + low) as u8;
+                if decoded.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&decoded) {
+                    canonical.push(decoded as char);
+                } else {
+                    canonical.push('%');
+                    canonical.push(bytes[index + 1].to_ascii_uppercase() as char);
+                    canonical.push(bytes[index + 2].to_ascii_uppercase() as char);
+                }
+                index += 3;
+                continue;
+            }
+        }
+        // Copy up to the next `%` in one go; the slice boundaries are ASCII
+        // `%` bytes, so they are always char boundaries.
+        let next = bytes[index + 1..]
+            .iter()
+            .position(|&byte| byte == b'%')
+            .map_or(bytes.len(), |offset| index + 1 + offset);
+        canonical.push_str(&user[index..next]);
+        index = next;
     }
 }
 
@@ -3875,14 +3948,24 @@ mod tests {
             "sip:alice@example.com",
             "alice@example.com",
             "<sip:alice@example.com>",
-            "sip:alice@example.com:5060",
             "sip:alice@example.com;transport=tcp",
+            "SIP:alice@EXAMPLE.COM",
+            "sip:%61lice@example.com",
         ] {
             assert!(
                 registrar.is_registered(form),
                 "{form} should resolve to the stored binding"
             );
             assert_eq!(registrar.lookup(form).len(), 1, "{form} should find it");
+        }
+        // RFC 3261 §19.1.4: an explicit port, even the default one, names a
+        // different URI than the binding registered without it.
+        for form in ["sip:alice@example.com:5060", "sip:alice@example.com:5070"] {
+            assert!(
+                !registrar.is_registered(form),
+                "{form} must not match a binding registered without a port"
+            );
+            assert!(registrar.lookup(form).is_empty(), "{form} must not find it");
         }
     }
 
@@ -3925,12 +4008,42 @@ mod tests {
             ("sips:alice@example.com", "sips:alice@example.com"),
             ("alice@example.com", "sip:alice@example.com"),
             ("<sip:alice@example.com>", "sip:alice@example.com"),
-            // The scheme's own default port is not part of the identity...
-            ("sip:alice@example.com:5060", "sip:alice@example.com"),
-            ("sips:alice@example.com:5061", "sips:alice@example.com"),
-            // ...but the *other* scheme's default port is explicit, and stays.
+            // RFC 3261 §19.1.4: a URI omitting the port does not match one that
+            // declares it, not even the default 5060. Every port stays.
+            ("sip:alice@example.com:5060", "sip:alice@example.com:5060"),
+            ("sips:alice@example.com:5061", "sips:alice@example.com:5061"),
             ("sip:alice@example.com:5061", "sip:alice@example.com:5061"),
             ("sips:alice@example.com:5060", "sips:alice@example.com:5060"),
+            ("sip:alice@example.com:5070", "sip:alice@example.com:5070"),
+            // §19.1.4: scheme and host compare case-insensitively, the user part
+            // case-sensitively.
+            ("SIP:alice@EXAMPLE.com", "sip:alice@example.com"),
+            ("Sips:alice@Example.COM", "sips:alice@example.com"),
+            ("sip:Alice@example.com", "sip:Alice@example.com"),
+            (
+                "sip:alice@[2001:DB8::1]:5070",
+                "sip:alice@[2001:db8::1]:5070",
+            ),
+            // §10.3 step 5 unescapes; §19.1.4 makes only characters outside the
+            // reserved set equal to their %HH form. Unreserved escapes decode,
+            // reserved and control ones stay escaped with the hex uppercased.
+            ("sip:%61lice@example.com", "sip:alice@example.com"),
+            (
+                "sip:alice%2dsmith@example.com",
+                "sip:alice-smith@example.com",
+            ),
+            ("sip:alice%2fbob@example.com", "sip:alice%2Fbob@example.com"),
+            ("sip:alice%40bob@example.com", "sip:alice%40bob@example.com"),
+            ("sip:a%00b@example.com", "sip:a%00b@example.com"),
+            // A malformed escape is left as written rather than guessed at.
+            ("sip:a%zzb@example.com", "sip:a%zzb@example.com"),
+            ("sip:ab%2@example.com", "sip:ab%2@example.com"),
+            // §25.1: the user part may itself contain `;` (a telephone-subscriber's
+            // phone-context). Only parameters after the host are removed.
+            (
+                "sip:+15551234567;phone-context=ims.example.com@ims.example.com;user=phone",
+                "sip:+15551234567;phone-context=ims.example.com@ims.example.com",
+            ),
             (
                 "sip:alice@example.com;transport=tcp",
                 "sip:alice@example.com",
@@ -3940,10 +4053,10 @@ mod tests {
                 "sip:alice@example.com;transport=tcp?h=1",
                 "sip:alice@example.com",
             ),
-            ("alice@example.com:5060", "sip:alice@example.com"),
+            ("alice@example.com:5060", "sip:alice@example.com:5060"),
             (
                 "<sip:alice@example.com:5060;transport=tcp>",
-                "sip:alice@example.com",
+                "sip:alice@example.com:5060",
             ),
             (
                 "sip:+15551234567@ims.example.com",
@@ -3978,7 +4091,16 @@ mod tests {
             Cow::Borrowed(_)
         ));
         assert!(matches!(
+            normalize_aor_cow("sip:alice@example.com:5070"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
             normalize_aor_cow("alice@example.com"),
+            Cow::Owned(_)
+        ));
+        // Only input that is actually rewritten allocates.
+        assert!(matches!(
+            normalize_aor_cow("sip:alice@Example.com"),
             Cow::Owned(_)
         ));
     }
@@ -6001,10 +6123,14 @@ mod tests {
         );
         assert_eq!(
             registrar
-                .registered_aor("<sip:201@example.com:5060>")
+                .registered_aor("<sip:201@example.com;transport=udp>")
                 .as_deref(),
             Some("sip:201@example.com")
         );
+        // RFC 3261 §19.1.4: an explicit port names a different URI.
+        assert!(registrar
+            .registered_aor("<sip:201@example.com:5060>")
+            .is_none());
         assert!(registrar.registered_aor("sip:202@example.com").is_none());
 
         registrar.set_associated_uris(
