@@ -353,6 +353,27 @@ impl Call {
     /// The callee hangs up: a BYE in the dialog its 2xx created, handed to
     /// [`handle_b2bua_bye`] the way the dispatcher's B2BUA gate hands it over.
     pub(super) fn callee_hangs_up(&self) {
+        let raw = self.callee_bye();
+        let message = parse_sip_message_bytes(raw.as_bytes()).expect("the callee's BYE parses");
+        handle_b2bua_bye(inbound_from_callee(raw), message, &self.state);
+    }
+
+    /// The callee hangs up through [`handle_request`], so a resend of its BYE
+    /// meets the server transaction layer the way one off the wire does.
+    pub(super) fn callee_hangs_up_through_the_dispatcher(&self) {
+        let raw = self.callee_bye();
+        let message = parse_sip_message_bytes(raw.as_bytes()).expect("the callee's BYE parses");
+        handle_request(
+            inbound_from_callee(raw),
+            message,
+            "BYE".to_string(),
+            &self.state,
+        );
+    }
+
+    /// The callee's BYE in the dialog its 2xx created. The same branch every
+    /// time, so a second one is a retransmission (RFC 3261 §17.2.3).
+    fn callee_bye(&self) -> String {
         let header = |name: &str| {
             self.invite
                 .headers
@@ -360,7 +381,7 @@ impl Call {
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| panic!("siphon's INVITE has no {name}"))
         };
-        let raw = format!(
+        format!(
             concat!(
                 "BYE sip:192.0.2.1:5060;transport=udp SIP/2.0\r\n",
                 "Via: SIP/2.0/UDP 198.51.100.77:5060;branch=z9hG4bK-callee-bye\r\n",
@@ -375,20 +396,7 @@ impl Call {
             from = header("To"),
             to = header("From"),
             call_id = header("Call-ID"),
-        );
-        let message = parse_sip_message_bytes(raw.as_bytes()).expect("the callee's BYE parses");
-        handle_b2bua_bye(
-            InboundMessage {
-                client_transport: None,
-                connection_id: ConnectionId::default(),
-                transport: Transport::Udp,
-                local_addr: "192.0.2.1:5060".parse().expect("a literal address"),
-                remote_addr: callee(),
-                data: Bytes::from(raw),
-            },
-            message,
-            &self.state,
-        );
+        )
     }
 
     fn callee_leg_acked(&self) -> bool {
@@ -479,6 +487,18 @@ fn acks(sent: &[Sent]) -> Vec<&Sent> {
 pub(super) fn request_line(message: &SipMessage) -> String {
     let text = String::from_utf8(message.to_bytes()).expect("serialized SIP is UTF-8");
     text.split("\r\n").next().expect("a start line").to_string()
+}
+
+/// `raw` as it arrives from the callee.
+fn inbound_from_callee(raw: String) -> InboundMessage {
+    InboundMessage {
+        client_transport: None,
+        connection_id: ConnectionId::default(),
+        transport: Transport::Udp,
+        local_addr: "192.0.2.1:5060".parse().expect("a literal address"),
+        remote_addr: callee(),
+        data: Bytes::from(raw),
+    }
 }
 
 pub(super) fn caller() -> SocketAddr {

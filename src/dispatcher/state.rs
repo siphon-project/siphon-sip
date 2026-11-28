@@ -419,6 +419,11 @@ pub struct DispatcherState {
     /// a second time — see [`AnsweredReferStore`]. Empty except for that long
     /// after a REFER.
     pub answered_refers: Arc<AnsweredReferStore>,
+    /// The 200 each B2BUA BYE was answered with over UDP, kept for Timer J so a
+    /// resend is answered again instead of 481 once the call is gone (RFC 3261
+    /// §17.2.2) — see [`AnsweredByeStore`]. Empty except for that long after a
+    /// hangup.
+    pub answered_byes: Arc<AnsweredByeStore>,
     /// REFER subscriptions on *controlled* B2BUA calls whose transfer the owning
     /// control app carries out itself (`accept_refer` in mode `controller`),
     /// open until it reports with `complete_refer` — see

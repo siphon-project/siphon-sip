@@ -494,6 +494,14 @@ pub(super) fn handle_request_after_queue(
         return;
     }
 
+    // A resend of a B2BUA BYE already answered (its 200 lost on UDP) gets that
+    // answer again (RFC 3261 §17.2.2). Ahead of the tombstone 481 below: the
+    // call the BYE ended is torn down by now, and a resend is not a new request
+    // on it.
+    if method == "BYE" && answer_bye_retransmission(&inbound, &message, state) {
+        return;
+    }
+
     // In-dialog request for a B2BUA call this node already tore down: 481 rather
     // than a silent drop (see `terminated_dialog_needs_481` for the why). Runs
     // ahead of the B2BUA intercepts below so a re-INVITE for a dead call is also

@@ -43,8 +43,9 @@ struct AnsweredRefer {
 }
 
 /// The identity a request shares with its retransmissions and its responses.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RequestIdentity {
+/// Also the key of [`AnsweredByeStore`](super::bye_answered::AnsweredByeStore).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct RequestIdentity {
     sip_call_id: String,
     cseq: String,
     branch: String,
@@ -53,7 +54,7 @@ struct RequestIdentity {
 impl RequestIdentity {
     /// Read off a request, or off a response to it: a response echoes all
     /// three (RFC 3261 §8.2.6.2). `None` for a message missing any of them.
-    fn of(message: &SipMessage) -> Option<Self> {
+    pub(super) fn of(message: &SipMessage) -> Option<Self> {
         Some(Self {
             sip_call_id: message.headers.call_id()?.clone(),
             cseq: message
