@@ -432,6 +432,8 @@ pub struct SiphonMetrics {
     pub registrant_source_last_success_timestamp_seconds: IntGauge,
     /// Registrant-source reads that failed.
     pub registrant_source_failures_total: IntCounter,
+    /// Trunks dropped because their `hold_secs` ran out with the source unreadable.
+    pub registrant_source_standdowns_total: IntCounter,
 
     // --- Security / abuse (failed_auth_ban scanner protection) ---
     /// Source IPs currently auto-banned. Pruned periodically; trusted_cidrs are
@@ -969,6 +971,10 @@ impl SiphonMetrics {
             "siphon_registrant_source_failures_total",
             "Total failed reads of the registrant.backend source",
         )?;
+        let registrant_source_standdowns_total = IntCounter::new(
+            "siphon_registrant_source_standdowns_total",
+            "Trunks that stopped registering because the registrant.backend source stayed unreadable past their hold_secs (nothing is sent)",
+        )?;
 
         let banned_ips = IntGauge::new(
             "siphon_banned_ips",
@@ -1385,6 +1391,7 @@ impl SiphonMetrics {
             registrant_source_last_success_timestamp_seconds.clone(),
         ))?;
         registry.register(Box::new(registrant_source_failures_total.clone()))?;
+        registry.register(Box::new(registrant_source_standdowns_total.clone()))?;
         registry.register(Box::new(banned_ips.clone()))?;
         registry.register(Box::new(auth_failures_total.clone()))?;
         registry.register(Box::new(handshake_failures_total.clone()))?;
@@ -1479,6 +1486,7 @@ impl SiphonMetrics {
             gateway_source_failures_total,
             registrant_source_last_success_timestamp_seconds,
             registrant_source_failures_total,
+            registrant_source_standdowns_total,
             banned_ips,
             auth_failures_total,
             handshake_failures_total,

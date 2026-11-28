@@ -88,7 +88,9 @@ registers from the same `(local_addr, ue_port_c)`, for a `local_addr` on a
 
 States are `unregistered`, `registering`, `challenging`, `registered`,
 `failed` and `awaiting_address`. `@registration.on_change` gets
-`awaiting_address` as an `event_type` when an entry loses its address.
+`awaiting_address` as an `event_type` when an entry loses its address, and
+`stood_down` when a source's trunk stops registering because its `hold_secs`
+ran out with the source unreadable (no REGISTER is sent).
 
 Limits:
 

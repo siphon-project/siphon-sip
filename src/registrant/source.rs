@@ -87,6 +87,19 @@ pub struct RegistrantRow {
     /// see `gateway.backend`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<String>,
+    /// How long, in seconds, this node may keep refreshing the trunk after it
+    /// last read this row, once the source has become unreadable. Past it the
+    /// node stops registering the trunk without sending a REGISTER: the
+    /// controller can no longer say whether another node holds the lease now,
+    /// and a refresh from a node that lost it steals the binding at a registrar
+    /// that keeps one per AoR. Absent keeps the trunk registered however long
+    /// the outage; `0` stands down on the first failed read. A negative value
+    /// is a malformed row.
+    ///
+    /// Signed on the wire so that a negative value rejects its own row rather
+    /// than the whole list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_secs: Option<i64>,
 }
 
 fn default_contract_version() -> String {
@@ -121,6 +134,10 @@ pub struct DesiredRegistrant {
     pub contact: Option<String>,
     pub transport: String,
     pub gateway: Option<String>,
+    /// See [`RegistrantRow::hold_secs`]. Not part of the
+    /// [fingerprint](Self::fingerprint): it changes when this node stops
+    /// registering, not what it registers.
+    pub hold_secs: Option<u32>,
 }
 
 impl DesiredRegistrant {
@@ -152,6 +169,12 @@ impl DesiredRegistrant {
                 &row.transport,
             ));
         }
+        let hold_secs = match row.hold_secs {
+            None => None,
+            Some(seconds) => Some(u32::try_from(seconds).map_err(|_| {
+                format!("`hold_secs` {seconds} is out of range (0 to {})", u32::MAX)
+            })?),
+        };
         Ok(Some(Self {
             aor: row.aor.trim().to_string(),
             registrar: row.registrar.trim().to_string(),
@@ -162,6 +185,7 @@ impl DesiredRegistrant {
             contact: row.contact.clone(),
             transport,
             gateway: row.gateway.clone(),
+            hold_secs,
         }))
     }
 
@@ -169,7 +193,10 @@ impl DesiredRegistrant {
     ///
     /// This is what stops a poll from re-REGISTERing the whole estate every
     /// cycle: an entry whose fingerprint is unchanged is left completely
-    /// alone, Call-ID, CSeq and refresh timer included.
+    /// alone, Call-ID, CSeq and refresh timer included. `hold_secs` is left
+    /// out on purpose: a change of it alone must not re-REGISTER the trunk, so
+    /// [`RegistrantManager::set_source_hold`](super::RegistrantManager::set_source_hold)
+    /// applies it in place.
     pub fn fingerprint(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         self.aor.hash(&mut hasher);
@@ -291,6 +318,7 @@ pub fn entry_from_desired(
         desired.contact.clone(),
     )
     .from_source(desired.fingerprint());
+    entry.hold_secs = desired.hold_secs;
 
     // Only a hostname gets re-resolved on failure; a literal has nothing to
     // re-resolve to.
@@ -652,6 +680,7 @@ mod postgres {
             transport: text(row, "transport").unwrap_or_else(|| "udp".to_string()),
             enabled: boolean(row, "enabled").unwrap_or(true),
             gateway: text(row, "gateway"),
+            hold_secs: integer(row, "hold_secs"),
         }
     }
 
@@ -715,7 +744,16 @@ pub async fn reconcile_once(
     if manager.is_shutting_down() {
         return Ok(ReconcileReport::default());
     }
-    let rows = source.fetch().await?;
+    let rows = match source.fetch().await {
+        Ok(rows) => rows,
+        Err(error) => {
+            // Stands down every trunk whose hold has run out, here rather than
+            // in the poll loop so the admin refresh reaches it too.
+            manager.record_source_unreadable();
+            return Err(error);
+        }
+    };
+    manager.record_source_read();
 
     let mut desired = Vec::with_capacity(rows.len());
     let mut report = ReconcileReport::default();
@@ -749,6 +787,12 @@ pub async fn reconcile_once(
         }
         true
     });
+
+    // A hold alone changes nothing a registrar sees, so it is applied in place
+    // and never reaches `reconcile`.
+    for entry in &desired {
+        manager.set_source_hold(&entry.aor, entry.hold_secs);
+    }
 
     let live = manager.source_fingerprints();
     let actions = reconcile(&desired, &live);
@@ -954,6 +998,7 @@ mod tests {
             transport: "udp".to_string(),
             enabled: true,
             gateway: None,
+            hold_secs: None,
         }
     }
 
@@ -1074,6 +1119,32 @@ mod tests {
                 .expect("enabled")
                 .fingerprint()
         );
+    }
+
+    #[test]
+    fn hold_secs_is_carried_but_is_not_part_of_the_fingerprint() {
+        // A change of it alone must not re-REGISTER the trunk.
+        let base = desired("sip:a@carrier.example");
+        assert_eq!(base.hold_secs, None);
+        for (value, expected) in [(0, 0), (90, 90)] {
+            let mut held = row("sip:a@carrier.example");
+            held.hold_secs = Some(value);
+            let entry = DesiredRegistrant::from_row(&held)
+                .expect("valid")
+                .expect("enabled");
+            assert_eq!(entry.hold_secs, Some(expected));
+            assert_eq!(entry.fingerprint(), base.fingerprint());
+        }
+    }
+
+    #[test]
+    fn a_negative_or_oversized_hold_secs_rejects_the_row() {
+        for value in [-1, i64::from(u32::MAX) + 1] {
+            let mut bad = row("sip:a@carrier.example");
+            bad.hold_secs = Some(value);
+            let error = DesiredRegistrant::from_row(&bad).expect_err("out of range");
+            assert!(error.contains("`hold_secs`"), "{error}");
+        }
     }
 
     #[test]
