@@ -13,6 +13,10 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- B2BUA: a resent BYE is answered with the 200 the original BYE got (RFC 3261 §17.2.2). When that 200 was lost on UDP, the peer's retransmitted BYE was handled as a new request after the call was gone and answered `481`, so a cleanly ended call showed up as a failed hangup at the peer (a few calls per thousand on a link with 0.3 % loss). The encoded 200 is now kept for Timer J (64*T1, UDP only) and sent again to each resend, and the teardown is not run twice. A BYE that matched no call is still answered `481` and is not kept.
+
 ## [1.21.0] — 2026-11-28
 
 ### Added

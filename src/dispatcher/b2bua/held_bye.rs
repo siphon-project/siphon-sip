@@ -307,14 +307,7 @@ pub fn answer_caller_bye_for_held_dialog(
         state.identity.load().server.as_deref(),
         &[],
     );
-    send_message_from(
-        response,
-        inbound.transport,
-        inbound.remote_addr,
-        inbound.connection_id,
-        Some(inbound.local_addr),
-        state,
-    );
+    answer_bye(response, message, inbound, state);
     true
 }
 

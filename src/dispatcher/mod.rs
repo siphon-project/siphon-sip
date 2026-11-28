@@ -121,6 +121,8 @@ mod answer_after_preview_tests;
 #[cfg(test)]
 mod async_request_handler_tests;
 #[cfg(test)]
+mod b2bua_bye_retransmission_tests;
+#[cfg(test)]
 mod b2bua_conclude_once_tests;
 #[cfg(test)]
 mod b2bua_invite_filter_tests;
@@ -935,6 +937,7 @@ pub async fn run(
         cdr_sessions: Arc::new(DashMap::new()),
         pending_inbound_refer: Arc::new(PendingInboundReferStore::default()),
         answered_refers: Arc::new(AnsweredReferStore::default()),
+        answered_byes: Arc::new(AnsweredByeStore::default()),
         controller_refers: Arc::new(ControllerReferStore::default()),
         deferred_referrer_bye: Arc::new(DeferredReferrerByeStore::default()),
         parse_error_log: Arc::new(ParseErrorLimiter::default()),

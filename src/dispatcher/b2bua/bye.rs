@@ -109,14 +109,7 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
             state.identity.load().server.as_deref(),
             &[],
         );
-        send_message_from(
-            bye_response,
-            inbound.transport,
-            inbound.remote_addr,
-            inbound.connection_id,
-            Some(inbound.local_addr),
-            state,
-        );
+        answer_bye(bye_response, &message, &inbound, state);
         info!(
             call_id = %call_id,
             referrer_on_a_leg = from_a_leg,
@@ -137,14 +130,7 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
             state.identity.load().server.as_deref(),
             &[],
         );
-        send_message_from(
-            bye_response,
-            inbound.transport,
-            inbound.remote_addr,
-            inbound.connection_id,
-            Some(inbound.local_addr),
-            state,
-        );
+        answer_bye(bye_response, &message, &inbound, state);
         debug!(call_id = %call_id, "B2BUA BYE: the call is already being torn down — answered");
         return;
     }
@@ -295,14 +281,7 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
         state.identity.load().server.as_deref(),
         &[],
     );
-    send_message_from(
-        bye_response,
-        inbound.transport,
-        inbound.remote_addr,
-        inbound.connection_id,
-        Some(inbound.local_addr),
-        state,
-    );
+    answer_bye(bye_response, &message, &inbound, state);
 
     // A fresh BYE for the other leg, built from its own dialog state — a B2BUA
     // MUST NOT forward the BYE it received: Call-ID and tags, From host (topology
