@@ -257,6 +257,12 @@ async fn a_refused_peer_fails_fast_then_recovers_after_the_window() {
     pool.send_tcp(peer, ping())
         .await
         .expect("the first send after the window connects");
+    // The kernel completes the connect from the listen backlog before the
+    // accept thread runs, so the count can lag the send by a scheduling slot.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while accepted.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
     assert_eq!(
         pool.connect_state_len(),
