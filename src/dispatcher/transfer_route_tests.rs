@@ -240,26 +240,28 @@ async fn a_bye_on_the_new_leg_follows_the_2xx_record_route() {
     });
 }
 
-/// With no Record-Route in the 2xx the leg has no route set: the BYE is
-/// addressed to the Contact (the remote target, RFC 3261 §12.2.1.1) and carries
-/// no Route, so the preloaded route was not stored as the dialog's. With an
-/// empty route set the send falls back to the leg's established peer, the first
-/// hop its INVITE went to, which is the same for a `dial` leg.
+/// With no Record-Route in the 2xx the leg has no route set, and its INVITE went
+/// to a preloaded route first: the BYE is addressed to the Contact, the remote
+/// target (RFC 3261 §12.2.1.1), and carries no Route, so the preloaded route was
+/// not stored as the dialog's. (This pinned the INVITE's first hop as the BYE's
+/// destination before proxy-first legs resolved the Contact.)
 #[tokio::test(flavor = "multi_thread")]
-async fn without_a_record_route_the_bye_is_addressed_to_the_contact_with_no_route() {
+async fn without_a_record_route_the_bye_goes_to_the_contact_with_no_route() {
+    const CONTACT_ADDRESS: &str = "203.0.113.88:5099";
     each_verb(9940, |verb, call, place| {
-        let invite = place(call, &preloaded(), None);
-        let first_hop = invite.destination.clone();
-        let to_c = invite.message;
-        let answered = answer(&to_c, call.c.1, "c-tag");
+        let to_c = place(call, &preloaded(), None).message;
+        let mut answered = answer(&to_c, call.c.1, "c-tag");
+        answered
+            .headers
+            .set("Contact", format!("<sip:phone@{CONTACT_ADDRESS}>"));
         let bye = bye_on_new_leg(call, &to_c, answered);
         assert_eq!(
             request_uri(&bye.message),
-            format!("sip:phone@{}", call.c.1),
+            format!("sip:phone@{CONTACT_ADDRESS}"),
             "{verb}"
         );
         assert!(route_headers(&bye.message).is_empty(), "{verb}");
-        assert_eq!(bye.destination, first_hop, "{verb}");
+        assert_eq!(bye.destination, CONTACT_ADDRESS, "{verb}");
     });
 }
 
@@ -331,5 +333,30 @@ async fn a_route_header_in_headers_does_not_replace_the_route_set() {
             [TOP_ENTRY, SECOND_ENTRY],
             "{verb}"
         );
+    });
+}
+
+/// The winning 2xx that carries no Record-Route leaves the dialog no route set
+/// (RFC 3261 §12.1.2): a route set an early dialog's reliable provisional put on
+/// the target leg does not survive it. (Main kept it on the transfer path, where
+/// the ordinary answer path clears it.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_winning_2xx_with_no_record_route_clears_an_early_route_set() {
+    each_verb(10120, |verb, call, place| {
+        let to_c = place(call, &preloaded(), None).message;
+        let branch = super::lcr_ring_timeout_tests::top_via_branch(&to_c);
+        call.dispatcher
+            .state
+            .call_actors
+            .get_call_mut(&call.call_id())
+            .expect("the call")
+            .find_b_leg_by_branch_mut(&branch)
+            .expect("the target leg")
+            .1
+            .dialog
+            .route_set = vec!["<sip:198.51.100.222:5099;lr>".to_string()];
+        let answered = answer(&to_c, call.c.1, "c-tag");
+        let bye = bye_on_new_leg(call, &to_c, answered);
+        assert!(route_headers(&bye.message).is_empty(), "{verb}");
     });
 }

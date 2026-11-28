@@ -591,8 +591,23 @@ pub fn feed_leg_actor_and_learn_dialog(
     // position it remembered.
     if (200..300).contains(&status_code) && snapshot.matched_b_leg {
         if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-            if let Some((_, b_leg)) = call.find_b_leg_by_branch_mut(&snapshot.branch) {
-                if let Some(to_tag) = crate::b2bua::actor::extract_to_tag(message) {
+            let winner = call.winner;
+            if let Some((index, b_leg)) = call.find_b_leg_by_branch_mut(&snapshot.branch) {
+                let to_tag = crate::b2bua::actor::extract_to_tag(message);
+                // Once the leg has answered, its dialog is the one that 2xx
+                // established: another dialog's 2xx (a proxy that forked the
+                // INVITE) is ACKed on its own account and writes none of its
+                // identity onto the leg, or a later BYE names two dialogs.
+                if winner == Some(index)
+                    && b_leg
+                        .dialog
+                        .remote_tag
+                        .as_deref()
+                        .is_some_and(|adopted| Some(adopted) != to_tag.as_deref())
+                {
+                    return;
+                }
+                if let Some(to_tag) = to_tag {
                     // Splice the to-tag into remote_to_uri so in-dialog
                     // requests (UPDATE, re-INVITE, BYE) toward this leg
                     // can build a proper tagged To: header (RFC 3261

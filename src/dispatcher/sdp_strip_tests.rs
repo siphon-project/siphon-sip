@@ -483,7 +483,8 @@ pub(super) fn dial_callee(dispatcher: &TestDispatcher, call_id: &str, invite: &S
             None,
             None,
             &[],
-            &dispatcher.state,
+            false,
+            &dispatcher.state
         ),
         "the callee was not dialled"
     );

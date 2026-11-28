@@ -97,6 +97,7 @@ fn dial(lab: &Lab, flow: &crate::script::api::registrar::PyFlow, invite: &SipMes
             None,
             None,
             &[],
+            false,
             &lab.state,
         )
     })
