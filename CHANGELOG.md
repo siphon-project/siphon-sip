@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.21.0] — 2026-11-28
+
 ### Added
 
 - Control plane: a `{uri}` target of `accept_refer` (mode `terminate`) and `replace_peer` takes `route`, the route set the transfer's new leg carries, in the shape and under the rules of a `dial` target's `route` (an array of name-addr Route entries, topmost first, `bad_request` for an entry that is not exactly one). The leg's first INVITE carries exactly those Route headers and goes to the topmost entry unless `next_hop` pins it; the leg's own route set is still the 2xx's Record-Route (RFC 3261 §12.1.2). This is how an application server sends a transfer's new leg back through the S-CSCF with the Route it was given (TS 24.229 §5.7.5). A `route` beside an `{aor}` target, or with `mode: "transparent"` or `"controller"`, which dial no leg, is `bad_request`. Previously the key was dropped without a word. The Rust, Python and TypeScript control SDKs take it (`TransferTarget::uri_routed`, `route=`, `{ uri, route }`). **Breaking for the Rust control client:** `TransferTarget` gains the `UriRouted` variant and is now `#[non_exhaustive]`, so an exhaustive `match` on it needs a wildcard arm; minor bump.
