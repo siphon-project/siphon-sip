@@ -1128,6 +1128,20 @@ async fn a_live_entry_takes_over_a_binding_on_its_own_tokened_contact() {
     assert_eq!(report.deregistered, 0);
 }
 
+/// A stored Call-ID a stand-down retired is not taken over by a live entry.
+#[tokio::test]
+async fn a_live_entry_does_not_take_over_a_call_id_a_stand_down_retired() {
+    let (manager, _store) = token_manager("node-a");
+    manager.add(trunk(AOR));
+    let own = test_support::call_id(&manager, AOR).expect("a call id");
+    manager.retire_call_id("reg-before-the-kill");
+
+    let report = cleanup_of(&manager, &tokened("node-a", "203.0.113.10:5060"));
+
+    assert_eq!(report.carried, 0);
+    assert_eq!(test_support::call_id(&manager, AOR), Some(own));
+}
+
 // ---------------------------------------------------------------------------
 // Contacts compared as SIP URIs (RFC 3261 §19.1.4), token case
 // ---------------------------------------------------------------------------

@@ -96,3 +96,17 @@ def test_a_lookup_answers_one_row_even_when_the_trunk_is_disabled():
 
 def test_a_lookup_of_an_unknown_aor_is_no_body():
     assert lookup_response(None) is None
+
+
+def test_hold_secs_defaults_to_absent_and_is_omitted():
+    assert row().hold_secs is None
+    assert "hold_secs" not in row().to_dict()
+
+
+def test_hold_secs_round_trips_including_zero():
+    # 0 means "stand down on the first failed read", which is not "absent", so
+    # it must be emitted rather than dropped as falsy.
+    for value in (0, 45):
+        encoded = row(hold_secs=value).to_dict()
+        assert encoded["hold_secs"] == value
+        assert RegistrantRow.from_dict(encoded).hold_secs == value

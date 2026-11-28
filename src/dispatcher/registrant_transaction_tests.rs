@@ -32,9 +32,17 @@ struct Setup {
 
 impl Setup {
     fn new() -> Self {
+        Self::with_timers(None)
+    }
+
+    /// With the transaction layer's timers as given (`transaction.timeout_secs`).
+    fn with_timers(timers: Option<crate::transaction::timer::TimerConfig>) -> Self {
         let registrant = Arc::new(test_support::manager());
         test_support::install_egress(&registrant);
         let mut dispatcher = super::test_dispatcher::test_dispatcher();
+        if let Some(timers) = timers {
+            dispatcher.state.transaction_manager = Arc::new(TransactionManager::new(timers));
+        }
         dispatcher.state.registrant_manager = Some(Arc::clone(&registrant));
         let listen = HashMap::from([(Transport::Udp, "192.0.2.1:5060".parse().expect("addr"))]);
         dispatcher.state.listen_addrs = listen.clone();
@@ -1429,3 +1437,243 @@ async fn a_partial_uri_or_an_expired_bare_contact_in_any_case_does_not_authorize
 
 #[path = "registrant_fetch_deregistration_tests.rs"]
 mod fetch_deregistration;
+
+/// An unanswered UDP REGISTER sent just before the hold ran out is not
+/// retransmitted after the entry stood down, and its transaction is gone: a
+/// retransmission could still be answered, refreshing a binding another node
+/// holds now.
+#[tokio::test(start_paused = true)]
+async fn a_stood_down_entry_leaves_no_transaction_to_retransmit() {
+    let setup = Setup::new();
+    let mut entry = trunk(TRUNK).from_source(1);
+    entry.hold_secs = Some(30);
+    setup.registrant.add(entry);
+    setup.registrant.record_source_read();
+    setup.registrant.record_source_unreadable();
+    let sent_at = Instant::now();
+    let (built, first) = setup.send(TRUNK, 3600);
+    assert_eq!(setup.transactions(), 1);
+
+    tokio::time::advance(Duration::from_secs(31)).await;
+    assert_eq!(setup.registrant.record_source_unreadable(), 1);
+
+    assert_eq!(setup.transactions(), 0, "the transaction is gone");
+    assert!(setup.timer(&built.message, TimerName::E).is_none());
+    assert!(setup.timer(&built.message, TimerName::F).is_none());
+    for after in [T1, T1 * 3, T1 * 7, T2 * 2, T2 * 20] {
+        setup.fire(sent_at + after);
+    }
+    assert!(
+        setup.dispatcher.udp.try_recv().is_err(),
+        "no retransmission of {:?}",
+        first.destination
+    );
+}
+
+/// A REGISTER built before the hold ran out, sent after: refused where the
+/// transaction would be opened, so nothing leaves and nothing is left open.
+#[tokio::test(start_paused = true)]
+async fn a_register_sent_after_its_hold_ran_out_opens_no_transaction() {
+    let setup = Setup::new();
+    let mut entry = trunk(TRUNK).from_source(1);
+    entry.hold_secs = Some(30);
+    setup.registrant.add(entry);
+    setup.registrant.record_source_read();
+    setup.registrant.record_source_unreadable();
+    let built = setup
+        .registrant
+        .build_register(TRUNK, setup.defaults(), 3600)
+        .expect("built");
+
+    setup
+        .registrant
+        .source_unreadable_since(Duration::from_secs(60));
+    send_registrant_request(&setup.registrant, TRUNK, &built, &setup.dispatcher.state);
+
+    assert!(setup.dispatcher.udp.try_recv().is_err(), "nothing sent");
+    assert_eq!(setup.transactions(), 0);
+    assert!(setup.registrant.is_empty());
+}
+
+/// Timer E asks the registrant before it re-sends: a Call-ID a stand-down
+/// retired is refused even when the abandon has not run (or lost a race), and
+/// the transaction and its timers end.
+#[tokio::test]
+async fn a_retransmission_on_a_stood_down_call_id_is_refused_and_ends_the_transaction() {
+    let setup = Setup::new();
+    setup.registrant.add(trunk(TRUNK));
+    let (built, _first) = setup.send(TRUNK, 3600);
+    assert_eq!(setup.transactions(), 1);
+
+    let call_id = test_support::call_id(&setup.registrant, TRUNK).expect("a call id");
+    setup.registrant.retire_call_id(&call_id);
+    let fires = setup.timer(&built.message, TimerName::E).expect("Timer E");
+    setup.fire(fires);
+
+    assert!(setup.dispatcher.udp.try_recv().is_err(), "nothing re-sent");
+    assert_eq!(setup.transactions(), 0);
+    assert!(setup.timer(&built.message, TimerName::E).is_none());
+    assert!(setup.timer(&built.message, TimerName::F).is_none());
+}
+
+/// A transaction opened for a Call-ID that was retired between the caller's
+/// check and the timers being armed is ended at once.
+#[tokio::test]
+async fn a_transaction_opened_for_a_stood_down_call_id_is_ended_at_once() {
+    use crate::registrant::RegisterTransactions;
+    let setup = Setup::new();
+    setup.registrant.add(trunk(TRUNK));
+    let built = setup
+        .registrant
+        .build_register(TRUNK, setup.defaults(), 3600)
+        .expect("built");
+    let call_id = test_support::call_id(&setup.registrant, TRUNK).expect("a call id");
+    setup.registrant.retire_call_id(&call_id);
+    let layer = RegisterTransactionLayer::of(&setup.dispatcher.state);
+    let wire = OutboundMessage {
+        relayed: false,
+        followups: None,
+        connection_id: Default::default(),
+        transport: built.transport,
+        destination: built.destination,
+        data: bytes::Bytes::from(built.message.to_bytes()),
+        source_local_addr: built.source_local_addr,
+        server_name: None,
+        verify_server: None,
+    };
+
+    assert!(layer.open(&built.message, &wire).is_err());
+
+    assert_eq!(setup.transactions(), 0);
+    assert!(setup.timer(&built.message, TimerName::E).is_none());
+}
+
+/// Shutdown began, then a script removed the IMS entry: the de-REGISTER already
+/// built still goes, and Timer E still retransmits it. No hold is involved.
+#[tokio::test]
+async fn an_ims_shutdown_de_register_survives_a_script_removing_the_entry() {
+    let setup = Setup::new();
+    setup
+        .registrant
+        .try_add(ue(1, Some(ip(UE_ADDR))))
+        .expect("added");
+    setup.registrant.handle_success(&impu(1), 600000);
+    assert_eq!(
+        crate::registrant::deregister_all(&setup.registrant, &setup.dispatcher.state.outbound),
+        1
+    );
+    let first = setup
+        .dispatcher
+        .udp
+        .try_recv()
+        .expect("the de-REGISTER goes");
+    let sent = parse_sent(&first);
+
+    setup.registrant.remove(&impu(1));
+    let fires = setup.timer(&sent, TimerName::E).expect("Timer E");
+    setup.fire(fires);
+
+    let again = setup
+        .dispatcher
+        .udp
+        .try_recv()
+        .expect("and is retransmitted");
+    assert_retransmission_of(&first, &again);
+}
+
+/// A removed entry's fetch keeps retransmitting once the manager has dropped
+/// its drain (70 s), when `transaction.timeout_secs` is longer.
+#[tokio::test]
+async fn a_removed_entrys_fetch_keeps_retransmitting_after_its_drain_is_dropped_under_a_long_timer_f(
+) {
+    let timers = crate::transaction::timer::TimerConfig {
+        timer_f_secs: std::num::NonZeroU16::new(120),
+        ..Default::default()
+    };
+    let setup = Setup::with_timers(Some(timers));
+    setup.registrant.add(trunk(TRUNK));
+    setup.registrant.handle_success(TRUNK, 3600);
+    setup.registrant.remove(TRUNK);
+    let mut queued = test_support::take_deregistrations(&setup.registrant);
+    assert_eq!(queued.len(), 1);
+    let fetch = queued.remove(0);
+    send_registrant_request(&setup.registrant, TRUNK, &fetch, &setup.dispatcher.state);
+    let first = setup.dispatcher.udp.try_recv().expect("the fetch goes");
+
+    // The loop's tick has dropped the drain by now (70 s), and Timer F, set to
+    // 120 s, has not fired: the fetch is still being retransmitted. (The
+    // harness re-arms each timer from the real clock, so the 70 s is the
+    // drain's deadline, passed to the expiry, not time that elapsed.)
+    setup
+        .registrant
+        .expire_removed_deregistrations(Instant::now() + Duration::from_secs(75));
+    assert!(!setup
+        .registrant
+        .is_deregistering(&test_support::call_id_of_message(&fetch.message)));
+    let next = setup
+        .timer(&fetch.message, TimerName::E)
+        .expect("Timer E still armed");
+    setup.fire(next);
+
+    let again = setup.dispatcher.udp.try_recv().expect("retransmitted");
+    assert_retransmission_of(&first, &again);
+    assert!(setup.timer(&fetch.message, TimerName::F).is_some());
+}
+
+/// An action produced before the transaction was abandoned and executed after
+/// it neither sends nor leaves a timer behind.
+#[tokio::test(start_paused = true)]
+async fn an_action_produced_before_the_abandon_sends_nothing_and_leaves_no_timer() {
+    let setup = Setup::new();
+    let mut entry = trunk(TRUNK).from_source(1);
+    entry.hold_secs = Some(30);
+    setup.registrant.add(entry);
+    setup.registrant.record_source_read();
+    setup.registrant.record_source_unreadable();
+    let (built, first) = setup.send(TRUNK, 3600);
+    let key = TransactionManager::key_from_message(&built.message).expect("a key");
+    let produced = vec![
+        Action::SendFrame(first.data.clone()),
+        Action::StartTimer(TimerName::E, T2),
+    ];
+
+    tokio::time::advance(Duration::from_secs(31)).await;
+    assert_eq!(setup.registrant.record_source_unreadable(), 1);
+    process_timer_actions(
+        &produced,
+        &key,
+        Some(first.destination),
+        Some(first.transport),
+        None,
+        first.source_local_addr,
+        &setup.dispatcher.state,
+    );
+
+    assert!(setup.dispatcher.udp.try_recv().is_err());
+    assert!(setup.timer(&built.message, TimerName::E).is_none());
+    assert_eq!(setup.transactions(), 0);
+}
+
+/// A timer started for a transaction the registrant ended meanwhile is not
+/// kept, even when what it was produced with is still allowed.
+#[tokio::test]
+async fn a_timer_started_for_an_ended_transaction_is_not_kept() {
+    let setup = Setup::new();
+    setup.registrant.add(trunk(TRUNK));
+    let (built, first) = setup.send(TRUNK, 3600);
+    let key = TransactionManager::key_from_message(&built.message).expect("a key");
+    setup.dispatcher.state.transaction_manager.remove(&key);
+    setup.dispatcher.state.timer_wheel.clear();
+
+    process_timer_actions(
+        &[Action::StartTimer(TimerName::E, T2)],
+        &key,
+        Some(first.destination),
+        Some(first.transport),
+        None,
+        first.source_local_addr,
+        &setup.dispatcher.state,
+    );
+
+    assert!(setup.timer(&built.message, TimerName::E).is_none());
+}

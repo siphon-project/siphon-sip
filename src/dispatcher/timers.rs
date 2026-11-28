@@ -411,9 +411,22 @@ fn process_timer_actions_marked(
     relayed: bool,
     state: &DispatcherState,
 ) {
+    // A registrant's REGISTER is only re-sent while the registrant still owns
+    // it (one cheap branch, for REGISTER client transactions alone).
+    let registrant_owned = super::registrant::is_register_branch(&key.branch);
     for action in actions {
         match action {
             Action::SendMessage(message) => {
+                if registrant_owned
+                    && destination.is_some()
+                    && super::registrant::registrant_send_refused(
+                        key,
+                        message.headers.get("Call-ID").map(String::as_str),
+                        state,
+                    )
+                {
+                    return;
+                }
                 if let (Some(dest), Some(trans)) = (destination, transport) {
                     let conn_id = connection_id.unwrap_or_default();
                     if followups.is_empty() {
@@ -440,6 +453,16 @@ fn process_timer_actions_marked(
                 }
             }
             Action::SendFrame(frame) => {
+                if registrant_owned
+                    && destination.is_some()
+                    && super::registrant::registrant_send_refused(
+                        key,
+                        super::registrant::call_id_of_frame(frame).as_deref(),
+                        state,
+                    )
+                {
+                    return;
+                }
                 // A client transaction's Timer A / Timer E retransmit: the
                 // octets that already went out, re-emitted verbatim
                 // (RFC 3261 §17.1.1.2 / §17.1.2.2). No serialize, and byte
@@ -489,6 +512,11 @@ fn process_timer_actions_marked(
                         source_local_addr,
                     }),
                 );
+                // Inserted after the registrant ended the transaction (an
+                // action produced before it, executed after): nothing may stay.
+                if registrant_owned && !state.transaction_manager.contains(key) {
+                    state.timer_wheel.remove(&format!("{}:{:?}", key, name));
+                }
             }
             Action::CancelTimer(name) => {
                 let timer_id = format!("{}:{:?}", key, name);

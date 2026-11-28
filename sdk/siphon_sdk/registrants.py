@@ -105,6 +105,19 @@ class RegistrantRow:
     """Optional ``gateway:`` group this trunk's calls egress through, linking
     the registration to a gateway destination so one row describes one trunk."""
 
+    hold_secs: Optional[int] = None
+    """How long, in seconds, after siphon's last *successful read* of this list
+    it may keep refreshing the trunk while the source is unreadable. Past it
+    siphon stops registering the trunk and sends nothing (no ``Expires: 0``:
+    another node may hold the binding now). ``None`` keeps the trunk registered
+    however long the outage; ``0`` stands down on the first failed read; a
+    negative value rejects the row.
+
+    For a controller that leases each trunk to one node, serve the time left on
+    the lease at serve time (lease expiry minus now, minus a small margin), not
+    the full lease length, because the anchor is the node's last read, not the
+    lease's last renewal."""
+
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
             "aor": self.aor,
@@ -114,7 +127,15 @@ class RegistrantRow:
             "enabled": self.enabled,
             "ha1_algorithm": self.ha1_algorithm,
         }
-        for name in ("password", "ha1", "realm", "interval", "contact", "gateway"):
+        for name in (
+            "password",
+            "ha1",
+            "realm",
+            "interval",
+            "contact",
+            "gateway",
+            "hold_secs",
+        ):
             value = getattr(self, name)
             if value is not None:
                 out[name] = value
@@ -135,6 +156,7 @@ class RegistrantRow:
             transport=data.get("transport", "udp"),
             enabled=data.get("enabled", True),
             gateway=data.get("gateway"),
+            hold_secs=data.get("hold_secs"),
         )
 
 

@@ -442,3 +442,17 @@ async fn a_registrant_snapshot_reaches_the_script_with_its_state() {
         )]
     );
 }
+
+/// A stand-down is reported as its own event, and the AoR is no longer held.
+#[test]
+fn a_registrant_stand_down_is_reported_as_stood_down_and_absent() {
+    let source = RegistrantSource {
+        registrant: Arc::new(registrant_manager()),
+    };
+    let change = source.change(RegistrantEvent::StoodDown {
+        aor: "sip:trunk@carrier.example".to_string(),
+    });
+    assert_eq!(change.event, "stood_down");
+    assert_eq!(change.status_code, None);
+    assert_eq!(source.presence(&change), Presence::Absent);
+}

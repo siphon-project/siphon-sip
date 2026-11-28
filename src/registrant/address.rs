@@ -114,7 +114,9 @@ impl RegistrantManager {
         // one Call-ID keep separate CSeq counters (a repeat, and an answer taken
         // for the other's), so the live entry registers afresh on a Call-ID of
         // its own (RFC 3261 §10.2.4).
-        if self.is_deregistering(&entry.call_id) {
+        // The same for one a stand-down retired: a Call-ID that is refused must
+        // never be the registration that comes back.
+        if self.is_deregistering(&entry.call_id) || self.call_id_stood_down(&entry.call_id) {
             entry.call_id = format!("reg-{}", uuid::Uuid::new_v4());
         }
         if entry.require_local_addr && entry.local_addr.is_none() {
@@ -128,7 +130,10 @@ impl RegistrantManager {
         );
         let awaiting = entry.state == RegistrantState::AwaitingAddress;
         let aor = entry.aor.clone();
+        // Counted before it is visible, so the count is never below the truth.
+        self.hold_added(entry.hold_secs);
         if let Some(replaced) = self.entries.insert(aor.clone(), entry) {
+            self.hold_removed(replaced.hold_secs);
             // The replacement starts a fresh handshake; the old one's SAs go.
             self.retire_sa_sets(&replaced, None);
         }

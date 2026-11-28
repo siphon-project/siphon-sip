@@ -391,6 +391,12 @@ impl RegistrantManager {
     }
 
     /// Queue SA pairs for deletion.
+    /// Queue the deletion of one SA set the dispatcher installed for a
+    /// registration that ended before its REGISTER could go.
+    pub fn queue_sa_deletions_for(&self, deletion: SaDeletion) {
+        self.queue_sa_deletions([deletion]);
+    }
+
     pub(super) fn queue_sa_deletions(&self, deletions: impl IntoIterator<Item = SaDeletion>) {
         let mut pending = self
             .pending_sa_deletions

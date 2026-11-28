@@ -164,6 +164,9 @@ impl RegistrantEntry {
             return false;
         }
         self.call_id = existing.call_id.clone();
+        // Its REGISTER may still be in flight: a stand-down before the next one
+        // is built must find and abandon that transaction.
+        self.in_flight_branch = existing.in_flight_branch.clone();
         self.cseq = std::sync::atomic::AtomicU32::new(
             existing.cseq.load(std::sync::atomic::Ordering::Relaxed),
         );
@@ -207,6 +210,12 @@ impl RegistrantEntry {
         copy.local_addr = self.local_addr;
         copy.ims_contact = self.ims_contact.clone();
         copy.register_extras = self.register_extras.clone();
+        // So a follow-up of this de-registration is held back like the entry
+        // was (see [`super::hold`]).
+        if self.hold_secs.is_some() {
+            copy.origin = self.origin;
+            copy.hold_secs = self.hold_secs;
+        }
         copy
     }
 }
@@ -284,6 +293,9 @@ impl RegistrantManager {
         let Some(cseq) = cseq_number(&built.message) else {
             return;
         };
+        if entry.hold_secs.is_some() {
+            self.note_held_drain();
+        }
         self.draining_deregistrations.insert(
             entry.call_id.clone(),
             DrainingDeregistration {
@@ -449,6 +461,13 @@ impl RegistrantManager {
         response_expires: Option<u32>,
         defaults: EgressDefaults<'_>,
     ) -> RemovedAnswer {
+        // Past its hold the AoR's follow-ups (the authenticated retry, the
+        // `Expires: 0` after the fetch) are not sent: stood down first, and the
+        // tracking with it (see [`super::hold`]).
+        self.stand_down_expired();
+        if self.send_refused(call_id) {
+            return RemovedAnswer::NotTracked;
+        }
         let Some(mut draining) = self.draining_deregistrations.get_mut(call_id) else {
             return RemovedAnswer::NotTracked;
         };
@@ -640,6 +659,11 @@ impl RegistrantManager {
         credentials: Result<Option<RegistrantCredentials>, String>,
         defaults: EgressDefaults<'_>,
     ) -> RemovedAnswer {
+        // The lookup may have taken a while: the hold may have run out.
+        self.stand_down_expired();
+        if self.send_refused(&request.call_id) {
+            return RemovedAnswer::NotTracked;
+        }
         // The lookup may have taken a while: the trunk may be live on that
         // Contact by now.
         if self.startup_deregistration_superseded(&request.call_id) {
