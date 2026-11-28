@@ -3282,8 +3282,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sigtran"
-version = "7.0.0"
-source = "git+https://github.com/siphon-project/siphon-sigtran?tag=v7.0.0#30abe037c566680d9062391d30f48bd69fa9e4b4"
+version = "7.1.0"
+source = "git+https://github.com/siphon-project/siphon-sigtran?tag=v7.1.0#1b812f6398836ad3fc9a8faea9946f21faff2b6f"
 dependencies = [
  "async-sctp",
  "gsm_cap",
@@ -3304,12 +3304,13 @@ dependencies = [
  "tcap",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "siphon-sip"
-version = "1.20.1"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#8737cdd1ffa8a030d3adad287594a5993eb27575"
+version = "1.21.0"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#a044736d5c3aa14df1dfe4c95d0a00e8346195eb"
 dependencies = [
  "aes",
  "arc-swap",
