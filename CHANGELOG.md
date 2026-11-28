@@ -25,6 +25,7 @@ entry, but a working config keeps working.
   a stripped key before the upgrade is found again on the UA's next REGISTER. Contact lookups
   (`registrar.lookup_contact`, `is_registered_contact`) are unchanged and still treat a missing port
   as the default one. The SDK mock registrar matches.
+
 ## [1.21.0] — 2026-11-28
 
 ### Added
