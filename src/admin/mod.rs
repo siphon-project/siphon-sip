@@ -872,6 +872,7 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
             "registrant": {
                 "last_success": metrics.registrant_source_last_success_timestamp_seconds.get(),
                 "failures": metrics.registrant_source_failures_total.get(),
+                "standdowns": metrics.registrant_source_standdowns_total.get(),
             },
         },
         "sip": {

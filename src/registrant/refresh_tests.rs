@@ -1030,3 +1030,47 @@ async fn over_mtu_register_cycles_leave_no_connection_behind() {
     }
     assert!(eventually(|| harness.connection_map.is_empty()).await);
 }
+
+/// The hold runs out while the over-MTU REGISTER's TCP connection opens: the
+/// task checks the entry once more before it sends, and sends nothing.
+#[tokio::test]
+async fn an_over_mtu_refresh_is_not_sent_when_its_hold_runs_out_while_it_connects() {
+    use tokio::io::AsyncReadExt;
+    let (udp, listener) = pcscf_ports(true).await;
+    let listener = listener.expect("TCP");
+    let pcscf = listener.local_addr().expect("its address");
+    let mut harness = tcp_loop(free_port());
+    harness.context.mtu = Some(1280);
+    let manager = Arc::new(test_support::manager());
+    install(&manager, &harness.context);
+    let aor = registered_over_a_set(&manager, 1, ip("127.0.0.81"), pcscf, 1500);
+    if let Some(mut entry) = manager.entries.get_mut(&aor) {
+        entry.origin = crate::registrant::EntryOrigin::Source;
+    }
+    manager.set_source_hold(&aor, Some(30));
+    manager.record_source_read();
+    manager.record_source_unreadable();
+
+    // Builds the REGISTER and queues the task that connects and sends it; the
+    // task does not run until this test awaits.
+    tick(&manager, &harness.context);
+    manager.source_unreadable_since(std::time::Duration::from_secs(60));
+
+    if let Ok(Ok((mut connection, _))) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
+    {
+        let mut buffer = [0u8; 1024];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            connection.read(&mut buffer),
+        )
+        .await;
+        assert!(
+            !matches!(read, Ok(Ok(length)) if length > 0),
+            "no REGISTER over the connection"
+        );
+    }
+    assert!(datagram(&udp).await.is_none(), "nothing over UDP either");
+    assert!(manager.is_empty(), "the entry stood down");
+    harness.inbound.drain().for_each(drop);
+}

@@ -184,7 +184,7 @@ fn handle_answer(
                 }
             }
 
-            registrant.handle_success(&aor, expires);
+            registrant.handle_success_for(&aor, &call_id, expires);
             // A REGISTER that was in flight at shutdown got its binding: clear
             // it at once, over the SA set the answer just settled.
             if deregistration == Deregistration::Owed {
@@ -195,6 +195,12 @@ fn handle_answer(
             }
         }
         401 | 407 => {
+            // An answer to a registration this entry no longer is (stood down
+            // and back, replaced) is not answered with the new one's state.
+            if !registrant.holds_call_id(&aor, &call_id) {
+                debug!(aor = %aor, "registrant challenge for an earlier registration: ignored");
+                return;
+            }
             // Parse challenge header
             let header_name = if status_code == 401 {
                 "WWW-Authenticate"
@@ -206,7 +212,7 @@ fn handle_answer(
                 Some(raw) => raw.clone(),
                 None => {
                     warn!(aor = %aor, status_code, "registrant: {status_code} without {header_name}");
-                    registrant.handle_failure(&aor, status_code, retry_after);
+                    registrant.handle_failure_for(&aor, &call_id, status_code, retry_after);
                     return;
                 }
             };
@@ -259,15 +265,15 @@ fn handle_answer(
                     // from whichever socket was the default.
                     send_registrant_request(registrant, &aor, &built, state);
                 } else {
-                    registrant.handle_failure(&aor, status_code, retry_after);
+                    registrant.handle_failure_for(&aor, &call_id, status_code, retry_after);
                 }
             } else {
                 warn!(aor = %aor, "failed to parse digest challenge from {header_name}");
-                registrant.handle_failure(&aor, status_code, retry_after);
+                registrant.handle_failure_for(&aor, &call_id, status_code, retry_after);
             }
         }
         _ => {
-            registrant.handle_failure(&aor, status_code, retry_after);
+            registrant.handle_failure_for(&aor, &call_id, status_code, retry_after);
         }
     }
 }
@@ -385,6 +391,21 @@ pub(super) fn handle_registrant_ipsec_challenge(
     let capture = TaskCapture::for_task(state, transport, Some(source));
     let registrant_task = Arc::clone(registrant);
     let aor_task = aor.to_string();
+    // What the set just installed is called, to delete it again if the
+    // registration ended while it was being installed.
+    let installed = sa.as_ref().map(|sa| {
+        (
+            crate::registrant::protected::SaDeletion {
+                address: registrant.ue_addr(aor),
+                key: crate::registrant::protected::UeSaKey {
+                    ue_port_c: sa.ue_port_c,
+                    spi_uc: sa.spi_uc,
+                    spi_us: sa.spi_us,
+                },
+            },
+            state.local_addr.ip(),
+        )
+    });
 
     tokio::spawn(async move {
         // The install below is a kernel round trip: shutdown, or the entry's
@@ -409,6 +430,17 @@ pub(super) fn handle_registrant_ipsec_challenge(
         if let Err(error) = ipsec_manager.create_ue_sa_pair(sa).await {
             warn!(aor = %aor_task, %error, "IPsec UE: SA install failed, protected REGISTER not sent");
             registrant_task.handle_failure(&aor_task, 0, None);
+            return;
+        }
+        // The install was a kernel round trip: the registration may have ended
+        // (removed, shut down, past its hold) while it ran. The set just made
+        // goes again, and nothing is sent.
+        if !registrant_task.registration_live(&aor_task, &call_id) {
+            debug!(aor = %aor_task, "IPsec UE: registration ended during the SA install; not sent");
+            if let Some((deletion, process_ue_ip)) = installed {
+                registrant_task.queue_sa_deletions_for(deletion);
+                registrant_task.spawn_sa_deletions(&ipsec_manager, process_ue_ip);
+            }
             return;
         }
         // The set is installed, so the P-CSCF may connect to the protected
@@ -588,6 +620,9 @@ fn handle_removed_entry_answer(
 pub(crate) struct RegisterTransactionLayer {
     transactions: Arc<TransactionManager>,
     timer_wheel: Arc<DashMap<String, Box<TimerEntry>>>,
+    /// Asked once more after a transaction is opened, to close the window in
+    /// which a stand-down ran between the check and the timers being armed.
+    registrant: std::sync::Weak<crate::registrant::RegistrantManager>,
 }
 
 impl RegisterTransactionLayer {
@@ -595,6 +630,11 @@ impl RegisterTransactionLayer {
         Self {
             transactions: Arc::clone(&state.transaction_manager),
             timer_wheel: Arc::clone(&state.timer_wheel),
+            registrant: state
+                .registrant_manager
+                .as_ref()
+                .map(Arc::downgrade)
+                .unwrap_or_default(),
         }
     }
 }
@@ -605,8 +645,91 @@ impl crate::registrant::RegisterTransactions for RegisterTransactionLayer {
         request: &SipMessage,
         message: &crate::transport::OutboundMessage,
     ) -> Result<(), String> {
-        open_client_transaction(&self.transactions, &self.timer_wheel, request, message).map(|_| ())
+        let key = open_client_transaction(&self.transactions, &self.timer_wheel, request, message)?;
+        // Stood down between the caller's check and the timers being armed:
+        // the abandon found none to stop, so end it here.
+        let refused = self.registrant.upgrade().is_some_and(|registrant| {
+            request
+                .headers
+                .get("Call-ID")
+                .is_some_and(|call_id| registrant.send_refused(call_id))
+        });
+        if refused {
+            terminate_register_transaction(&self.transactions, &self.timer_wheel, &key);
+            return Err("the registration stood down (hold_secs): not sent".to_string());
+        }
+        Ok(())
     }
+
+    fn transaction_lifetime(&self) -> std::time::Duration {
+        let timers = self.transactions.timers();
+        timers.timer_f() + timers.t4
+    }
+
+    fn abandon(&self, branch: &str) {
+        // The key also holds the sent-by, which the registrant does not keep;
+        // Timer F is armed for as long as the transaction is open, so the
+        // wheel names every key of the branch.
+        let keys: Vec<TransactionKey> = self
+            .timer_wheel
+            .iter()
+            .filter(|entry| entry.key.branch == branch)
+            .map(|entry| entry.key.clone())
+            .collect();
+        for key in keys {
+            terminate_register_transaction(&self.transactions, &self.timer_wheel, &key);
+        }
+    }
+}
+
+/// End the client transaction `key` of a registrant REGISTER and stop its
+/// timers. The transaction goes first: a timer inserted meanwhile by an action
+/// produced before this ran finds no transaction to act on, and the insert
+/// checks for that (see [`registrant_send_refused`]).
+pub(super) fn terminate_register_transaction(
+    transactions: &TransactionManager,
+    timer_wheel: &DashMap<String, Box<TimerEntry>>,
+    key: &TransactionKey,
+) {
+    transactions.remove(key);
+    for name in [TimerName::E, TimerName::F, TimerName::K] {
+        timer_wheel.remove(&format!("{key}:{name:?}"));
+    }
+}
+
+/// Whether the registrant refuses to send what its client transaction `key`
+/// wants on the wire (Timer E's retransmission): its manager is asked, with
+/// the Call-ID of the REGISTER, and a refusal ends the transaction. The same
+/// rule as the first send ([`crate::registrant::RegistrantManager::send_refused`]);
+/// an action produced before the entry went is refused here when it is executed.
+/// A request already queued at a transport may still leave: the controller's
+/// margin below the lease covers that window.
+pub(super) fn registrant_send_refused(
+    key: &TransactionKey,
+    call_id: Option<&str>,
+    state: &DispatcherState,
+) -> bool {
+    let Some(registrant) = state.registrant_manager.as_ref() else {
+        return false;
+    };
+    if !call_id.is_some_and(|call_id| registrant.send_refused(call_id)) {
+        return false;
+    }
+    debug!(branch = %key.branch, "registrant REGISTER no longer owned: transaction ended, nothing sent");
+    terminate_register_transaction(&state.transaction_manager, &state.timer_wheel, key);
+    true
+}
+
+/// The Call-ID of a REGISTER's wire form.
+pub(super) fn call_id_of_frame(frame: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(frame).ok()?;
+    text.split("\r\n")
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            (name.trim().eq_ignore_ascii_case("call-id") || name.trim().eq_ignore_ascii_case("i"))
+                .then(|| value.trim().to_string())
+        })
 }
 
 /// Timer F of a registrant REGISTER fired (RFC 3261 17.1.2.2): the entry

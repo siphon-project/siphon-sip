@@ -103,7 +103,7 @@ pub async fn registration_loop(manager: Arc<RegistrantManager>, context: Registr
 }
 
 /// One pass of [`registration_loop`].
-fn run_tick(
+pub(super) fn run_tick(
     manager: &Arc<RegistrantManager>,
     context: &RegistrationLoopContext,
     egress: &RegistrantEgress,
@@ -122,6 +122,7 @@ fn run_tick(
     // those of removed entries whose de-REGISTER went unanswered.
     manager.expire_teardowns(std::time::Instant::now());
     manager.expire_removed_deregistrations(std::time::Instant::now());
+    manager.sweep_tombstones(std::time::Instant::now());
     delete_queued_sas(manager, context, egress);
 
     // Shutting down: nothing is started, and the sockets and connections stay

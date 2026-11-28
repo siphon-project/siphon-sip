@@ -902,7 +902,7 @@ whether or not a `@registration.on_change` handler is registered:
 | `seq` | per-process number, its own sequence, as for `RegistrationChanged` |
 | `instance_epoch` | as for `RegistrationChanged` |
 | `aor` | the registration's AoR |
-| `event` | `registered`, `refreshed`, `failed`, `deregistered`, `awaiting_address` or `snapshot` (as above) |
+| `event` | `registered`, `refreshed`, `failed`, `deregistered`, `stood_down` (a source's trunk stopped registering when its `hold_secs` ran out with the source unreadable, nothing sent), `awaiting_address` or `snapshot` (as above) |
 | `registrar` | the registrar it registers with, `null` once the registration was removed |
 | `state` | `unregistered`, `registering`, `challenging`, `registered`, `failed` or `awaiting_address` (it needs an address of its own and has none), `null` once removed |
 | `expires_in` | seconds left on the binding the registrar granted, `0` when none |

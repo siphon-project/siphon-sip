@@ -391,6 +391,11 @@ impl RegistrantManager {
             // Registered since, on the same contact: that REGISTER replaced it.
             return Outcome::Left;
         }
+        // A Call-ID a stand-down retired is never taken over: the entry keeps
+        // the one it registers on (see [`super::hold`]).
+        if self.call_id_stood_down(&record.call_id) {
+            return Outcome::Left;
+        }
         live.call_id = record.call_id.clone();
         live.cseq = AtomicU32::new(record.next_cseq.saturating_add(CSEQ_HEADROOM));
         live.binding_until =

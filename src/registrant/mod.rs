@@ -24,6 +24,7 @@ mod egress;
 #[cfg(test)]
 pub(crate) use egress::{established_ue, rotate_sa_set, rotate_sa_set_against};
 pub mod entry_config;
+mod hold;
 pub mod ipsec_offer;
 mod lifecycle;
 pub mod messages;
@@ -100,6 +101,10 @@ pub enum RegistrantEvent {
     Failed { aor: String, status_code: u16 },
     /// De-registration sent (shutdown or manual remove).
     Deregistered { aor: String },
+    /// A source's trunk stopped registering because its `hold_secs` ran out
+    /// with the source unreadable (see [`hold`]). Nothing was sent: no
+    /// de-REGISTER, since another node may hold the binding.
+    StoodDown { aor: String },
     /// The entry needs an address of its own and has none: it stopped
     /// registering until [`RegistrantManager::set_local_addr`] gives it one.
     AwaitingAddress { aor: String },
@@ -533,6 +538,9 @@ pub struct RegistrantEntry {
     /// Fingerprint of the source row this was built from, for
     /// [`source::reconcile`]. `None` for anything not created by a source.
     pub source_fingerprint: Option<u64>,
+    /// The row's `hold_secs` (see [`hold`]). `None` for anything not created by
+    /// a source, and for a row that serves none.
+    pub hold_secs: Option<u32>,
 
     // --- IMS AKA (Phase 1) ---
     /// Authentication mode. `Digest` (default) keeps the carrier-trunk path
@@ -618,6 +626,7 @@ impl RegistrantEntry {
             invalid_challenges: 0,
             origin: EntryOrigin::Script,
             source_fingerprint: None,
+            hold_secs: None,
             auth_mode: AuthMode::Digest,
             aka: None,
             sqn_ms: [0u8; 6],
@@ -757,6 +766,19 @@ pub struct RegistrantManager {
     /// The de-REGISTERs of removed entries in flight, by Call-ID, kept to
     /// answer a challenge (see [`removed`]).
     draining_deregistrations: DashMap<String, removed::DrainingDeregistration>,
+    /// Call-IDs a stand-down retired and until when (see [`hold`]): a REGISTER
+    /// on one is refused, wherever it is asked.
+    stood_down_call_ids: DashMap<String, Instant>,
+    /// How many live entries have a `hold_secs`: while none does (and no drain
+    /// of one is tracked) no sweep has anything to do.
+    held_entries: std::sync::atomic::AtomicUsize,
+    /// A tracked de-registration carries a hold (see [`hold`]); cleared by the
+    /// loop's sweep once none does.
+    held_drains: std::sync::atomic::AtomicBool,
+    /// Some stood-down Call-ID is remembered; cleared by the sweep once none is.
+    tombstones_live: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    expiry_scans: std::sync::atomic::AtomicUsize,
     /// UE SA pairs to tear down: an entry moved off an address (see
     /// [`address`]), a superseded or abandoned SA set (see [`protected`]), a
     /// removed entry's sets. The manager has no kernel access; the loop and the
@@ -792,6 +814,7 @@ pub struct RegistrantManager {
     /// `server.instance_id`: what the Contact token (see [`contact`]) is made of.
     instance_id: Option<String>,
     restart: startup::RestartState, // clearing a killed process's bindings (see [`startup`])
+    source_read: hold::SourceRead,  // when the source was last read (see [`hold`])
 }
 
 /// Everything [`registration_loop`] needs to put a REGISTER on the wire.
@@ -834,6 +857,12 @@ impl RegistrantManager {
             stream_reconcile: std::sync::OnceLock::new(),
             pending_deregistrations: std::sync::Mutex::new(Vec::new()),
             draining_deregistrations: DashMap::new(),
+            stood_down_call_ids: DashMap::new(),
+            held_entries: std::sync::atomic::AtomicUsize::new(0),
+            held_drains: std::sync::atomic::AtomicBool::new(false),
+            tombstones_live: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            expiry_scans: std::sync::atomic::AtomicUsize::new(0),
             pending_sa_deletions: std::sync::Mutex::new(Vec::new()),
             teardowns: std::sync::Mutex::new(Vec::new()),
             ipsec: std::sync::OnceLock::new(),
@@ -847,6 +876,7 @@ impl RegistrantManager {
             transactions: std::sync::OnceLock::new(),
             instance_id: None,
             restart: startup::RestartState::default(),
+            source_read: hold::SourceRead::default(),
         }
     }
 
@@ -988,9 +1018,14 @@ impl RegistrantManager {
     /// leaves exactly the expiry-based cleanup that was the only behaviour
     /// before.
     pub fn remove(&self, aor: &str) -> Option<RegistrantEntry> {
+        // Past its hold nothing is sent for it, not even this (see [`hold`]).
+        if let Some(stood_down) = self.stand_down_entry(aor) {
+            return Some(stood_down);
+        }
         let deregistration = self.build_deregistration(aor);
         let removed = self.entries.remove(aor).map(|(_, entry)| entry);
         if let Some(entry) = removed.as_ref() {
+            self.hold_removed(entry.hold_secs);
             self.retire_sa_sets(entry, deregistration.as_ref());
             if let Some(message) = deregistration {
                 self.queue_removed_deregistration(entry, message);
@@ -1001,71 +1036,6 @@ impl RegistrantManager {
             });
         }
         removed
-    }
-
-    /// AoR to source-row fingerprint, for the entries a source created.
-    ///
-    /// The live half of [`source::reconcile`]. Deliberately excludes YAML and
-    /// script entries, so a reconcile can neither update nor remove one.
-    pub fn source_fingerprints(&self) -> HashMap<String, u64> {
-        self.entries
-            .iter()
-            .filter(|entry| entry.origin == EntryOrigin::Source)
-            .filter_map(|entry| {
-                entry
-                    .source_fingerprint
-                    .map(|fingerprint| (entry.aor.clone(), fingerprint))
-            })
-            .collect()
-    }
-
-    /// Whether an AoR is held by something other than a source, so a reconcile
-    /// must leave it alone and say so rather than overwrite it.
-    pub fn is_foreign_to_source(&self, aor: &str) -> bool {
-        self.entries
-            .get(aor)
-            .is_some_and(|entry| entry.origin != EntryOrigin::Source)
-    }
-
-    /// Replace a source-created entry in place, keeping its registration
-    /// identity.
-    ///
-    /// The upstream registrar should see a refresh of the binding it already
-    /// holds, not an unrelated new registration from the same trunk, so the
-    /// Call-ID carries over and the CSeq continues instead of restarting at 1
-    /// (RFC 3261 §10.2.4 / §8.1.1.5). The entry is marked due immediately, so a
-    /// rotated password takes effect on the next tick rather than at the next
-    /// refresh interval.
-    ///
-    /// Returns `false` when the AoR is gone or is not the source's to change.
-    pub fn update_from_source(&self, mut entry: RegistrantEntry) -> bool {
-        if self.is_shutting_down() {
-            return false;
-        }
-        let carried = self.entries.get(&entry.aor).and_then(|existing| {
-            (existing.origin == EntryOrigin::Source).then(|| entry.carry_binding_from(&existing))
-        });
-        let Some(same_target) = carried else {
-            return false;
-        };
-        // A binding on the registrar (or contact) being replaced is one no
-        // REGISTER of the new entry reaches: clear it there, on its own
-        // Call-ID, and let the new entry register afresh.
-        let deregistration = (!same_target)
-            .then(|| self.build_deregistration(&entry.aor))
-            .flatten();
-        entry.state = RegistrantState::Unregistered;
-        entry.next_attempt = Instant::now();
-
-        info!(aor = %entry.aor, "registrant updated from source");
-        if let Some(replaced) = self.entries.insert(entry.aor.clone(), entry) {
-            // The replacement starts a fresh handshake; the old one's SAs go.
-            self.retire_sa_sets(&replaced, None);
-            if let Some(message) = deregistration {
-                self.queue_removed_deregistration(&replaced, message);
-            }
-        }
-        true
     }
 
     /// Get number of entries.
@@ -1220,7 +1190,23 @@ impl RegistrantManager {
     /// refresh window chosen by `unit` (`[0, 1)`) rather than at random, so a
     /// test can pin it.
     pub fn handle_success_with_draw(&self, aor: &str, granted_expires: u32, unit: f64) {
-        if let Some(mut entry) = self.entries.get_mut(aor) {
+        self.apply_success(aor, None, granted_expires, unit);
+    }
+
+    /// [`handle_success`](Self::handle_success) for the answer to the REGISTER
+    /// on `call_id`: applied only if the entry still holds that Call-ID, so an
+    /// answer that raced a stand-down and the entry's return is not credited to
+    /// the new registration.
+    pub fn handle_success_for(&self, aor: &str, call_id: &str, granted_expires: u32) {
+        self.apply_success(aor, Some(call_id), granted_expires, pacing::unit_draw());
+    }
+
+    fn apply_success(&self, aor: &str, call_id: Option<&str>, granted_expires: u32, unit: f64) {
+        if let Some(mut entry) = self
+            .entries
+            .get_mut(aor)
+            .filter(|entry| call_id.is_none_or(|call_id| entry.call_id == call_id))
+        {
             // A refresh, not a new registration, when the registrar still held
             // a binding granted to this entry. Not read from the state: sending
             // the refresh moved it to Registering (or Challenging on a 401),
@@ -1272,12 +1258,41 @@ impl RegistrantManager {
     /// registrar stops sending `Retry-After` we resume climbing from where we
     /// were rather than resetting.
     pub fn handle_failure(&self, aor: &str, status_code: u16, retry_after: Option<Duration>) {
+        self.apply_failure(aor, None, status_code, retry_after);
+    }
+
+    /// [`handle_failure`](Self::handle_failure) for the answer to the REGISTER
+    /// on `call_id`: applied only if the entry still holds that Call-ID.
+    pub fn handle_failure_for(
+        &self,
+        aor: &str,
+        call_id: &str,
+        status_code: u16,
+        retry_after: Option<Duration>,
+    ) {
+        self.apply_failure(aor, Some(call_id), status_code, retry_after);
+    }
+
+    fn apply_failure(
+        &self,
+        aor: &str,
+        call_id: Option<&str>,
+        status_code: u16,
+        retry_after: Option<Duration>,
+    ) {
+        if call_id.is_some_and(|call_id| !self.holds_call_id(aor, call_id)) {
+            return;
+        }
         if self.deregistration_owed_or_in_flight(aor) {
             // Shutting down: nothing is retried, the de-registration is over.
             self.finish_deregistration(aor, status_code);
             return;
         }
-        if let Some(mut entry) = self.entries.get_mut(aor) {
+        if let Some(mut entry) = self
+            .entries
+            .get_mut(aor)
+            .filter(|entry| call_id.is_none_or(|call_id| entry.call_id == call_id))
+        {
             self.abandon_ipsec_exchange(&mut entry);
             entry.state = RegistrantState::Failed;
             entry.failure_count += 1;
@@ -1362,6 +1377,9 @@ impl RegistrantManager {
         if self.is_shutting_down() {
             return Vec::new();
         }
+        // Past its hold with the source down, an entry is gone before it can be
+        // picked (see [`hold`]).
+        self.stand_down_expired();
         let mut due: Vec<(Instant, String)> = self
             .entries
             .iter()

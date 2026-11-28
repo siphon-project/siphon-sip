@@ -164,6 +164,12 @@ impl super::RegisterTransactions for Untracked {
     ) -> Result<(), String> {
         Ok(())
     }
+
+    fn abandon(&self, _branch: &str) {}
+
+    fn transaction_lifetime(&self) -> Duration {
+        Duration::from_secs(37)
+    }
 }
 
 /// Attach [`Untracked`], so [`super::registration_loop`] starts.
@@ -197,4 +203,9 @@ pub(crate) fn set_sqn(manager: &RegistrantManager, aor: &str, sqn: [u8; 6]) {
 /// The Call-ID of the live entry `aor`.
 pub(crate) fn call_id(manager: &RegistrantManager, aor: &str) -> Option<String> {
     manager.entries.get(aor).map(|entry| entry.call_id.clone())
+}
+
+/// The Call-ID of `message`.
+pub(crate) fn call_id_of_message(message: &crate::sip::message::SipMessage) -> String {
+    message.headers.get("Call-ID").cloned().unwrap_or_default()
 }

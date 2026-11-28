@@ -306,8 +306,8 @@ pub struct RegistrantChangedPayload {
     /// identity, or one that predates it.
     #[serde(default)]
     pub instance_epoch: Option<String>,
-    /// `registered`, `refreshed`, `failed`, `deregistered`, `awaiting_address`
-    /// or `snapshot`.
+    /// `registered`, `refreshed`, `failed`, `deregistered`, `stood_down`,
+    /// `awaiting_address` or `snapshot`.
     pub event: String,
     /// The registration's state now.
     #[serde(flatten)]

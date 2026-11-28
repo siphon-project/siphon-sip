@@ -100,7 +100,10 @@ pub enum RegistrantBackendType {
 /// would mean every deployment maintaining a view for us. Columns are read by
 /// name — `aor`, `registrar` and `username` are required; `password`, `ha1`,
 /// `ha1_algorithm`, `realm`, `interval`, `contact`, `transport`, `enabled` and
-/// `gateway` are optional. When the statement references `$1`, the instance id
+/// `gateway` and `hold_secs` are optional. `hold_secs` is an integer: how long
+/// after the last successful read this node may keep refreshing the trunk while
+/// the source is unreadable (absent: always; negative: the row is rejected; see
+/// `docs/reference/registrant-api.md`). When the statement references `$1`, the instance id
 /// (`server.instance_id`) is bound to it, so a deployment can shard its trunks
 /// across nodes with `WHERE node = $1`.
 #[derive(Debug, Deserialize, Clone)]

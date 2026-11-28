@@ -13,6 +13,14 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- Outbound registrations: three races no longer let a stale action reach a registration. An answer, challenge or retry is applied only if the entry still holds the Call-ID of the REGISTER it answers, so a late answer cannot be credited to an entry that was replaced or stood down and added again. A source update replaces the entry only if it is still the one it looked at, so it cannot undo a concurrent removal. After a UE's SA install the registration is checked again before its protected REGISTER is sent, and the installed set is deleted if it ended meanwhile. A replacement of a source entry also keeps the Via branch of the REGISTER in flight, so a later stand-down or abandon can find and end its client transaction.
+
+### Added
+
+- A `registrant.backend: http` / `database` row may carry `hold_secs` (the `hold_secs` integer column for the database source). Once the source has failed to read and that many seconds have passed since the last successful read, the node stops registering the trunk: the entry is dropped without any REGISTER (no `Expires: 0` and no fetch, since it cannot know who holds the binding now), a refresh that falls due is refused where the REGISTER is built, and the stored binding record is kept for a later restart's clean-up. The next successful read that serves the row registers it afresh. This stops a node whose controller is down, while siphon is up, from stealing the binding of a trunk another node has taken over at a registrar that keeps one binding per AoR. `0` stands down on the first failed read; absent keeps today's behaviour; a negative value rejects the row. A change of `hold_secs` alone does not re-REGISTER. Stand-down also ends the entry's in-flight REGISTER transaction (no retransmission) and refuses a stood-down Call-ID at every send, retransmission and de-registration follow-up; a request already handed to a transport may still leave, so serve `hold_secs` with a margin of a few seconds below the lease's remaining time. Controllers should serve the time left on the lease at serve time, since the anchor is the last successful read. New `siphon_registrant_source_standdowns_total` counter, a `standdowns` count under `provisioning.registrant` on the admin status, and a `stood_down` registrant event.
+
 ## [1.20.1] — 2026-11-27
 
 ### Deprecated
