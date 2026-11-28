@@ -138,6 +138,20 @@ impl ReplacementDial {
         targets
     }
 
+    /// Whether this names anything only a transfer that dials a leg can use: a
+    /// registered AoR to dial over its flow, a route set, headers, or an
+    /// identity to present. A transfer siphon relays instead of dialling would
+    /// have to ignore it.
+    pub(crate) fn names_a_dial(&self) -> bool {
+        self.aor.is_some()
+            || !self.route.is_empty()
+            || !self.headers.is_empty()
+            || self.shaping.from.is_some()
+            || self.shaping.from_display.is_some()
+            || self.shaping.p_asserted_identity.is_some()
+            || self.shaping.privacy.is_some()
+    }
+
     /// Whether the target is a registered contact, dialled exactly as it
     /// registered: its URI is not a number to reshape.
     pub(super) fn is_registered_contact(&self) -> bool {

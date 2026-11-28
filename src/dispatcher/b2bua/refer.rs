@@ -1142,7 +1142,7 @@ pub fn handle_b2bua_refer_on(
             profile,
             number_shape,
         } => {
-            let mode = mode.unwrap_or(state.default_refer_mode);
+            let mode = effective_refer_mode(state, mode);
             let target_uri = target.unwrap_or_else(|| refer_to.uri.clone());
             b2bua_refer_accept(
                 inbound,

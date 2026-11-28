@@ -13,6 +13,17 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- Control plane: a `{uri}` target of `accept_refer` (mode `terminate`) and `replace_peer` takes `route`, the route set the transfer's new leg carries, in the shape and under the rules of a `dial` target's `route` (an array of name-addr Route entries, topmost first, `bad_request` for an entry that is not exactly one). The leg's first INVITE carries exactly those Route headers and goes to the topmost entry unless `next_hop` pins it; the leg's own route set is still the 2xx's Record-Route (RFC 3261 §12.1.2). This is how an application server sends a transfer's new leg back through the S-CSCF with the Route it was given (TS 24.229 §5.7.5). A `route` beside an `{aor}` target, or with `mode: "transparent"` or `"controller"`, which dial no leg, is `bad_request`. Previously the key was dropped without a word. The Rust, Python and TypeScript control SDKs take it (`TransferTarget::uri_routed`, `route=`, `{ uri, route }`). **Breaking for the Rust control client:** `TransferTarget` gains the `UriRouted` variant and is now `#[non_exhaustive]`, so an exhaustive `match` on it needs a wildcard arm; minor bump.
+- Control plane: `accept_refer` refuses a leg-shaping argument (`{aor}`, a target's `route`, `headers`, an identity) as `bad_request` when `b2bua.default_refer_mode` is `transparent` and no `mode` is named, before the pending REFER is taken, as it already did for an explicit `mode: "transparent"`.
+
+### Fixed
+
+- Control plane: a `Route` in `headers` (on `dial`, `route`, `accept_refer`, `replace_peer`, command-level or per target) is refused as `bad_request`. It used to replace the Route headers of the B-leg's INVITE after the destination had been chosen from the target's `route`; a B-leg builder also ignores one injected that way now, for script callers.
+- SIP: a `Route`, `Record-Route` or `Contact` list now splits on commas outside quoted strings, so a valid entry whose display name holds a comma (`"Edge, west" <sip:...;lr>`) is one entry, not a parse error. A `"` inside `<...>` no longer starts a quoted string, and an unterminated quote falls back to the old angle-only split, so a malformed quote never merges two entries or drops a hop.
+- A script's sequential hunt over registered contacts now carries a binding's Path as the B-leg's route set rather than as an injected header.
+
 ## [1.20.1] — 2026-11-27
 
 ### Deprecated

@@ -727,6 +727,15 @@ pub fn b2bua_dial_b_leg(
     // account token / routing tag always lands on the wire regardless of the
     // policy's strip set.
     for (name, value) in extra_headers {
+        // The route set is the `b_leg_route` this leg's destination was chosen
+        // from, set above: an injected `Route` would replace it with another.
+        if name.eq_ignore_ascii_case("Route") {
+            warn!(
+                call_id = %call_id,
+                "B2BUA: ignoring a Route injected as a header, the route set is the leg's own",
+            );
+            continue;
+        }
         b_leg_invite.headers.set(name, value.clone());
     }
 

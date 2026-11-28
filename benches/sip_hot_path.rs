@@ -729,8 +729,32 @@ fn bench_name_addr(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// `RouteEntry::parse_multi`, the Route / Record-Route / Path split that runs on
+/// every in-dialog request: an ordinary three-hop list, a single hop, and a
+/// list whose entries carry a quoted display name with a comma.
+fn bench_route_split(criterion: &mut Criterion) {
+    use siphon::sip::headers::route::RouteEntry;
+
+    let hops = "<sip:p1.example.com;lr>, <sip:198.51.100.7:5070;lr;transport=tcp>, \
+                <sip:p3.example.com;lr;ftag=abc>";
+    let one = "<sip:p1.example.com;lr>";
+    let quoted = "\"Edge, west\" <sip:p1.example.com;lr>, \"East\" <sip:p2.example.com;lr>";
+    let mut group = criterion.benchmark_group("route_split");
+    group.bench_function("parse_multi_three_hops", |bencher| {
+        bencher.iter(|| black_box(RouteEntry::parse_multi(black_box(hops))));
+    });
+    group.bench_function("parse_multi_one_hop", |bencher| {
+        bencher.iter(|| black_box(RouteEntry::parse_multi(black_box(one))));
+    });
+    group.bench_function("parse_multi_quoted_display_names", |bencher| {
+        bencher.iter(|| black_box(RouteEntry::parse_multi(black_box(quoted))));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_route_split,
     bench_name_addr,
     bench_register_exchange,
     bench_listener_identity,

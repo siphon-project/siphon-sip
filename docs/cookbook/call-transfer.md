@@ -401,7 +401,9 @@ on its own: it dials, and the far end replaces.
 
     Pass the target's real address: `call.accept_refer(target="sip:carol@…")`
     from a script, or `accept_refer {target}` from a controller, where `target`
-    may be `{aor}` to reach a registered phone over the connection it holds.
+    may be `{aor}` to reach a registered phone over the connection it holds,
+    or `{uri, route}` to send the new leg through a proxy (an IMS application
+    server returning it to the S-CSCF) as a `dial` target does.
     An AoR with several registered contacts rings them all; the first to answer
     is kept and the rest are CANCELled.
     A controller finds out who that is from `TransferRequested`: when the

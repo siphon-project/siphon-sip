@@ -276,7 +276,7 @@ pub(crate) fn split_entry(entry: &str) -> Option<(&str, &str)> {
 /// The byte offset of the first `target` outside a quoted string (RFC 3261
 /// §25.1: a backslash inside the quotes makes the next character a
 /// quoted-pair, so `\"` does not close the string).
-fn find_outside_quotes(input: &str, target: char) -> Option<usize> {
+pub(crate) fn find_outside_quotes(input: &str, target: char) -> Option<usize> {
     let mut in_quotes = false;
     let mut escaped = false;
     for (index, c) in input.char_indices() {
@@ -299,7 +299,30 @@ fn find_outside_quotes(input: &str, target: char) -> Option<usize> {
 /// Split comma-separated values while respecting angle brackets and quoted
 /// strings (quoted-pairs included).
 /// `"A" <sip:a@x>;tag=1, "B" <sip:b@y>;tag=2` → two parts.
+///
+/// A `"` opens a quoted string only outside angle brackets: a raw `"` is not
+/// valid inside a SIP URI (RFC 3261 §25.1), while a display name before the `<`
+/// and a quoted parameter value after the `>` are. A raw `<` inside a URI is
+/// invalid too, so the angle depth is a plain count, as it has always been.
+///
+/// A quoted string that never closes is malformed: the value is then split
+/// again with quotes ignored, which cuts it at the commas outside `<...>`. A
+/// well-formed quoted string is respected; a malformed one never costs an entry.
 pub(crate) fn split_comma_respecting_angles(input: &str) -> Vec<&str> {
+    split_commas(input, true)
+        .or_else(|| split_commas(input, false))
+        .unwrap_or_default()
+}
+
+/// Whether `input` ends inside a quoted string that never closes (a quote opens
+/// only outside angle brackets, as in [`split_comma_respecting_angles`]).
+pub(crate) fn has_unterminated_quote(input: &str) -> bool {
+    split_commas(input, true).is_none()
+}
+
+/// One pass of [`split_comma_respecting_angles`]. `None` when `respect_quotes`
+/// and a quoted string is still open at the end of `input`.
+fn split_commas(input: &str, respect_quotes: bool) -> Option<Vec<&str>> {
     let mut parts = Vec::new();
     let mut depth = 0u32;
     let mut start = 0;
@@ -317,7 +340,7 @@ pub(crate) fn split_comma_respecting_angles(input: &str) -> Vec<&str> {
             continue;
         }
         match c {
-            '"' => in_quotes = true,
+            '"' if respect_quotes && depth == 0 => in_quotes = true,
             '<' => depth += 1,
             '>' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
@@ -330,13 +353,16 @@ pub(crate) fn split_comma_respecting_angles(input: &str) -> Vec<&str> {
             _ => {}
         }
     }
+    if in_quotes {
+        return None;
+    }
 
     let last = input[start..].trim();
     if !last.is_empty() {
         parts.push(last);
     }
 
-    parts
+    Some(parts)
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +387,41 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].uri.host, "192.0.2.1");
         assert_eq!(entries[1].uri.host, "192.0.2.2");
+    }
+
+    /// A raw `"` is not valid inside a SIP URI (RFC 3261 §25.1), so inside
+    /// `<...>` it opens no quoted string and never swallows the next entry.
+    #[test]
+    fn a_quote_inside_angle_brackets_does_not_swallow_the_next_entry() {
+        for list in [
+            r#"<sip:a@192.0.2.1;x=">, <sip:b@192.0.2.2>"#,
+            r#"<sip:a@192.0.2.1;lr?x=">, <sip:b@192.0.2.2>"#,
+        ] {
+            let parts = split_comma_respecting_angles(list);
+            assert_eq!(parts.len(), 2, "{list}: {parts:?}");
+            assert!(parts[1].contains("192.0.2.2"), "{list}");
+            let entries =
+                NameAddr::parse_multi(list).unwrap_or_else(|error| panic!("{list}: {error}"));
+            assert_eq!(entries.len(), 2, "{list}");
+        }
+        // A quoted gen-value after `>` is still one quoted string.
+        let parts =
+            split_comma_respecting_angles(r#"<sip:a@192.0.2.1>;note="x, y", <sip:b@192.0.2.2>"#);
+        assert_eq!(parts.len(), 2);
+    }
+
+    /// A quote that never closes is malformed: the list is then split as if it
+    /// had no quotes, so no entry is lost to it.
+    #[test]
+    fn an_unterminated_quote_never_costs_an_entry() {
+        for list in [
+            r#""Edge <sip:a@192.0.2.1>, <sip:b@192.0.2.2>"#,
+            r#"<sip:a@192.0.2.1>;x=", <sip:b@192.0.2.2>"#,
+        ] {
+            let parts = split_comma_respecting_angles(list);
+            assert_eq!(parts.len(), 2, "{list}: {parts:?}");
+            assert!(parts[1].starts_with("<sip:b@"), "{list}");
+        }
     }
 
     #[test]

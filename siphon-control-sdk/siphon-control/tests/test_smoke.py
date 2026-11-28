@@ -2445,6 +2445,89 @@ def test_play_sources_gain_and_number_shaping_roundtrip():
     asyncio.run(scenario())
 
 
+def test_transfer_route_set_roundtrip():
+    """`route=` on `accept_refer` / `replace_peer` goes out as the `{uri, route}`
+    target a `dial` target is, in the order given; none (or an empty list) is a
+    bare URI. A route beside `aor=`, with no target, beside a controller
+    transfer, or that is not a list of strings raises before a frame goes out."""
+
+    async def scenario():
+        frames = []
+        verbs = {"accept_refer", "replace_peer"}
+        stub = _verb_stub(verbs, lambda frame: {"channel": "ch1"}, frames)
+        async with websockets.serve(
+            stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/control/ws"
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            done = asyncio.get_event_loop().create_future()
+            route = [
+                "<sip:term@scscf.example.test;lr;odi=4f1c>",
+                "<sip:edge.example.test;lr>",
+            ]
+
+            async def drive(call):
+                await call.accept_refer(
+                    "sip:+15550100@ims.example.test", mode="terminate", route=route
+                )
+                await call.replace_peer(
+                    "sip:+15550100@ims.example.test", next_hop="sip:198.51.100.9", route=route
+                )
+                # An empty route set is no route set.
+                await call.accept_refer("sip:+15550100@ims.example.test", route=[])
+                await call.replace_peer("sip:+15550100@ims.example.test")
+                for verb in (call.accept_refer, call.replace_peer):
+                    with pytest.raises(ValueError, match="aor"):
+                        await verb(aor="sip:3001@example.com", route=route)
+                    with pytest.raises(ValueError, match="route"):
+                        await verb(route=route)
+                    with pytest.raises(TypeError):
+                        await verb("sip:+15550100@ims.example.test", route=route[0])
+                    with pytest.raises(TypeError):
+                        await verb("sip:+15550100@ims.example.test", route=[7])
+                with pytest.raises(ValueError, match="controller"):
+                    await call.accept_refer(mode="controller", route=route)
+
+            @client.on_call
+            async def handle(call):
+                try:
+                    await drive(call)
+                except BaseException as error:  # noqa: BLE001
+                    if not done.done():
+                        done.set_exception(error)
+                    return
+                if not done.done():
+                    done.set_result(None)
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_stasis")
+            await asyncio.wait_for(done, timeout=10)
+
+            def args_of(verb):
+                return [frame["args"] for frame in frames if frame["verb"] == verb]
+
+            target = {"uri": "sip:+15550100@ims.example.test", "route": route}
+            assert args_of("accept_refer") == [
+                {"target": target, "mode": "terminate"},
+                {"target": "sip:+15550100@ims.example.test"},
+            ]
+            assert args_of("replace_peer") == [
+                {"target": target, "next_hop": "sip:198.51.100.9"},
+                {"target": "sip:+15550100@ims.example.test"},
+            ]
+            # Nothing refused went out.
+            assert len(frames) == 4
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
 def test_dial_reroute_after_progress_roundtrip():
     """`reroute_after_progress` goes out on a `dial` target of either form as
     given, `False` included, stays off the wire when not given, and anything but

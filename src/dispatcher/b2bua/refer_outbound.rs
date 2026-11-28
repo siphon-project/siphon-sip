@@ -464,6 +464,8 @@ pub fn b2bua_accept_refer_call(
         number_shape,
         &ReplacementDial::default(),
     )
+    // No dial is named, so there is nothing to refuse.
+    .unwrap_or(false)
 }
 
 /// [`b2bua_accept_refer_call`], naming how the transfer's new leg reaches its
@@ -478,9 +480,9 @@ pub(crate) fn b2bua_accept_refer_call_dialling(
     media_profile: Option<String>,
     number_shape: Option<crate::script::api::numbers::NumberShape>,
     dial: &ReplacementDial,
-) -> bool {
+) -> Result<bool, TransparentDialRefused> {
     let Some(control) = B2BUA_CONTROL.get() else {
-        return false;
+        return Ok(false);
     };
     // The send path re-anchors media (block_in_place) and may spawn (TCP/TLS
     // connect); the caller may be on a non-tokio thread (control apply task) —
@@ -498,10 +500,57 @@ pub(crate) fn b2bua_accept_refer_call_dialling(
     )
 }
 
+/// The mode a transfer runs in: the one named, else `b2bua.default_refer_mode`.
+/// The one place that default is applied.
+pub(crate) fn effective_refer_mode(
+    state: &DispatcherState,
+    mode: Option<crate::script::api::call::ReferMode>,
+) -> crate::script::api::call::ReferMode {
+    mode.unwrap_or(state.default_refer_mode)
+}
+
+/// An accept that names a leg to dial (an `{aor}`, a route set, headers, an
+/// identity) in a mode that relays the REFER and dials none: refused rather
+/// than accepted and ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransparentDialRefused;
+
 /// [`b2bua_accept_refer_call_dialling`] on the dispatcher in hand, from a
 /// thread already inside its runtime.
+///
+/// Refused with [`TransparentDialRefused`], and the held REFER left pending,
+/// when the effective mode is `transparent` (named, or the configured default)
+/// and `dial` names something only a dialled leg can use.
 #[allow(clippy::too_many_arguments)]
 pub fn b2bua_accept_refer_with_state(
+    state: &DispatcherState,
+    sip_call_id: &str,
+    target: Option<String>,
+    next_hop: Option<String>,
+    mode: Option<crate::script::api::call::ReferMode>,
+    media_profile: Option<String>,
+    number_shape: Option<crate::script::api::numbers::NumberShape>,
+    dial: &ReplacementDial,
+) -> Result<bool, TransparentDialRefused> {
+    if effective_refer_mode(state, mode) == crate::script::api::call::ReferMode::Transparent
+        && dial.names_a_dial()
+    {
+        return Err(TransparentDialRefused);
+    }
+    Ok(accept_pending_refer(
+        state,
+        sip_call_id,
+        target,
+        next_hop,
+        mode,
+        media_profile,
+        number_shape,
+        dial,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accept_pending_refer(
     state: &DispatcherState,
     sip_call_id: &str,
     target: Option<String>,
@@ -539,7 +588,7 @@ pub fn b2bua_accept_refer_with_state(
         std::time::Instant::now(),
     );
 
-    let mode = mode.unwrap_or(state.default_refer_mode);
+    let mode = effective_refer_mode(state, mode);
     let target_uri = target.unwrap_or_else(|| pending.refer_to.uri.clone());
     b2bua_refer_accept(
         pending.inbound,
